@@ -1,0 +1,1749 @@
+/* Reset e variabili - Enterprise Security Design */
+:root {
+    /* Primary colors - Corporate Trust & Security */
+    --primary: #1e3a8a;          /* Deep navy blue - massima fiducia */
+    --primary-dark: #1e293b;     /* Almost black navy */
+    --primary-light: #3b82f6;    /* Bright blue for accents */
+    --accent: #0ea5e9;           /* Sky blue - tecnologia avanzata */
+    --accent-dark: #0369a1;      /* Darker sky blue */
+    --accent-green: #10b981;     /* Emerald - sicurezza attiva */
+
+    /* Semantic colors */
+    --success: #047857;          /* Dark emerald - sicurezza confermata */
+    --success-light: #10b981;    /* Lighter green for badges */
+    --warning: #ea580c;          /* Dark orange - attenzione critica */
+    --warning-dark: #c2410c;     /* Darker orange */
+    --error: #dc2626;            /* Deep red - pericolo massimo */
+    --error-dark: #991b1b;       /* Darker red */
+
+    /* Backgrounds - Professional grays */
+    --bg: #f8fafc;               /* Very light slate - ultra professionale */
+    --bg-secondary: #e2e8f0;     /* Slightly darker slate */
+    --bg-card: #ffffff;          /* Pure white for cards */
+    --bg-dark: #0f172a;          /* Very dark slate - contrasto forte */
+    --bg-dark-secondary: #1e293b;/* Dark slate */
+
+    /* Text colors */
+    --text: #0f172a;             /* Almost black - massima leggibilità */
+    --text-medium: #334155;      /* Medium slate - strong presence */
+    --text-light: #64748b;       /* Light slate */
+    --text-lighter: #94a3b8;     /* Very light slate */
+
+    /* Borders - Soft & Professional */
+    --border: #e2e8f0;           /* Light slate border (softened) */
+    --border-medium: #cbd5e1;    /* Medium slate border */
+    --border-strong: #94a3b8;    /* Stronger border (kept for accents only) */
+
+    /* Shadows - Layered depth for security feel */
+    --shadow-sm: 0 1px 3px rgba(15, 23, 42, 0.12), 0 1px 2px rgba(15, 23, 42, 0.08);
+    --shadow-md: 0 4px 6px rgba(15, 23, 42, 0.15), 0 2px 4px rgba(15, 23, 42, 0.10);
+    --shadow-lg: 0 10px 15px rgba(15, 23, 42, 0.18), 0 4px 6px rgba(15, 23, 42, 0.12);
+    --shadow-xl: 0 20px 25px rgba(15, 23, 42, 0.22), 0 10px 10px rgba(15, 23, 42, 0.15);
+    --shadow-secure: 0 0 0 3px rgba(30, 58, 138, 0.1), 0 4px 6px rgba(15, 23, 42, 0.15);
+}
+
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.6;
+    font-weight: 450;  /* Slightly heavier for more presence */
+}
+
+/* Container Homepage */
+.container {
+    max-width: 600px;
+    margin: 0 auto;
+    padding: 2rem 1rem;
+}
+
+header {
+    text-align: center;
+    margin-bottom: 2.5rem;
+    padding-bottom: 2rem;
+    border-bottom: 2px solid var(--border);
+    position: relative;
+}
+
+header::after {
+    content: '';
+    position: absolute;
+    bottom: -2px;
+    left: 50%;
+    transform: translateX(-50%);
+    width: 120px;
+    height: 2px;
+    background: linear-gradient(90deg, var(--primary) 0%, var(--accent) 100%);
+}
+
+header h1 {
+    font-size: 2.75rem;
+    margin-bottom: 0.75rem;
+    color: var(--primary);
+    font-weight: 900;  /* Maximum bold for authority */
+    letter-spacing: -0.03em;  /* Tighter tracking for modern look */
+    text-shadow: 0 2px 4px rgba(30, 58, 138, 0.1);
+}
+
+.subtitle {
+    color: var(--text-medium);
+    font-size: 1.15rem;
+    font-weight: 500;
+    margin-bottom: 1.25rem;
+}
+
+/* Security Badges - Trust Indicators */
+.security-badges {
+    display: flex;
+    gap: 0.75rem;
+    justify-content: center;
+    flex-wrap: wrap;
+    margin-top: 1.5rem;
+}
+
+.security-badge {
+    display: inline-flex;
+    align-items: center;
+    padding: 0.5rem 1rem;
+    background: linear-gradient(135deg, var(--success) 0%, var(--success-light) 100%);
+    color: white;
+    font-size: 0.75rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    border-radius: 0;
+    border: 2px solid var(--success);
+    border-left-width: 4px;
+    box-shadow: var(--shadow-md);
+    transition: all 0.25s ease;
+}
+
+.security-badge:hover {
+    box-shadow: var(--shadow-lg);
+}
+
+/* Card - Mixed corners (sharp top, slightly rounded bottom) */
+.card {
+    background: var(--bg-card);
+    border-radius: 0;  /* Sharp corners */
+    padding: 2rem;
+    margin-bottom: 2rem;
+    box-shadow: var(--shadow-lg);  /* Stronger shadow for depth */
+    border: 2px solid var(--border);  /* Softer, lighter border */
+    border-top: 4px solid var(--primary);  /* Accent top border for emphasis */
+    transition: all 0.25s ease;
+    position: relative;
+}
+
+.card::before {
+    content: '';
+    position: absolute;
+    top: -4px;
+    left: -3px;
+    right: -3px;
+    height: 4px;
+    background: linear-gradient(90deg, var(--primary) 0%, var(--accent) 100%);
+    border-radius: 0;
+}
+
+.card:hover {
+    box-shadow: var(--shadow-secure);  /* Security-focused shadow */
+    border-color: var(--primary);
+}
+
+.card h2 {
+    margin-bottom: 1.5rem;
+    font-size: 1.5rem;
+    font-weight: 700;  /* Bold for strong headings */
+    color: var(--text);
+}
+
+/* Form */
+.form-group {
+    margin-bottom: 1.5rem;
+}
+
+.form-group label {
+    display: block;
+    margin-bottom: 0.5rem;
+    font-weight: 600;  /* Semibold for stronger labels */
+    color: var(--text);
+}
+
+.form-group small {
+    display: block;
+    margin-top: 0.25rem;
+    color: var(--text-light);
+    font-size: 0.875rem;
+}
+
+.radio-group {
+    display: flex;
+    gap: 1rem;
+    flex-wrap: wrap;
+}
+
+.radio-label {
+    display: flex;
+    align-items: center;
+    padding: 0.75rem 1rem;
+    border: 2px solid var(--border-medium);  /* Medium border (softened) */
+    border-radius: 2px;  /* Slightly rounded (mixed approach) */
+    cursor: pointer;
+    transition: all 0.25s ease;
+    background: var(--bg);
+}
+
+.radio-label:hover {
+    border-color: var(--primary);
+    background: var(--bg-card);
+    box-shadow: var(--shadow-md);
+}
+
+.radio-label:has(input[type="radio"]:checked) {
+    border-color: var(--primary);
+    background: var(--bg-card);
+    box-shadow: var(--shadow-secure);
+}
+
+.radio-label input[type="radio"] {
+    margin-right: 0.5rem;
+}
+
+.radio-label input[type="radio"]:checked + span {
+    color: var(--primary);
+    font-weight: 600;
+}
+
+.input,
+.select {
+    width: 100%;
+    padding: 0.75rem 1rem;
+    border: 2px solid var(--border-medium);  /* Medium border (softened) */
+    border-radius: 2px;  /* Slightly rounded */
+    font-size: 1rem;
+    font-weight: 500;  /* Medium weight for inputs */
+    transition: all 0.25s ease;
+    background: var(--bg);
+}
+
+.input:focus,
+.select:focus {
+    outline: none;
+    border-color: var(--primary);
+    background: var(--bg-card);
+    box-shadow: var(--shadow-secure);  /* Security-focused ring */
+}
+
+/* Buttons - Enterprise Security Style */
+.btn {
+    padding: 0.875rem 1.75rem;
+    border: none;
+    border-radius: 0;  /* Sharp corners for authority */
+    font-size: 1rem;
+    font-weight: 700;  /* Bold for strong CTAs */
+    cursor: pointer;
+    transition: all 0.2s ease;
+    display: inline-block;
+    text-align: center;
+    letter-spacing: 0.05em;  /* Wider tracking for emphasis */
+    text-transform: uppercase;  /* Uppercase for authority */
+    font-size: 0.875rem;  /* Slightly smaller when uppercase */
+    position: relative;
+    overflow: hidden;
+}
+
+.btn::after {
+    content: '';
+    position: absolute;
+    top: 0;
+    left: -100%;
+    width: 100%;
+    height: 100%;
+    background: linear-gradient(90deg, transparent, rgba(255,255,255,0.2), transparent);
+    transition: left 0.5s ease;
+}
+
+.btn:hover::after {
+    left: 100%;
+}
+
+.btn-primary {
+    background: var(--primary);
+    color: white;
+    width: 100%;
+    box-shadow: var(--shadow-lg);
+    border: 2px solid var(--primary-dark);  /* Defined edge (softened) */
+    border-bottom-width: 3px;  /* Heavier bottom for 3D effect */
+}
+
+.btn-primary:hover:not(:disabled) {
+    background: var(--primary-dark);
+    box-shadow: var(--shadow-xl);
+}
+
+.btn-primary:active:not(:disabled) {
+    box-shadow: var(--shadow-md);
+}
+
+.btn-primary:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+    box-shadow: none;
+    border-bottom-width: 2px;
+}
+
+.btn-small {
+    padding: 0.5rem 1rem;
+    font-size: 0.75rem;  /* Adjusted for uppercase */
+    box-shadow: var(--shadow-sm);
+}
+
+.btn-small:hover:not(:disabled) {
+    box-shadow: var(--shadow-md);
+}
+
+.link-button {
+    background: none;
+    border: none;
+    color: var(--primary);
+    cursor: pointer;
+    text-decoration: underline;
+    font-size: inherit;
+}
+
+/* Info boxes - Squared with accent border */
+.info-box {
+    background: var(--bg-card);
+    border-left: 4px solid var(--primary);  /* Accent border (softened) */
+    padding: 1.75rem;
+    margin-bottom: 1.5rem;
+    border-radius: 0;  /* Sharp corners */
+    border: 2px solid var(--border);  /* Soft border all around */
+    border-left-width: 4px;
+    box-shadow: var(--shadow-md);
+    position: relative;
+}
+
+.info-box::before {
+    content: '';
+    position: absolute;
+    left: 0;
+    top: 0;
+    bottom: 0;
+    width: 4px;
+    background: linear-gradient(180deg, var(--primary) 0%, var(--accent) 100%);
+}
+
+.info-box.warning {
+    background: #fffbeb;
+    border-left-color: var(--warning);
+    border-color: var(--warning);
+}
+
+.info-box.warning::before {
+    background: linear-gradient(180deg, var(--warning) 0%, var(--warning-dark) 100%);
+}
+
+.info-box h3 {
+    margin-bottom: 0.75rem;
+    font-size: 1.1rem;
+    font-weight: 700;  /* Bold headings */
+    color: var(--text);
+}
+
+.info-box ul {
+    list-style: none;
+    padding-left: 0;
+}
+
+.info-box li {
+    padding: 0.5rem 0;
+    padding-left: 1.5rem;
+    position: relative;
+}
+
+.info-box li::before {
+    content: "•";
+    position: absolute;
+    left: 0;
+    color: var(--primary);
+    font-weight: bold;
+}
+
+/* Error message */
+.error-message {
+    background: #fee2e2;
+    color: var(--error);
+    padding: 1rem;
+    border-radius: 8px;
+    margin-top: 1rem;
+    border: 3px solid var(--error);  /* Thicker border for visibility */
+    font-weight: 600;  /* Bold text */
+    box-shadow: var(--shadow-sm);
+}
+
+/* Login error message (lighter style for form errors) */
+.login-error-message {
+    color: #e74c3c;
+    background: rgba(231, 76, 60, 0.1);
+    padding: 12px;
+    border-radius: 8px;
+    margin-bottom: 16px;
+    text-align: center;
+}
+
+/* Button centering utility */
+.btn-centered {
+    margin: 10px auto;
+    display: block;
+}
+
+.info-message {
+    background: #dbeafe;
+    color: var(--primary);
+    padding: 1rem;
+    border-radius: 8px;
+    margin-top: 1rem;
+    border: 2px solid var(--primary-light);
+    font-weight: 500;
+}
+
+/* Footer - Professional & Trustworthy */
+footer {
+    text-align: center;
+    color: var(--text-light);
+    margin-top: 4rem;
+    padding: 2.5rem 0;
+    font-size: 0.875rem;
+    border-top: 2px solid var(--border);
+    position: relative;
+    font-weight: 600;
+}
+
+footer::before {
+    content: '';
+    position: absolute;
+    top: -2px;
+    left: 50%;
+    transform: translateX(-50%);
+    width: 80px;
+    height: 2px;
+    background: linear-gradient(90deg, var(--primary) 0%, var(--accent) 100%);
+}
+
+/* ========== CHAT PAGE STYLES ========== */
+
+.chat-page {
+    margin: 0;
+    padding: 0;
+    height: 100vh;
+    overflow: hidden;
+}
+
+.chat-container {
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+    max-width: 100%;
+}
+
+/* Chat Header */
+.chat-header {
+    background: var(--bg-card);
+    border-bottom: 2px solid var(--border);  /* Soft border */
+    padding: 1rem;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex-shrink: 0;
+    box-shadow: var(--shadow-md);  /* Stronger shadow */
+}
+
+.room-info h1 {
+    font-size: 1.25rem;
+    margin-bottom: 0.25rem;
+    font-weight: 800;  /* Extra bold */
+    letter-spacing: -0.01em;
+}
+
+.room-details {
+    display: flex;
+    gap: 1rem;
+    font-size: 0.875rem;
+    color: var(--text-light);
+}
+
+.badge {
+    background: var(--primary);
+    color: white;
+    padding: 0.4rem 0.85rem;  /* Slightly larger for presence */
+    border-radius: 0;  /* Sharp corners for authority */
+    font-size: 0.7rem;
+    font-weight: 800;  /* Extra bold for emphasis */
+    letter-spacing: 0.05em;  /* Wider tracking */
+    text-transform: uppercase;  /* Uppercase for authority */
+    border: 2px solid var(--primary-dark);
+    border-left-width: 4px;  /* Accent left border */
+    box-shadow: var(--shadow-sm);
+    transition: all 0.25s ease;
+}
+
+.badge:hover {
+    box-shadow: var(--shadow-md);
+}
+
+.badge-success {
+    background: linear-gradient(135deg, var(--success) 0%, var(--success-light) 100%);
+    border-color: var(--success);
+}
+
+.badge-warning {
+    background: linear-gradient(135deg, var(--warning) 0%, var(--warning-dark) 100%);
+    border-color: var(--warning-dark);
+}
+
+.badge-info {
+    background: linear-gradient(135deg, var(--primary) 0%, var(--primary-light) 100%);
+    border-color: var(--primary);
+}
+
+/* Verified badge - subtle green checkmark */
+.badge-verified {
+    background: transparent;
+    border: 1px solid var(--success-light);
+    color: var(--success);
+    font-weight: 600;
+    padding: 0.25rem 0.6rem;
+    font-size: 0.65rem;
+    border-left-width: 2px;
+}
+
+.participants {
+    display: flex;
+    align-items: center;
+    gap: 0.25rem;
+    min-width: 60px;  /* Fixed width to prevent shifting */
+}
+
+.ttl-countdown {
+    font-weight: 500;
+    display: inline-block;
+    min-width: 85px;  /* Fixed width to prevent shifting when digits change */
+    text-align: left;
+}
+
+.header-actions {
+    display: flex;
+    gap: 0.5rem;
+}
+
+/* Status banners */
+.status-banner {
+    padding: 0.75rem;
+    text-align: center;
+    font-size: 0.875rem;
+    flex-shrink: 0;
+}
+
+.status-banner.warning {
+    background: #fef3c7;
+    color: #92400e;
+}
+
+.status-banner.error {
+    background: #fee2e2;
+    color: var(--error);
+}
+
+/* Messages container */
+.messages-container {
+    flex: 1;
+    overflow-y: auto;
+    background: var(--bg);
+    padding: 1rem;
+}
+
+.messages {
+    max-width: 800px;
+    margin: 0 auto;
+}
+
+/* Message bubbles */
+.message {
+    margin-bottom: 0.35rem;
+    display: flex;
+}
+
+.message-other {
+    justify-content: flex-start;
+}
+
+.message-own {
+    justify-content: flex-end;
+}
+
+.message-bubble {
+    max-width: 70%;
+    padding: 0.4rem 0.75rem;
+    border-radius: 2px;  /* Slightly rounded corners */
+    position: relative;
+    box-shadow: var(--shadow-sm);
+    transition: all 0.2s ease;
+}
+
+.message-bubble:hover {
+    box-shadow: var(--shadow-md);
+}
+
+.message-other .message-bubble {
+    background: var(--bg-card);
+    border: 1px solid var(--border-medium);
+    border-left-width: 2px;
+}
+
+.message-own .message-bubble {
+    background: linear-gradient(135deg, var(--primary) 0%, var(--primary-dark) 100%);
+    color: white;
+    border: 1px solid var(--primary-dark);
+    border-left-width: 2px;
+    box-shadow: var(--shadow-md);
+}
+
+.message-bubble p {
+    margin: 0;
+    word-wrap: break-word;
+    font-size: 0.9rem;
+    line-height: 1.4;
+}
+
+.message-sender {
+    font-size: 0.7rem;
+    margin-bottom: 0.15rem;
+    opacity: 0.8;
+}
+
+.message-sender strong {
+    font-weight: 600;
+}
+
+.message-time {
+    display: inline;
+    font-size: 0.65rem;
+    margin-left: 0.5rem;
+    opacity: 0.6;
+}
+
+/* System messages */
+.system-message {
+    text-align: center;
+    color: var(--text-light);
+    font-size: 0.75rem;
+    margin: 0.5rem 0;
+    padding: 0.25rem 0.5rem;
+}
+
+.system-message.error {
+    background: #fee2e2;
+    color: var(--error);
+    padding: 0.5rem;
+    border-radius: 4px;
+    font-size: 0.8rem;
+}
+
+/* Input area */
+.input-area {
+    background: var(--bg-card);
+    border-top: 2px solid var(--border);  /* Soft border */
+    padding: 1rem;
+    flex-shrink: 0;
+    box-shadow: 0 -2px 8px rgba(15, 23, 42, 0.08);  /* Subtle shadow upwards */
+}
+
+/* Security Status Banner - PFS Handshake Indicator (1:1 chats) */
+.security-status-banner {
+    background: linear-gradient(135deg, #fef3c7 0%, #fde68a 100%);
+    color: #92400e;
+    padding: 0.75rem 1rem;
+    text-align: center;
+    font-size: 0.875rem;
+    font-weight: 700;
+    border: 2px solid #f59e0b;
+    border-left-width: 4px;
+    margin-bottom: 0.75rem;
+    box-shadow: var(--shadow-sm);
+    animation: pulse-warning 2s ease-in-out infinite;
+}
+
+@keyframes pulse-warning {
+    0%, 100% {
+        opacity: 1;
+    }
+    50% {
+        opacity: 0.85;
+    }
+}
+
+/* Group Chat Security Warning - Informational Banner */
+.group-chat-warning {
+    background: linear-gradient(135deg, #dbeafe 0%, #bfdbfe 100%);
+    color: #1e40af;
+    padding: 0.75rem 1rem;
+    text-align: center;
+    font-size: 0.875rem;
+    font-weight: 600;
+    border: 2px solid #3b82f6;
+    border-left-width: 4px;
+    margin-bottom: 0.75rem;
+    box-shadow: var(--shadow-sm);
+}
+
+.message-form {
+    display: flex;
+    gap: 0.5rem;
+    max-width: 800px;
+    margin: 0 auto;
+}
+
+.message-input {
+    flex: 1;
+    padding: 0.875rem 1.15rem;
+    border: 2px solid var(--border-medium);  /* Medium border (softened) */
+    border-radius: 2px;  /* Slightly rounded */
+    font-size: 1rem;
+    font-weight: 500;
+    transition: all 0.25s ease;
+    background: var(--bg);
+}
+
+.message-input:focus {
+    outline: none;
+    border-color: var(--primary);
+    background: var(--bg-card);
+    box-shadow: var(--shadow-secure);  /* Security-focused ring */
+}
+
+.message-input:disabled {
+    background: var(--bg-secondary);
+    opacity: 0.7;
+    cursor: not-allowed;
+}
+
+/* Send Button - Square Icon-Only Style */
+.btn-send {
+    width: 56px !important;  /* Fixed square width */
+    min-width: 56px;
+    padding: 0 !important;  /* Remove padding for perfect square */
+    font-size: 1.75rem;  /* Large icon */
+    line-height: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    text-transform: none;  /* Don't uppercase the icon */
+    letter-spacing: 0;  /* Reset letter spacing */
+    flex-shrink: 0;  /* Don't shrink */
+}
+
+.btn-send::after {
+    display: none;  /* Disable shimmer effect on icon button */
+}
+
+/* Responsive */
+@media (max-width: 640px) {
+    .container {
+        padding: 1rem;
+    }
+
+    header h1 {
+        font-size: 2rem;
+    }
+
+    .card {
+        padding: 1.5rem;
+    }
+
+    .chat-header {
+        flex-direction: column;
+        gap: 0.75rem;
+        align-items: flex-start;
+    }
+
+    .room-details {
+        flex-wrap: wrap;
+    }
+
+    .message-bubble {
+        max-width: 85%;
+    }
+}
+
+/* Utility classes */
+.hidden {
+    display: none !important;
+}
+
+/* Alpine.js transitions */
+[x-cloak] {
+    display: none !important;
+}
+
+/* SAS Verification Modal - Vault-like Security Display */
+.sas-modal {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background: rgba(15, 23, 42, 0.85);  /* Darker overlay */
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 1000;
+    padding: 1rem;
+    backdrop-filter: blur(4px);  /* Blur effect */
+}
+
+.sas-modal-content {
+    background: white;
+    border-radius: 0;  /* Sharp corners for vault-like feel */
+    padding: 3rem;
+    max-width: 500px;
+    width: 100%;
+    position: relative;
+    box-shadow: var(--shadow-xl);  /* Extra strong shadow */
+    border: 2px solid var(--border-medium);  /* Medium border (softened) */
+    border-top: 4px solid var(--primary);  /* Accent top border */
+}
+
+.sas-modal-content::before {
+    content: '';
+    position: absolute;
+    top: -4px;
+    left: -2px;
+    right: -2px;
+    height: 4px;
+    background: linear-gradient(90deg, var(--primary) 0%, var(--accent) 100%);
+}
+
+.sas-modal h3 {
+    margin: 0 0 1.25rem 0;
+    color: var(--text);
+    font-weight: 900;  /* Maximum bold */
+    font-size: 1.2rem;
+    letter-spacing: -0.02em;
+    text-transform: uppercase;
+}
+
+.sas-modal p {
+    margin: 0 0 1.25rem 0;
+    color: var(--text-medium);
+    font-weight: 600;
+}
+
+.sas-code {
+    background: var(--bg-dark);  /* Dark background for maximum contrast */
+    padding: 2.5rem;
+    border-radius: 0;  /* Sharp corners like vault display */
+    text-align: center;
+    font-size: 3rem;
+    font-weight: 900;  /* Maximum bold */
+    font-family: 'SF Mono', 'Monaco', 'Cascadia Code', 'Courier New', monospace;
+    letter-spacing: 0.4em;
+    color: var(--accent);  /* Cyan for tech/security feel */
+    margin: 2rem 0;
+    border: 3px solid var(--accent-dark);  /* Strong border (softened) */
+    border-left-width: 5px;  /* Accent left border (softened) */
+    box-shadow: inset 0 3px 12px rgba(0, 0, 0, 0.4), var(--shadow-lg);  /* Deep inset shadow */
+    text-shadow: 0 0 25px rgba(14, 165, 233, 0.5), 0 0 10px rgba(14, 165, 233, 0.3);  /* Enhanced glow */
+}
+
+/* Emoji SAS Grid - 6 emoji in 2 righe da 3 (like Signal) */
+.sas-code-emoji {
+    display: grid;
+    grid-template-columns: repeat(3, 60px);
+    gap: 0.5rem;
+    justify-content: center;
+    padding: 1rem;
+    margin: 1.5rem auto;
+    background: var(--bg-dark);
+    border-radius: 8px;
+    border: 3px solid var(--accent-dark);
+    box-shadow: inset 0 3px 12px rgba(0, 0, 0, 0.4), var(--shadow-lg);
+    user-select: all;
+    /* Cross-platform emoji font */
+    font-family: "Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji", sans-serif;
+    font-variant-emoji: emoji;
+}
+
+.sas-code-emoji span {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 60px;
+    height: 60px;
+    font-size: 2.5rem;
+    background: rgba(255, 255, 255, 0.05);
+    border-radius: 8px;
+    transition: transform 0.2s ease;
+    -webkit-font-smoothing: antialiased;
+}
+
+.sas-code-emoji span:hover {
+    transform: scale(1.1);
+    background: rgba(255, 255, 255, 0.1);
+}
+
+/* Mobile: celle più piccole */
+@media (max-width: 400px) {
+    .sas-code-emoji {
+        grid-template-columns: repeat(3, 50px);
+        gap: 0.4rem;
+    }
+
+    .sas-code-emoji span {
+        width: 50px;
+        height: 50px;
+        font-size: 2rem;
+    }
+}
+
+/* Hex SAS - Fallback for phone verification */
+.sas-code-hex {
+    background: var(--bg-secondary);
+    padding: 1rem;
+    border-radius: 4px;
+    text-align: center;
+    font-size: 1.2rem;
+    font-weight: 700;
+    font-family: 'SF Mono', 'Monaco', 'Cascadia Code', 'Courier New', monospace;
+    letter-spacing: 0.15em;
+    color: var(--text);
+    border: 2px solid var(--border);
+    user-select: all;
+}
+
+.sas-hint {
+    font-size: 0.875rem;
+    color: var(--text-light);
+    text-align: left;
+    font-weight: 600;
+}
+
+.sas-actions {
+    display: flex;
+    gap: 1rem;
+    margin-top: 1.5rem;
+}
+
+.sas-actions .btn {
+    flex: 1;
+}
+
+.btn-danger {
+    background: linear-gradient(135deg, var(--error) 0%, var(--error-dark) 100%);
+    border: 2px solid var(--error-dark);
+    border-bottom-width: 3px;
+}
+
+.btn-danger:hover:not(:disabled) {
+    background: var(--error-dark);
+    box-shadow: var(--shadow-xl);
+}
+
+.btn-danger:active:not(:disabled) {
+    box-shadow: var(--shadow-md);
+}
+
+.sas-close {
+    position: absolute;
+    top: 0.5rem;
+    right: 0.5rem;
+    background: var(--bg-secondary);
+    border: 2px solid var(--border-medium);  /* Medium border (softened) */
+    font-size: 1.5rem;
+    color: var(--text-medium);
+    cursor: pointer;
+    padding: 0;
+    width: 42px;
+    height: 42px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 0;  /* Sharp corners */
+    transition: all 0.25s ease;
+    font-weight: 900;
+}
+
+.sas-close:hover {
+    background: var(--error);
+    color: white;
+    border-color: var(--error-dark);
+    box-shadow: var(--shadow-lg);
+}
+
+.sas-close:active {
+    box-shadow: var(--shadow-sm);
+}
+
+/* ========== SAS MODAL IMPROVEMENTS ========== */
+
+/* SAS Details (phone verification) */
+.sas-details {
+    margin-top: 15px;
+    background: var(--bg-secondary);
+    padding: 0.75rem 1rem;
+    border-radius: 4px;
+    border: 1px solid var(--border);
+}
+
+.sas-details summary {
+    cursor: pointer;
+    font-size: 0.9em;
+    color: var(--text-medium);
+    font-weight: 600;
+}
+
+.sas-details .sas-code-hex {
+    margin-top: 10px;
+}
+
+/* Copy Button */
+.btn-copy {
+    background: var(--bg-secondary);
+    color: var(--text);
+    padding: 0.5rem 1rem;
+    font-size: 0.875rem;
+    font-weight: 600;
+    border: 2px solid var(--border-medium);
+    text-transform: none;
+    letter-spacing: 0;
+}
+
+.btn-copy:hover {
+    background: var(--bg-card);
+    border-color: var(--primary);
+    box-shadow: var(--shadow-md);
+}
+
+/* Skip Button */
+.btn-skip {
+    width: 100%;
+    margin-top: 1rem;
+    background: transparent;
+    color: var(--text-light);
+    padding: 0.75rem 1rem;
+    font-size: 0.875rem;
+    font-weight: 500;
+    border: 2px dashed var(--border-medium);
+    text-transform: none;
+    letter-spacing: 0;
+    transition: all 0.25s ease;
+}
+
+.btn-skip:hover {
+    background: var(--bg-secondary);
+    color: var(--text);
+    border-color: var(--text-light);
+}
+
+/* Verified Button (Primary in SAS modal) */
+.btn-verified {
+    background: linear-gradient(135deg, var(--success) 0%, var(--success-light) 100%);
+    border-color: var(--success);
+}
+
+.btn-verified:hover:not(:disabled) {
+    background: var(--success);
+    box-shadow: var(--shadow-xl);
+}
+
+/* ========== WARNING BANNERS ========== */
+
+/* MITM Warning Banner */
+.mitm-warning-banner {
+    background: linear-gradient(135deg, #fee2e2 0%, #fecaca 100%);
+    border: 3px solid var(--error);
+    border-left-width: 6px;
+    padding: 1rem 1.25rem;
+    margin-bottom: 0.75rem;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
+    box-shadow: var(--shadow-md);
+    animation: pulse-danger 2s ease-in-out infinite;
+}
+
+@keyframes pulse-danger {
+    0%, 100% {
+        box-shadow: var(--shadow-md);
+    }
+    50% {
+        box-shadow: 0 0 0 4px rgba(220, 38, 38, 0.2), var(--shadow-md);
+    }
+}
+
+.mitm-warning-content {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+}
+
+.mitm-warning-icon {
+    font-size: 1.75rem;
+    flex-shrink: 0;
+}
+
+.mitm-warning-text {
+    color: var(--error-dark);
+}
+
+.mitm-warning-text strong {
+    display: block;
+    font-size: 1rem;
+    margin-bottom: 0.25rem;
+}
+
+.mitm-warning-text p {
+    margin: 0;
+    font-size: 0.875rem;
+    opacity: 0.9;
+}
+
+.btn-new-chat {
+    flex-shrink: 0;
+    text-decoration: none;
+    padding: 0.5rem 1rem;
+    font-size: 0.75rem;
+}
+
+/* Unverified Key Warning Banner */
+.unverified-warning-banner {
+    background: linear-gradient(135deg, #fef3c7 0%, #fde68a 100%);
+    border: 2px solid var(--warning);
+    border-left-width: 4px;
+    padding: 0.75rem 1rem;
+    margin-bottom: 0.75rem;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
+    box-shadow: var(--shadow-sm);
+}
+
+.unverified-warning-content {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+}
+
+.unverified-warning-icon {
+    font-size: 1.5rem;
+    flex-shrink: 0;
+}
+
+.unverified-warning-text {
+    color: #92400e;
+}
+
+.unverified-warning-text strong {
+    display: block;
+    font-size: 0.9rem;
+    margin-bottom: 0.125rem;
+}
+
+.unverified-warning-text p {
+    margin: 0;
+    font-size: 0.8rem;
+    opacity: 0.85;
+}
+
+.btn-verify-now {
+    flex-shrink: 0;
+    background: var(--warning);
+    color: white;
+    border: 2px solid var(--warning-dark);
+    padding: 0.5rem 1rem;
+    font-size: 0.75rem;
+    text-transform: uppercase;
+}
+
+.btn-verify-now:hover {
+    background: var(--warning-dark);
+    box-shadow: var(--shadow-md);
+}
+
+/* Warning banners responsive */
+@media (max-width: 500px) {
+    .mitm-warning-banner,
+    .unverified-warning-banner {
+        flex-direction: column;
+        text-align: center;
+    }
+
+    .mitm-warning-content,
+    .unverified-warning-content {
+        flex-direction: column;
+    }
+
+    .btn-new-chat,
+    .btn-verify-now {
+        width: 100%;
+    }
+}
+
+/* ========== LOGIN PAGE STYLES ========== */
+
+.login-container {
+    max-width: 400px;
+    margin: 0 auto;
+    padding-top: 60px;
+}
+
+.login-card {
+    background: var(--bg-card);
+    border-radius: 16px;
+    padding: 32px;
+    box-shadow: var(--shadow-lg);
+}
+
+.login-header {
+    text-align: center;
+    margin-bottom: 32px;
+}
+
+.login-header h1 {
+    margin-bottom: 8px;
+}
+
+.login-header p {
+    color: var(--text-light);
+    font-size: 14px;
+}
+
+.password-input {
+    width: 100%;
+    padding: 14px 16px;
+    font-size: 16px;
+    border: 2px solid var(--border);
+    border-radius: 8px;
+    background: var(--bg);
+    color: var(--text);
+    transition: border-color 0.2s, box-shadow 0.2s;
+}
+
+.password-input:focus {
+    outline: none;
+    border-color: var(--primary);
+    box-shadow: 0 0 0 3px rgba(30, 58, 138, 0.1);
+}
+
+.login-btn {
+    width: 100%;
+    padding: 14px;
+    margin-top: 20px;
+    font-size: 16px;
+    font-weight: 600;
+    background: var(--primary);
+    color: white;
+    border: none;
+    border-radius: 8px;
+    cursor: pointer;
+    transition: background 0.2s, transform 0.1s;
+}
+
+.login-btn:hover {
+    background: var(--primary-dark);
+}
+
+.login-btn:active {
+    transform: scale(0.98);
+}
+
+.login-btn:disabled {
+    background: var(--text-light);
+    cursor: not-allowed;
+}
+
+.beta-badge {
+    display: inline-block;
+    background: linear-gradient(135deg, var(--primary) 0%, var(--accent) 100%);
+    color: white;
+    padding: 4px 12px;
+    border-radius: 20px;
+    font-size: 12px;
+    font-weight: 600;
+    margin-bottom: 16px;
+}
+
+.security-note {
+    margin-top: 24px;
+    padding: 16px;
+    background: rgba(30, 58, 138, 0.05);
+    border-radius: 8px;
+    font-size: 13px;
+    color: var(--text-light);
+}
+
+.security-note ul {
+    margin: 8px 0 0 0;
+    padding-left: 20px;
+}
+
+.security-note li {
+    margin-bottom: 4px;
+}
+
+/* Form group label for login page */
+.form-group-label {
+    display: block;
+    margin-bottom: 8px;
+    font-weight: 500;
+}
+
+/* ========== IMAGE SHARING STYLES ========== */
+
+/* Image upload button */
+.btn-image {
+    width: 48px;
+    min-width: 48px;
+    height: 48px;
+    padding: 0;
+    font-size: 1.25rem;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: var(--bg-secondary);
+    border: 2px solid var(--border-medium);
+    color: var(--text-medium);
+    border-radius: 2px;
+    text-transform: none;
+    letter-spacing: 0;
+    flex-shrink: 0;
+    transition: all 0.25s ease;
+}
+
+.btn-image:hover:not(:disabled) {
+    background: var(--bg-card);
+    border-color: var(--primary);
+    color: var(--primary);
+    box-shadow: var(--shadow-md);
+}
+
+.btn-image:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+/* Image preview container */
+.image-preview-container {
+    background: var(--bg-secondary);
+    border: 2px solid var(--border-medium);
+    border-radius: 4px;
+    padding: 1rem;
+    margin-bottom: 0.75rem;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0.75rem;
+}
+
+.image-preview-wrapper {
+    position: relative;
+    display: inline-block;
+    max-width: 100%;
+}
+
+.image-preview {
+    max-width: 300px;
+    max-height: 200px;
+    border-radius: 4px;
+    box-shadow: var(--shadow-md);
+    object-fit: contain;
+}
+
+.image-preview-cancel {
+    position: absolute;
+    top: -10px;
+    right: -10px;
+    width: 28px;
+    height: 28px;
+    border-radius: 50%;
+    background: var(--error);
+    color: white;
+    border: 2px solid white;
+    font-size: 1.25rem;
+    line-height: 1;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    box-shadow: var(--shadow-md);
+    transition: all 0.2s ease;
+}
+
+.image-preview-cancel:hover {
+    background: var(--error-dark);
+    transform: scale(1.1);
+}
+
+.image-preview-info {
+    font-size: 0.8rem;
+    color: var(--text-light);
+    display: flex;
+    gap: 0.75rem;
+}
+
+.btn-send-image {
+    width: auto;
+    padding: 0.75rem 2rem;
+    font-size: 0.875rem;
+}
+
+/* Message bubble for images */
+.message-bubble-image {
+    padding: 0.5rem;
+    max-width: 80%;
+}
+
+.message-image-container {
+    overflow: hidden;
+    border-radius: 4px;
+    margin: 0.25rem 0;
+}
+
+.message-image {
+    max-width: 100%;
+    max-height: 300px;
+    display: block;
+    border-radius: 4px;
+    cursor: pointer;
+    transition: transform 0.2s ease, opacity 0.2s ease;
+}
+
+.message-image:hover {
+    opacity: 0.9;
+}
+
+.message-time-standalone {
+    margin: 0.25rem 0 0 0;
+    font-size: 0.65rem;
+    opacity: 0.6;
+    text-align: right;
+}
+
+/* Fullscreen image modal */
+.fullscreen-image-modal {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background: rgba(0, 0, 0, 0.95);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 2000;
+    padding: 1rem;
+    cursor: zoom-out;
+}
+
+.fullscreen-image {
+    max-width: 95vw;
+    max-height: 95vh;
+    object-fit: contain;
+    cursor: default;
+    box-shadow: 0 0 50px rgba(0, 0, 0, 0.5);
+}
+
+.fullscreen-close {
+    position: absolute;
+    top: 1rem;
+    right: 1rem;
+    width: 48px;
+    height: 48px;
+    border-radius: 50%;
+    background: rgba(255, 255, 255, 0.1);
+    color: white;
+    border: 2px solid rgba(255, 255, 255, 0.3);
+    font-size: 2rem;
+    line-height: 1;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: all 0.2s ease;
+}
+
+.fullscreen-close:hover {
+    background: rgba(255, 255, 255, 0.2);
+    border-color: rgba(255, 255, 255, 0.5);
+    transform: scale(1.1);
+}
+
+/* Responsive adjustments for image sharing */
+@media (max-width: 640px) {
+    .image-preview {
+        max-width: 100%;
+        max-height: 150px;
+    }
+
+    .message-image {
+        max-height: 200px;
+    }
+
+    .message-bubble-image {
+        max-width: 90%;
+    }
+
+    .btn-image {
+        width: 44px;
+        min-width: 44px;
+        height: 44px;
+    }
+}
+
+/* ========== EMOJI PICKER STYLES ========== */
+
+/* Emoji button in input area */
+.btn-emoji {
+    width: 48px;
+    min-width: 48px;
+    height: 48px;
+    padding: 0;
+    font-size: 1.25rem;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: var(--bg-secondary);
+    border: 2px solid var(--border-medium);
+    color: var(--text-medium);
+    border-radius: 2px;
+    text-transform: none;
+    letter-spacing: 0;
+    flex-shrink: 0;
+    transition: all 0.25s ease;
+}
+
+.btn-emoji:hover:not(:disabled) {
+    background: var(--bg-card);
+    border-color: var(--primary);
+    color: var(--primary);
+    box-shadow: var(--shadow-md);
+}
+
+.btn-emoji.active {
+    background: var(--primary);
+    border-color: var(--primary-dark);
+    color: white;
+    box-shadow: var(--shadow-md);
+}
+
+.btn-emoji:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+/* Emoji picker container */
+.emoji-picker-container {
+    position: relative;
+}
+
+.emoji-picker {
+    position: absolute;
+    bottom: 100%;
+    left: 0;
+    margin-bottom: 8px;
+    background: var(--bg-card);
+    border: 2px solid var(--border-medium);
+    border-radius: 8px;
+    box-shadow: var(--shadow-xl);
+    width: 320px;
+    max-height: 400px;
+    display: flex;
+    flex-direction: column;
+    z-index: 100;
+    overflow: hidden;
+}
+
+/* Emoji picker header with categories */
+.emoji-picker-header {
+    display: flex;
+    border-bottom: 1px solid var(--border);
+    padding: 4px;
+    gap: 2px;
+    flex-wrap: wrap;
+    background: var(--bg-secondary);
+}
+
+.emoji-category-btn {
+    padding: 6px 10px;
+    font-size: 0.75rem;
+    font-weight: 600;
+    background: transparent;
+    border: none;
+    color: var(--text-light);
+    cursor: pointer;
+    border-radius: 4px;
+    transition: all 0.2s ease;
+    text-transform: uppercase;
+    letter-spacing: 0.02em;
+}
+
+.emoji-category-btn:hover {
+    background: var(--bg-card);
+    color: var(--text);
+}
+
+.emoji-category-btn.active {
+    background: var(--primary);
+    color: white;
+}
+
+/* Emoji grid */
+.emoji-grid {
+    display: grid;
+    grid-template-columns: repeat(8, 1fr);
+    gap: 2px;
+    padding: 8px;
+    overflow-y: auto;
+    max-height: 280px;
+}
+
+.emoji-item {
+    width: 36px;
+    height: 36px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 1.5rem;
+    cursor: pointer;
+    border-radius: 4px;
+    background: transparent;
+    border: none;
+    transition: all 0.15s ease;
+    /* Emoji font stack */
+    font-family:
+        "Apple Color Emoji",
+        "Segoe UI Emoji",
+        "Noto Color Emoji",
+        "Twemoji Mozilla",
+        sans-serif;
+}
+
+.emoji-item:hover {
+    background: var(--bg-secondary);
+    transform: scale(1.15);
+}
+
+.emoji-item:active {
+    transform: scale(0.95);
+}
+
+/* Emoji picker footer with shortcut hint */
+.emoji-picker-footer {
+    padding: 8px 12px;
+    font-size: 0.7rem;
+    color: var(--text-lighter);
+    background: var(--bg-secondary);
+    border-top: 1px solid var(--border);
+    text-align: center;
+}
+
+/* ========== CODE BLOCK STYLES ========== */
+
+/* Multi-line code block */
+.code-block {
+    background: var(--bg-dark);
+    color: #e2e8f0;
+    border-radius: 6px;
+    padding: 12px 16px;
+    margin: 8px 0;
+    overflow-x: auto;
+    font-family: 'SF Mono', 'Monaco', 'Cascadia Code', 'Fira Code', 'Consolas', 'Courier New', monospace;
+    font-size: 0.85rem;
+    line-height: 1.5;
+    border: 1px solid var(--bg-dark-secondary);
+    box-shadow: var(--shadow-sm);
+    white-space: pre;
+    word-wrap: normal;
+}
+
+.code-block code {
+    font-family: inherit;
+    font-size: inherit;
+    background: transparent;
+    padding: 0;
+    color: inherit;
+}
+
+/* Language indicator for code blocks */
+.code-block[data-language]::before {
+    content: attr(data-language);
+    display: block;
+    font-size: 0.7rem;
+    color: var(--text-lighter);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    margin-bottom: 8px;
+    padding-bottom: 6px;
+    border-bottom: 1px solid var(--bg-dark-secondary);
+}
+
+/* Inline code */
+.inline-code {
+    background: var(--bg-secondary);
+    color: var(--primary);
+    font-family: 'SF Mono', 'Monaco', 'Cascadia Code', 'Fira Code', 'Consolas', 'Courier New', monospace;
+    font-size: 0.85em;
+    padding: 2px 6px;
+    border-radius: 4px;
+    border: 1px solid var(--border);
+    white-space: nowrap;
+}
+
+/* Message own code blocks - adjust colors for contrast */
+.message-own .code-block {
+    background: rgba(0, 0, 0, 0.3);
+    border-color: rgba(255, 255, 255, 0.1);
+}
+
+.message-own .inline-code {
+    background: rgba(255, 255, 255, 0.15);
+    color: #bfdbfe;
+    border-color: rgba(255, 255, 255, 0.2);
+}
+
+/* Responsive emoji picker */
+@media (max-width: 400px) {
+    .emoji-picker {
+        width: 280px;
+    }
+
+    .emoji-grid {
+        grid-template-columns: repeat(7, 1fr);
+    }
+
+    .emoji-item {
+        width: 32px;
+        height: 32px;
+        font-size: 1.25rem;
+    }
+
+    .emoji-category-btn {
+        padding: 4px 8px;
+        font-size: 0.65rem;
+    }
+
+    .btn-emoji {
+        width: 44px;
+        min-width: 44px;
+        height: 44px;
+    }
+}

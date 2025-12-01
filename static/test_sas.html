@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SAS PBKDF2 Test</title>
+</head>
+<body>
+    <h1>SAS PBKDF2 Test</h1>
+    <button id="testBtn">Run Test</button>
+    <pre id="output"></pre>
+
+    <script src="/static/js/crypto.js"></script>
+    <script src="/static/js/ecdh.js"></script>
+    <script>
+        const output = document.getElementById('output');
+
+        async function log(msg) {
+            output.textContent += msg + '\n';
+            console.log(msg);
+        }
+
+        async function runTest() {
+            output.textContent = '';
+            await log('=== Testing PBKDF2 SAS Generation ===\n');
+
+            try {
+                // Generate bootstrap key
+                const bootstrapKeyRaw = crypto.getRandomValues(new Uint8Array(32));
+                const bootstrapKey = await crypto.subtle.importKey(
+                    'raw',
+                    bootstrapKeyRaw,
+                    'AES-GCM',
+                    false,
+                    ['encrypt', 'decrypt']
+                );
+
+                // Create two ECDH managers (Alice and Bob)
+                const alice = new ECDHKeyExchange(bootstrapKey);
+                const bob = new ECDHKeyExchange(bootstrapKey);
+
+                await log('1. Generating keypairs...');
+                await alice.generateKeypair();
+                await bob.generateKeypair();
+
+                const roomId = 'test-room-123';
+                const aliceId = 'alice-connection-id';
+                const bobId = 'bob-connection-id';
+
+                await log('2. Encrypting public keys with AAD binding...');
+                const alicePayload = await alice.encryptPublicKey(roomId, aliceId);
+                const bobPayload = await bob.encryptPublicKey(roomId, bobId);
+
+                await log('3. Exchanging and decrypting public keys...');
+                await alice.decryptPublicKey(
+                    bobPayload.encryptedKey,
+                    roomId,
+                    bobId,
+                    bobPayload.timestamp,
+                    bobPayload.nonce
+                );
+
+                await bob.decryptPublicKey(
+                    alicePayload.encryptedKey,
+                    roomId,
+                    aliceId,
+                    alicePayload.timestamp,
+                    alicePayload.nonce
+                );
+
+                await log('4. Generating SAS (this will take ~1 second due to PBKDF2 100K iterations)...');
+                const startTime = performance.now();
+
+                const aliceSAS = await alice.generateSAS(roomId);
+                const aliceTime = performance.now() - startTime;
+
+                const bobStartTime = performance.now();
+                const bobSAS = await bob.generateSAS(roomId);
+                const bobTime = performance.now() - bobStartTime;
+
+                await log(`\n5. Results:`);
+                await log(`   Alice SAS: ${aliceSAS.emoji}`);
+                await log(`   Alice Hex: ${aliceSAS.hex}`);
+                await log(`   Alice Time: ${aliceTime.toFixed(0)}ms`);
+                await log(`   Alice Bits: ${aliceSAS.bits}`);
+                await log(`   Alice Iterations: ${aliceSAS.iterations}`);
+
+                await log(`\n   Bob SAS:   ${bobSAS.emoji}`);
+                await log(`   Bob Hex:   ${bobSAS.hex}`);
+                await log(`   Bob Time: ${bobTime.toFixed(0)}ms`);
+                await log(`   Bob Bits: ${bobSAS.bits}`);
+                await log(`   Bob Iterations: ${bobSAS.iterations}`);
+
+                await log(`\n6. Verification:`);
+                const match = aliceSAS.emoji === bobSAS.emoji && aliceSAS.hex === bobSAS.hex;
+                await log(`   SAS Match: ${match ? '✅ PASS' : '❌ FAIL'}`);
+
+                if (match) {
+                    await log(`   Emoji Count: ${aliceSAS.emoji.length} (expected: 8)`);
+                    await log(`   Average Latency: ${((aliceTime + bobTime) / 2).toFixed(0)}ms`);
+                    await log('\n✅ Test PASSED: Both parties computed identical SAS');
+                } else {
+                    await log('\n❌ Test FAILED: SAS mismatch detected');
+                }
+
+            } catch (error) {
+                await log(`\n❌ Error: ${error.message}`);
+                console.error(error);
+            }
+        }
+
+        document.getElementById('testBtn').addEventListener('click', runTest);
+
+        // Auto-run on load
+        window.addEventListener('load', () => {
+            setTimeout(runTest, 500);
+        });
+    </script>
+</body>
+</html>

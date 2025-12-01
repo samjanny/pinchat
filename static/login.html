@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Login</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+    <div class="login-container">
+        <div class="login-card">
+            <div class="login-header">
+                <h1>Secure Access</h1>
+            </div>
+
+            <!-- error_placeholder -->
+
+            <form method="POST" action="/login">
+                <input type="hidden" name="csrf_token" value="{{csrf_token}}">
+                <input type="hidden" name="redirect_url" value="{{redirect_url}}">
+
+                <div class="form-group">
+                    <input
+                        type="password"
+                        id="password"
+                        name="password"
+                        class="password-input"
+                        placeholder="Password"
+                        autocomplete="current-password"
+                        required
+                        autofocus
+                    >
+                </div>
+
+                <button type="submit" class="login-btn">
+                    Enter
+                </button>
+            </form>
+
+        </div>
+    </div>
+</body>
+</html>

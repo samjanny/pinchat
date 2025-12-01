@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PinChat - E2E Encrypted Chat</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+    <script src="/static/js/pow.js"></script>
+    <script src="/static/js/homepage.js"></script>
+    <script src="/static/js/alpine-csp.min.js" defer></script>
+</head>
+<body>
+    <div class="container" x-data>
+        <header>
+            <h1>🔐 PinChat</h1>
+            <p class="subtitle">End-to-end encrypted, temporary, and anonymous chat</p>
+            <!-- Security Badges -->
+            <div class="security-badges">
+                <span class="security-badge">🔒 E2E Encrypted</span>
+                <span class="security-badge">🚫 Zero-Log</span>
+                <span class="security-badge">⏱️ Auto-Destruct</span>
+            </div>
+        </header>
+
+        <main>
+            <div class="card">
+                <h2>Create a new room</h2>
+
+                <form @submit.prevent="$store.homepage.createRoom()">
+                    <!-- Chat type (hidden - group chats temporarily disabled) -->
+                    <input type="hidden" name="roomType" value="onetoone" x-model="$store.homepage.roomType">
+
+                    <!-- TTL -->
+                    <div class="form-group">
+                        <label for="ttl">Room duration:</label>
+                        <select id="ttl" x-model.number="$store.homepage.ttlMinutes" class="select">
+                            <option value="15">15 minutes</option>
+                            <option value="30" selected>30 minutes</option>
+                            <option value="60">1 hour</option>
+                            <option value="180">3 hours</option>
+                            <option value="360">6 hours</option>
+                            <option value="1440">24 hours</option>
+                        </select>
+                        <small>The room will be automatically deleted after this time</small>
+                    </div>
+
+                    <!-- Create button -->
+                    <button type="submit" class="btn btn-primary" :disabled="$store.homepage.loading">
+                        <span x-show="!$store.homepage.loading">Create Secure Room</span>
+                        <span x-show="$store.homepage.loading" x-text="$store.homepage.loadingMessage">Creating...</span>
+                    </button>
+
+                    <!-- PoW progress -->
+                    <div x-show="$store.homepage.powProgress" class="info-message" x-text="$store.homepage.powProgress"></div>
+
+                    <!-- Error -->
+                    <div x-show="$store.homepage.error" class="error-message" x-text="$store.homepage.error"></div>
+                </form>
+            </div>
+
+            <!-- Information -->
+            <div class="info-box">
+                <h3>✨ Features</h3>
+                <ul>
+                    <li><strong>End-to-End Encryption</strong> - Only you and your contacts can read the messages</li>
+                    <li><strong>No accounts</strong> - No registration, no personal data</li>
+                    <li><strong>No persistence</strong> - Messages are never stored on disk</li>
+                    <li><strong>Auto-destruction</strong> - Rooms delete themselves at expiration</li>
+                    <li><strong>Open Source</strong> - Code that can be publicly verified</li>
+                </ul>
+            </div>
+
+            <div class="info-box warning">
+                <h3>⚠️ Important notes</h3>
+                <ul>
+                    <li>Do not share the room link on public channels</li>
+                    <li>The encryption key is contained in the link (after the # symbol)</li>
+                    <li>If you lose the link, you can no longer access the chat</li>
+                    <li>Messages cannot be recovered after the room expires</li>
+                </ul>
+            </div>
+        </main>
+
+        <footer>
+            <p>PinChat - Privacy-first ephemeral chat</p>
+        </footer>
+    </div>
+</body>
+</html>

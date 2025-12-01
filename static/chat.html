@@ -1,0 +1,306 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PinChat - Secure Chat</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+    <script src="/static/js/pow.js"></script>
+    <script src="/static/js/nicknames.js"></script>
+</head>
+<body class="chat-page">
+    <div class="chat-container" x-data="$store.chatRoom">
+        <!-- Header -->
+        <header class="chat-header">
+            <div class="room-info">
+                <h1>🔐 Secure Chat</h1>
+                <div class="room-details">
+                    <!-- Show loading state until server sends room config -->
+                    <span class="badge" x-text="roomType ? (roomType === 'onetoone' ? '1:1' : 'Group') : '🔄 Loading...'"></span>
+                    <span class="participants">👥 <span x-text="participantCount"></span>/<span x-text="maxParticipants !== null ? maxParticipants : '-'"></span></span>
+                    <span class="ttl-countdown" x-show="timeRemaining" x-text="formatTime(timeRemaining)"></span>
+
+                    <!-- User's nickname -->
+                    <span x-show="myNickname" class="badge badge-info" :title="'Your session identifier: ' + userId">
+                        👤 <span x-text="myNickname"></span>
+                    </span>
+
+                    <!-- PFS & PCS Status Badges -->
+                    <span x-show="pfsActive" class="badge badge-success" title="Perfect Forward Secrecy active - Past messages protected">
+                        🔐 PFS
+                    </span>
+                    <span x-show="pfsActive" class="badge badge-success" title="Post-Compromise Security active - Future messages protected via Double Ratchet">
+                        🔄 PCS
+                    </span>
+                    <!-- Verified Key Badge (subtle indicator when verified) -->
+                    <span x-show="sasVerificationStatus === 'verified'" class="badge badge-verified" title="Key verified - Identity confirmed via SAS code">
+                        ✓ Verified
+                    </span>
+                    <span x-show="roomType === 'onetoone' && participantCount < 2 && connected" class="badge badge-info" title="Waiting for other participant">
+                        ⏱️ Waiting
+                    </span>
+                    <span x-show="(roomType !== 'onetoone' && connected) || ecdhHandshakeStatus === 'aborted'" class="badge badge-warning" title="Encrypted, but no Forward Secrecy">
+                        🔐 Encrypted
+                    </span>
+                </div>
+            </div>
+
+            <div class="header-actions">
+                <button @click="copyLink" class="btn btn-small" title="Copy link">
+                    📋 <span x-text="copied ? 'Copied!' : 'Copy link'"></span>
+                </button>
+            </div>
+        </header>
+
+        <!-- Status -->
+        <div x-show="!connected" class="status-banner warning">
+            <span x-show="connecting" x-text="connectingMessage || 'Connecting...'"></span>
+            <span x-show="!connecting && !connected">⚠️ Disconnected - <button @click="reconnect" class="link-button">Reconnect</button></span>
+        </div>
+
+        <div x-show="error" class="status-banner error">
+            <span x-text="error"></span>
+        </div>
+
+        <!-- Messages Area -->
+        <div class="messages-container">
+            <div class="messages">
+                <!-- Welcome message -->
+                <div class="system-message" x-show="messages.length === 0 && connected">
+                    <p>✅ Connected to the secure chat</p>
+                    <p>Messages are end-to-end encrypted. No one else, not even the server, can read them.</p>
+                    <p><strong>Share the link</strong> to invite more participants.</p>
+                </div>
+
+                <!-- Messages -->
+                <template x-for="msg in messages" :key="msg.id">
+                    <div>
+                        <!-- User text message -->
+                        <div x-show="msg.type === 'message'" class="message" :class="msg.isOwn ? 'message-own' : 'message-other'">
+                            <div class="message-bubble">
+                                <!-- Show nickname for all messages -->
+                                <div x-show="msg.nickname" class="message-sender" :title="msg.senderId">
+                                    <strong x-text="msg.nickname"></strong>
+                                </div>
+                                <p><span x-html="renderMessage(msg.text)"></span><span class="message-time" x-text="formatTimestamp(msg.timestamp)"></span></p>
+                            </div>
+                        </div>
+
+                        <!-- User image message -->
+                        <div x-show="msg.type === 'image'" class="message" :class="msg.isOwn ? 'message-own' : 'message-other'">
+                            <div class="message-bubble message-bubble-image">
+                                <!-- Show nickname for all messages -->
+                                <div x-show="msg.nickname" class="message-sender" :title="msg.senderId">
+                                    <strong x-text="msg.nickname"></strong>
+                                </div>
+                                <div class="message-image-container">
+                                    <img :src="msg.imageUrl" class="message-image" alt="Shared image" @click="openImageFullscreen(msg.imageUrl)">
+                                </div>
+                                <p class="message-time-standalone" x-text="formatTimestamp(msg.timestamp)"></p>
+                            </div>
+                        </div>
+
+                        <!-- System notification -->
+                        <div x-show="msg.type === 'system'" class="system-message">
+                            <span x-text="msg.text"></span>
+                        </div>
+                    </div>
+                </template>
+
+                <!-- Failed decryption indicator -->
+                <div x-show="decryptionError" class="system-message error">
+                    ⚠️ Unable to decrypt some messages. Make sure you have the correct link with the encryption key.
+                </div>
+            </div>
+        </div>
+
+        <!-- Input Area -->
+        <div class="input-area">
+            <!-- MITM Warning Banner (Keys don't match) -->
+            <div x-show="sasVerificationStatus === 'mismatch'" class="mitm-warning-banner">
+                <div class="mitm-warning-content">
+                    <span class="mitm-warning-icon">⚠️</span>
+                    <div class="mitm-warning-text">
+                        <strong>WARNING: Possible MITM attack!</strong>
+                        <p>Keys do not match. It is strongly recommended to start a new chat.</p>
+                    </div>
+                </div>
+                <a href="/static/index.html" class="btn btn-danger btn-new-chat">New Chat</a>
+            </div>
+
+            <!-- Unverified Key Warning Banner -->
+            <div x-show="sasVerificationStatus === 'skipped'" class="unverified-warning-banner">
+                <div class="unverified-warning-content">
+                    <span class="unverified-warning-icon">🔓</span>
+                    <div class="unverified-warning-text">
+                        <strong>Key not verified</strong>
+                        <p>Connection security has not been confirmed.</p>
+                    </div>
+                </div>
+                <button @click="reopenSasVerification()" class="btn btn-verify-now">Verify now</button>
+            </div>
+
+            <!-- PFS Handshake Status Banner (1:1 chats only) -->
+            <div x-show="connected && roomType === 'onetoone' && participantCount === 2 && !pfsActive" class="security-status-banner">
+                🔐 Establishing secure end-to-end encryption... Please wait.
+            </div>
+
+            <!-- Group Chat Security Warning (3+ participants OR non-1:1 room types) -->
+            <div x-show="connected && roomType !== 'onetoone'" class="group-chat-warning">
+                ℹ️ <strong>Group chats</strong> currently use bootstrap encryption. Perfect Forward Secrecy for group chats is planned for future implementation.
+            </div>
+
+            <!-- Image Preview (shown when image is selected or being sent) -->
+            <div x-show="pendingImage || sendingImage" class="image-preview-container">
+                <div class="image-preview-wrapper" x-show="pendingImage">
+                    <img :src="pendingImage ? pendingImage.dataUrl : ''" class="image-preview" alt="Preview">
+                    <button @click="cancelImage()" class="image-preview-cancel" title="Cancel" x-show="!sendingImage">×</button>
+                </div>
+                <div class="image-preview-info" x-show="pendingImage">
+                    <span x-text="pendingImage ? pendingImage.name : ''"></span>
+                    <span x-text="pendingImage ? formatFileSize(pendingImage.size) : ''"></span>
+                </div>
+                <button
+                    @click="sendImage()"
+                    class="btn btn-primary btn-send-image"
+                    :disabled="!connected || (roomType === 'onetoone' && participantCount === 2 && !pfsActive) || sendingImage">
+                    <span x-show="!sendingImage">Send Image</span>
+                    <span x-show="sendingImage">Sending...</span>
+                </button>
+            </div>
+
+            <form @submit.prevent="sendMessage" class="message-form" x-show="!pendingImage && !sendingImage">
+                <!-- Hidden file input for images -->
+                <input
+                    type="file"
+                    x-ref="imageInput"
+                    @change="handleImageSelect($event)"
+                    accept="image/jpeg,image/png,image/gif,image/webp"
+                    class="hidden"
+                >
+                <!-- Image upload button -->
+                <button
+                    type="button"
+                    @click="$refs.imageInput.click()"
+                    class="btn btn-image"
+                    :disabled="!connected || (roomType === 'onetoone' && participantCount === 2 && !pfsActive)"
+                    title="Send image">
+                    📷
+                </button>
+                <!-- Emoji picker button and container -->
+                <div class="emoji-picker-container">
+                    <button
+                        type="button"
+                        @click="toggleEmojiPicker()"
+                        class="btn btn-emoji"
+                        :class="{ 'active': emojiPickerOpen }"
+                        :disabled="!connected || (roomType === 'onetoone' && participantCount === 2 && !pfsActive)"
+                        title="Emoji">
+                        😊
+                    </button>
+                    <!-- Emoji Picker Panel -->
+                    <div x-show="emojiPickerOpen" class="emoji-picker" @click.outside="closeEmojiPicker()">
+                        <!-- Category tabs -->
+                        <div class="emoji-picker-header">
+                            <template x-for="(cat, catIndex) in emojiCategories" :key="'cat-' + catIndex">
+                                <button
+                                    type="button"
+                                    class="emoji-category-btn"
+                                    :class="{ 'active': selectedEmojiCategory === cat }"
+                                    @click="selectEmojiCategory(cat)"
+                                    x-text="cat.substring(0, 4)">
+                                </button>
+                            </template>
+                        </div>
+                        <!-- Emoji grid -->
+                        <div class="emoji-grid">
+                            <template x-for="(emoji, index) in currentEmojis" :key="'emoji-' + index">
+                                <button
+                                    type="button"
+                                    class="emoji-item"
+                                    @click="insertEmoji(emoji)"
+                                    x-text="emoji">
+                                </button>
+                            </template>
+                        </div>
+                        <!-- Footer hint -->
+                        <div class="emoji-picker-footer">
+                            Tip: Type :) :D :P for auto-emoji | Use `code` or ```code``` for code blocks
+                        </div>
+                    </div>
+                </div>
+                <input
+                    type="text"
+                    x-model="messageInput"
+                    x-ref="messageInputField"
+                    :placeholder="(roomType === 'onetoone' && participantCount === 2 && !pfsActive) ? '🔐 Establishing secure connection...' : 'Write an encrypted message...'"
+                    class="message-input"
+                    :disabled="!connected || (roomType === 'onetoone' && participantCount === 2 && !pfsActive)"
+                    maxlength="1000"
+                >
+                <button
+                    type="submit"
+                    class="btn btn-primary btn-send"
+                    :disabled="!connected || (roomType === 'onetoone' && participantCount === 2 && !pfsActive) || !messageInput.trim()"
+                    :title="(roomType === 'onetoone' && participantCount === 2 && !pfsActive) ? 'Waiting for secure connection...' : 'Send message'">
+                    <span x-show="!(roomType === 'onetoone' && participantCount === 2 && !pfsActive)">↑</span>
+                    <span x-show="roomType === 'onetoone' && participantCount === 2 && !pfsActive">⏳</span>
+                </button>
+            </form>
+        </div>
+
+        <!-- SAS Verification Modal (MITM detection) -->
+        <div x-show="sas && pfsActive" class="sas-modal">
+            <div class="sas-modal-content">
+                <h3>🔐 Security Verification</h3>
+                <p>To ensure no man-in-the-middle attack, verify this code matches with your contact:</p>
+
+                <!-- Emoji SAS (Primary) -->
+                <div class="sas-code-emoji" x-html="formatEmojiGrid(sas ? (sas.emoji || '') : '')"></div>
+
+                <!-- Copy Emoji Button -->
+                <button @click="copySasEmoji()" class="btn btn-copy btn-centered">
+                    <span x-text="sasCopied ? '✓ Copied!' : '📋 Copy Emoji'"></span>
+                </button>
+
+                <!-- Hex Fallback (for phone verification) -->
+                <details class="sas-details">
+                    <summary>For phone verification</summary>
+                    <div class="sas-code-hex" x-text="sas ? (sas.hex || '') : ''"></div>
+                </details>
+
+                <p class="sas-hint">This code should be identical on both sides.</p>
+
+                <div class="sas-actions">
+                    <button @click="handleSasVerified()" class="btn btn-primary btn-verified">
+                        ✓ Verified
+                    </button>
+                    <button @click="handleSasMismatch()" class="btn btn-danger">
+                        ✗ Code doesn't match
+                    </button>
+                </div>
+
+                <button @click="handleSasSkipped()" class="btn btn-skip">
+                    I don't want to verify
+                </button>
+            </div>
+        </div>
+
+        <!-- Fullscreen Image Viewer Modal -->
+        <div x-show="fullscreenImage" class="fullscreen-image-modal" @click="fullscreenImage = null">
+            <button class="fullscreen-close" @click="fullscreenImage = null">×</button>
+            <img :src="fullscreenImage" class="fullscreen-image" alt="Full size image" @click.stop>
+        </div>
+    </div>
+
+    <!-- Include JS modules -->
+    <script src="/static/js/crypto.js"></script>
+    <script src="/static/js/identity.js"></script>
+    <script src="/static/js/double-ratchet.js"></script>
+    <script src="/static/js/ecdh.js"></script>
+    <script src="/static/js/websocket.js"></script>
+    <script src="/static/js/emoji.js"></script>
+    <script src="/static/js/app.js"></script>
+    <script src="/static/js/alpine-csp.min.js" defer></script>
+</body>
+</html>

@@ -1,0 +1,70 @@
+{
+    "data": {
+        "version": "1.0.0",
+        "generated": "2024-01-01T00:00:00.000Z",
+        "site": "https://pinchat.io",
+        "files": [
+            {
+                "path": "/index.html",
+                "hash": "sha256_hash_here"
+            },
+            {
+                "path": "/chat.html",
+                "hash": "sha256_hash_here"
+            },
+            {
+                "path": "/login.html",
+                "hash": "sha256_hash_here"
+            },
+            {
+                "path": "/css/style.css",
+                "hash": "sha256_hash_here"
+            },
+            {
+                "path": "/js/app.js",
+                "hash": "sha256_hash_here"
+            },
+            {
+                "path": "/js/crypto.js",
+                "hash": "sha256_hash_here"
+            },
+            {
+                "path": "/js/double-ratchet.js",
+                "hash": "sha256_hash_here"
+            },
+            {
+                "path": "/js/ecdh.js",
+                "hash": "sha256_hash_here"
+            },
+            {
+                "path": "/js/emoji.js",
+                "hash": "sha256_hash_here"
+            },
+            {
+                "path": "/js/homepage.js",
+                "hash": "sha256_hash_here"
+            },
+            {
+                "path": "/js/identity.js",
+                "hash": "sha256_hash_here"
+            },
+            {
+                "path": "/js/nicknames.js",
+                "hash": "sha256_hash_here"
+            },
+            {
+                "path": "/js/pow.js",
+                "hash": "sha256_hash_here"
+            },
+            {
+                "path": "/js/websocket.js",
+                "hash": "sha256_hash_here"
+            },
+            {
+                "path": "/js/alpine-csp.min.js",
+                "hash": "sha256_hash_here"
+            }
+        ]
+    },
+    "signature": "base64_ecdsa_signature_here"
+}

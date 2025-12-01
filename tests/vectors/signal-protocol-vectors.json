@@ -1,0 +1,246 @@
+{
+  "version": "1.0.0",
+  "description": "Signal Protocol Test Vectors for PinChat",
+  "generated": "2024-01-01",
+
+  "chainRatchet": {
+    "description": "Chain Ratchet (Symmetric Key Ratchet) test vectors",
+    "vectors": [
+      {
+        "name": "basic_chain_derivation",
+        "description": "Derive 3 consecutive message keys from fixed chain key",
+        "input": {
+          "chainKeyMaterial": "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20",
+          "messageCount": 3
+        },
+        "expected": {
+          "messageKeys": [
+            {
+              "counter": 0,
+              "info": "MessageKey-0"
+            },
+            {
+              "counter": 1,
+              "info": "MessageKey-1"
+            },
+            {
+              "counter": 2,
+              "info": "MessageKey-2"
+            }
+          ],
+          "note": "Each key is HMAC-SHA256(chainKey, 'MessageKey-N') then chain ratchets with HMAC-SHA256(chainKey, 'ChainRatchet')"
+        }
+      },
+      {
+        "name": "chain_ratchet_irreversibility",
+        "description": "Verify chain ratcheting is one-way (cannot derive previous keys)",
+        "input": {
+          "chainKeyMaterial": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        "steps": [
+          "derive message key 0",
+          "ratchet chain",
+          "derive message key 1",
+          "verify: cannot derive message key 0 from current state"
+        ]
+      },
+      {
+        "name": "bidirectional_chain_symmetry",
+        "description": "Alice's sending chain matches Bob's receiving chain",
+        "input": {
+          "sharedSecret": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+          "salt": "0000000000000000000000000000000000000000000000000000000000000000"
+        },
+        "expected": {
+          "initiatorSendingLabel": "InitiatorToResponder",
+          "initiatorReceivingLabel": "ResponderToInitiator",
+          "responderSendingLabel": "ResponderToInitiator",
+          "responderReceivingLabel": "InitiatorToResponder",
+          "symmetryCheck": "Alice.sendingChainKey === Bob.receivingChainKey"
+        }
+      }
+    ]
+  },
+
+  "doubleRatchet": {
+    "description": "Double Ratchet (DH + Symmetric) test vectors",
+    "vectors": [
+      {
+        "name": "initialization",
+        "description": "Initialize Double Ratchet with shared secret",
+        "input": {
+          "sharedSecret": "cafebabecafebabecafebabecafebabecafebabecafebabecafebabecafebabe",
+          "isInitiator": true
+        },
+        "expected": {
+          "rootKeyLabel": "DoubleRatchet-RootKey",
+          "sendingChainLabel": "InitiatorToResponder",
+          "receivingChainLabel": "ResponderToInitiator"
+        }
+      },
+      {
+        "name": "message_exchange_basic",
+        "description": "Alice sends 2 messages, Bob receives them",
+        "scenario": [
+          {"action": "alice_init", "role": "initiator"},
+          {"action": "bob_init", "role": "responder"},
+          {"action": "alice_encrypt", "message": "Hello Bob!"},
+          {"action": "bob_decrypt", "expectedPlaintext": "Hello Bob!"},
+          {"action": "alice_encrypt", "message": "How are you?"},
+          {"action": "bob_decrypt", "expectedPlaintext": "How are you?"}
+        ],
+        "expected": {
+          "aliceRatchetCount": 0,
+          "bobRatchetCount": 0,
+          "note": "No DH ratchet yet - Alice keeps sending"
+        }
+      },
+      {
+        "name": "dh_ratchet_on_reply",
+        "description": "DH ratchet triggers when Bob replies",
+        "scenario": [
+          {"action": "alice_init", "role": "initiator"},
+          {"action": "bob_init", "role": "responder"},
+          {"action": "alice_encrypt", "message": "Hello Bob!"},
+          {"action": "bob_decrypt", "expectedPlaintext": "Hello Bob!"},
+          {"action": "bob_encrypt", "message": "Hello Alice!", "triggersDHRatchet": true},
+          {"action": "alice_decrypt", "expectedPlaintext": "Hello Alice!", "triggersDHRatchet": true}
+        ],
+        "expected": {
+          "bobRatchetCountAfterReply": 1,
+          "aliceRatchetCountAfterReceive": 1,
+          "note": "Bob's reply triggers his send-side ratchet, Alice's receive triggers her ratchet"
+        }
+      },
+      {
+        "name": "ping_pong_conversation",
+        "description": "Full ping-pong conversation with multiple ratchets",
+        "scenario": [
+          {"action": "alice_encrypt", "message": "A1"},
+          {"action": "bob_decrypt"},
+          {"action": "bob_encrypt", "message": "B1", "ratchet": 1},
+          {"action": "alice_decrypt", "ratchet": 1},
+          {"action": "alice_encrypt", "message": "A2", "ratchet": 2},
+          {"action": "bob_decrypt", "ratchet": 2},
+          {"action": "bob_encrypt", "message": "B2", "ratchet": 3},
+          {"action": "alice_decrypt", "ratchet": 3}
+        ],
+        "expected": {
+          "finalRatchetCount": 3,
+          "note": "Each direction change triggers a DH ratchet"
+        }
+      },
+      {
+        "name": "out_of_order_messages",
+        "description": "Handle out-of-order message delivery",
+        "scenario": [
+          {"action": "alice_encrypt", "message": "M0", "counter": 0},
+          {"action": "alice_encrypt", "message": "M1", "counter": 1},
+          {"action": "alice_encrypt", "message": "M2", "counter": 2},
+          {"action": "bob_decrypt", "receivedCounter": 2, "expectsSkip": true},
+          {"action": "bob_decrypt", "receivedCounter": 0, "usesSkippedKey": true},
+          {"action": "bob_decrypt", "receivedCounter": 1, "usesSkippedKey": true}
+        ],
+        "expected": {
+          "allMessagesDecrypted": true,
+          "skippedKeysUsed": 2
+        }
+      }
+    ]
+  },
+
+  "aad": {
+    "description": "Additional Authenticated Data (AAD) encoding test vectors",
+    "vectors": [
+      {
+        "name": "tlv_encoding",
+        "description": "TLV encoding for AAD fields",
+        "input": {
+          "roomId": "room-123",
+          "senderId": "user-456",
+          "messageNumber": 42,
+          "messageType": "message",
+          "ratchetCount": 3
+        },
+        "expected": {
+          "format": "[type:1][length:2][value:n]",
+          "fields": [
+            {"type": "0x01", "name": "ROOM_ID", "value": "room-123"},
+            {"type": "0x02", "name": "SENDER_ID", "value": "user-456"},
+            {"type": "0x05", "name": "MESSAGE_NUMBER", "value": 42},
+            {"type": "0x06", "name": "MESSAGE_TYPE", "value": "message"},
+            {"type": "0x07", "name": "RATCHET_COUNT", "value": 3}
+          ]
+        }
+      },
+      {
+        "name": "cross_context_prevention",
+        "description": "AAD prevents replay across rooms/senders",
+        "test": "Encrypt with roomA, try decrypt with roomB AAD -> must fail",
+        "expected": {
+          "decryptionFails": true,
+          "errorType": "authentication"
+        }
+      }
+    ]
+  },
+
+  "hkdf": {
+    "description": "RFC 5869 HKDF test vectors (for reference)",
+    "vectors": [
+      {
+        "name": "deterministic_output",
+        "description": "Same inputs always produce same outputs",
+        "input": {
+          "ikm": "4242424242424242424242424242424242424242424242424242424242424242",
+          "salt": "2424242424242424242424242424242424242424242424242424242424242424",
+          "info": "TestLabel",
+          "length": 32
+        },
+        "note": "Output is deterministic and can be verified across implementations"
+      }
+    ]
+  },
+
+  "securityScenarios": {
+    "description": "Security attack scenario tests",
+    "vectors": [
+      {
+        "name": "replay_attack",
+        "description": "Replay of old message should fail",
+        "scenario": "Capture encrypted message, replay later",
+        "expected": {
+          "replayFails": true,
+          "reason": "Chain has ratcheted forward, message key destroyed"
+        }
+      },
+      {
+        "name": "key_compromise_recovery",
+        "description": "Post-Compromise Security: future messages secure after key rotation",
+        "scenario": [
+          "Attacker compromises current state at time T",
+          "Parties exchange N more messages",
+          "DH ratchets occur",
+          "Attacker cannot decrypt messages after T+ratchet"
+        ],
+        "expected": {
+          "pcsGuarantee": true,
+          "healingRatchets": 1
+        }
+      },
+      {
+        "name": "forward_secrecy",
+        "description": "Perfect Forward Secrecy: past messages secure if current key compromised",
+        "scenario": [
+          "Alice and Bob exchange 10 messages",
+          "Attacker compromises Alice's state at message 10",
+          "Attacker cannot decrypt messages 1-9"
+        ],
+        "expected": {
+          "pfsGuarantee": true,
+          "reason": "Previous message keys deleted after ratcheting"
+        }
+      }
+    ]
+  }
+}
