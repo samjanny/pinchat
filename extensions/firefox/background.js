@@ -11,17 +11,36 @@ const CONFIG = {
 MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAExkuEOYHEQQfDqsyO+uamOnf5b/AH
 OqRJNIZ5zBHCr2HbJsHCtrPQUOKd4cBqfDZlQZ62rzF7ofA39ITBUyLxaA==
 -----END PUBLIC KEY-----`,
-    CHECK_INTERVAL_MINUTES: 5
+    CHECK_INTERVAL_MINUTES: 5,
+    FETCH_TIMEOUT_MS: 10000  // 10 second timeout per request
 };
 
 // State management
 let verificationState = {
-    status: 'unknown',
+    status: 'unknown', // 'verified', 'partial', 'failed', 'error', 'checking', 'unknown'
     lastCheck: null,
     errors: [],
     mismatches: [],
     details: null
 };
+
+/**
+ * Fetch with timeout support
+ */
+async function fetchWithTimeout(url, options = {}) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), CONFIG.FETCH_TIMEOUT_MS);
+
+    try {
+        const response = await fetch(url, {
+            ...options,
+            signal: controller.signal
+        });
+        return response;
+    } finally {
+        clearTimeout(timeout);
+    }
+}
 
 /**
  * Import the public key for signature verification
@@ -125,19 +144,32 @@ async function calculateHash(content) {
 
 /**
  * Fetch and verify a single file
+ * Returns: { path, hash, error, errorType }
+ * errorType: 'auth' (401/403), 'not_found' (404), 'network', 'timeout', null (success)
  */
 async function fetchAndHashFile(path) {
     const url = `${CONFIG.SITE_URL}${path}`;
     try {
-        const response = await fetch(url, { cache: 'no-store' });
+        const response = await fetchWithTimeout(url, { cache: 'no-store' });
         if (!response.ok) {
-            return { path, error: `HTTP ${response.status}`, hash: null };
+            // Categorize HTTP errors
+            const status = response.status;
+            let errorType = 'network';
+            if (status === 401 || status === 403) {
+                errorType = 'auth';
+            } else if (status === 404) {
+                errorType = 'not_found';
+            }
+            return { path, error: `HTTP ${status}`, hash: null, errorType };
         }
         const content = await response.text();
         const hash = await calculateHash(content);
-        return { path, hash, error: null };
+        return { path, hash, error: null, errorType: null };
     } catch (error) {
-        return { path, error: error.message, hash: null };
+        // Handle timeout and network errors
+        const errorType = error.name === 'AbortError' ? 'timeout' : 'network';
+        const errorMsg = error.name === 'AbortError' ? 'Timeout' : error.message;
+        return { path, error: errorMsg, hash: null, errorType };
     }
 }
 
@@ -152,15 +184,20 @@ async function verifyIntegrity() {
         lastCheck: new Date().toISOString(),
         errors: [],
         mismatches: [],
-        details: { filesChecked: 0, filesMatched: 0, filesFailed: 0 }
+        details: {
+            filesChecked: 0,
+            filesMatched: 0,
+            filesFailed: 0,
+            filesAuthRequired: 0
+        }
     };
 
     await updateAllTabsBadges();
     await notifyContentScripts();
 
     try {
-        // Fetch hash list from GitHub
-        const response = await fetch(CONFIG.HASH_LIST_URL, { cache: 'no-store' });
+        // Fetch hash list from GitHub (with timeout)
+        const response = await fetchWithTimeout(CONFIG.HASH_LIST_URL, { cache: 'no-store' });
         if (!response.ok) {
             throw new Error(`Failed to fetch hash list: ${response.status}`);
         }
@@ -193,40 +230,76 @@ async function verifyIntegrity() {
             const result = await fetchAndHashFile(fileEntry.path);
 
             if (result.error) {
-                verificationState.details.filesFailed++;
-                verificationState.mismatches.push({
-                    path: fileEntry.path,
-                    expected: fileEntry.hash,
-                    actual: null,
-                    error: result.error
-                });
+                // Distinguish auth errors from real failures
+                if (result.errorType === 'auth') {
+                    // File requires authentication - not a failure
+                    verificationState.details.filesAuthRequired++;
+                    verificationState.mismatches.push({
+                        path: fileEntry.path,
+                        expected: fileEntry.hash,
+                        actual: null,
+                        error: result.error,
+                        errorType: 'auth'
+                    });
+                } else {
+                    // Real failure (404, network error, timeout)
+                    verificationState.details.filesFailed++;
+                    verificationState.mismatches.push({
+                        path: fileEntry.path,
+                        expected: fileEntry.hash,
+                        actual: null,
+                        error: result.error,
+                        errorType: result.errorType
+                    });
+                }
                 continue;
             }
 
             if (result.hash !== fileEntry.hash) {
+                // Hash mismatch - this is a real security concern
                 verificationState.details.filesFailed++;
                 verificationState.mismatches.push({
                     path: fileEntry.path,
                     expected: fileEntry.hash,
                     actual: result.hash,
-                    error: 'Hash mismatch'
+                    error: 'Hash mismatch',
+                    errorType: 'mismatch'
                 });
             } else {
                 verificationState.details.filesMatched++;
             }
+
+            // Notify progress
+            await notifyContentScripts();
         }
 
-        // Update final status
-        if (verificationState.mismatches.length > 0) {
+        // Update final status based on results
+        const { filesMatched, filesFailed, filesAuthRequired } = verificationState.details;
+
+        if (filesFailed > 0) {
+            // Real failures (hash mismatch, 404, network errors)
             verificationState.status = 'failed';
-            verificationState.errors.push(`${verificationState.mismatches.length} file(s) failed verification`);
-        } else {
+            verificationState.errors.push(`${filesFailed} file(s) failed verification`);
+        } else if (filesMatched > 0 && filesAuthRequired > 0) {
+            // Some files verified, some require auth
+            verificationState.status = 'partial';
+            verificationState.errors.push(`${filesAuthRequired} file(s) require authentication`);
+        } else if (filesMatched > 0) {
+            // All accessible files verified
             verificationState.status = 'verified';
+        } else if (filesAuthRequired > 0) {
+            // All files require auth
+            verificationState.status = 'partial';
+            verificationState.errors.push('All files require authentication');
+        } else {
+            verificationState.status = 'error';
+            verificationState.errors.push('No files could be verified');
         }
 
     } catch (error) {
         verificationState.status = 'error';
-        verificationState.errors.push(error.message);
+        const errorMsg = error.name === 'AbortError' ? 'Request timeout' : error.message;
+        verificationState.errors.push(errorMsg);
         console.error('[PinChat Verify] Error:', error);
     }
 
@@ -242,10 +315,11 @@ async function verifyIntegrity() {
  * Badge configurations for different states
  */
 const BADGES = {
-    verified: { text: '✓', color: '#22c55e' },
-    failed: { text: '!', color: '#ef4444' },
-    error: { text: '?', color: '#f59e0b' },
-    checking: { text: '...', color: '#3b82f6' },
+    verified: { text: '✓', color: '#22c55e' },   // Green - all files verified
+    partial: { text: '◐', color: '#3b82f6' },    // Blue - some files verified, some require auth
+    failed: { text: '!', color: '#ef4444' },     // Red - hash mismatch or real failure
+    error: { text: '?', color: '#f59e0b' },      // Yellow - network/config error
+    checking: { text: '...', color: '#3b82f6' }, // Blue - in progress
     unknown: { text: '', color: '#6b7280' },
     inactive: { text: '', color: '#6b7280' }
 };

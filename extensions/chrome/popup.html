@@ -50,6 +50,7 @@
         }
 
         .status-verified { color: #22c55e; }
+        .status-partial { color: #3b82f6; }
         .status-failed { color: #ef4444; }
         .status-error { color: #f59e0b; }
         .status-checking { color: #3b82f6; }
@@ -202,6 +203,10 @@
         <div class="detail-row">
             <span class="detail-label">Files Matched</span>
             <span id="files-matched" class="detail-value">0</span>
+        </div>
+        <div class="detail-row" id="auth-row" style="display: none;">
+            <span class="detail-label">Auth Required</span>
+            <span id="files-auth" class="detail-value" style="color: #3b82f6;">0</span>
         </div>
         <div class="detail-row">
             <span class="detail-label">Files Failed</span>

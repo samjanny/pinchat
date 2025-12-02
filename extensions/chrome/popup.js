@@ -27,6 +27,11 @@ const statusConfig = {
         text: 'All Files Verified',
         class: 'status-verified'
     },
+    partial: {
+        icon: '◐',
+        text: 'Partially Verified',
+        class: 'status-partial'
+    },
     failed: {
         icon: '✗',
         text: 'Verification Failed!',
@@ -83,15 +88,28 @@ function updateUI(state) {
         document.getElementById('files-checked').textContent = state.details.filesChecked;
         document.getElementById('files-matched').textContent = state.details.filesMatched;
         document.getElementById('files-failed').textContent = state.details.filesFailed;
+
+        // Show auth required row if there are any
+        const authRow = document.getElementById('auth-row');
+        const filesAuth = document.getElementById('files-auth');
+        if (state.details.filesAuthRequired > 0) {
+            authRow.style.display = 'flex';
+            filesAuth.textContent = state.details.filesAuthRequired;
+        } else {
+            authRow.style.display = 'none';
+        }
     } else {
         details.style.display = 'none';
     }
 
-    // Update mismatches if any
-    if (state.mismatches && state.mismatches.length > 0) {
+    // Update mismatches if any (only show real failures, not auth-required)
+    const realFailures = state.mismatches ?
+        state.mismatches.filter(m => m.errorType !== 'auth') : [];
+
+    if (realFailures.length > 0) {
         mismatches.style.display = 'block';
         const mismatchList = document.getElementById('mismatch-list');
-        mismatchList.innerHTML = state.mismatches.map(m =>
+        mismatchList.innerHTML = realFailures.map(m =>
             `<div class="mismatch-item">${m.path}: ${m.error}</div>`
         ).join('');
     } else {
