@@ -44,17 +44,70 @@ async function importPublicKey(pemKey) {
 }
 
 /**
- * Verify signature using ECDSA
+ * Convert DER-encoded ECDSA signature to IEEE P1363 format (raw r||s)
+ * OpenSSL and Node.js produce DER format, but WebCrypto expects P1363
+ * DER format: 0x30 [total-length] 0x02 [r-length] [r] 0x02 [s-length] [s]
+ * P1363 format for P-256: 32 bytes r || 32 bytes s (64 bytes total)
  */
-async function verifySignature(data, signature, publicKey) {
+function derToP1363(derSignature) {
+    const der = new Uint8Array(derSignature);
+
+    // Skip SEQUENCE tag (0x30) and length byte
+    let offset = 2;
+
+    // Read r INTEGER
+    if (der[offset] !== 0x02) throw new Error('Invalid DER signature: expected INTEGER tag for r');
+    offset++;
+    let rLength = der[offset++];
+    // Skip leading zero padding (used for positive integers in DER)
+    while (der[offset] === 0x00 && rLength > 32) {
+        offset++;
+        rLength--;
+    }
+    const r = der.slice(offset, offset + Math.min(rLength, 32));
+    offset += rLength;
+
+    // Read s INTEGER
+    if (der[offset] !== 0x02) throw new Error('Invalid DER signature: expected INTEGER tag for s');
+    offset++;
+    let sLength = der[offset++];
+    // Skip leading zero padding
+    while (der[offset] === 0x00 && sLength > 32) {
+        offset++;
+        sLength--;
+    }
+    const s = der.slice(offset, offset + Math.min(sLength, 32));
+
+    // Pad r and s to 32 bytes each (P-256 curve order)
+    const rPadded = new Uint8Array(32);
+    const sPadded = new Uint8Array(32);
+    rPadded.set(r, 32 - r.length);
+    sPadded.set(s, 32 - s.length);
+
+    // Concatenate r || s
+    const p1363 = new Uint8Array(64);
+    p1363.set(rPadded, 0);
+    p1363.set(sPadded, 32);
+
+    return p1363;
+}
+
+/**
+ * Verify signature using ECDSA
+ * Handles DER-encoded signatures from OpenSSL/Node.js
+ */
+async function verifySignature(data, signatureBase64, publicKey) {
     const encoder = new TextEncoder();
     const dataBuffer = encoder.encode(data);
-    const signatureBuffer = Uint8Array.from(atob(signature), c => c.charCodeAt(0));
+    const derSignature = Uint8Array.from(atob(signatureBase64), c => c.charCodeAt(0));
+
+    // Convert DER to P1363 format for WebCrypto
+    const p1363Signature = derToP1363(derSignature);
 
     return await crypto.subtle.verify(
         { name: 'ECDSA', hash: 'SHA-256' },
         publicKey,
-        signatureBuffer,
+        p1363Signature,
         dataBuffer
     );
 }

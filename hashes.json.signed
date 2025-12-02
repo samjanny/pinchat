@@ -1,70 +1,70 @@
 {
   "data": {
-  "version": "1.0.0",
-  "generated": "2025-12-02T09:41:18.348Z",
-  "site": "https://pinchat.io",
-  "files": [
-    {
-      "path": "/index.html",
-      "hash": "5a92962707a72b61088538c802658b6f4dbb7971e402d58d3f4eefeffebd0daa"
-    },
-    {
-      "path": "/login.html",
-      "hash": "ccc7137e4e4769ca67b9447f4c3262137c09059b559ce07c0f272d21803a1c54"
-    },
-    {
-      "path": "/chat.html",
-      "hash": "5dcb28a1a8a507f22e1807e0f3094a0095f2ef2c5160a22fc3613dc52baa6fe3"
-    },
-    {
-      "path": "/static/css/style.css",
-      "hash": "4ef5da32154a54e6b6e5c23811974751832792ea31331e21ecdb036df3dc4d22"
-    },
-    {
-      "path": "/static/js/alpine-csp.min.js",
-      "hash": "e7c863da5896692f5d478e10dae089e6164fed1c5c1b6a1f7cbbf7a9b093f055"
-    },
-    {
-      "path": "/static/js/app.js",
-      "hash": "1efecbebaae6073ddf8c5ac83bf0dc89e4c4540651d51ca308af26cdc96516d2"
-    },
-    {
-      "path": "/static/js/crypto.js",
-      "hash": "f10c0d137430b1c12f255d023e518a79f739d31e7e967ee96a0d4bab8342bf12"
-    },
-    {
-      "path": "/static/js/double-ratchet.js",
-      "hash": "5c1ef71515817661591098849e9267d5ee1ac5f591dd594b10adcee6e35bac74"
-    },
-    {
-      "path": "/static/js/ecdh.js",
-      "hash": "5a475891291c10bd8d19242702642754f68013c2b73c4c22095c3eb662db4e53"
-    },
-    {
-      "path": "/static/js/emoji.js",
-      "hash": "e74265f3d515031b1e6ddfa9341d648636a7cbc5157b4ceadd9a0e65c1a2e826"
-    },
-    {
-      "path": "/static/js/homepage.js",
-      "hash": "3a149d8425f1db00947755514a1eb31c23f09f9b15785fe364185f949ccbe383"
-    },
-    {
-      "path": "/static/js/identity.js",
-      "hash": "d39ccaa200ab11b8e8e644a83553ade4e3a037c17b7f950787d7f9d9ea74df8f"
-    },
-    {
-      "path": "/static/js/nicknames.js",
-      "hash": "1459661f5d872d8fdc2b5d14bb900b21a6e4b73c3e2a2089745da9eb4aa54ae7"
-    },
-    {
-      "path": "/static/js/pow.js",
-      "hash": "e23c83920e34d0b9579328b4cc2f906c826187aa446239dea38dc95ae1554597"
-    },
-    {
-      "path": "/static/js/websocket.js",
-      "hash": "c4ca04a1cfa77d0cf784c3ea232adc89147ad561dd1b1c22097f6b488d999183"
-    }
-  ]
-},
-  "signature": "MEUCIGcmf58nZXGfFGuHR8Yq2cWB+Hqh2FhqzWdf3p3JI4HgAiEAn5GvoeMk/rE6K7dtjIA6kx2wf+3wb30Tu9urVF3HLtk="
+    "version": "1.0.0",
+    "generated": "2025-12-02T11:56:54.517Z",
+    "site": "https://pinchat.io",
+    "files": [
+      {
+        "path": "/index.html",
+        "hash": "5a92962707a72b61088538c802658b6f4dbb7971e402d58d3f4eefeffebd0daa"
+      },
+      {
+        "path": "/login.html",
+        "hash": "ccc7137e4e4769ca67b9447f4c3262137c09059b559ce07c0f272d21803a1c54"
+      },
+      {
+        "path": "/chat.html",
+        "hash": "5dcb28a1a8a507f22e1807e0f3094a0095f2ef2c5160a22fc3613dc52baa6fe3"
+      },
+      {
+        "path": "/static/css/style.css",
+        "hash": "4ef5da32154a54e6b6e5c23811974751832792ea31331e21ecdb036df3dc4d22"
+      },
+      {
+        "path": "/static/js/alpine-csp.min.js",
+        "hash": "e7c863da5896692f5d478e10dae089e6164fed1c5c1b6a1f7cbbf7a9b093f055"
+      },
+      {
+        "path": "/static/js/app.js",
+        "hash": "1efecbebaae6073ddf8c5ac83bf0dc89e4c4540651d51ca308af26cdc96516d2"
+      },
+      {
+        "path": "/static/js/crypto.js",
+        "hash": "f10c0d137430b1c12f255d023e518a79f739d31e7e967ee96a0d4bab8342bf12"
+      },
+      {
+        "path": "/static/js/double-ratchet.js",
+        "hash": "5c1ef71515817661591098849e9267d5ee1ac5f591dd594b10adcee6e35bac74"
+      },
+      {
+        "path": "/static/js/ecdh.js",
+        "hash": "5a475891291c10bd8d19242702642754f68013c2b73c4c22095c3eb662db4e53"
+      },
+      {
+        "path": "/static/js/emoji.js",
+        "hash": "e74265f3d515031b1e6ddfa9341d648636a7cbc5157b4ceadd9a0e65c1a2e826"
+      },
+      {
+        "path": "/static/js/homepage.js",
+        "hash": "3a149d8425f1db00947755514a1eb31c23f09f9b15785fe364185f949ccbe383"
+      },
+      {
+        "path": "/static/js/identity.js",
+        "hash": "d39ccaa200ab11b8e8e644a83553ade4e3a037c17b7f950787d7f9d9ea74df8f"
+      },
+      {
+        "path": "/static/js/nicknames.js",
+        "hash": "1459661f5d872d8fdc2b5d14bb900b21a6e4b73c3e2a2089745da9eb4aa54ae7"
+      },
+      {
+        "path": "/static/js/pow.js",
+        "hash": "e23c83920e34d0b9579328b4cc2f906c826187aa446239dea38dc95ae1554597"
+      },
+      {
+        "path": "/static/js/websocket.js",
+        "hash": "c4ca04a1cfa77d0cf784c3ea232adc89147ad561dd1b1c22097f6b488d999183"
+      }
+    ]
+  },
+  "signature": "MEYCIQCliapoFQweyhwCokhlc2ndpAr5NMzcsHRC6RxHPTzN2QIhAI3x01T3kb3BKReh0FxBITpznWrEO6b5BsPlO1iYD2up"
 }
