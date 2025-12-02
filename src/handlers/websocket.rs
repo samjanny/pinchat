@@ -11,6 +11,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::{HashSet, VecDeque};
+use tokio::time::{interval, Duration};
 use uuid::Uuid;
 
 use crate::jwt::verify_token;
@@ -183,10 +184,27 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: Uuid, connec
     };
 
     // Task that receives broadcast messages and forwards them to the client
+    // Also sends heartbeat pings every 30 seconds to keep the connection alive
     let mut send_task = tokio::spawn(async move {
-        while let Ok(msg) = broadcast_rx.recv().await {
-            if sender.send(WsMessage::Text(msg)).await.is_err() {
-                break;
+        let mut ping_interval = interval(Duration::from_secs(30));
+
+        loop {
+            tokio::select! {
+                result = broadcast_rx.recv() => {
+                    match result {
+                        Ok(msg) => {
+                            if sender.send(WsMessage::Text(msg)).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                _ = ping_interval.tick() => {
+                    if sender.send(WsMessage::Ping(vec![])).await.is_err() {
+                        break;
+                    }
+                }
             }
         }
     });
