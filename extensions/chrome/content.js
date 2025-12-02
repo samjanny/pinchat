@@ -1,23 +1,22 @@
 /**
  * PinChat Integrity Verifier - Content Script
- * Shows warning overlay if verification fails
+ * Verifies SRI (Subresource Integrity) attributes in the actual DOM
  *
- * Security features:
- * - Verifies hashes of known files
- * - Detects unauthorized scripts/stylesheets not in whitelist
- * - Uses MutationObserver to detect dynamic injections
+ * Security model:
+ * - Extension fetches signed manifest from GitHub
+ * - Manifest contains expected SRI hashes for all JS/CSS files
+ * - Content script verifies that DOM has correct integrity attributes
+ * - Browser enforces SRI (blocks tampered files)
+ * - This prevents bypass attacks where server serves different content
  */
 
 let overlayElement = null;
-let authorizedPaths = null;
 let domObserver = null;
 let unauthorizedResources = [];
+let manifestData = null;  // Will be populated from background script
 
-// Whitelist of allowed resource paths (must match generate-hashes.js)
+// Allowed resource paths (JS/CSS that should have SRI)
 const ALLOWED_PATHS = [
-    '/static/index.html',
-    '/static/login.html',
-    '/static/chat.html',
     '/static/css/style.css',
     '/static/js/alpine-csp.min.js',
     '/static/js/app.js',
@@ -33,26 +32,19 @@ const ALLOWED_PATHS = [
     '/static/js/websocket.js'
 ];
 
-// Allowed inline script hashes (for legitimate inline scripts if any)
-const ALLOWED_INLINE_HASHES = [];
-
 /**
- * Extract pathname from a URL, handling both absolute and relative URLs
+ * Extract pathname from a URL
  */
 function getPathFromUrl(url) {
     if (!url) return null;
     try {
-        // Handle relative URLs
         if (url.startsWith('/')) {
             return url.split('?')[0].split('#')[0];
         }
-        // Handle absolute URLs
         const parsed = new URL(url, window.location.origin);
-        // Only check resources from the same origin
         if (parsed.origin === window.location.origin) {
             return parsed.pathname;
         }
-        // External resources - return full URL for logging
         return url;
     } catch (e) {
         return url;
@@ -60,51 +52,97 @@ function getPathFromUrl(url) {
 }
 
 /**
- * Check if a resource path is authorized
+ * Check if path is an internal resource that should have SRI
  */
-function isAuthorizedPath(path) {
-    if (!path) return true; // Inline resources handled separately
-
-    // Check if it's an external resource (different origin)
+function isInternalResource(path) {
+    if (!path) return false;
     if (path.startsWith('http://') || path.startsWith('https://')) {
-        // External resources are NOT authorized unless explicitly whitelisted
-        // This prevents loading malicious scripts from other domains
         return false;
     }
-
-    // Check against whitelist
-    return ALLOWED_PATHS.includes(path);
+    return path.startsWith('/static/');
 }
 
 /**
- * Scan the DOM for unauthorized scripts and stylesheets
+ * Convert hex hash to SRI format (sha256-base64)
  */
-function scanDOMForUnauthorizedResources() {
-    const unauthorized = [];
+function hexToSRI(hexHash) {
+    // Convert hex to bytes
+    const bytes = new Uint8Array(hexHash.match(/.{1,2}/g).map(byte => parseInt(byte, 16)));
+    // Convert to base64
+    const base64 = btoa(String.fromCharCode(...bytes));
+    return `sha256-${base64}`;
+}
+
+/**
+ * Verify SRI attributes in the DOM against manifest
+ */
+function verifySRIInDOM(manifest) {
+    const issues = [];
+
+    // Build a map of path -> expected SRI from manifest
+    const expectedSRI = {};
+    if (manifest && manifest.files) {
+        manifest.files.forEach(file => {
+            if (file.path && file.hash) {
+                // Convert hex hash to SRI format
+                expectedSRI[file.path] = hexToSRI(file.hash);
+            }
+        });
+    }
 
     // Check all script tags
-    const scripts = document.querySelectorAll('script');
+    const scripts = document.querySelectorAll('script[src]');
     scripts.forEach(script => {
         const src = script.getAttribute('src');
-        if (src) {
-            const path = getPathFromUrl(src);
-            if (!isAuthorizedPath(path)) {
-                unauthorized.push({
-                    type: 'script',
-                    path: path || src,
-                    element: script.outerHTML.substring(0, 100)
+        const path = getPathFromUrl(src);
+        const integrity = script.getAttribute('integrity');
+
+        if (isInternalResource(path)) {
+            const expected = expectedSRI[path];
+
+            if (!expected) {
+                // Unknown script - not in manifest
+                issues.push({
+                    path: path,
+                    error: 'Script not in manifest',
+                    type: 'unknown-script'
+                });
+            } else if (!integrity) {
+                // Missing SRI attribute
+                issues.push({
+                    path: path,
+                    error: 'Missing integrity attribute',
+                    type: 'missing-sri'
+                });
+            } else if (integrity !== expected) {
+                // SRI mismatch - server may have modified HTML
+                issues.push({
+                    path: path,
+                    error: `SRI mismatch (expected ${expected.substring(0, 20)}...)`,
+                    type: 'sri-mismatch'
                 });
             }
-        } else if (script.textContent && script.textContent.trim()) {
-            // Inline script - check if it's allowed
-            // For now, flag all inline scripts as they could be injected
-            const content = script.textContent.trim();
+        } else if (path && (path.startsWith('http://') || path.startsWith('https://'))) {
+            // External script - flag it
+            issues.push({
+                path: path,
+                error: 'External script not allowed',
+                type: 'external-script'
+            });
+        }
+    });
+
+    // Check for inline scripts (always unauthorized)
+    const allScripts = document.querySelectorAll('script');
+    allScripts.forEach(script => {
+        if (!script.getAttribute('src')) {
+            const content = (script.textContent || '').trim();
+            // Skip JSON data scripts and empty scripts
             if (content.length > 0 && !script.type?.includes('application/json')) {
-                // Skip JSON data scripts (like Alpine.js data)
-                unauthorized.push({
-                    type: 'inline-script',
+                issues.push({
                     path: '[inline]',
-                    element: `<script>${content.substring(0, 50)}...</script>`
+                    error: 'Inline script not allowed',
+                    type: 'inline-script'
                 });
             }
         }
@@ -114,35 +152,94 @@ function scanDOMForUnauthorizedResources() {
     const stylesheets = document.querySelectorAll('link[rel="stylesheet"]');
     stylesheets.forEach(link => {
         const href = link.getAttribute('href');
-        if (href) {
-            const path = getPathFromUrl(href);
-            if (!isAuthorizedPath(path)) {
-                unauthorized.push({
-                    type: 'stylesheet',
-                    path: path || href,
-                    element: link.outerHTML.substring(0, 100)
+        const path = getPathFromUrl(href);
+        const integrity = link.getAttribute('integrity');
+
+        if (isInternalResource(path)) {
+            const expected = expectedSRI[path];
+
+            if (!expected) {
+                issues.push({
+                    path: path,
+                    error: 'Stylesheet not in manifest',
+                    type: 'unknown-stylesheet'
+                });
+            } else if (!integrity) {
+                issues.push({
+                    path: path,
+                    error: 'Missing integrity attribute',
+                    type: 'missing-sri'
+                });
+            } else if (integrity !== expected) {
+                issues.push({
+                    path: path,
+                    error: `SRI mismatch`,
+                    type: 'sri-mismatch'
                 });
             }
-        }
-    });
-
-    // Check for style tags with @import (could load external CSS)
-    const styles = document.querySelectorAll('style');
-    styles.forEach(style => {
-        const content = style.textContent || '';
-        const importMatches = content.match(/@import\s+(?:url\()?['"]?([^'")\s]+)/gi);
-        if (importMatches) {
-            importMatches.forEach(match => {
-                unauthorized.push({
-                    type: 'css-import',
-                    path: match,
-                    element: `<style>@import detected</style>`
-                });
+        } else if (path && (path.startsWith('http://') || path.startsWith('https://'))) {
+            issues.push({
+                path: path,
+                error: 'External stylesheet not allowed',
+                type: 'external-stylesheet'
             });
         }
     });
 
-    return unauthorized;
+    // Check for CSS @import in style tags
+    const styles = document.querySelectorAll('style');
+    styles.forEach(style => {
+        const content = style.textContent || '';
+        if (/@import/i.test(content)) {
+            issues.push({
+                path: '[style @import]',
+                error: 'CSS @import not allowed',
+                type: 'css-import'
+            });
+        }
+    });
+
+    // Check for iframes (potential phishing)
+    const iframes = document.querySelectorAll('iframe');
+    iframes.forEach(iframe => {
+        const src = iframe.getAttribute('src');
+        if (src) {
+            try {
+                const parsed = new URL(src, window.location.origin);
+                if (parsed.origin !== window.location.origin) {
+                    issues.push({
+                        path: src,
+                        error: 'External iframe detected',
+                        type: 'external-iframe'
+                    });
+                }
+            } catch (e) {
+                // Invalid URL
+            }
+        }
+    });
+
+    // Check for forms pointing to external URLs
+    const forms = document.querySelectorAll('form[action]');
+    forms.forEach(form => {
+        const action = form.getAttribute('action');
+        if (action) {
+            try {
+                const parsed = new URL(action, window.location.origin);
+                if (parsed.origin !== window.location.origin) {
+                    issues.push({
+                        path: action,
+                        error: 'Form submits to external URL',
+                        type: 'external-form'
+                    });
+                }
+            } catch (e) {
+                // Invalid URL
+            }
+        }
+    });
+
+    return issues;
 }
 
 /**
@@ -160,70 +257,56 @@ function setupDOMObserver() {
             mutation.addedNodes.forEach(node => {
                 if (node.nodeType !== Node.ELEMENT_NODE) return;
 
-                // Check if the added node is a script or stylesheet
+                // Check if the added node is a script
                 if (node.tagName === 'SCRIPT') {
                     const src = node.getAttribute('src');
-                    const path = src ? getPathFromUrl(src) : '[inline]';
+                    if (src) {
+                        const path = getPathFromUrl(src);
+                        const integrity = node.getAttribute('integrity');
 
-                    if (src && !isAuthorizedPath(path)) {
-                        unauthorizedResources.push({
-                            type: 'script (dynamic)',
-                            path: path,
-                            error: 'Unauthorized script injected dynamically'
-                        });
-                        foundUnauthorized = true;
-                    } else if (!src && node.textContent?.trim() && !node.type?.includes('application/json')) {
-                        unauthorizedResources.push({
-                            type: 'inline-script (dynamic)',
-                            path: '[inline]',
-                            error: 'Inline script injected dynamically'
-                        });
-                        foundUnauthorized = true;
-                    }
-                }
-
-                if (node.tagName === 'LINK' && node.rel === 'stylesheet') {
-                    const href = node.getAttribute('href');
-                    const path = href ? getPathFromUrl(href) : null;
-
-                    if (!isAuthorizedPath(path)) {
-                        unauthorizedResources.push({
-                            type: 'stylesheet (dynamic)',
-                            path: path || href,
-                            error: 'Unauthorized stylesheet injected dynamically'
-                        });
-                        foundUnauthorized = true;
-                    }
-                }
-
-                // Also check children of added nodes
-                if (node.querySelectorAll) {
-                    const scripts = node.querySelectorAll('script');
-                    const links = node.querySelectorAll('link[rel="stylesheet"]');
-
-                    scripts.forEach(script => {
-                        const src = script.getAttribute('src');
-                        const path = src ? getPathFromUrl(src) : '[inline]';
-                        if (src && !isAuthorizedPath(path)) {
+                        if (isInternalResource(path) && !integrity) {
                             unauthorizedResources.push({
-                                type: 'script (dynamic)',
                                 path: path,
-                                error: 'Unauthorized script in injected HTML'
+                                error: 'Dynamic script without SRI'
                             });
                             foundUnauthorized = true;
                         }
-                    });
+                    } else if (node.textContent?.trim() && !node.type?.includes('application/json')) {
+                        unauthorizedResources.push({
+                            path: '[inline]',
+                            error: 'Dynamic inline script'
+                        });
+                        foundUnauthorized = true;
+                    }
+                }
 
-                    links.forEach(link => {
-                        const href = link.getAttribute('href');
-                        const path = href ? getPathFromUrl(href) : null;
-                        if (!isAuthorizedPath(path)) {
-                            unauthorizedResources.push({
-                                type: 'stylesheet (dynamic)',
-                                path: path || href,
-                                error: 'Unauthorized stylesheet in injected HTML'
-                            });
-                            foundUnauthorized = true;
+                // Check for dynamic stylesheets
+                if (node.tagName === 'LINK' && node.rel === 'stylesheet') {
+                    const href = node.getAttribute('href');
+                    const path = getPathFromUrl(href);
+                    const integrity = node.getAttribute('integrity');
+
+                    if (isInternalResource(path) && !integrity) {
+                        unauthorizedResources.push({
+                            path: path,
+                            error: 'Dynamic stylesheet without SRI'
+                        });
+                        foundUnauthorized = true;
+                    }
+                }
+
+                // Check children recursively
+                if (node.querySelectorAll) {
+                    node.querySelectorAll('script, link[rel="stylesheet"]').forEach(el => {
+                        if (el.tagName === 'SCRIPT') {
+                            const src = el.getAttribute('src');
+                            if (src && isInternalResource(getPathFromUrl(src)) && !el.getAttribute('integrity')) {
+                                unauthorizedResources.push({
+                                    path: getPathFromUrl(src),
+                                    error: 'Injected script without SRI'
+                                });
+                                foundUnauthorized = true;
+                            }
                         }
                     });
                 }
@@ -231,11 +314,10 @@ function setupDOMObserver() {
         });
 
         if (foundUnauthorized) {
-            showUnauthorizedResourceWarning(unauthorizedResources);
+            showWarningOverlay(unauthorizedResources, true);
         }
     });
 
-    // Observe the entire document for added nodes
     domObserver.observe(document.documentElement, {
         childList: true,
         subtree: true
@@ -243,37 +325,23 @@ function setupDOMObserver() {
 }
 
 /**
- * Show warning for unauthorized resources
- */
-function showUnauthorizedResourceWarning(resources) {
-    const mismatches = resources.map(r => ({
-        path: r.path,
-        error: r.error || 'Unauthorized resource'
-    }));
-
-    showWarningOverlay(mismatches, true);
-}
-
-/**
- * Perform initial DOM scan
+ * Perform DOM security verification
  */
 function performDOMSecurityCheck() {
-    const unauthorized = scanDOMForUnauthorizedResources();
+    // First check for unauthorized resources (even without manifest)
+    const issues = verifySRIInDOM(manifestData);
 
-    if (unauthorized.length > 0) {
-        console.warn('[PinChat Verify] Unauthorized resources detected:', unauthorized);
-        unauthorizedResources = unauthorized.map(r => ({
-            path: r.path,
-            error: `Unauthorized ${r.type}`
-        }));
-        showUnauthorizedResourceWarning(unauthorizedResources);
+    if (issues.length > 0) {
+        console.warn('[PinChat Verify] Security issues detected:', issues);
+        unauthorizedResources = issues;
+        showWarningOverlay(issues, true);
+    } else {
+        console.log('[PinChat Verify] DOM security check passed');
     }
 }
 
 /**
  * Create and show the warning overlay
- * @param {Array} mismatches - List of mismatched/unauthorized resources
- * @param {boolean} isUnauthorized - True if warning is for unauthorized resources (not hash mismatch)
  */
 function showWarningOverlay(mismatches = [], isUnauthorized = false) {
     if (overlayElement) {
@@ -312,10 +380,7 @@ function showWarningOverlay(mismatches = [], isUnauthorized = false) {
             padding: 20px;
             box-sizing: border-box;
         ">
-            <div style="
-                font-size: 72px;
-                margin-bottom: 20px;
-            ">⚠️</div>
+            <div style="font-size: 72px; margin-bottom: 20px;">⚠️</div>
 
             <h1 style="
                 font-size: 48px;
@@ -363,7 +428,6 @@ function showWarningOverlay(mismatches = [], isUnauthorized = false) {
                     font-weight: bold;
                     border-radius: 8px;
                     cursor: pointer;
-                    transition: transform 0.2s;
                 ">Leave This Site</button>
 
                 <button id="pinchat-dismiss-btn" style="
@@ -376,15 +440,10 @@ function showWarningOverlay(mismatches = [], isUnauthorized = false) {
                     border-radius: 8px;
                     cursor: pointer;
                     opacity: 0.7;
-                    transition: opacity 0.2s;
                 ">Dismiss (Unsafe)</button>
             </div>
 
-            <p style="
-                margin-top: 30px;
-                font-size: 14px;
-                opacity: 0.8;
-            ">
+            <p style="margin-top: 30px; font-size: 14px; opacity: 0.8;">
                 This warning is shown by the PinChat Integrity Verifier extension.
             </p>
         </div>
@@ -392,14 +451,12 @@ function showWarningOverlay(mismatches = [], isUnauthorized = false) {
 
     document.documentElement.appendChild(overlayElement);
 
-    // Event listeners
     document.getElementById('pinchat-leave-btn').addEventListener('click', () => {
         window.location.href = 'about:blank';
     });
 
     document.getElementById('pinchat-dismiss-btn').addEventListener('click', () => {
-        if (confirm('WARNING: You are choosing to ignore a security warning. ' +
-                    'The server may be compromised. Continue at your own risk.')) {
+        if (confirm('WARNING: You are choosing to ignore a security warning. Continue at your own risk.')) {
             hideWarningOverlay();
         }
     });
@@ -416,15 +473,19 @@ function hideWarningOverlay() {
 }
 
 /**
- * Handle verification status updates
+ * Handle verification status from background script
  */
 function handleVerificationStatus(state) {
     if (state.status === 'failed') {
         showWarningOverlay(state.mismatches);
     } else if (state.status === 'verified') {
-        hideWarningOverlay();
+        // Store manifest data for DOM verification
+        if (state.manifest) {
+            manifestData = state.manifest;
+            // Re-run DOM check with manifest data
+            performDOMSecurityCheck();
+        }
     }
-    // For 'checking', 'error', 'unknown' - don't change overlay state
 }
 
 // Listen for messages from background script
@@ -432,31 +493,36 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message.type === 'VERIFICATION_STATUS') {
         handleVerificationStatus(message.state);
     }
+    if (message.type === 'MANIFEST_DATA') {
+        manifestData = message.manifest;
+        performDOMSecurityCheck();
+    }
 });
 
-// Request current status when page loads
+// Request current status and manifest when page loads
 chrome.runtime.sendMessage({ type: 'GET_STATUS' }, (response) => {
     if (response) {
+        if (response.manifest) {
+            manifestData = response.manifest;
+        }
         handleVerificationStatus(response);
     }
 });
 
 // Initialize DOM security monitoring
-// Wait for DOM to be ready before scanning
 if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', () => {
         performDOMSecurityCheck();
         setupDOMObserver();
     });
 } else {
-    // DOM is already ready
     performDOMSecurityCheck();
     setupDOMObserver();
 }
 
-// Also perform a delayed check to catch late-loaded resources
+// Delayed check for late-loaded resources
 setTimeout(() => {
     performDOMSecurityCheck();
 }, 2000);
 
-console.log('[PinChat Verify] Content script loaded with DOM security monitoring');
+console.log('[PinChat Verify] Content script loaded with SRI verification');

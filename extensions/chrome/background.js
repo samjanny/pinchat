@@ -1,10 +1,17 @@
 /**
  * PinChat Integrity Verifier - Chrome Background Service Worker
+ *
+ * Security model with SRI:
+ * 1. Fetch signed manifest from GitHub (hashes.json.signed)
+ * 2. Verify ECDSA signature with embedded public key
+ * 3. Send manifest to content scripts
+ * 4. Content scripts verify SRI attributes in actual DOM match manifest
+ * 5. Browser enforces SRI (blocks tampered files)
  */
 
 // Configuration
 const CONFIG = {
-    HASH_LIST_URL: 'https://raw.githubusercontent.com/samjanny/pinchat/main/hashes.json.signed',
+    HASH_LIST_URL: 'https://raw.githubusercontent.com/pinchat-io/pinchat/main/hashes.json.signed',
     SITE_URL: 'https://pinchat.io',
     // IMPORTANT: Replace with your actual ECDSA P-256 public key
     PUBLIC_KEY: `-----BEGIN PUBLIC KEY-----
@@ -12,25 +19,16 @@ MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAExkuEOYHEQQfDqsyO+uamOnf5b/AH
 OqRJNIZ5zBHCr2HbJsHCtrPQUOKd4cBqfDZlQZ62rzF7ofA39ITBUyLxaA==
 -----END PUBLIC KEY-----`,
     CHECK_INTERVAL_MINUTES: 5,
-    FETCH_TIMEOUT_MS: 10000,  // 10 second timeout per request
-    REQUEST_DELAY_MS: 200     // Delay between requests to avoid rate limiting
+    FETCH_TIMEOUT_MS: 10000
 };
 
 // State management
 let verificationState = {
-    status: 'unknown', // 'verified', 'partial', 'failed', 'error', 'checking', 'unknown'
+    status: 'unknown', // 'verified', 'failed', 'error', 'checking', 'unknown'
     lastCheck: null,
     errors: [],
-    mismatches: [],
-    details: null
+    manifest: null  // Store manifest for content scripts
 };
-
-/**
- * Sleep for a given number of milliseconds
- */
-function sleep(ms) {
-    return new Promise(resolve => setTimeout(resolve, ms));
-}
 
 /**
  * Fetch with timeout support
@@ -71,22 +69,16 @@ async function importPublicKey(pemKey) {
 }
 
 /**
- * Convert DER-encoded ECDSA signature to IEEE P1363 format (raw r||s)
- * OpenSSL and Node.js produce DER format, but WebCrypto expects P1363
- * DER format: 0x30 [total-length] 0x02 [r-length] [r] 0x02 [s-length] [s]
- * P1363 format for P-256: 32 bytes r || 32 bytes s (64 bytes total)
+ * Convert DER-encoded ECDSA signature to IEEE P1363 format
  */
 function derToP1363(derSignature) {
     const der = new Uint8Array(derSignature);
 
-    // Skip SEQUENCE tag (0x30) and length byte
     let offset = 2;
 
-    // Read r INTEGER
     if (der[offset] !== 0x02) throw new Error('Invalid DER signature: expected INTEGER tag for r');
     offset++;
     let rLength = der[offset++];
-    // Skip leading zero padding (used for positive integers in DER)
     while (der[offset] === 0x00 && rLength > 32) {
         offset++;
         rLength--;
@@ -94,24 +86,20 @@ function derToP1363(derSignature) {
     const r = der.slice(offset, offset + Math.min(rLength, 32));
     offset += rLength;
 
-    // Read s INTEGER
     if (der[offset] !== 0x02) throw new Error('Invalid DER signature: expected INTEGER tag for s');
     offset++;
     let sLength = der[offset++];
-    // Skip leading zero padding
     while (der[offset] === 0x00 && sLength > 32) {
         offset++;
         sLength--;
     }
     const s = der.slice(offset, offset + Math.min(sLength, 32));
 
-    // Pad r and s to 32 bytes each (P-256 curve order)
     const rPadded = new Uint8Array(32);
     const sPadded = new Uint8Array(32);
     rPadded.set(r, 32 - r.length);
     sPadded.set(s, 32 - s.length);
 
-    // Concatenate r || s
     const p1363 = new Uint8Array(64);
     p1363.set(rPadded, 0);
     p1363.set(sPadded, 32);
@@ -121,14 +109,12 @@ function derToP1363(derSignature) {
 
 /**
  * Verify signature using ECDSA
- * Handles DER-encoded signatures from OpenSSL/Node.js
  */
 async function verifySignature(data, signatureBase64, publicKey) {
     const encoder = new TextEncoder();
     const dataBuffer = encoder.encode(data);
     const derSignature = Uint8Array.from(atob(signatureBase64), c => c.charCodeAt(0));
 
-    // Convert DER to P1363 format for WebCrypto
     const p1363Signature = derToP1363(derSignature);
 
     return await crypto.subtle.verify(
@@ -140,51 +126,9 @@ async function verifySignature(data, signatureBase64, publicKey) {
 }
 
 /**
- * Calculate SHA-256 hash
- */
-async function calculateHash(content) {
-    const encoder = new TextEncoder();
-    const data = encoder.encode(content);
-    const hashBuffer = await crypto.subtle.digest('SHA-256', data);
-    const hashArray = Array.from(new Uint8Array(hashBuffer));
-    return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
-}
-
-/**
- * Fetch and verify a single file
- * Returns: { path, hash, error, errorType }
- * errorType: 'auth' (401/403), 'not_found' (404), 'rate_limited' (429), 'network', 'timeout', null (success)
- */
-async function fetchAndHashFile(path) {
-    const url = `${CONFIG.SITE_URL}${path}`;
-    try {
-        const response = await fetchWithTimeout(url, { cache: 'no-store' });
-        if (!response.ok) {
-            // Categorize HTTP errors
-            const status = response.status;
-            let errorType = 'network';
-            if (status === 401 || status === 403) {
-                errorType = 'auth';
-            } else if (status === 404) {
-                errorType = 'not_found';
-            } else if (status === 429) {
-                errorType = 'rate_limited';
-            }
-            return { path, error: `HTTP ${status}`, hash: null, errorType };
-        }
-        const content = await response.text();
-        const hash = await calculateHash(content);
-        return { path, hash, error: null, errorType: null };
-    } catch (error) {
-        // Handle timeout and network errors
-        const errorType = error.name === 'AbortError' ? 'timeout' : 'network';
-        const errorMsg = error.name === 'AbortError' ? 'Timeout' : error.message;
-        return { path, error: errorMsg, hash: null, errorType };
-    }
-}
-
-/**
  * Main verification function
+ * Fetches signed manifest and verifies signature
+ * Actual file verification is done by content scripts via SRI
  */
 async function verifyIntegrity() {
     console.log('[PinChat Verify] Starting verification...');
@@ -193,20 +137,14 @@ async function verifyIntegrity() {
         status: 'checking',
         lastCheck: new Date().toISOString(),
         errors: [],
-        mismatches: [],
-        details: {
-            filesChecked: 0,
-            filesMatched: 0,
-            filesFailed: 0,
-            filesAuthRequired: 0
-        }
+        manifest: null
     };
 
     await updateAllTabsBadges();
     await notifyContentScripts();
 
     try {
-        // Fetch hash list from GitHub (with timeout)
+        // Fetch signed manifest from GitHub
         const response = await fetchWithTimeout(CONFIG.HASH_LIST_URL, { cache: 'no-store' });
         if (!response.ok) {
             throw new Error(`Failed to fetch hash list: ${response.status}`);
@@ -225,92 +163,18 @@ async function verifyIntegrity() {
 
         if (!isSignatureValid) {
             verificationState.status = 'failed';
-            verificationState.errors.push('SIGNATURE VERIFICATION FAILED');
+            verificationState.errors.push('SIGNATURE VERIFICATION FAILED - Manifest may be tampered');
             await updateAllTabsBadges();
             await notifyContentScripts();
             return verificationState;
         }
 
-        // Verify each file
-        const hashList = signedData.data.files;
+        // Signature valid - store manifest for content scripts
+        verificationState.manifest = signedData.data;
+        verificationState.status = 'verified';
 
-        for (let i = 0; i < hashList.length; i++) {
-            const fileEntry = hashList[i];
-            verificationState.details.filesChecked++;
-
-            // Add delay between requests to avoid rate limiting (except for first request)
-            if (i > 0) {
-                await sleep(CONFIG.REQUEST_DELAY_MS);
-            }
-
-            const result = await fetchAndHashFile(fileEntry.path);
-
-            if (result.error) {
-                // Distinguish auth/rate-limit errors from real failures
-                if (result.errorType === 'auth' || result.errorType === 'rate_limited') {
-                    // File requires authentication or was rate-limited - not a security failure
-                    verificationState.details.filesAuthRequired++;
-                    verificationState.mismatches.push({
-                        path: fileEntry.path,
-                        expected: fileEntry.hash,
-                        actual: null,
-                        error: result.error,
-                        errorType: result.errorType
-                    });
-                } else {
-                    // Real failure (404, network error, timeout)
-                    verificationState.details.filesFailed++;
-                    verificationState.mismatches.push({
-                        path: fileEntry.path,
-                        expected: fileEntry.hash,
-                        actual: null,
-                        error: result.error,
-                        errorType: result.errorType
-                    });
-                }
-                continue;
-            }
-
-            if (result.hash !== fileEntry.hash) {
-                // Hash mismatch - this is a real security concern
-                verificationState.details.filesFailed++;
-                verificationState.mismatches.push({
-                    path: fileEntry.path,
-                    expected: fileEntry.hash,
-                    actual: result.hash,
-                    error: 'Hash mismatch',
-                    errorType: 'mismatch'
-                });
-            } else {
-                verificationState.details.filesMatched++;
-            }
-
-            // Notify progress
-            await notifyContentScripts();
-        }
-
-        // Update final status based on results
-        const { filesMatched, filesFailed, filesAuthRequired } = verificationState.details;
-
-        if (filesFailed > 0) {
-            // Real failures (hash mismatch, 404, network errors)
-            verificationState.status = 'failed';
-            verificationState.errors.push(`${filesFailed} file(s) failed verification`);
-        } else if (filesMatched > 0 && filesAuthRequired > 0) {
-            // Some files verified, some require auth
-            verificationState.status = 'partial';
-            verificationState.errors.push(`${filesAuthRequired} file(s) require authentication`);
-        } else if (filesMatched > 0) {
-            // All accessible files verified
-            verificationState.status = 'verified';
-        } else if (filesAuthRequired > 0) {
-            // All files require auth
-            verificationState.status = 'partial';
-            verificationState.errors.push('All files require authentication');
-        } else {
-            verificationState.status = 'error';
-            verificationState.errors.push('No files could be verified');
-        }
+        console.log('[PinChat Verify] Manifest signature verified successfully');
+        console.log(`[PinChat Verify] Manifest contains ${signedData.data.files.length} files`);
 
     } catch (error) {
         verificationState.status = 'error';
@@ -328,14 +192,13 @@ async function verifyIntegrity() {
 }
 
 /**
- * Badge configurations for different states
+ * Badge configurations
  */
 const BADGES = {
-    verified: { text: '✓', color: '#22c55e' },   // Green - all files verified
-    partial: { text: '◐', color: '#3b82f6' },    // Blue - some files verified, some require auth
-    failed: { text: '!', color: '#ef4444' },     // Red - hash mismatch or real failure
-    error: { text: '?', color: '#f59e0b' },      // Yellow - network/config error
-    checking: { text: '...', color: '#3b82f6' }, // Blue - in progress
+    verified: { text: '✓', color: '#22c55e' },
+    failed: { text: '!', color: '#ef4444' },
+    error: { text: '?', color: '#f59e0b' },
+    checking: { text: '...', color: '#3b82f6' },
     unknown: { text: '', color: '#6b7280' },
     inactive: { text: '', color: '#6b7280' }
 };
@@ -354,27 +217,16 @@ function isPinChatUrl(url) {
 }
 
 /**
- * Update the extension badge based on status
- */
-function updateBadge(status) {
-    const badge = BADGES[status] || BADGES.unknown;
-    chrome.action.setBadgeText({ text: badge.text });
-    chrome.action.setBadgeBackgroundColor({ color: badge.color });
-}
-
-/**
- * Update badge for a specific tab based on its URL
+ * Update badge for a specific tab
  */
 async function updateBadgeForTab(tabId) {
     try {
         const tab = await chrome.tabs.get(tabId);
         if (isPinChatUrl(tab.url)) {
-            // On pinchat.io - show verification status
             const badge = BADGES[verificationState.status] || BADGES.unknown;
             chrome.action.setBadgeText({ text: badge.text, tabId });
             chrome.action.setBadgeBackgroundColor({ color: badge.color, tabId });
         } else {
-            // Not on pinchat.io - show inactive/empty badge
             chrome.action.setBadgeText({ text: '', tabId });
             chrome.action.setBadgeBackgroundColor({ color: BADGES.inactive.color, tabId });
         }
@@ -398,7 +250,7 @@ async function updateAllTabsBadges() {
 }
 
 /**
- * Notify all pinchat.io tabs of the current verification status
+ * Notify all pinchat.io tabs of verification status and manifest
  */
 async function notifyContentScripts() {
     try {
@@ -419,6 +271,7 @@ async function notifyContentScripts() {
 // Message handler
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message.type === 'GET_STATUS') {
+        // Return full state including manifest
         sendResponse(verificationState);
         return true;
     }
@@ -429,12 +282,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     }
 });
 
-// Run verification when extension is installed or updated
+// Run verification when extension is installed/updated
 chrome.runtime.onInstalled.addListener(() => {
     console.log('[PinChat Verify] Extension installed/updated');
     verifyIntegrity();
 
-    // Set up periodic verification
     chrome.alarms.create('verify-integrity', {
         periodInMinutes: CONFIG.CHECK_INTERVAL_MINUTES
     });
@@ -447,7 +299,7 @@ chrome.alarms.onAlarm.addListener((alarm) => {
     }
 });
 
-// Listen for tab activation changes
+// Listen for tab activation
 chrome.tabs.onActivated.addListener((activeInfo) => {
     updateBadgeForTab(activeInfo.tabId);
 });

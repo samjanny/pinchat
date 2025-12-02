@@ -1,9 +1,12 @@
 #!/usr/bin/env node
 /**
- * PinChat Hash Generator and Signer
+ * PinChat Hash Generator and Signer with SRI Support
  *
- * This script generates SHA-256 hashes of all static files
- * and signs them with an ECDSA P-256 private key.
+ * This script:
+ * 1. Generates SHA-256 hashes of JS/CSS files
+ * 2. Injects SRI integrity attributes into HTML files
+ * 3. Generates hashes of the updated HTML files
+ * 4. Signs everything with an ECDSA P-256 private key
  *
  * Usage:
  *   node generate-hashes.js --private-key path/to/private.pem --output hashes.json.signed
@@ -18,14 +21,8 @@ const path = require('path');
 const crypto = require('crypto');
 const readline = require('readline');
 
-// Files to hash (URL paths as seen by browser)
-// HTML files are in static/ and served at /static/*.html
-const FILES_TO_HASH = [
-  // HTML pages
-  '/static/index.html',
-  '/static/login.html',
-  '/static/chat.html',
-
+// Files to hash - order matters: JS/CSS first, then HTML (which depends on JS/CSS hashes)
+const JS_CSS_FILES = [
   // CSS
   '/static/css/style.css',
 
@@ -44,24 +41,103 @@ const FILES_TO_HASH = [
   '/static/js/websocket.js'
 ];
 
+const HTML_FILES = [
+  '/static/index.html',
+  '/static/login.html',
+  '/static/chat.html'
+];
+
 /**
  * Convert URL path to filesystem path relative to static directory
- * URLs use /static/... but files are in static/... (without the /static prefix)
  */
 function urlPathToFilePath(urlPath) {
-    // Remove /static prefix if present, since staticDir is already the static folder
     if (urlPath.startsWith('/static/')) {
-        return urlPath.substring('/static'.length); // returns /css/style.css
+        return urlPath.substring('/static'.length);
     }
     return urlPath;
 }
 
 /**
- * Calculate SHA-256 hash of a file
+ * Calculate SHA-256 hash of a file (hex format for manifest)
  */
-function hashFile(filePath) {
+function hashFileHex(filePath) {
     const content = fs.readFileSync(filePath, 'utf8');
     return crypto.createHash('sha256').update(content).digest('hex');
+}
+
+/**
+ * Calculate SHA-256 hash of a file (base64 format for SRI)
+ */
+function hashFileSRI(filePath) {
+    const content = fs.readFileSync(filePath, 'utf8');
+    const hash = crypto.createHash('sha256').update(content).digest('base64');
+    return `sha256-${hash}`;
+}
+
+/**
+ * Calculate SHA-256 hash of content (base64 format for SRI)
+ */
+function hashContentSRI(content) {
+    const hash = crypto.createHash('sha256').update(content).digest('base64');
+    return `sha256-${hash}`;
+}
+
+/**
+ * Inject SRI attributes into HTML file
+ * Returns the modified HTML content
+ */
+function injectSRIIntoHTML(htmlPath, sriMap) {
+    let content = fs.readFileSync(htmlPath, 'utf8');
+
+    // Inject integrity into <script src="..."> tags
+    content = content.replace(
+        /<script\s+([^>]*?)src="([^"]+)"([^>]*?)>/gi,
+        (match, before, src, after) => {
+            // Skip if already has integrity
+            if (before.includes('integrity=') || after.includes('integrity=')) {
+                return match;
+            }
+
+            // Get SRI for this file
+            const sri = sriMap[src];
+            if (sri) {
+                // Remove any existing crossorigin attribute
+                before = before.replace(/crossorigin="[^"]*"\s*/gi, '');
+                after = after.replace(/crossorigin="[^"]*"\s*/gi, '');
+                return `<script ${before}src="${src}" integrity="${sri}" crossorigin="anonymous"${after}>`;
+            }
+            return match;
+        }
+    );
+
+    // Inject integrity into <link rel="stylesheet" href="..."> tags
+    content = content.replace(
+        /<link\s+([^>]*?)href="([^"]+)"([^>]*?)>/gi,
+        (match, before, href, after) => {
+            // Check if it's a stylesheet
+            const fullTag = before + after;
+            if (!fullTag.includes('rel="stylesheet"') && !fullTag.includes("rel='stylesheet'")) {
+                return match;
+            }
+
+            // Skip if already has integrity
+            if (before.includes('integrity=') || after.includes('integrity=')) {
+                return match;
+            }
+
+            // Get SRI for this file
+            const sri = sriMap[href];
+            if (sri) {
+                // Remove any existing crossorigin attribute
+                before = before.replace(/crossorigin="[^"]*"\s*/gi, '');
+                after = after.replace(/crossorigin="[^"]*"\s*/gi, '');
+                return `<link ${before}href="${href}" integrity="${sri}" crossorigin="anonymous"${after}>`;
+            }
+            return match;
+        }
+    );
+
+    return content;
 }
 
 /**
@@ -71,8 +147,6 @@ function signData(data, privateKeyPem) {
     const sign = crypto.createSign('SHA256');
     sign.update(data);
     sign.end();
-
-    // Sign and return base64 encoded signature
     const signature = sign.sign(privateKeyPem);
     return signature.toString('base64');
 }
@@ -87,7 +161,6 @@ function promptPassword(prompt) {
             output: process.stdout
         });
 
-        // Disable echo for password input
         process.stdout.write(prompt);
         process.stdin.setRawMode(true);
         process.stdin.resume();
@@ -97,18 +170,15 @@ function promptPassword(prompt) {
             char = char.toString();
 
             if (char === '\n' || char === '\r' || char === '\u0004') {
-                // Enter or Ctrl+D pressed
                 process.stdin.setRawMode(false);
                 process.stdin.removeListener('data', onData);
                 rl.close();
-                console.log(''); // New line after password
+                console.log('');
                 resolve(password);
             } else if (char === '\u0003') {
-                // Ctrl+C pressed
                 process.stdin.setRawMode(false);
                 process.exit(1);
             } else if (char === '\u007F' || char === '\b') {
-                // Backspace
                 if (password.length > 0) {
                     password = password.slice(0, -1);
                 }
@@ -122,27 +192,21 @@ function promptPassword(prompt) {
 }
 
 /**
- * Decrypt an OpenSSL-encrypted PEM file (aes-256-cbc with pbkdf2)
- * OpenSSL format: "Salted__" + 8 bytes salt + encrypted data
+ * Decrypt an OpenSSL-encrypted PEM file
  */
 function decryptPemFile(encryptedData, password) {
-    // Check for OpenSSL "Salted__" header
     const header = encryptedData.slice(0, 8).toString('utf8');
     if (header !== 'Salted__') {
         throw new Error('Invalid encrypted file format: missing OpenSSL "Salted__" header');
     }
 
-    // Extract salt (8 bytes after "Salted__")
     const salt = encryptedData.slice(8, 16);
     const ciphertext = encryptedData.slice(16);
 
-    // Derive key and IV using PBKDF2 (OpenSSL default: 10000 iterations, SHA-256)
-    // AES-256-CBC needs 32-byte key + 16-byte IV = 48 bytes total
     const keyIv = crypto.pbkdf2Sync(password, salt, 10000, 48, 'sha256');
     const key = keyIv.slice(0, 32);
     const iv = keyIv.slice(32, 48);
 
-    // Decrypt
     const decipher = crypto.createDecipheriv('aes-256-cbc', key, iv);
     let decrypted = decipher.update(ciphertext);
     decrypted = Buffer.concat([decrypted, decipher.final()]);
@@ -156,11 +220,8 @@ function decryptPemFile(encryptedData, password) {
 function secureClear(data) {
     if (Buffer.isBuffer(data)) {
         data.fill(0);
-    } else if (typeof data === 'string') {
-        // Strings are immutable in JS, but we can at least dereference
-        // For true security, use Buffer for sensitive data
-        return null;
     }
+    return null;
 }
 
 /**
@@ -174,7 +235,8 @@ function parseArgs() {
         output: 'hashes.json.signed',
         staticDir: path.join(__dirname, '..', 'static'),
         help: false,
-        noSign: false
+        noSign: false,
+        dryRun: false
     };
 
     for (let i = 0; i < args.length; i++) {
@@ -202,6 +264,9 @@ function parseArgs() {
             case '--no-sign':
                 options.noSign = true;
                 break;
+            case '--dry-run':
+                options.dryRun = true;
+                break;
         }
     }
 
@@ -213,7 +278,7 @@ function parseArgs() {
  */
 function printUsage() {
     console.log(`
-PinChat Hash Generator and Signer
+PinChat Hash Generator with SRI Support
 
 Usage:
   node generate-hashes.js --private-key <path> [options]
@@ -223,22 +288,21 @@ Usage:
 Options:
   -k, --private-key <path>    Path to ECDSA P-256 private key (PEM format)
   -e, --encrypted-key <path>  Path to encrypted private key (.pem.enc)
-                              Key is decrypted in RAM only during signing
   -o, --output <path>         Output file path (default: hashes.json.signed)
   -s, --static-dir <path>     Path to static files directory (default: ../static)
   --no-sign                   Generate hashes only, without signing
+  --dry-run                   Show what would be changed without modifying files
   -h, --help                  Show this help message
+
+This script:
+  1. Calculates SRI hashes for all JS/CSS files
+  2. Injects integrity attributes into HTML files
+  3. Calculates hashes of updated HTML files
+  4. Signs the manifest with ECDSA P-256
 
 Generate a new key pair:
   openssl ecparam -genkey -name prime256v1 -noout -out private.pem
   openssl ec -in private.pem -pubout -out public.pem
-
-Encrypt an existing private key:
-  openssl enc -aes-256-cbc -pbkdf2 -in private.pem -out private.pem.enc
-
-Examples:
-  node generate-hashes.js -k private.pem -o ../hashes.json.signed
-  node generate-hashes.js -e private.pem.enc -o ../hashes.json.signed
 `);
 }
 
@@ -253,7 +317,6 @@ async function main() {
         process.exit(0);
     }
 
-    // Validate key options
     if (!options.noSign && !options.privateKey && !options.encryptedKey) {
         console.error('Error: Private key path is required (use -k, -e, or --no-sign)');
         printUsage();
@@ -265,44 +328,108 @@ async function main() {
         process.exit(1);
     }
 
-    // Check if key file exists (only if signing)
     const keyPath = options.privateKey || options.encryptedKey;
     if (!options.noSign && !fs.existsSync(keyPath)) {
         console.error(`Error: Key file not found: ${keyPath}`);
         process.exit(1);
     }
 
-    // Check if static directory exists
     if (!fs.existsSync(options.staticDir)) {
         console.error(`Error: Static directory not found: ${options.staticDir}`);
         process.exit(1);
     }
 
-    console.log('PinChat Hash Generator');
-    console.log('======================');
+    console.log('PinChat Hash Generator with SRI');
+    console.log('================================');
     console.log(`Static directory: ${options.staticDir}`);
     console.log(`Output file: ${options.output}`);
+    if (options.dryRun) {
+        console.log('DRY RUN - no files will be modified');
+    }
     console.log('');
 
-    // Generate hashes for all files
-    const files = [];
+    // Step 1: Generate SRI hashes for JS/CSS files
+    console.log('Step 1: Generating SRI hashes for JS/CSS files...');
+    const sriMap = {};  // URL path -> SRI hash
+    const files = [];   // Final manifest entries
     let errorCount = 0;
 
-    for (const urlPath of FILES_TO_HASH) {
-        // Convert URL path to filesystem path
+    for (const urlPath of JS_CSS_FILES) {
         const fsPath = urlPathToFilePath(urlPath);
         const fullPath = path.join(options.staticDir, fsPath);
 
         if (!fs.existsSync(fullPath)) {
-            console.error(`Warning: File not found: ${urlPath} (looked in ${fullPath})`);
+            console.error(`  Warning: File not found: ${urlPath}`);
             errorCount++;
             continue;
         }
 
-        const hash = hashFile(fullPath);
-        // Store the URL path (as seen by browser), not the filesystem path
-        files.push({ path: urlPath, hash });
-        console.log(`  ${urlPath}: ${hash.substring(0, 16)}...`);
+        const sriHash = hashFileSRI(fullPath);
+        const hexHash = hashFileHex(fullPath);
+        sriMap[urlPath] = sriHash;
+        files.push({ path: urlPath, hash: hexHash });
+        console.log(`  ${urlPath}: ${sriHash.substring(0, 30)}...`);
+    }
+
+    // Step 2: Inject SRI into HTML files
+    console.log('\nStep 2: Injecting SRI attributes into HTML files...');
+    const htmlUpdates = [];
+
+    for (const urlPath of HTML_FILES) {
+        const fsPath = urlPathToFilePath(urlPath);
+        const fullPath = path.join(options.staticDir, fsPath);
+
+        if (!fs.existsSync(fullPath)) {
+            console.error(`  Warning: HTML file not found: ${urlPath}`);
+            errorCount++;
+            continue;
+        }
+
+        const originalContent = fs.readFileSync(fullPath, 'utf8');
+        const updatedContent = injectSRIIntoHTML(fullPath, sriMap);
+
+        if (originalContent !== updatedContent) {
+            console.log(`  ${urlPath}: Updated with SRI attributes`);
+            htmlUpdates.push({ path: fullPath, content: updatedContent });
+        } else {
+            console.log(`  ${urlPath}: No changes needed`);
+        }
+    }
+
+    // Step 3: Write updated HTML files (unless dry run)
+    if (!options.dryRun && htmlUpdates.length > 0) {
+        console.log('\nStep 3: Writing updated HTML files...');
+        for (const update of htmlUpdates) {
+            fs.writeFileSync(update.path, update.content);
+            console.log(`  Written: ${update.path}`);
+        }
+    }
+
+    // Step 4: Calculate hashes of HTML files (after SRI injection)
+    console.log('\nStep 4: Calculating HTML file hashes...');
+    for (const urlPath of HTML_FILES) {
+        const fsPath = urlPathToFilePath(urlPath);
+        const fullPath = path.join(options.staticDir, fsPath);
+
+        if (!fs.existsSync(fullPath)) {
+            continue;
+        }
+
+        // If we have an update pending, hash the new content, otherwise read from disk
+        const update = htmlUpdates.find(u => u.path === fullPath);
+        let hexHash;
+        if (update && !options.dryRun) {
+            // Hash the updated content (already written to disk)
+            hexHash = hashFileHex(fullPath);
+        } else if (update) {
+            // Dry run: hash the content that would be written
+            hexHash = crypto.createHash('sha256').update(update.content).digest('hex');
+        } else {
+            hexHash = hashFileHex(fullPath);
+        }
+
+        files.push({ path: urlPath, hash: hexHash });
+        console.log(`  ${urlPath}: ${hexHash.substring(0, 16)}...`);
     }
 
     if (errorCount > 0) {
@@ -311,22 +438,19 @@ async function main() {
 
     // Create data object
     const data = {
-        version: '1.0.0',
+        version: '1.1.0',  // Bumped version for SRI support
         generated: new Date().toISOString(),
         site: 'https://pinchat.io',
         files
     };
 
-    // If --no-sign, save hashes without signature and exit
-    // NOTE: Output is compact JSON (no formatting) to match what the extension
-    // expects when verifying signatures (JSON.stringify produces compact output)
     if (options.noSign) {
         fs.writeFileSync(options.output, JSON.stringify(data));
-        console.log(`\nHashes generated (unsigned, compact JSON): ${options.output}`);
+        console.log(`\nHashes generated (unsigned): ${options.output}`);
         process.exit(0);
     }
 
-    // Get private key (decrypt if encrypted)
+    // Get private key
     let privateKeyPem;
     let encryptedBuffer = null;
 
@@ -337,7 +461,6 @@ async function main() {
         try {
             const password = await promptPassword('Enter key password: ');
             privateKeyPem = decryptPemFile(encryptedBuffer, password);
-            // Clear password from memory (best effort)
             secureClear(password);
         } catch (error) {
             console.error(`Error decrypting key: ${error.message}`);
@@ -354,7 +477,6 @@ async function main() {
     try {
         signature = signData(dataString, privateKeyPem);
     } finally {
-        // Clear private key from memory immediately after signing
         if (options.encryptedKey) {
             privateKeyPem = secureClear(privateKeyPem);
             if (encryptedBuffer) {
@@ -367,27 +489,26 @@ async function main() {
     console.log(`\nSigned with ECDSA P-256`);
     console.log(`Signature: ${signature.substring(0, 32)}...`);
 
-    // Create final output
     const output = {
         data,
         signature
     };
 
-    // Write output file
     fs.writeFileSync(options.output, JSON.stringify(output, null, 2));
     console.log(`\nOutput written to: ${options.output}`);
 
-    // Also output the public key reminder
-    const keySource = options.encryptedKey
-        ? `${options.encryptedKey} (after decryption)`
-        : options.privateKey;
+    // Summary
     console.log(`
-IMPORTANT: Copy your public key to the browser extensions!
-Run: openssl ec -in ${options.privateKey || '<decrypted-key>'} -pubout
+Summary:
+  - JS/CSS files: ${JS_CSS_FILES.length}
+  - HTML files: ${HTML_FILES.length}
+  - HTML files updated with SRI: ${htmlUpdates.length}
+  - Total files in manifest: ${files.length}
 
-Then update the PUBLIC_KEY constant in:
-  - extensions/chrome/background.js
-  - extensions/firefox/background.js
+IMPORTANT:
+  1. Commit the updated HTML files to git
+  2. Upload hashes.json.signed to GitHub
+  3. Update extension PUBLIC_KEY if key changed
 `);
 }
 
