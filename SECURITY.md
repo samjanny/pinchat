@@ -367,51 +367,51 @@ With SRI:
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
-│                    SRI-BASED INTEGRITY VERIFICATION                      │
+│                    SRI-BASED INTEGRITY VERIFICATION                     │
 ├─────────────────────────────────────────────────────────────────────────┤
-│                                                                          │
-│   GitHub Repository                    pinchat.io Server                 │
-│   (Out-of-band source)                 (Potentially compromised)         │
+│                                                                         │
+│   GitHub Repository                    pinchat.io Server                │
+│   (Out-of-band source)                 (Potentially compromised)        │
 │   ┌──────────────────┐                 ┌──────────────────────────────┐ │
-│   │ hashes.json.signed│                │  HTML with SRI attributes     │ │
-│   │ ┌──────────────┐ │                 │  <script src="app.js"         │ │
-│   │ │ file hashes  │ │                 │   integrity="sha256-ABC...">  │ │
+│   │hashes.json.signed│                 │  HTML with SRI attributes    │ │
+│   │ ┌──────────────┐ │                 │  <script src="app.js"        │ │
+│   │ │ file hashes  │ │                 │   integrity="sha256-ABC..."> │ │
 │   │ │ + signature  │ │                 └──────────────┬───────────────┘ │
-│   │ └──────────────┘ │                                │                  │
-│   └────────┬─────────┘                                │                  │
-│            │                                          │                  │
-│            │ 1. Fetch signed                          │ 2. User visits   │
-│            │    manifest                              │    page          │
-│            ▼                                          ▼                  │
+│   │ └──────────────┘ │                                │                 │
+│   └────────┬─────────┘                                │                 │
+│            │                                          │                 │
+│            │ 1. Fetch signed                          │ 2. User visits  │
+│            │    manifest                              │    page         │
+│            ▼                                          ▼                 │
 │   ┌─────────────────────────────────────────────────────────────────┐   │
-│   │                      BROWSER EXTENSION                           │   │
+│   │                      BROWSER EXTENSION                          │   │
 │   │  ┌─────────────────┐    ┌─────────────────┐    ┌─────────────┐  │   │
 │   │  │ 2. Verify       │    │ 3. Content      │    │ 4. Compare  │  │   │
-│   │  │    ECDSA        │───▶│    script reads │───▶│    DOM SRI  │  │   │
+│   │  │    ECDSA        │──▶│    script reads │───▶│    DOM SRI  │  │   │
 │   │  │    Signature    │    │    actual DOM   │    │    vs       │  │   │
 │   │  └─────────────────┘    └─────────────────┘    │    Manifest │  │   │
-│   │                                                 └──────┬──────┘  │   │
+│   │                                                └──────┬──────┘  │   │
 │   └────────────────────────────────────────────────────────┼────────┘   │
-│                                                            │             │
-│   ┌────────────────────────────────────────────────────────┘             │
-│   │                                                                      │
-│   ▼                                                                      │
+│                                                            │            │
+│   ┌────────────────────────────────────────────────────────┘            │
+│   │                                                                     │
+│   ▼                                                                     │
 │   ┌─────────────────────────────────────────────────────────────────┐   │
-│   │                        BROWSER ENGINE                            │   │
+│   │                        BROWSER ENGINE                           │   │
 │   │  ┌─────────────────────────────────────────────────────────┐    │   │
 │   │  │ 5. SRI Enforcement: Browser blocks any JS/CSS where     │    │   │
 │   │  │    file hash ≠ integrity attribute hash                 │    │   │
 │   │  └─────────────────────────────────────────────────────────┘    │   │
 │   └─────────────────────────────────────────────────────────────────┘   │
-│                                                                          │
-│            ┌──────────────────────┬──────────────────────┐               │
-│            ▼                      ▼                      ▼               │
+│                                                                         │
+│            ┌──────────────────────┬──────────────────────┐              │
+│            ▼                      ▼                      ▼              │
 │   ┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐     │
-│   │   ✓ VERIFIED    │    │  ⚠ SRI MISSING  │    │  ⚠ SRI MISMATCH │     │
+│   │   ✓ VERIFIED    │    │  ⚠ SRI MISSING │    │  ⚠ SRI MISMATCH │     │
 │   │   All checks    │    │  Extension      │    │  Extension      │     │
 │   │   passed        │    │  warns user     │    │  warns user     │     │
 │   └─────────────────┘    └─────────────────┘    └─────────────────┘     │
-│                                                                          │
+│                                                                         │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
