@@ -15,9 +15,9 @@ let unauthorizedResources = [];
 
 // Whitelist of allowed resource paths (must match generate-hashes.js)
 const ALLOWED_PATHS = [
-    '/index.html',
-    '/login.html',
-    '/chat.html',
+    '/static/index.html',
+    '/static/login.html',
+    '/static/chat.html',
     '/static/css/style.css',
     '/static/js/alpine-csp.min.js',
     '/static/js/app.js',
@@ -27,6 +27,7 @@ const ALLOWED_PATHS = [
     '/static/js/emoji.js',
     '/static/js/homepage.js',
     '/static/js/identity.js',
+    '/static/js/login.js',
     '/static/js/nicknames.js',
     '/static/js/pow.js',
     '/static/js/websocket.js'
@@ -247,7 +248,7 @@ function setupDOMObserver() {
 function showUnauthorizedResourceWarning(resources) {
     const mismatches = resources.map(r => ({
         path: r.path,
-        error: `Unauthorized ${r.type}: ${r.error || 'Not in whitelist'}`
+        error: r.error || 'Unauthorized resource'
     }));
 
     showWarningOverlay(mismatches, true);
