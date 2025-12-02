@@ -22,6 +22,7 @@ PinChat is a secure messaging application designed for privacy-first communicati
 
 - **1:1 Chat**: Private conversations between two participants
 - **Group Chat**: Secure group messaging for up to 20 participants
+  - ⚠️ **Currently disabled**: Group chat functionality is temporarily disabled until a robust cryptographic solution is implemented (the current Bootstrap Key approach is insufficient for secure group key management)
 
 ## Security Model
 

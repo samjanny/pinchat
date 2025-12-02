@@ -298,6 +298,8 @@ chainKey = chainKey'
 - Pre-derived keys stored for future messages
 - Keys outside window are deleted (PFS)
 
+> **TODO**: Improve support for out-of-order messages older than the current receive counter (n < Nr) within the same chain. A `skipMessageKeys(messageNumber)` function should be implemented when `messageNumber > this.Nr`, storing skipped keys in a `skippedKeys` map for later decryption of delayed messages.
+
 ---
 
 ## Message Formats
