@@ -1,19 +1,19 @@
 {
   "data": {
     "version": "1.0.0",
-    "generated": "2025-12-02T11:56:54.517Z",
+    "generated": "2025-12-02T14:36:45.804Z",
     "site": "https://pinchat.io",
     "files": [
       {
-        "path": "/index.html",
+        "path": "/static/index.html",
         "hash": "5a92962707a72b61088538c802658b6f4dbb7971e402d58d3f4eefeffebd0daa"
       },
       {
-        "path": "/login.html",
-        "hash": "ccc7137e4e4769ca67b9447f4c3262137c09059b559ce07c0f272d21803a1c54"
+        "path": "/static/login.html",
+        "hash": "2d4b721d1dfdf29df9613ab1b5ec31bc806be07f23255d613f20c000a8217570"
       },
       {
-        "path": "/chat.html",
+        "path": "/static/chat.html",
         "hash": "5dcb28a1a8a507f22e1807e0f3094a0095f2ef2c5160a22fc3613dc52baa6fe3"
       },
       {
@@ -53,6 +53,10 @@
         "hash": "d39ccaa200ab11b8e8e644a83553ade4e3a037c17b7f950787d7f9d9ea74df8f"
       },
       {
+        "path": "/static/js/login.js",
+        "hash": "f7467d251f7d88d99c2fc733c3a13bc95f78f06d5934a2a2f67cb1aecdf2e1f8"
+      },
+      {
         "path": "/static/js/nicknames.js",
         "hash": "1459661f5d872d8fdc2b5d14bb900b21a6e4b73c3e2a2089745da9eb4aa54ae7"
       },
@@ -66,5 +70,5 @@
       }
     ]
   },
-  "signature": "MEYCIQCliapoFQweyhwCokhlc2ndpAr5NMzcsHRC6RxHPTzN2QIhAI3x01T3kb3BKReh0FxBITpznWrEO6b5BsPlO1iYD2up"
+  "signature": "MEUCIQDTU4JvcGPhP5zwe0JC5/sCA/tgffrcwQ2Js/b9+PSLIgIgIsIBux/SDDy8wtPR6ZizurXNhVfflMWxkLe8CHEiHOk="
 }

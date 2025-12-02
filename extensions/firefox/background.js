@@ -12,7 +12,8 @@ MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAExkuEOYHEQQfDqsyO+uamOnf5b/AH
 OqRJNIZ5zBHCr2HbJsHCtrPQUOKd4cBqfDZlQZ62rzF7ofA39ITBUyLxaA==
 -----END PUBLIC KEY-----`,
     CHECK_INTERVAL_MINUTES: 5,
-    FETCH_TIMEOUT_MS: 10000  // 10 second timeout per request
+    FETCH_TIMEOUT_MS: 10000,  // 10 second timeout per request
+    REQUEST_DELAY_MS: 200     // Delay between requests to avoid rate limiting
 };
 
 // State management
@@ -23,6 +24,13 @@ let verificationState = {
     mismatches: [],
     details: null
 };
+
+/**
+ * Sleep for a given number of milliseconds
+ */
+function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
 
 /**
  * Fetch with timeout support
@@ -145,7 +153,7 @@ async function calculateHash(content) {
 /**
  * Fetch and verify a single file
  * Returns: { path, hash, error, errorType }
- * errorType: 'auth' (401/403), 'not_found' (404), 'network', 'timeout', null (success)
+ * errorType: 'auth' (401/403), 'not_found' (404), 'rate_limited' (429), 'network', 'timeout', null (success)
  */
 async function fetchAndHashFile(path) {
     const url = `${CONFIG.SITE_URL}${path}`;
@@ -159,6 +167,8 @@ async function fetchAndHashFile(path) {
                 errorType = 'auth';
             } else if (status === 404) {
                 errorType = 'not_found';
+            } else if (status === 429) {
+                errorType = 'rate_limited';
             }
             return { path, error: `HTTP ${status}`, hash: null, errorType };
         }
@@ -224,22 +234,28 @@ async function verifyIntegrity() {
         // Verify each file
         const hashList = signedData.data.files;
 
-        for (const fileEntry of hashList) {
+        for (let i = 0; i < hashList.length; i++) {
+            const fileEntry = hashList[i];
             verificationState.details.filesChecked++;
+
+            // Add delay between requests to avoid rate limiting (except for first request)
+            if (i > 0) {
+                await sleep(CONFIG.REQUEST_DELAY_MS);
+            }
 
             const result = await fetchAndHashFile(fileEntry.path);
 
             if (result.error) {
-                // Distinguish auth errors from real failures
-                if (result.errorType === 'auth') {
-                    // File requires authentication - not a failure
+                // Distinguish auth/rate-limit errors from real failures
+                if (result.errorType === 'auth' || result.errorType === 'rate_limited') {
+                    // File requires authentication or was rate-limited - not a security failure
                     verificationState.details.filesAuthRequired++;
                     verificationState.mismatches.push({
                         path: fileEntry.path,
                         expected: fileEntry.hash,
                         actual: null,
                         error: result.error,
-                        errorType: 'auth'
+                        errorType: result.errorType
                     });
                 } else {
                     // Real failure (404, network error, timeout)

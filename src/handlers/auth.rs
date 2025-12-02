@@ -1,7 +1,7 @@
 use axum::{
     extract::{Query, State},
     http::{header, HeaderMap, StatusCode},
-    response::{Html, IntoResponse, Response},
+    response::{IntoResponse, Response},
     Form,
 };
 use axum_extra::extract::cookie::{Cookie, SameSite};
@@ -54,25 +54,13 @@ fn should_use_secure_cookies(force_secure: bool) -> bool {
     cert_exists && key_exists
 }
 
-/// Login page handler - serves the login HTML with CSRF token
+/// Login page handler - redirects to static HTML
+/// CSRF token is obtained via /api/csrf endpoint
 pub async fn login_page(
     State(state): State<AppState>,
     Query(query): Query<LoginQuery>,
 ) -> impl IntoResponse {
-    // Generate CSRF token
-    let csrf_token = generate_csrf_token(&state.csrf_secret);
     let use_secure = should_use_secure_cookies(state.config.force_secure_cookies);
-
-    // Create CSRF cookie; HttpOnly because the token is injected into the HTML form
-    // Client scripts do not require access because the server validates that the cookie
-    // matches the submitted form field
-    let csrf_cookie = Cookie::build((CSRF_COOKIE_NAME, csrf_token.clone()))
-        .path("/")
-        .same_site(SameSite::Strict)
-        .secure(use_secure)
-        .http_only(true)
-        .max_age(time::Duration::minutes(15))
-        .build();
 
     // Clear any stale session cookie to ensure clean state
     let clear_session = Cookie::build((SESSION_COOKIE_NAME, ""))
@@ -90,19 +78,51 @@ pub async fn login_page(
         .filter(|url| url.starts_with('/') && !url.starts_with("//"))
         .unwrap_or_default();
 
-    // Read login.html template and inject CSRF token and redirect URL
-    let html = include_str!("../../static/login.html")
-        .replace("{{csrf_token}}", &csrf_token)
-        .replace("{{redirect_url}}", &redirect_url);
-
     let mut headers = HeaderMap::new();
-    headers.append(header::SET_COOKIE, csrf_cookie.to_string().parse().unwrap());
     headers.append(
         header::SET_COOKIE,
         clear_session.to_string().parse().unwrap(),
     );
 
-    (StatusCode::OK, headers, Html(html))
+    // Redirect to static login page with optional redirect parameter
+    let location = if redirect_url.is_empty() {
+        "/static/login.html".to_string()
+    } else {
+        format!("/static/login.html?redirect={}", urlencoding::encode(&redirect_url))
+    };
+    headers.insert(header::LOCATION, location.parse().unwrap());
+
+    (StatusCode::SEE_OTHER, headers)
+}
+
+/// CSRF token API endpoint
+/// Returns a new CSRF token and sets the corresponding cookie
+pub async fn get_csrf_token(State(state): State<AppState>) -> impl IntoResponse {
+    let csrf_token = generate_csrf_token(&state.csrf_secret);
+    let use_secure = should_use_secure_cookies(state.config.force_secure_cookies);
+
+    // Create CSRF cookie
+    let csrf_cookie = Cookie::build((CSRF_COOKIE_NAME, csrf_token.clone()))
+        .path("/")
+        .same_site(SameSite::Strict)
+        .secure(use_secure)
+        .http_only(true)
+        .max_age(time::Duration::minutes(15))
+        .build();
+
+    let mut headers = HeaderMap::new();
+    headers.append(header::SET_COOKIE, csrf_cookie.to_string().parse().unwrap());
+    headers.insert(
+        header::CONTENT_TYPE,
+        "application/json".parse().unwrap(),
+    );
+
+    // Return token in JSON response
+    (
+        StatusCode::OK,
+        headers,
+        format!(r#"{{"csrf_token":"{}"}}"#, csrf_token),
+    )
 }
 
 /// Login form submission handler
@@ -288,34 +308,21 @@ pub fn extract_session_id(headers: &HeaderMap) -> Option<uuid::Uuid> {
 }
 
 /// Helper to create an error response for login failures
-/// Generates a new CSRF token so the user can retry
+/// Redirects back to login page with error parameter
 fn login_error_response(
     message: &str,
-    csrf_secret: &[u8; 32],
-    force_secure_cookies: bool,
+    _csrf_secret: &[u8; 32],
+    _force_secure_cookies: bool,
 ) -> Response {
-    let csrf_token = generate_csrf_token(csrf_secret);
-    let use_secure = should_use_secure_cookies(force_secure_cookies);
-
-    let csrf_cookie = Cookie::build((CSRF_COOKIE_NAME, csrf_token.clone()))
-        .path("/")
-        .same_site(SameSite::Strict)
-        .secure(use_secure)
-        .http_only(true)
-        .max_age(time::Duration::minutes(15))
-        .build();
-
-    let html = include_str!("../../static/login.html")
-        .replace("{{csrf_token}}", &csrf_token)
-        .replace(
-            "<!-- error_placeholder -->",
-            &format!(r#"<div class="login-error-message">{}</div>"#, message),
-        );
+    // Redirect back to static login page with error message
+    let location = format!(
+        "/static/login.html?error={}",
+        urlencoding::encode(message)
+    );
 
     (
-        StatusCode::UNAUTHORIZED,
-        [(header::SET_COOKIE, csrf_cookie.to_string())],
-        Html(html),
+        StatusCode::SEE_OTHER,
+        [(header::LOCATION, location)],
     )
         .into_response()
 }

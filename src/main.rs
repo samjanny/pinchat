@@ -37,8 +37,8 @@ use crate::auth_middleware::{redirect_if_authenticated, require_auth, require_au
 use crate::cleanup::start_cleanup_task;
 use crate::config::Config;
 use crate::handlers::{
-    create_room, generate_ws_token, homepage, login_page, login_submit, logout, room_page,
-    ws_handler,
+    create_room, generate_ws_token, get_csrf_token, homepage, login_page, login_submit, logout,
+    room_page, ws_handler,
 };
 use crate::rate_limit_extractor::HmacIpKeyExtractor;
 use crate::state::AppState;
@@ -296,7 +296,9 @@ async fn main() {
             )),
         )
         .route("/login", post(login_submit).layer(login_rate_limiter))
-        // Serve static files (CSS, JS)
+        // CSRF token API (for static login page)
+        .route("/api/csrf", get(get_csrf_token))
+        // Serve static files (CSS, JS, HTML)
         .nest_service("/static", ServeDir::new("static"))
         .with_state(app_state.clone());
 

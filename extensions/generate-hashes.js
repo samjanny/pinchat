@@ -18,16 +18,17 @@ const path = require('path');
 const crypto = require('crypto');
 const readline = require('readline');
 
-// Files to hash (relative to static directory)
+// Files to hash (URL paths as seen by browser)
+// HTML files are in static/ and served at /static/*.html
 const FILES_TO_HASH = [
   // HTML pages
-  '/index.html',
-  '/login.html',
-  '/chat.html',
-  
+  '/static/index.html',
+  '/static/login.html',
+  '/static/chat.html',
+
   // CSS
   '/static/css/style.css',
-  
+
   // JavaScript
   '/static/js/alpine-csp.min.js',
   '/static/js/app.js',
@@ -37,6 +38,7 @@ const FILES_TO_HASH = [
   '/static/js/emoji.js',
   '/static/js/homepage.js',
   '/static/js/identity.js',
+  '/static/js/login.js',
   '/static/js/nicknames.js',
   '/static/js/pow.js',
   '/static/js/websocket.js'

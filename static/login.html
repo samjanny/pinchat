@@ -13,11 +13,11 @@
                 <h1>Secure Access</h1>
             </div>
 
-            <!-- error_placeholder -->
+            <div id="error-container"></div>
 
-            <form method="POST" action="/login">
-                <input type="hidden" name="csrf_token" value="{{csrf_token}}">
-                <input type="hidden" name="redirect_url" value="{{redirect_url}}">
+            <form id="login-form" method="POST" action="/login">
+                <input type="hidden" id="csrf_token" name="csrf_token" value="">
+                <input type="hidden" id="redirect_url" name="redirect_url" value="">
 
                 <div class="form-group">
                     <input
@@ -32,12 +32,14 @@
                     >
                 </div>
 
-                <button type="submit" class="login-btn">
-                    Enter
+                <button type="submit" class="login-btn" id="submit-btn" disabled>
+                    Loading...
                 </button>
             </form>
 
         </div>
     </div>
+
+    <script src="/static/js/login.js"></script>
 </body>
 </html>

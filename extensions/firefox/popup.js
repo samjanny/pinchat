@@ -102,9 +102,9 @@ function updateUI(state) {
         details.style.display = 'none';
     }
 
-    // Update mismatches if any (only show real failures, not auth-required)
+    // Update mismatches if any (only show real failures, not auth-required or rate-limited)
     const realFailures = state.mismatches ?
-        state.mismatches.filter(m => m.errorType !== 'auth') : [];
+        state.mismatches.filter(m => m.errorType !== 'auth' && m.errorType !== 'rate_limited') : [];
 
     if (realFailures.length > 0) {
         mismatches.style.display = 'block';
