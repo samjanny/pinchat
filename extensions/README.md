@@ -1,15 +1,26 @@
 # PinChat Integrity Verifier Browser Extensions
 
-Browser extensions that verify the integrity of files served by pinchat.io against cryptographically signed hashes.
+Browser extensions that verify the integrity of files served by pinchat.io using Subresource Integrity (SRI) verification.
 
 ## How It Works
 
-1. The extension fetches a signed hash list from GitHub
-2. Verifies the ECDSA P-256 signature using the embedded public key
-3. Fetches each file from pinchat.io and calculates its SHA-256 hash
-4. Compares the calculated hashes with the signed list
-5. Shows a green checkmark badge if all files match
-6. Shows a **red warning overlay** if any file doesn't match
+The extension uses a defense-in-depth approach combining SRI with signed manifests:
+
+1. **Manifest Verification**: Extension fetches signed hash list from GitHub
+2. **Signature Verification**: Verifies ECDSA P-256 signature using embedded public key
+3. **SRI DOM Verification**: Content script checks that all `<script>` and `<link>` tags in the actual page DOM have correct `integrity` attributes matching the signed manifest
+4. **Browser Enforcement**: Browser natively enforces SRI - blocks any file that doesn't match its integrity hash
+5. **Visual Feedback**: Green checkmark if verified, red warning overlay if issues detected
+
+### Why SRI?
+
+Previous approach (separate fetches) was vulnerable to bypass attacks: a compromised server could serve clean files to the extension while serving malicious code to the browser.
+
+With SRI:
+- The `integrity` attribute is hardcoded in HTML files
+- Browser refuses to execute any JS/CSS that doesn't match the hash
+- Extension verifies the HTML contains correct integrity attributes
+- Both the manifest AND integrity values are signed/verified
 
 ## Setup
 
@@ -34,26 +45,36 @@ Edit the `PUBLIC_KEY` constant in both:
 
 Replace the placeholder with your actual public key from `public.pem`.
 
-### 3. Generate Signed Hash List
+### 3. Generate Signed Hash List with SRI Injection
 
 ```bash
 node generate-hashes.js --private-key private.pem --output ../hashes.json.signed
 ```
 
 This will:
-- Calculate SHA-256 hashes for all static files
-- Sign the hash list with your private key
-- Output `hashes.json.signed` to the repository root
+1. Calculate SHA-256 hashes (SRI format) for all JS/CSS files
+2. **Inject `integrity` attributes** into HTML files (`<script>` and `<link>` tags)
+3. Calculate hashes of updated HTML files
+4. Sign the complete manifest with your private key
+5. Output `hashes.json.signed` to the repository root
 
-### 4. Commit and Push Hash File
+**Important**: The script modifies HTML files in-place. Commit these changes along with the signed manifest.
+
+Use `--dry-run` to preview changes without modifying files:
+```bash
+node generate-hashes.js --private-key private.pem --dry-run
+```
+
+### 4. Commit and Push Changes
 
 ```bash
-git add ../hashes.json.signed
-git commit -m "Update signed hash list"
+# Add both HTML files (with SRI) and signed manifest
+git add static/*.html hashes.json.signed
+git commit -m "Update SRI attributes and signed hash list"
 git push
 ```
 
-The extensions will fetch from:
+The extensions will fetch the manifest from:
 `https://raw.githubusercontent.com/samjanny/pinchat/main/hashes.json.signed`
 
 ### 5. Generate Icon PNGs
@@ -94,18 +115,28 @@ For permanent Firefox installation, the extension needs to be signed by Mozilla.
 
 | Badge | Meaning |
 |-------|---------|
-| ✓ (green) | All files verified |
+| ✓ (green) | Manifest signature verified, SRI attributes checked |
 | ! (red) | Verification failed - possible compromise |
-| ? (yellow) | Error during verification |
+| ? (yellow) | Error fetching/verifying manifest |
 | ... (blue) | Verification in progress |
 
 ### Warning Overlay
 
 If verification fails, a full-screen red overlay appears with:
-- **POSSIBLE SERVER COMPROMISE!** warning
-- List of files that failed verification
+- **UNAUTHORIZED RESOURCES DETECTED!** warning
+- List of issues (missing SRI, SRI mismatch, unauthorized scripts, etc.)
 - "Leave This Site" button
 - "Dismiss (Unsafe)" button with confirmation
+
+### What the Extension Detects
+
+- Missing `integrity` attribute on scripts/stylesheets
+- SRI hash mismatch with signed manifest
+- Inline scripts (not allowed)
+- External scripts/stylesheets (not allowed)
+- External iframes
+- Forms submitting to external URLs
+- CSS `@import` directives
 
 ### Verification Interval
 
@@ -128,6 +159,23 @@ After deploying changes to pinchat.io:
 - The public key is embedded in the extension, so users trust files signed by you
 - If your private key is compromised, attackers could sign malicious hash lists
 - Consider using a hardware security module (HSM) for production
+
+### Defense in Depth
+
+The SRI approach provides multiple layers of protection:
+
+1. **Browser-level enforcement**: Even without the extension, browsers block any script/stylesheet that doesn't match its `integrity` hash
+2. **Extension verification**: Verifies that the HTML contains the correct integrity values (matching signed manifest from GitHub)
+3. **Signed manifest**: Hash list is signed, so attackers can't forge a valid manifest even with server access
+
+### Attack Prevention
+
+| Attack | Protection |
+|--------|------------|
+| Server serves malicious JS | Browser blocks (SRI mismatch) |
+| Server removes SRI from HTML | Extension detects missing integrity |
+| Server changes SRI in HTML | Extension detects SRI doesn't match manifest |
+| Server serves different content to extension vs browser | N/A - Extension checks actual DOM, not separate fetch |
 
 ## File Structure
 

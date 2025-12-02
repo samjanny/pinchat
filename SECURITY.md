@@ -66,7 +66,8 @@ We consider adversaries with the following capabilities:
 **Mitigation**:
 - No keys stored server-side (PFS)
 - No message content accessible
-- Subresource Integrity (SRI) for static assets (recommended)
+- **Subresource Integrity (SRI)** enforced on all static assets
+- Browser extension verifies SRI attributes match signed manifest
 - CSP prevents inline script injection
 
 ### Out of Scope Threats
@@ -348,47 +349,68 @@ Even with end-to-end encryption, web applications face a fundamental trust issue
 
 This is known as the "JavaScript delivery problem" and affects all web-based E2E encryption systems.
 
-### Browser Extension Solution
+### Browser Extension Solution with SRI
 
-PinChat provides browser extensions for Chrome and Firefox that verify file integrity using out-of-band hash verification.
+PinChat provides browser extensions for Chrome and Firefox that verify file integrity using **Subresource Integrity (SRI)** combined with signed manifests.
+
+#### Why SRI?
+
+The previous approach (extension fetches files separately and computes hashes) was vulnerable to bypass attacks: a sophisticated attacker could detect extension requests (via headers, timing) and serve clean files to the extension while serving malicious code to the browser.
+
+With SRI:
+1. HTML files contain hardcoded `integrity="sha256-..."` attributes
+2. Browser **natively refuses** to execute any JS/CSS that doesn't match the hash
+3. Extension verifies the actual DOM contains correct integrity attributes
+4. Manifest is signed and hosted on GitHub (out of server's control)
 
 #### Architecture
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
-│                         INTEGRITY VERIFICATION FLOW                      │
+│                    SRI-BASED INTEGRITY VERIFICATION                      │
 ├─────────────────────────────────────────────────────────────────────────┤
 │                                                                          │
 │   GitHub Repository                    pinchat.io Server                 │
 │   (Out-of-band source)                 (Potentially compromised)         │
-│   ┌──────────────────┐                 ┌──────────────────┐              │
-│   │ hashes.json.signed│                │   Static Files   │              │
-│   │ ┌──────────────┐ │                 │  - index.html    │              │
-│   │ │ file hashes  │ │                 │  - app.js        │              │
-│   │ │ + signature  │ │                 │  - crypto.js     │              │
-│   │ └──────────────┘ │                 │  - ...           │              │
-│   └────────┬─────────┘                 └────────┬─────────┘              │
-│            │                                    │                         │
-│            │ 1. Fetch signed                    │ 3. Fetch files          │
-│            │    hash list                       │                         │
-│            ▼                                    ▼                         │
+│   ┌──────────────────┐                 ┌──────────────────────────────┐ │
+│   │ hashes.json.signed│                │  HTML with SRI attributes     │ │
+│   │ ┌──────────────┐ │                 │  <script src="app.js"         │ │
+│   │ │ file hashes  │ │                 │   integrity="sha256-ABC...">  │ │
+│   │ │ + signature  │ │                 └──────────────┬───────────────┘ │
+│   │ └──────────────┘ │                                │                  │
+│   └────────┬─────────┘                                │                  │
+│            │                                          │                  │
+│            │ 1. Fetch signed                          │ 2. User visits   │
+│            │    manifest                              │    page          │
+│            ▼                                          ▼                  │
 │   ┌─────────────────────────────────────────────────────────────────┐   │
 │   │                      BROWSER EXTENSION                           │   │
 │   │  ┌─────────────────┐    ┌─────────────────┐    ┌─────────────┐  │   │
-│   │  │ 2. Verify       │    │ 4. Calculate    │    │ 5. Compare  │  │   │
-│   │  │    ECDSA        │───▶│    SHA-256      │───▶│    Hashes   │  │   │
-│   │  │    Signature    │    │    Hashes       │    │             │  │   │
-│   │  └─────────────────┘    └─────────────────┘    └──────┬──────┘  │   │
-│   └──────────────────────────────────────────────────────┬┘         │   │
-│                                                          │           │   │
-│            ┌─────────────────────────────────────────────┘           │   │
-│            │                                                          │   │
-│            ▼                                                          │   │
-│   ┌─────────────────┐              ┌─────────────────┐               │   │
-│   │   ✓ VERIFIED    │              │  ⚠ MISMATCH     │               │   │
-│   │   Green badge   │              │  Red warning    │               │   │
-│   │   Safe to use   │              │  overlay        │               │   │
-│   └─────────────────┘              └─────────────────┘               │   │
+│   │  │ 2. Verify       │    │ 3. Content      │    │ 4. Compare  │  │   │
+│   │  │    ECDSA        │───▶│    script reads │───▶│    DOM SRI  │  │   │
+│   │  │    Signature    │    │    actual DOM   │    │    vs       │  │   │
+│   │  └─────────────────┘    └─────────────────┘    │    Manifest │  │   │
+│   │                                                 └──────┬──────┘  │   │
+│   └────────────────────────────────────────────────────────┼────────┘   │
+│                                                            │             │
+│   ┌────────────────────────────────────────────────────────┘             │
+│   │                                                                      │
+│   ▼                                                                      │
+│   ┌─────────────────────────────────────────────────────────────────┐   │
+│   │                        BROWSER ENGINE                            │   │
+│   │  ┌─────────────────────────────────────────────────────────┐    │   │
+│   │  │ 5. SRI Enforcement: Browser blocks any JS/CSS where     │    │   │
+│   │  │    file hash ≠ integrity attribute hash                 │    │   │
+│   │  └─────────────────────────────────────────────────────────┘    │   │
+│   └─────────────────────────────────────────────────────────────────┘   │
+│                                                                          │
+│            ┌──────────────────────┬──────────────────────┐               │
+│            ▼                      ▼                      ▼               │
+│   ┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐     │
+│   │   ✓ VERIFIED    │    │  ⚠ SRI MISSING  │    │  ⚠ SRI MISMATCH │     │
+│   │   All checks    │    │  Extension      │    │  Extension      │     │
+│   │   passed        │    │  warns user     │    │  warns user     │     │
+│   └─────────────────┘    └─────────────────┘    └─────────────────┘     │
 │                                                                          │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
@@ -408,12 +430,14 @@ PinChat provides browser extensions for Chrome and Firefox that verify file inte
 - CDN/proxy tampering with static files
 - DNS hijacking serving fake content
 - Supply chain attacks on deployment
+- **Bypass attacks** where server detects extension and serves clean files to it
 
 **What This Does NOT Protect Against**:
 - Compromised signing key (attacker could sign malicious hashes)
 - Malicious browser extension updates
 - Users ignoring warning overlays
 - Dynamic content manipulation (API responses)
+- First-page-load without extension (user must install extension first)
 
 #### Trust Model
 
@@ -433,29 +457,44 @@ Trust Chain:
 
 #### Verification Process
 
-1. **Fetch Hash List**: Extension retrieves `hashes.json.signed` from GitHub raw content
+1. **Fetch Manifest**: Extension retrieves `hashes.json.signed` from GitHub
 2. **Verify Signature**: ECDSA P-256 signature validated using embedded public key
-3. **Fetch Files**: Each file listed is fetched from the live server
-4. **Calculate Hashes**: SHA-256 hash computed for each file
-5. **Compare**: Calculated hashes compared against signed list
-6. **Alert**: Visual feedback (badge + overlay) based on verification result
+3. **Read Actual DOM**: Content script reads `<script>` and `<link>` elements from the actual page
+4. **Verify SRI Attributes**: Each element's `integrity` attribute compared against signed manifest
+5. **Detect Unauthorized Resources**: Inline scripts, external resources, iframes, external forms
+6. **Browser Enforcement**: Browser independently blocks any file not matching its SRI hash
+7. **Alert**: Visual feedback (badge + overlay) based on verification result
+
+#### Defense in Depth
+
+| Layer | Protection | Bypassed by |
+|-------|------------|-------------|
+| Browser SRI | Blocks tampered files | N/A (native browser security) |
+| Extension SRI check | Detects missing/wrong integrity | User ignoring warnings |
+| Manifest signature | Authenticates hash list | Key compromise |
+| Out-of-band manifest | Server can't forge hashes | GitHub compromise |
 
 #### Failure Modes
 
 | Condition | Badge | Action |
 |-----------|-------|--------|
-| All files match | ✓ Green | Safe to proceed |
-| Signature invalid | ! Red | **Full-screen warning overlay** |
-| Hash mismatch | ! Red | **Full-screen warning overlay** |
-| Network error | ? Yellow | Retry, inform user |
+| All SRI attributes match manifest | ✓ Green | Safe to proceed |
+| Manifest signature invalid | ! Red | **Full-screen warning overlay** |
+| SRI attribute missing | ! Red | **Full-screen warning overlay** |
+| SRI mismatch with manifest | ! Red | **Full-screen warning overlay** |
+| Inline script detected | ! Red | **Full-screen warning overlay** |
+| External resource detected | ! Red | **Full-screen warning overlay** |
+| Network error fetching manifest | ? Yellow | Retry, inform user |
 | GitHub unavailable | ? Yellow | Cached result or warning |
+| File hash ≠ SRI attribute | N/A | **Browser blocks the file** |
 
 #### Limitations
 
 1. **First-Use Trust**: User must trust the initial extension installation
-2. **Update Window**: Between file changes and hash list update, verification fails
+2. **Update Window**: Between file changes and hash list update, verification may fail
 3. **Key Compromise**: If signing key is compromised, protection is void
 4. **User Override**: Determined users can dismiss warnings
+5. **Extension Required**: Browser SRI protects against file tampering, but without extension, HTML could be modified to remove/change SRI
 
 #### Recommendations
 
@@ -522,8 +561,14 @@ Security researchers who responsibly disclose valid vulnerabilities will be:
 
 This implementation follows established protocols (Signal Double Ratchet) and uses standard cryptographic primitives via the WebCrypto API. However, it has not undergone a formal security audit by an independent third party.
 
+**Security Features Implemented**:
+- ✅ Subresource Integrity (SRI) for all static assets
+- ✅ Browser extension with SRI verification
+- ✅ Signed manifest hosted out-of-band (GitHub)
+- ✅ CSP preventing inline script execution
+
 **Recommendations before production use**:
 1. Commission a professional cryptographic audit
-2. Implement Subresource Integrity (SRI) for all static assets
-3. Consider certificate pinning for mobile clients
-4. Establish incident response procedures
+2. Consider certificate pinning for mobile clients
+3. Establish incident response procedures
+4. Set up monitoring for manifest signature failures

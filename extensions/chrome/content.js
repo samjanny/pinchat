@@ -326,9 +326,15 @@ function setupDOMObserver() {
 
 /**
  * Perform DOM security verification
+ * Only runs if manifest is available
  */
 function performDOMSecurityCheck() {
-    // First check for unauthorized resources (even without manifest)
+    // Don't verify without manifest - wait for it
+    if (!manifestData || !manifestData.files) {
+        console.log('[PinChat Verify] Waiting for manifest...');
+        return;
+    }
+
     const issues = verifySRIInDOM(manifestData);
 
     if (issues.length > 0) {
@@ -337,6 +343,7 @@ function performDOMSecurityCheck() {
         showWarningOverlay(issues, true);
     } else {
         console.log('[PinChat Verify] DOM security check passed');
+        hideWarningOverlay();
     }
 }
 
@@ -362,94 +369,102 @@ function showWarningOverlay(mismatches = [], isUnauthorized = false) {
 
     overlayElement = document.createElement('div');
     overlayElement.id = 'pinchat-integrity-warning';
-    overlayElement.innerHTML = `
-        <div style="
-            position: fixed;
-            top: 0;
-            left: 0;
-            right: 0;
-            bottom: 0;
-            background: rgba(220, 38, 38, 0.95);
-            z-index: 2147483647;
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            justify-content: center;
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            color: white;
-            padding: 20px;
-            box-sizing: border-box;
-        ">
-            <div style="font-size: 72px; margin-bottom: 20px;">⚠️</div>
 
-            <h1 style="
-                font-size: 48px;
-                font-weight: bold;
-                margin: 0 0 20px 0;
-                text-align: center;
-                text-shadow: 2px 2px 4px rgba(0,0,0,0.3);
-            ">${title}</h1>
-
-            <p style="
-                font-size: 24px;
-                margin: 0 0 30px 0;
-                text-align: center;
-                max-width: 800px;
-                line-height: 1.5;
-            ">
-                ${description}
-                <br>
-                <strong>Do not enter any sensitive information.</strong>
-            </p>
-
-            <div style="
-                background: rgba(0,0,0,0.3);
-                padding: 20px;
-                border-radius: 10px;
-                max-width: 600px;
-                width: 100%;
-                max-height: 200px;
-                overflow-y: auto;
-                margin-bottom: 30px;
-            ">
-                <h3 style="margin: 0 0 10px 0; font-size: 18px;">${listTitle}</h3>
-                <ul style="margin: 0; padding-left: 20px; font-size: 14px; font-family: monospace;">
-                    ${mismatches.map(m => `<li>${m.path}: ${m.error}</li>`).join('')}
-                </ul>
-            </div>
-
-            <div style="display: flex; gap: 20px;">
-                <button id="pinchat-leave-btn" style="
-                    background: white;
-                    color: #dc2626;
-                    border: none;
-                    padding: 15px 40px;
-                    font-size: 18px;
-                    font-weight: bold;
-                    border-radius: 8px;
-                    cursor: pointer;
-                ">Leave This Site</button>
-
-                <button id="pinchat-dismiss-btn" style="
-                    background: transparent;
-                    color: white;
-                    border: 2px solid white;
-                    padding: 15px 40px;
-                    font-size: 18px;
-                    font-weight: bold;
-                    border-radius: 8px;
-                    cursor: pointer;
-                    opacity: 0.7;
-                ">Dismiss (Unsafe)</button>
-            </div>
-
-            <p style="margin-top: 30px; font-size: 14px; opacity: 0.8;">
-                This warning is shown by the PinChat Integrity Verifier extension.
-            </p>
-        </div>
+    // Apply styles directly to the overlay element
+    overlayElement.style.cssText = `
+        position: fixed !important;
+        top: 0 !important;
+        left: 0 !important;
+        right: 0 !important;
+        bottom: 0 !important;
+        width: 100vw !important;
+        height: 100vh !important;
+        background: rgba(220, 38, 38, 0.98) !important;
+        z-index: 2147483647 !important;
+        display: flex !important;
+        flex-direction: column !important;
+        align-items: center !important;
+        justify-content: center !important;
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif !important;
+        color: white !important;
+        padding: 20px !important;
+        box-sizing: border-box !important;
+        margin: 0 !important;
     `;
 
-    document.documentElement.appendChild(overlayElement);
+    overlayElement.innerHTML = `
+        <div style="font-size: 72px; margin-bottom: 20px;">⚠️</div>
+
+        <h1 style="
+            font-size: 48px;
+            font-weight: bold;
+            margin: 0 0 20px 0;
+            text-align: center;
+            text-shadow: 2px 2px 4px rgba(0,0,0,0.3);
+            color: white;
+        ">${title}</h1>
+
+        <p style="
+            font-size: 24px;
+            margin: 0 0 30px 0;
+            text-align: center;
+            max-width: 800px;
+            line-height: 1.5;
+            color: white;
+        ">
+            ${description}
+            <br>
+            <strong>Do not enter any sensitive information.</strong>
+        </p>
+
+        <div style="
+            background: rgba(0,0,0,0.3);
+            padding: 20px;
+            border-radius: 10px;
+            max-width: 600px;
+            width: 100%;
+            max-height: 200px;
+            overflow-y: auto;
+            margin-bottom: 30px;
+        ">
+            <h3 style="margin: 0 0 10px 0; font-size: 18px; color: white;">${listTitle}</h3>
+            <ul style="margin: 0; padding-left: 20px; font-size: 14px; font-family: monospace; color: white;">
+                ${mismatches.map(m => `<li>${m.path}: ${m.error}</li>`).join('')}
+            </ul>
+        </div>
+
+        <div style="display: flex; gap: 20px;">
+            <button id="pinchat-leave-btn" style="
+                background: white;
+                color: #dc2626;
+                border: none;
+                padding: 15px 40px;
+                font-size: 18px;
+                font-weight: bold;
+                border-radius: 8px;
+                cursor: pointer;
+            ">Leave This Site</button>
+
+            <button id="pinchat-dismiss-btn" style="
+                background: transparent;
+                color: white;
+                border: 2px solid white;
+                padding: 15px 40px;
+                font-size: 18px;
+                font-weight: bold;
+                border-radius: 8px;
+                cursor: pointer;
+                opacity: 0.7;
+            ">Dismiss (Unsafe)</button>
+        </div>
+
+        <p style="margin-top: 30px; font-size: 14px; opacity: 0.8; color: white;">
+            This warning is shown by the PinChat Integrity Verifier extension.
+        </p>
+    `;
+
+    // Append to body if available, otherwise to documentElement
+    (document.body || document.documentElement).appendChild(overlayElement);
 
     document.getElementById('pinchat-leave-btn').addEventListener('click', () => {
         window.location.href = 'about:blank';

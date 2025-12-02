@@ -11,7 +11,7 @@
 
 // Configuration
 const CONFIG = {
-    HASH_LIST_URL: 'https://raw.githubusercontent.com/pinchat-io/pinchat/main/hashes.json.signed',
+    HASH_LIST_URL: 'https://raw.githubusercontent.com/samjanny/pinchat/main/hashes.json.signed',
     SITE_URL: 'https://pinchat.io',
     // IMPORTANT: Replace with your actual ECDSA P-256 public key
     PUBLIC_KEY: `-----BEGIN PUBLIC KEY-----
