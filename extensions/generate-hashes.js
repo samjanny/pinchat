@@ -25,21 +25,33 @@ const FILES_TO_HASH = [
   '/chat.html',
   
   // CSS
-  '/css/style.css',
+  '/static/css/style.css',
   
   // JavaScript
-  '/js/alpine-csp.min.js',
-  '/js/app.js',
-  '/js/crypto.js',
-  '/js/double-ratchet.js',
-  '/js/ecdh.js',
-  '/js/emoji.js',
-  '/js/homepage.js',
-  '/js/identity.js',
-  '/js/nicknames.js',
-  '/js/pow.js',
-  '/js/websocket.js'
+  '/static/js/alpine-csp.min.js',
+  '/static/js/app.js',
+  '/static/js/crypto.js',
+  '/static/js/double-ratchet.js',
+  '/static/js/ecdh.js',
+  '/static/js/emoji.js',
+  '/static/js/homepage.js',
+  '/static/js/identity.js',
+  '/static/js/nicknames.js',
+  '/static/js/pow.js',
+  '/static/js/websocket.js'
 ];
+
+/**
+ * Convert URL path to filesystem path relative to static directory
+ * URLs use /static/... but files are in static/... (without the /static prefix)
+ */
+function urlPathToFilePath(urlPath) {
+    // Remove /static prefix if present, since staticDir is already the static folder
+    if (urlPath.startsWith('/static/')) {
+        return urlPath.substring('/static'.length); // returns /css/style.css
+    }
+    return urlPath;
+}
 
 /**
  * Calculate SHA-256 hash of a file
@@ -168,18 +180,21 @@ function main() {
     const files = [];
     let errorCount = 0;
 
-    for (const filePath of FILES_TO_HASH) {
-        const fullPath = path.join(options.staticDir, filePath);
+    for (const urlPath of FILES_TO_HASH) {
+        // Convert URL path to filesystem path
+        const fsPath = urlPathToFilePath(urlPath);
+        const fullPath = path.join(options.staticDir, fsPath);
 
         if (!fs.existsSync(fullPath)) {
-            console.error(`Warning: File not found: ${filePath}`);
+            console.error(`Warning: File not found: ${urlPath} (looked in ${fullPath})`);
             errorCount++;
             continue;
         }
 
         const hash = hashFile(fullPath);
-        files.push({ path: filePath, hash });
-        console.log(`  ${filePath}: ${hash.substring(0, 16)}...`);
+        // Store the URL path (as seen by browser), not the filesystem path
+        files.push({ path: urlPath, hash });
+        console.log(`  ${urlPath}: ${hash.substring(0, 16)}...`);
     }
 
     if (errorCount > 0) {

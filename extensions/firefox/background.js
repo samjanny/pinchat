@@ -102,7 +102,7 @@ async function verifyIntegrity() {
         details: { filesChecked: 0, filesMatched: 0, filesFailed: 0 }
     };
 
-    updateBadge('checking');
+    await updateAllTabsBadges();
     await notifyContentScripts();
 
     try {
@@ -126,7 +126,7 @@ async function verifyIntegrity() {
         if (!isSignatureValid) {
             verificationState.status = 'failed';
             verificationState.errors.push('SIGNATURE VERIFICATION FAILED');
-            updateBadge('failed');
+            await updateAllTabsBadges();
             await notifyContentScripts();
             return verificationState;
         }
@@ -177,7 +177,7 @@ async function verifyIntegrity() {
         console.error('[PinChat Verify] Error:', error);
     }
 
-    updateBadge(verificationState.status);
+    await updateAllTabsBadges();
     await notifyContentScripts();
     await browser.storage.local.set({ verificationState });
 
@@ -186,21 +186,72 @@ async function verifyIntegrity() {
 }
 
 /**
+ * Badge configurations for different states
+ */
+const BADGES = {
+    verified: { text: '✓', color: '#22c55e' },
+    failed: { text: '!', color: '#ef4444' },
+    error: { text: '?', color: '#f59e0b' },
+    checking: { text: '...', color: '#3b82f6' },
+    unknown: { text: '', color: '#6b7280' },
+    inactive: { text: '', color: '#6b7280' }
+};
+
+/**
+ * Check if a URL is pinchat.io
+ */
+function isPinChatUrl(url) {
+    if (!url) return false;
+    try {
+        const parsed = new URL(url);
+        return parsed.hostname === 'pinchat.io' || parsed.hostname === 'www.pinchat.io';
+    } catch {
+        return false;
+    }
+}
+
+/**
  * Update the extension badge based on status
  */
 function updateBadge(status) {
-    const badges = {
-        verified: { text: '✓', color: '#22c55e' },
-        failed: { text: '!', color: '#ef4444' },
-        error: { text: '?', color: '#f59e0b' },
-        checking: { text: '...', color: '#3b82f6' },
-        unknown: { text: '', color: '#6b7280' }
-    };
-
-    const badge = badges[status] || badges.unknown;
-
+    const badge = BADGES[status] || BADGES.unknown;
     browser.browserAction.setBadgeText({ text: badge.text });
     browser.browserAction.setBadgeBackgroundColor({ color: badge.color });
+}
+
+/**
+ * Update badge for a specific tab based on its URL
+ */
+async function updateBadgeForTab(tabId) {
+    try {
+        const tab = await browser.tabs.get(tabId);
+        if (isPinChatUrl(tab.url)) {
+            // On pinchat.io - show verification status
+            const badge = BADGES[verificationState.status] || BADGES.unknown;
+            browser.browserAction.setBadgeText({ text: badge.text, tabId });
+            browser.browserAction.setBadgeBackgroundColor({ color: badge.color, tabId });
+        } else {
+            // Not on pinchat.io - show inactive/empty badge
+            browser.browserAction.setBadgeText({ text: '', tabId });
+            browser.browserAction.setBadgeBackgroundColor({ color: BADGES.inactive.color, tabId });
+        }
+    } catch {
+        // Tab might not exist anymore
+    }
+}
+
+/**
+ * Update badge for all tabs
+ */
+async function updateAllTabsBadges() {
+    try {
+        const tabs = await browser.tabs.query({});
+        for (const tab of tabs) {
+            await updateBadgeForTab(tab.id);
+        }
+    } catch {
+        // Ignore errors
+    }
 }
 
 /**
@@ -248,6 +299,18 @@ browser.runtime.onInstalled.addListener(() => {
 browser.alarms.onAlarm.addListener((alarm) => {
     if (alarm.name === 'verify-integrity') {
         verifyIntegrity();
+    }
+});
+
+// Listen for tab activation changes
+browser.tabs.onActivated.addListener((activeInfo) => {
+    updateBadgeForTab(activeInfo.tabId);
+});
+
+// Listen for tab URL changes
+browser.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+    if (changeInfo.url || changeInfo.status === 'complete') {
+        updateBadgeForTab(tabId);
     }
 });
 

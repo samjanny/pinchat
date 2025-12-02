@@ -18,18 +18,18 @@ const ALLOWED_PATHS = [
     '/index.html',
     '/login.html',
     '/chat.html',
-    '/css/style.css',
-    '/js/alpine-csp.min.js',
-    '/js/app.js',
-    '/js/crypto.js',
-    '/js/double-ratchet.js',
-    '/js/ecdh.js',
-    '/js/emoji.js',
-    '/js/homepage.js',
-    '/js/identity.js',
-    '/js/nicknames.js',
-    '/js/pow.js',
-    '/js/websocket.js'
+    '/static/css/style.css',
+    '/static/js/alpine-csp.min.js',
+    '/static/js/app.js',
+    '/static/js/crypto.js',
+    '/static/js/double-ratchet.js',
+    '/static/js/ecdh.js',
+    '/static/js/emoji.js',
+    '/static/js/homepage.js',
+    '/static/js/identity.js',
+    '/static/js/nicknames.js',
+    '/static/js/pow.js',
+    '/static/js/websocket.js'
 ];
 
 // Allowed inline script hashes (for legitimate inline scripts if any)

@@ -2,6 +2,25 @@
  * PinChat Integrity Verifier - Popup Script
  */
 
+/**
+ * Check if current tab is on pinchat.io and show/hide banner
+ */
+async function checkCurrentTab() {
+    try {
+        const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+        const banner = document.getElementById('not-on-site-banner');
+        if (tab && tab.url) {
+            const url = new URL(tab.url);
+            const isPinChat = url.hostname === 'pinchat.io' || url.hostname === 'www.pinchat.io';
+            banner.style.display = isPinChat ? 'none' : 'block';
+        } else {
+            banner.style.display = 'block';
+        }
+    } catch {
+        document.getElementById('not-on-site-banner').style.display = 'block';
+    }
+}
+
 const statusConfig = {
     verified: {
         icon: '✓',
@@ -84,6 +103,9 @@ function updateUI(state) {
     verifyBtn.disabled = state.status === 'checking';
     verifyBtn.textContent = state.status === 'checking' ? 'Verifying...' : 'Verify Now';
 }
+
+// Check if we're on pinchat.io
+checkCurrentTab();
 
 // Get current status
 chrome.runtime.sendMessage({ type: 'GET_STATUS' }, (response) => {

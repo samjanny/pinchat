@@ -1,6 +1,32 @@
 #!/bin/bash
-# Generate PNG icons from SVG
-# Requires: ImageMagick (convert) or inkscape
+#
+# PinChat Extension Icon Generator
+# =================================
+#
+# Generates PNG icons in multiple sizes from the source SVG file
+# for both Chrome and Firefox browser extensions.
+#
+# REQUIREMENTS:
+#   One of the following tools must be installed:
+#   - ImageMagick (convert command)
+#   - Inkscape
+#
+#   Install on Ubuntu/Debian:  sudo apt install imagemagick
+#   Install on macOS:          brew install imagemagick
+#
+# USAGE:
+#   cd extensions/
+#   ./generate-icons.sh
+#
+# OUTPUT:
+#   Creates PNG icons in the following sizes: 16x16, 32x32, 48x48, 128x128
+#   Files are placed in:
+#     - chrome/icons/icon-{size}.png
+#     - firefox/icons/icon-{size}.png
+#
+# SOURCE:
+#   The source SVG file is: chrome/icons/icon.svg
+#
 
 SVG_FILE="chrome/icons/icon.svg"
 CHROME_ICONS="chrome/icons"

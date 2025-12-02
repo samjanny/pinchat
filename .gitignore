@@ -16,3 +16,7 @@ certs/
 .DS_Store
 Thumbs.db
 .env
+
+# Icons
+/extensions/chrome/icons/
+/extensions/firefox/icons/

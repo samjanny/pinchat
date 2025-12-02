@@ -158,9 +158,30 @@
         @keyframes spin {
             to { transform: rotate(360deg); }
         }
+
+        .not-on-site-banner {
+            background: #374151;
+            padding: 10px 15px;
+            text-align: center;
+            font-size: 12px;
+            color: #9ca3af;
+            border-bottom: 1px solid #333;
+        }
+
+        .not-on-site-banner a {
+            color: #60a5fa;
+            text-decoration: none;
+        }
+
+        .not-on-site-banner a:hover {
+            text-decoration: underline;
+        }
     </style>
 </head>
 <body>
+    <div id="not-on-site-banner" class="not-on-site-banner" style="display: none;">
+        You're not on pinchat.io — <a href="https://pinchat.io" target="_blank">Visit site</a>
+    </div>
     <div class="header">
         <h1>PinChat Integrity Verifier</h1>
         <p>Verifying pinchat.io file integrity</p>
