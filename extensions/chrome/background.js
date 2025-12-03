@@ -9,15 +9,43 @@
  * 5. Browser enforces SRI (blocks tampered files)
  */
 
+// =============================================================================
+// OFFICIAL PINCHAT.IO HARDCODED SECURITY CONFIGURATION
+// =============================================================================
+//
+// SECURITY NOTE: These values are intentionally hardcoded in the extension code.
+// This is a critical security feature, NOT a configuration option.
+//
+// WHY HARDCODING IS SECURE:
+// 1. The extension code is distributed through browser extension stores (Chrome/Firefox)
+// 2. Users can verify the extension code matches the open-source repository
+// 3. An attacker who compromises only the server CANNOT change these values
+// 4. The public key can only be changed by releasing a new extension version
+// 5. This creates a "trust anchor" that is independent of the pinchat.io server
+//
+// FOR SELF-HOSTED INSTANCES:
+// If you are running your own PinChat instance, you MUST:
+// 1. Generate your own ECDSA P-256 key pair (see README.md)
+// 2. Replace PINCHAT_PUBLIC_KEY with your public key
+// 3. Replace OFFICIAL_DOMAIN with your domain
+// 4. Build and distribute your own extension
+//
+// =============================================================================
+
+// Official PinChat.io public key - DO NOT MODIFY for official pinchat.io usage
+const PINCHAT_PUBLIC_KEY = `-----BEGIN PUBLIC KEY-----
+MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAExkuEOYHEQQfDqsyO+uamOnf5b/AH
+OqRJNIZ5zBHCr2HbJsHCtrPQUOKd4cBqfDZlQZ62rzF7ofA39ITBUyLxaA==
+-----END PUBLIC KEY-----`;
+
+// Official domain - DO NOT MODIFY for official pinchat.io usage
+const OFFICIAL_DOMAIN = 'pinchat.io';
+
 // Configuration
 const CONFIG = {
     HASH_LIST_URL: 'https://raw.githubusercontent.com/samjanny/pinchat/main/hashes.json.signed',
-    SITE_URL: 'https://pinchat.io',
-    // IMPORTANT: Replace with your actual ECDSA P-256 public key
-    PUBLIC_KEY: `-----BEGIN PUBLIC KEY-----
-MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAExkuEOYHEQQfDqsyO+uamOnf5b/AH
-OqRJNIZ5zBHCr2HbJsHCtrPQUOKd4cBqfDZlQZ62rzF7ofA39ITBUyLxaA==
------END PUBLIC KEY-----`,
+    SITE_URL: `https://${OFFICIAL_DOMAIN}`,
+    PUBLIC_KEY: PINCHAT_PUBLIC_KEY,
     CHECK_INTERVAL_MINUTES: 5,
     FETCH_TIMEOUT_MS: 10000
 };

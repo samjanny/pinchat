@@ -155,6 +155,39 @@ After deploying changes to pinchat.io:
 
 ## Security Considerations
 
+### Why the Public Key is Hardcoded
+
+The public key (`PINCHAT_PUBLIC_KEY`) and domain (`OFFICIAL_DOMAIN`) are **intentionally hardcoded** in the extension source code. This is a critical security feature, not a limitation.
+
+**Security benefits of hardcoding:**
+
+1. **Server compromise protection**: If an attacker gains access to the pinchat.io server, they CANNOT change the public key used to verify file signatures. The key is baked into the extension code that users have already installed.
+
+2. **Independent trust anchor**: The extension creates a verification path that is completely independent of the server:
+   - Signed manifests are hosted on GitHub (separate from the main server)
+   - The public key is embedded in extension code (distributed via browser stores)
+   - An attacker would need to compromise BOTH GitHub AND the browser extension stores
+
+3. **Verifiable by users**: Anyone can inspect the extension source code to verify:
+   - Which public key is being used
+   - That it matches the official PinChat repository
+   - That the verification logic hasn't been tampered with
+
+4. **Update protection**: The only way to change the public key is to release a new extension version, which requires:
+   - Pushing to the official repository
+   - Publishing through Chrome/Firefox extension stores
+   - Users actively updating the extension
+
+**Attack scenarios prevented:**
+
+| Attack | Why it fails |
+|--------|--------------|
+| Attacker compromises server, serves malicious JS | Browser blocks (SRI mismatch) |
+| Attacker signs malicious manifest with fake key | Extension rejects (wrong public key) |
+| Attacker modifies extension on server | N/A - extension is from browser store, not server |
+
+### Private Key Security
+
 - **Keep your private key secure!** Never commit it to the repository
 - The public key is embedded in the extension, so users trust files signed by you
 - If your private key is compromised, attackers could sign malicious hash lists
@@ -176,6 +209,59 @@ The SRI approach provides multiple layers of protection:
 | Server removes SRI from HTML | Extension detects missing integrity |
 | Server changes SRI in HTML | Extension detects SRI doesn't match manifest |
 | Server serves different content to extension vs browser | N/A - Extension checks actual DOM, not separate fetch |
+
+## Self-Hosted Instances
+
+If you are running your own PinChat instance (not using the official pinchat.io), you **MUST** create your own extension with your own keys. Using the official extension with a self-hosted instance will not work because:
+
+1. The hardcoded public key won't match your private key
+2. The hardcoded domain won't match your server
+3. Signature verification will always fail
+
+### Steps for Self-Hosting
+
+1. **Generate your own ECDSA P-256 key pair:**
+   ```bash
+   openssl ecparam -genkey -name prime256v1 -noout -out private.pem
+   openssl ec -in private.pem -pubout -out public.pem
+   ```
+
+2. **Fork or copy the extension code**
+
+3. **Update the hardcoded values in these files:**
+
+   - `chrome/background.js`
+   - `firefox/background.js`
+   - `shared/verify.js`
+
+   Replace:
+   ```javascript
+   // Change this to YOUR public key
+   const PINCHAT_PUBLIC_KEY = `-----BEGIN PUBLIC KEY-----
+   YOUR_PUBLIC_KEY_HERE
+   -----END PUBLIC KEY-----`;
+
+   // Change this to YOUR domain
+   const OFFICIAL_DOMAIN = 'your-domain.com';
+   ```
+
+4. **Update the manifest URL** in `CONFIG.HASH_LIST_URL` to point to your repository
+
+5. **Generate signed hashes** for your static files:
+   ```bash
+   node generate-hashes.js --private-key private.pem --output hashes.json.signed
+   ```
+
+6. **Distribute your custom extension** to your users:
+   - For internal use: Load unpacked in developer mode
+   - For public distribution: Publish to Chrome/Firefox stores under your own account
+
+### Important Notes for Self-Hosting
+
+- Your users must install YOUR extension, not the official one
+- Keep your private key secure and separate from your server
+- Consider hosting your signed manifest on a separate service (e.g., GitHub) for additional security
+- Document your public key so users can verify the extension they install
 
 ## File Structure
 
