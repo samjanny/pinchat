@@ -34,6 +34,13 @@ COPY static ./static
 # Create directory for certificates
 RUN mkdir -p /app/certs
 
+# Create non-root user
+RUN useradd -m -u 1000 pinchat && \
+    chown -R pinchat:pinchat /app
+
+# Switch to non-root user
+USER pinchat
+
 # Expose port
 EXPOSE 3000
 

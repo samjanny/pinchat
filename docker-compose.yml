@@ -3,19 +3,29 @@ services:
     build: .
     container_name: pinchat
     ports:
-      - "3000:3000"
+      - "127.0.0.1:3000:3000"
     volumes:
-      # Mount certificates (read-only)
       - ./certs:/app/certs:ro
     env_file:
       - .env
-    # Use tmpfs for maximum security (data only in RAM)
     tmpfs:
       - /tmp:mode=1777,size=512M
     restart: unless-stopped
+    
     # Security options
     security_opt:
       - no-new-privileges:true
-    # Read-only root filesystem (except tmpfs mounts)
-    # Commented out for now as it may cause issues with some operations
+    
+    # Linux capabilities
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN        # If the app needs to change file ownership
+      - SETUID       # If the app needs to change user IDs
+      - SETGID       # If the app needs to change group IDs
+    
+    # Uncomment after testing:
     # read_only: true
+    # tmpfs:
+    #   - /tmp:mode=1777,size=512M
+    #   - /app/target:mode=1777,size=256M  # If the app needs to write to target
