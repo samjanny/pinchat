@@ -73,6 +73,8 @@ pub enum Message {
         max_participants: usize,
         /// Maximum image size in bytes from server configuration
         max_image_size: usize,
+        /// Room creation timestamp (for accurate countdown calculation)
+        created_at: DateTime<Utc>,
     },
 
     /// ECDH public key exchange (for Perfect Forward Secrecy)

@@ -140,9 +140,9 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: Uuid, connec
     let (mut sender, mut receiver) = socket.split();
 
     // Get validated room configuration from server (prevents URL spoofing)
-    let (room_type, ttl_minutes, max_participants) = {
+    let (room_type, ttl_minutes, max_participants, created_at) = {
         let room = state.rooms.get(&room_id).expect("Room must exist");
-        (room.room_type, room.ttl_minutes, room.max_participants)
+        (room.room_type, room.ttl_minutes, room.max_participants, room.created_at)
     };
 
     // Send connection confirmation message with validated room config
@@ -154,6 +154,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: Uuid, connec
         ttl_minutes,                                 // Validated from server
         max_participants,                            // Validated from server
         max_image_size: state.config.max_image_size, // From server config
+        created_at,                                  // Room creation timestamp for countdown
     };
 
     if let Ok(json) = serde_json::to_string(&connected_msg) {

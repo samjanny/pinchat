@@ -185,8 +185,17 @@ document.addEventListener('alpine:init', () => {
                     if (message.ttl_minutes) {
                         console.log('[SECURITY] Using validated ttl_minutes from server:', message.ttl_minutes);
                         this.ttlMinutes = message.ttl_minutes;
-                        // Recalculate expiration with validated TTL
-                        this.expiresAt = Date.now() + (this.ttlMinutes * 60 * 1000);
+                        // Calculate expiration based on server's created_at timestamp (not client connection time)
+                        // This ensures countdown is accurate even if client joins late
+                        if (message.created_at) {
+                            const createdAtMs = new Date(message.created_at).getTime();
+                            this.expiresAt = createdAtMs + (this.ttlMinutes * 60 * 1000);
+                            console.log('[COUNTDOWN] Using server created_at:', message.created_at, '→ expires at:', new Date(this.expiresAt).toISOString());
+                        } else {
+                            // Fallback to client time if created_at not provided (backwards compatibility)
+                            this.expiresAt = Date.now() + (this.ttlMinutes * 60 * 1000);
+                            console.warn('[COUNTDOWN] No created_at from server, using client time as fallback');
+                        }
                     }
                     if (message.max_participants) {
                         console.log('[SECURITY] Using validated max_participants from server:', message.max_participants);
