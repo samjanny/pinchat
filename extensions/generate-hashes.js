@@ -89,20 +89,17 @@ function hashContentSRI(content) {
 function injectSRIIntoHTML(htmlPath, sriMap) {
     let content = fs.readFileSync(htmlPath, 'utf8');
 
-    // Inject integrity into <script src="..."> tags
+    // Inject/update integrity into <script src="..."> tags
     content = content.replace(
         /<script\s+([^>]*?)src="([^"]+)"([^>]*?)>/gi,
         (match, before, src, after) => {
-            // Skip if already has integrity
-            if (before.includes('integrity=') || after.includes('integrity=')) {
-                return match;
-            }
-
             // Get SRI for this file
             const sri = sriMap[src];
             if (sri) {
-                // Remove any existing crossorigin attribute
+                // Remove any existing integrity and crossorigin attributes
+                before = before.replace(/integrity="[^"]*"\s*/gi, '');
                 before = before.replace(/crossorigin="[^"]*"\s*/gi, '');
+                after = after.replace(/integrity="[^"]*"\s*/gi, '');
                 after = after.replace(/crossorigin="[^"]*"\s*/gi, '');
                 return `<script ${before}src="${src}" integrity="${sri}" crossorigin="anonymous"${after}>`;
             }
@@ -110,7 +107,7 @@ function injectSRIIntoHTML(htmlPath, sriMap) {
         }
     );
 
-    // Inject integrity into <link rel="stylesheet" href="..."> tags
+    // Inject/update integrity into <link rel="stylesheet" href="..."> tags
     content = content.replace(
         /<link\s+([^>]*?)href="([^"]+)"([^>]*?)>/gi,
         (match, before, href, after) => {
@@ -120,16 +117,13 @@ function injectSRIIntoHTML(htmlPath, sriMap) {
                 return match;
             }
 
-            // Skip if already has integrity
-            if (before.includes('integrity=') || after.includes('integrity=')) {
-                return match;
-            }
-
             // Get SRI for this file
             const sri = sriMap[href];
             if (sri) {
-                // Remove any existing crossorigin attribute
+                // Remove any existing integrity and crossorigin attributes
+                before = before.replace(/integrity="[^"]*"\s*/gi, '');
                 before = before.replace(/crossorigin="[^"]*"\s*/gi, '');
+                after = after.replace(/integrity="[^"]*"\s*/gi, '');
                 after = after.replace(/crossorigin="[^"]*"\s*/gi, '');
                 return `<link ${before}href="${href}" integrity="${sri}" crossorigin="anonymous"${after}>`;
             }
