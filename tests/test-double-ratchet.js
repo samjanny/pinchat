@@ -884,6 +884,383 @@ async function runTests() {
     }
     console.log('');
 
+    // -------------------------------------------------------------------------
+    // Test 9: Message Too Old (Out of Window)
+    // -------------------------------------------------------------------------
+    console.log('--- Test 9: Message Too Old (Out of Window) ---');
+    try {
+        const sharedSecret = hexToBytes('8888888888888888888888888888888888888888888888888888888888888888');
+
+        const aliceKeypair = await subtle.generateKey(
+            { name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveKey', 'deriveBits']);
+        const bobKeypair = await subtle.generateKey(
+            { name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveKey', 'deriveBits']);
+
+        const alice = new DoubleRatchet();
+        await alice.initialize(sharedSecret, true, aliceKeypair, bobKeypair.publicKey);
+
+        const bob = new DoubleRatchet();
+        await bob.initialize(new Uint8Array(sharedSecret), false, bobKeypair, null);
+
+        // Alice sends messages 0-20
+        const encryptedMessages = [];
+        for (let i = 0; i <= 20; i++) {
+            const enc = await alice.encryptMessage(`Message ${i}`, ROOM_ID, ALICE_ID);
+            encryptedMessages.push(enc);
+        }
+
+        // Bob receives messages 0-20 in order (advances his window)
+        for (let i = 0; i <= 20; i++) {
+            await bob.decryptMessage(
+                encryptedMessages[i].payload, encryptedMessages[i].header, ROOM_ID, ALICE_ID);
+        }
+
+        console.log(`  Bob received messages 0-20, Nr=${bob.Nr}`);
+
+        // Now try to decrypt old message 0 again (should fail - out of window)
+        let caught = false;
+        try {
+            await bob.decryptMessage(
+                encryptedMessages[0].payload, encryptedMessages[0].header, ROOM_ID, ALICE_ID);
+        } catch (e) {
+            caught = true;
+            console.log(`  Error (expected): ${e.message}`);
+        }
+
+        if (caught) {
+            console.log('PASSED: Old message (out of window) rejected');
+            passed++;
+        } else {
+            console.log('FAILED: Should have rejected message too old for window');
+            failed++;
+        }
+    } catch (e) {
+        console.log('FAILED:', e.message);
+        console.log(e.stack);
+        failed++;
+    }
+    console.log('');
+
+    // -------------------------------------------------------------------------
+    // Test 10: MAX_SKIP During DH Ratchet (DoS Prevention)
+    // -------------------------------------------------------------------------
+    console.log('--- Test 10: MAX_SKIP During DH Ratchet (DoS Prevention) ---');
+    try {
+        const sharedSecret = hexToBytes('9999999999999999999999999999999999999999999999999999999999999999');
+
+        const aliceKeypair = await subtle.generateKey(
+            { name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveKey', 'deriveBits']);
+        const bobKeypair = await subtle.generateKey(
+            { name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveKey', 'deriveBits']);
+
+        const alice = new DoubleRatchet();
+        await alice.initialize(sharedSecret, true, aliceKeypair, bobKeypair.publicKey);
+
+        const bob = new DoubleRatchet();
+        await bob.initialize(new Uint8Array(sharedSecret), false, bobKeypair, null);
+
+        // Phase 1: Alice sends 150 messages on her initial chain
+        console.log(`  Phase 1: Alice sends 150 messages (same DH key)`);
+        const aliceFirstChainMsgs = [];
+        for (let i = 0; i <= 150; i++) {
+            const enc = await alice.encryptMessage(`A-chain1-${i}`, ROOM_ID, ALICE_ID);
+            aliceFirstChainMsgs.push(enc);
+        }
+
+        // Bob receives ONLY message 0 (skipping 1-150 on Alice's first chain)
+        await bob.decryptMessage(
+            aliceFirstChainMsgs[0].payload, aliceFirstChainMsgs[0].header, ROOM_ID, ALICE_ID);
+        console.log(`  Bob received only message 0, Nr=${bob.Nr}`);
+
+        // Phase 2: Bob sends a reply (triggers Bob's send-side DH ratchet)
+        const bobReply = await bob.encryptMessage('Reply', ROOM_ID, BOB_ID);
+        await alice.decryptMessage(bobReply.payload, bobReply.header, ROOM_ID, BOB_ID);
+        console.log(`  Phase 2: Alice received Bob's reply`);
+
+        // Phase 3: Alice sends ONE message with her NEW DH key (after ratchet)
+        // This message header will have pn=151 (Alice sent 151 messages before ratcheting)
+        // When Bob receives this, he must skip 150 messages (from Nr=1 to pn=151)
+        // on Alice's OLD chain before setting up the new chain
+        const aliceNewChainMsg = await alice.encryptMessage('A-chain2-0', ROOM_ID, ALICE_ID);
+        console.log(`  Phase 3: Alice sends msg with new DH key (pn=${aliceNewChainMsg.header.pn})`);
+        console.log(`  Bob needs to skip ${aliceNewChainMsg.header.pn - bob.Nr} messages on old chain`);
+
+        let maxSkipCaught = false;
+        try {
+            await bob.decryptMessage(
+                aliceNewChainMsg.payload, aliceNewChainMsg.header, ROOM_ID, ALICE_ID);
+        } catch (e) {
+            maxSkipCaught = true;
+            console.log(`  Error (expected): ${e.message}`);
+        }
+
+        if (maxSkipCaught) {
+            console.log('PASSED: MAX_SKIP limit enforced during DH ratchet');
+            passed++;
+        } else {
+            console.log('FAILED: Should have rejected excessive skip (>100 messages on old chain)');
+            failed++;
+        }
+    } catch (e) {
+        console.log('FAILED:', e.message);
+        console.log(e.stack);
+        failed++;
+    }
+    console.log('');
+
+    // -------------------------------------------------------------------------
+    // Test 11: Concurrent Bidirectional Sending (Cross-Talk)
+    // -------------------------------------------------------------------------
+    console.log('--- Test 11: Concurrent Bidirectional Sending (Cross-Talk) ---');
+    try {
+        const sharedSecret = hexToBytes('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
+
+        const aliceKeypair = await subtle.generateKey(
+            { name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveKey', 'deriveBits']);
+        const bobKeypair = await subtle.generateKey(
+            { name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveKey', 'deriveBits']);
+
+        const alice = new DoubleRatchet();
+        await alice.initialize(sharedSecret, true, aliceKeypair, bobKeypair.publicKey);
+
+        const bob = new DoubleRatchet();
+        await bob.initialize(new Uint8Array(sharedSecret), false, bobKeypair, null);
+
+        // Alice sends 3 messages WITHOUT receiving anything
+        const aliceMessages = [];
+        for (let i = 1; i <= 3; i++) {
+            const enc = await alice.encryptMessage(`A${i}`, ROOM_ID, ALICE_ID);
+            aliceMessages.push({ enc, text: `A${i}` });
+            console.log(`  Alice sends: A${i} (n=${enc.header.n}, rc=${enc.header.rc})`);
+        }
+
+        // Bob sends 3 messages WITHOUT receiving anything
+        const bobMessages = [];
+        for (let i = 1; i <= 3; i++) {
+            const enc = await bob.encryptMessage(`B${i}`, ROOM_ID, BOB_ID);
+            bobMessages.push({ enc, text: `B${i}` });
+            console.log(`  Bob sends: B${i} (n=${enc.header.n}, rc=${enc.header.rc})`);
+        }
+
+        console.log(`  State before receiving:`);
+        console.log(`    Alice: Ns=${alice.Ns}, Nr=${alice.Nr}, rc=${alice.ratchetCount}`);
+        console.log(`    Bob: Ns=${bob.Ns}, Nr=${bob.Nr}, rc=${bob.ratchetCount}`);
+
+        // Receive messages in order (from each sender's perspective)
+        // but interleaved between senders: A1, B1, A2, B2, A3, B3
+        const receiveOrder = [
+            { receiver: bob, msg: aliceMessages[0], sender: ALICE_ID, expected: 'A1' },
+            { receiver: alice, msg: bobMessages[0], sender: BOB_ID, expected: 'B1' },
+            { receiver: bob, msg: aliceMessages[1], sender: ALICE_ID, expected: 'A2' },
+            { receiver: alice, msg: bobMessages[1], sender: BOB_ID, expected: 'B2' },
+            { receiver: bob, msg: aliceMessages[2], sender: ALICE_ID, expected: 'A3' },
+            { receiver: alice, msg: bobMessages[2], sender: BOB_ID, expected: 'B3' },
+        ];
+
+        let allDecrypted = true;
+        console.log(`  Receiving interleaved (in-order per sender): A1, B1, A2, B2, A3, B3`);
+
+        for (const item of receiveOrder) {
+            try {
+                const dec = await item.receiver.decryptMessage(
+                    item.msg.enc.payload, item.msg.enc.header, ROOM_ID, item.sender);
+
+                if (dec.text !== item.expected) {
+                    console.log(`  MISMATCH: expected "${item.expected}", got "${dec.text}"`);
+                    allDecrypted = false;
+                } else {
+                    console.log(`  ✓ Decrypted: "${dec.text}"`);
+                }
+            } catch (e) {
+                console.log(`  ✗ Failed to decrypt ${item.expected}: ${e.message}`);
+                allDecrypted = false;
+            }
+        }
+
+        console.log(`  Final state:`);
+        console.log(`    Alice: Ns=${alice.Ns}, Nr=${alice.Nr}, rc=${alice.ratchetCount}`);
+        console.log(`    Bob: Ns=${bob.Ns}, Nr=${bob.Nr}, rc=${bob.ratchetCount}`);
+
+        if (allDecrypted) {
+            console.log('PASSED: All cross-talk messages decrypted correctly');
+            passed++;
+        } else {
+            console.log('FAILED: Some cross-talk messages failed to decrypt');
+            failed++;
+        }
+    } catch (e) {
+        console.log('FAILED:', e.message);
+        console.log(e.stack);
+        failed++;
+    }
+    console.log('');
+
+    // -------------------------------------------------------------------------
+    // Test 11b: Out-of-Order Within Same Chain (Known Limitation)
+    // -------------------------------------------------------------------------
+    console.log('--- Test 11b: Out-of-Order Within Same Chain (Known Limitation) ---');
+    try {
+        const sharedSecret = hexToBytes('aabbccddaabbccddaabbccddaabbccddaabbccddaabbccddaabbccddaabbccdd');
+
+        const aliceKeypair = await subtle.generateKey(
+            { name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveKey', 'deriveBits']);
+        const bobKeypair = await subtle.generateKey(
+            { name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveKey', 'deriveBits']);
+
+        const alice = new DoubleRatchet();
+        await alice.initialize(sharedSecret, true, aliceKeypair, bobKeypair.publicKey);
+
+        const bob = new DoubleRatchet();
+        await bob.initialize(new Uint8Array(sharedSecret), false, bobKeypair, null);
+
+        // Alice sends messages 0, 1, 2
+        const messages = [];
+        for (let i = 0; i < 3; i++) {
+            const enc = await alice.encryptMessage(`Msg${i}`, ROOM_ID, ALICE_ID);
+            messages.push(enc);
+        }
+
+        console.log('  Alice sent messages 0, 1, 2');
+
+        // Bob receives message 2 FIRST (skipping 0 and 1)
+        const dec2 = await bob.decryptMessage(
+            messages[2].payload, messages[2].header, ROOM_ID, ALICE_ID);
+        console.log(`  Bob received msg 2 first: "${dec2.text}"`);
+
+        // Now Bob tries to receive message 0 (should fail - no skipped key storage within chain)
+        let msg0Failed = false;
+        try {
+            await bob.decryptMessage(
+                messages[0].payload, messages[0].header, ROOM_ID, ALICE_ID);
+        } catch (e) {
+            msg0Failed = true;
+            console.log(`  Msg 0 failed (expected - no backward key recovery): ${e.message}`);
+        }
+
+        // Bob tries to receive message 1 (should also fail)
+        let msg1Failed = false;
+        try {
+            await bob.decryptMessage(
+                messages[1].payload, messages[1].header, ROOM_ID, ALICE_ID);
+        } catch (e) {
+            msg1Failed = true;
+            console.log(`  Msg 1 failed (expected - no backward key recovery): ${e.message}`);
+        }
+
+        if (msg0Failed && msg1Failed) {
+            console.log('PASSED: Out-of-order within same chain correctly rejected');
+            console.log('  NOTE: This is a known limitation. Messages must be received');
+            console.log('        in order within the same DH epoch, or skipped keys are lost.');
+            passed++;
+        } else {
+            console.log('FAILED: Expected messages to fail (backward key recovery not implemented)');
+            failed++;
+        }
+    } catch (e) {
+        console.log('FAILED:', e.message);
+        console.log(e.stack);
+        failed++;
+    }
+    console.log('');
+
+    // -------------------------------------------------------------------------
+    // Test 12: Extended Concurrent Sending with Multiple Ratchets
+    // -------------------------------------------------------------------------
+    console.log('--- Test 12: Extended Concurrent Sending with Multiple Ratchets ---');
+    try {
+        const sharedSecret = hexToBytes('bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb');
+
+        const aliceKeypair = await subtle.generateKey(
+            { name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveKey', 'deriveBits']);
+        const bobKeypair = await subtle.generateKey(
+            { name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveKey', 'deriveBits']);
+
+        const alice = new DoubleRatchet();
+        await alice.initialize(sharedSecret, true, aliceKeypair, bobKeypair.publicKey);
+
+        const bob = new DoubleRatchet();
+        await bob.initialize(new Uint8Array(sharedSecret), false, bobKeypair, null);
+
+        // Phase 1: Alice sends 2, Bob receives them
+        console.log('  Phase 1: Alice → Bob (2 msgs)');
+        for (let i = 1; i <= 2; i++) {
+            const enc = await alice.encryptMessage(`A-phase1-${i}`, ROOM_ID, ALICE_ID);
+            const dec = await bob.decryptMessage(enc.payload, enc.header, ROOM_ID, ALICE_ID);
+            console.log(`    ${dec.text}`);
+        }
+
+        // Phase 2: Both send simultaneously without receiving
+        console.log('  Phase 2: Simultaneous sending');
+        const phase2Alice = [];
+        const phase2Bob = [];
+
+        for (let i = 1; i <= 3; i++) {
+            phase2Alice.push(await alice.encryptMessage(`A-phase2-${i}`, ROOM_ID, ALICE_ID));
+        }
+        for (let i = 1; i <= 3; i++) {
+            phase2Bob.push(await bob.encryptMessage(`B-phase2-${i}`, ROOM_ID, BOB_ID));
+        }
+
+        // Phase 3: Receive everything (interleaved)
+        console.log('  Phase 3: Receiving interleaved');
+        let success = true;
+
+        // Bob receives Alice's phase2 messages
+        for (let i = 0; i < 3; i++) {
+            try {
+                const dec = await bob.decryptMessage(
+                    phase2Alice[i].payload, phase2Alice[i].header, ROOM_ID, ALICE_ID);
+                console.log(`    Bob got: ${dec.text}`);
+            } catch (e) {
+                console.log(`    Bob failed: ${e.message}`);
+                success = false;
+            }
+        }
+
+        // Alice receives Bob's phase2 messages
+        for (let i = 0; i < 3; i++) {
+            try {
+                const dec = await alice.decryptMessage(
+                    phase2Bob[i].payload, phase2Bob[i].header, ROOM_ID, BOB_ID);
+                console.log(`    Alice got: ${dec.text}`);
+            } catch (e) {
+                console.log(`    Alice failed: ${e.message}`);
+                success = false;
+            }
+        }
+
+        // Phase 4: Continue normal conversation
+        console.log('  Phase 4: Continue normal ping-pong');
+        const encA = await alice.encryptMessage('Final from Alice', ROOM_ID, ALICE_ID);
+        const decA = await bob.decryptMessage(encA.payload, encA.header, ROOM_ID, ALICE_ID);
+        console.log(`    Bob got: ${decA.text}`);
+
+        const encB = await bob.encryptMessage('Final from Bob', ROOM_ID, BOB_ID);
+        const decB = await alice.decryptMessage(encB.payload, encB.header, ROOM_ID, BOB_ID);
+        console.log(`    Alice got: ${decB.text}`);
+
+        if (decA.text === 'Final from Alice' && decB.text === 'Final from Bob') {
+            success = success && true;
+        } else {
+            success = false;
+        }
+
+        console.log(`  Final ratchet counts: Alice=${alice.ratchetCount}, Bob=${bob.ratchetCount}`);
+
+        if (success) {
+            console.log('PASSED: Extended concurrent sending works correctly');
+            passed++;
+        } else {
+            console.log('FAILED: Extended concurrent test failed');
+            failed++;
+        }
+    } catch (e) {
+        console.log('FAILED:', e.message);
+        console.log(e.stack);
+        failed++;
+    }
+    console.log('');
+
     // =========================================================================
     // Summary
     // =========================================================================
