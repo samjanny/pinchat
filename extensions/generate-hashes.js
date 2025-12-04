@@ -236,7 +236,8 @@ function parseArgs() {
         staticDir: path.join(__dirname, '..', 'static'),
         help: false,
         noSign: false,
-        dryRun: false
+        dryRun: false,
+        sequence: null  // Optional sequence override
     };
 
     for (let i = 0; i < args.length; i++) {
@@ -267,6 +268,9 @@ function parseArgs() {
             case '--dry-run':
                 options.dryRun = true;
                 break;
+            case '--sequence':
+                options.sequence = parseInt(args[++i], 10);
+                break;
         }
     }
 
@@ -290,6 +294,7 @@ Options:
   -e, --encrypted-key <path>  Path to encrypted private key (.pem.enc)
   -o, --output <path>         Output file path (default: hashes.json.signed)
   -s, --static-dir <path>     Path to static files directory (default: ../static)
+  --sequence <number>         Override sequence number (default: auto-increment)
   --no-sign                   Generate hashes only, without signing
   --dry-run                   Show what would be changed without modifying files
   -h, --help                  Show this help message
@@ -299,11 +304,30 @@ This script:
   2. Injects integrity attributes into HTML files
   3. Calculates hashes of updated HTML files
   4. Signs the manifest with ECDSA P-256
+  5. Increments sequence number for anti-downgrade protection
 
 Generate a new key pair:
   openssl ecparam -genkey -name prime256v1 -noout -out private.pem
   openssl ec -in private.pem -pubout -out public.pem
 `);
+}
+
+/**
+ * Get current sequence number from existing manifest
+ */
+function getCurrentSequence(outputPath) {
+    try {
+        if (fs.existsSync(outputPath)) {
+            const content = fs.readFileSync(outputPath, 'utf8');
+            const manifest = JSON.parse(content);
+            // Handle both signed and unsigned formats
+            const data = manifest.data || manifest;
+            return data.sequence || 0;
+        }
+    } catch (e) {
+        console.log('  No existing manifest found, starting sequence at 1');
+    }
+    return 0;
 }
 
 /**
@@ -436,9 +460,22 @@ async function main() {
         console.log(`\nWarning: ${errorCount} file(s) not found`);
     }
 
+    // Get and increment sequence number (anti-downgrade protection)
+    console.log('\nStep 5: Setting sequence number...');
+    let sequence;
+    if (options.sequence !== null) {
+        sequence = options.sequence;
+        console.log(`  Using override sequence: ${sequence}`);
+    } else {
+        const currentSequence = getCurrentSequence(options.output);
+        sequence = currentSequence + 1;
+        console.log(`  Previous sequence: ${currentSequence}, new sequence: ${sequence}`);
+    }
+
     // Create data object
     const data = {
-        version: '1.1.0',  // Bumped version for SRI support
+        version: '1.2.0',  // Bumped version for anti-downgrade support
+        sequence: sequence,  // Anti-downgrade sequence number
         generated: new Date().toISOString(),
         site: 'https://pinchat.io',
         files
@@ -504,11 +541,16 @@ Summary:
   - HTML files: ${HTML_FILES.length}
   - HTML files updated with SRI: ${htmlUpdates.length}
   - Total files in manifest: ${files.length}
+  - Sequence number: ${sequence}
 
 IMPORTANT:
   1. Commit the updated HTML files to git
   2. Upload hashes.json.signed to GitHub
   3. Update extension PUBLIC_KEY if key changed
+
+ANTI-DOWNGRADE PROTECTION:
+  The sequence number (${sequence}) prevents replay attacks with old manifests.
+  Extensions will reject any manifest with a lower sequence number.
 `);
 }
 

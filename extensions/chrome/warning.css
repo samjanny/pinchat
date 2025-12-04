@@ -1,0 +1,83 @@
+:host {
+    position: fixed !important;
+    top: 0 !important;
+    left: 0 !important;
+    width: 100vw !important;
+    height: 100vh !important;
+    z-index: 2147483647 !important;
+    display: block !important;
+    margin: 0 !important;
+    padding: 0 !important;
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+.overlay {
+    position: absolute;
+    top: 0; left: 0; right: 0; bottom: 0;
+    background: rgba(220, 38, 38, 0.98);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    color: white;
+    padding: 20px;
+}
+.icon { font-size: 72px; margin-bottom: 20px; }
+h1 {
+    font-size: 48px;
+    font-weight: bold;
+    margin: 0 0 20px 0;
+    text-align: center;
+    text-shadow: 2px 2px 4px rgba(0,0,0,0.3);
+}
+.description {
+    font-size: 24px;
+    margin: 0 0 30px 0;
+    text-align: center;
+    max-width: 800px;
+    line-height: 1.5;
+}
+.file-list {
+    background: rgba(0,0,0,0.3);
+    padding: 20px;
+    border-radius: 10px;
+    max-width: 600px;
+    width: 100%;
+    max-height: 200px;
+    overflow-y: auto;
+    margin-bottom: 30px;
+}
+.file-list h3 { margin: 0 0 10px 0; font-size: 18px; }
+.file-list ul {
+    margin: 0;
+    padding-left: 20px;
+    font-size: 14px;
+    font-family: monospace;
+    list-style: disc;
+}
+.file-list li { margin-bottom: 5px; word-break: break-all; }
+.buttons { display: flex; gap: 20px; }
+.btn-leave {
+    background: white;
+    color: #dc2626;
+    border: none;
+    padding: 15px 40px;
+    font-size: 18px;
+    font-weight: bold;
+    border-radius: 8px;
+    cursor: pointer;
+}
+.btn-leave:hover { background: #f0f0f0; }
+.btn-dismiss {
+    background: transparent;
+    color: white;
+    border: 2px solid white;
+    padding: 15px 40px;
+    font-size: 18px;
+    font-weight: bold;
+    border-radius: 8px;
+    cursor: pointer;
+    opacity: 0.7;
+}
+.btn-dismiss:hover { opacity: 1; }
+.footer { margin-top: 30px; font-size: 14px; opacity: 0.8; }

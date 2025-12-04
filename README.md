@@ -299,11 +299,11 @@ PinChat includes browser extensions for Chrome and Firefox that verify the integ
 
 1. The extension fetches a signed hash list from GitHub (out-of-band source)
 2. Verifies the ECDSA P-256 signature using an embedded public key
-3. Calculates SHA-256 hashes of files served by pinchat.io
-4. Compares calculated hashes against the signed list
-5. Displays a warning overlay if any file has been modified
+3. **DOM SRI Check**: Verifies `<script>` and `<link>` tags have correct `integrity` attributes
+4. **File Hash Verification**: Fetches ALL files from manifest and verifies SHA-256 hashes
+5. Displays a warning overlay if any integrity check fails
 
-This provides protection against server compromise scenarios where an attacker could serve malicious JavaScript to intercept encryption keys.
+This dual verification approach catches both HTML tampering (modified SRI attributes) and file tampering (modified JS/CSS), providing protection against server compromise scenarios.
 
 See [extensions/README.md](extensions/README.md) for setup and installation instructions.
 

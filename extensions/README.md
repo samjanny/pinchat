@@ -128,15 +128,47 @@ If verification fails, a full-screen red overlay appears with:
 - "Leave This Site" button
 - "Dismiss (Unsafe)" button with confirmation
 
+**CSP Compatibility**: The warning overlay uses Shadow DOM with external CSS loaded from the extension's `web_accessible_resources`. This ensures the overlay displays correctly even on pages with strict Content Security Policy (CSP) that blocks inline styles.
+
 ### What the Extension Detects
 
 - Missing `integrity` attribute on scripts/stylesheets
 - SRI hash mismatch with signed manifest
+- **File hash mismatch** (fetches ALL manifest files and verifies hashes)
 - Inline scripts (not allowed)
 - External scripts/stylesheets (not allowed)
+- **Unauthorized same-origin scripts/stylesheets** (outside `/static/` path)
 - External iframes
 - Forms submitting to external URLs
 - CSS `@import` directives
+
+### Verification Approach
+
+The extension uses a **dual verification** approach:
+
+1. **DOM SRI Check**: Verifies that all `<script>` and `<link>` tags have correct `integrity` attributes matching the signed manifest
+2. **File Hash Verification**: Fetches ALL files listed in the manifest (not just those in DOM) and computes their SHA-256 hashes to detect tampering
+
+This catches:
+- Lazy-loaded or deferred scripts not yet in DOM
+- Server serving modified files (even with correct SRI in HTML)
+- Files blocked by browser SRI (hash mismatch detected independently)
+
+### Anti-Downgrade Protection
+
+The manifest includes an incrementing `sequence` number to prevent replay attacks:
+
+1. Each new manifest has a higher sequence number than the previous
+2. Extension stores the highest seen sequence in local storage
+3. **Rejects** any manifest with sequence < stored sequence
+4. Prevents attackers from replaying old (but validly signed) manifests
+
+| Scenario | Result |
+|----------|--------|
+| First install | Accept any sequence, store it |
+| New manifest (sequence >= stored) | Accept, update stored |
+| Old manifest (sequence < stored) | **REJECT - Downgrade attack** |
+| Storage cleared | Like first install (acceptable risk) |
 
 ### Verification Interval
 
@@ -279,6 +311,8 @@ extensions/
 │   ├── content.js         # Content script for overlay
 │   ├── popup.html         # Extension popup UI
 │   ├── popup.js           # Popup logic
+│   ├── warning.html       # Warning overlay page (web_accessible_resource)
+│   ├── warning.css        # Warning overlay styles (CSP-compliant)
 │   └── icons/             # Extension icons
 └── firefox/
     ├── manifest.json      # Firefox extension manifest (MV2)
@@ -286,6 +320,8 @@ extensions/
     ├── content.js         # Content script for overlay
     ├── popup.html         # Extension popup UI
     ├── popup.js           # Popup logic
+    ├── warning.html       # Warning overlay page (web_accessible_resource)
+    ├── warning.css        # Warning overlay styles (CSP-compliant)
     └── icons/             # Extension icons
 ```
 

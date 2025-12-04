@@ -1,17 +1,18 @@
 {
-    "manifest_version": 2,
+    "manifest_version": 3,
     "name": "PinChat Integrity Verifier",
     "version": "1.0.0",
     "description": "Verifies the integrity of files served by pinchat.io against signed hashes",
     "permissions": [
         "storage",
-        "alarms",
+        "alarms"
+    ],
+    "host_permissions": [
         "https://pinchat.io/*",
-        "https://raw.githubusercontent.com/*"
+        "https://raw.githubusercontent.com/samjanny/pinchat/*"
     ],
     "background": {
-        "scripts": ["background.js"],
-        "persistent": false
+        "scripts": ["background.js"]
     },
     "content_scripts": [
         {
@@ -20,7 +21,7 @@
             "run_at": "document_start"
         }
     ],
-    "browser_action": {
+    "action": {
         "default_popup": "popup.html",
         "default_icon": {
             "16": "icons/icon-16.png",
@@ -35,7 +36,13 @@
     "browser_specific_settings": {
         "gecko": {
             "id": "pinchat-verifier@pinchat.io",
-            "strict_min_version": "78.0"
+            "strict_min_version": "109.0"
         }
-    }
+    },
+    "web_accessible_resources": [
+        {
+            "resources": ["warning.css"],
+            "matches": ["https://pinchat.io/*"]
+        }
+    ]
 }

@@ -119,6 +119,54 @@
             word-break: break-all;
         }
 
+        .file-list {
+            padding: 15px 20px;
+            background: #0f0f1a;
+            border-top: 1px solid #333;
+            max-height: 200px;
+            overflow-y: auto;
+        }
+
+        .file-list h3 {
+            font-size: 12px;
+            color: #888;
+            margin-bottom: 10px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .file-item {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 6px 0;
+            border-bottom: 1px solid #222;
+            font-size: 12px;
+        }
+
+        .file-item:last-child {
+            border-bottom: none;
+        }
+
+        .file-status {
+            font-size: 14px;
+            width: 18px;
+            text-align: center;
+        }
+
+        .file-status.ok { color: #22c55e; }
+        .file-status.failed { color: #ef4444; }
+        .file-status.error { color: #f59e0b; }
+        .file-status.dom-issue { color: #f59e0b; }
+        .file-status.unknown { color: #6b7280; }
+
+        .file-path {
+            font-family: monospace;
+            color: #ccc;
+            word-break: break-all;
+            flex: 1;
+        }
+
         .actions {
             padding: 15px 20px;
             border-top: 1px solid #333;
@@ -194,8 +242,20 @@
         <div id="last-check" class="last-check"></div>
     </div>
 
+    <div id="verification-steps" class="details" style="display: none;">
+        <h3>Verification Steps</h3>
+        <div class="detail-row">
+            <span class="detail-label">1. Signature Check</span>
+            <span id="signature-status" class="detail-value">⏳ Pending</span>
+        </div>
+        <div class="detail-row" id="file-hash-row">
+            <span class="detail-label">2. File Hash Check</span>
+            <span id="file-status" class="detail-value">⏳ Pending</span>
+        </div>
+    </div>
+
     <div id="details" class="details" style="display: none;">
-        <h3>Verification Details</h3>
+        <h3>File Verification Details</h3>
         <div class="detail-row">
             <span class="detail-label">Files Checked</span>
             <span id="files-checked" class="detail-value">0</span>
@@ -217,6 +277,11 @@
     <div id="mismatches" class="mismatches" style="display: none;">
         <h3>Failed Files</h3>
         <div id="mismatch-list"></div>
+    </div>
+
+    <div id="file-list" class="file-list" style="display: none;">
+        <h3>Verified Files</h3>
+        <div id="file-items"></div>
     </div>
 
     <div class="actions">

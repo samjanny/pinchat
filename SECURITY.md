@@ -457,13 +457,20 @@ Trust Chain:
 
 #### Verification Process
 
+The extension uses a **dual verification** approach:
+
 1. **Fetch Manifest**: Extension retrieves `hashes.json.signed` from GitHub
 2. **Verify Signature**: ECDSA P-256 signature validated using embedded public key
-3. **Read Actual DOM**: Content script reads `<script>` and `<link>` elements from the actual page
-4. **Verify SRI Attributes**: Each element's `integrity` attribute compared against signed manifest
-5. **Detect Unauthorized Resources**: Inline scripts, external resources, iframes, external forms
+3. **DOM SRI Check**: Content script reads `<script>` and `<link>` elements, verifies `integrity` attributes match signed manifest
+4. **File Hash Verification**: Fetches ALL files listed in manifest (not just DOM) and computes SHA-256 hashes
+5. **Detect Unauthorized Resources**: Inline scripts, external resources, same-origin scripts outside `/static/`, iframes, external forms
 6. **Browser Enforcement**: Browser independently blocks any file not matching its SRI hash
 7. **Alert**: Visual feedback (badge + overlay) based on verification result
+
+This dual approach catches:
+- Lazy-loaded or deferred scripts not yet in DOM
+- Server serving modified files (even with correct SRI in HTML)
+- Files blocked by browser SRI (hash mismatch detected independently)
 
 #### Defense in Depth
 
@@ -471,19 +478,24 @@ Trust Chain:
 |-------|------------|-------------|
 | Browser SRI | Blocks tampered files | N/A (native browser security) |
 | Extension SRI check | Detects missing/wrong integrity | User ignoring warnings |
+| Extension hash verification | Detects file tampering (all manifest files) | User ignoring warnings |
 | Manifest signature | Authenticates hash list | Key compromise |
 | Out-of-band manifest | Server can't forge hashes | GitHub compromise |
+| **Anti-downgrade sequence** | Prevents replay of old manifests | Storage cleared + old manifest |
 
 #### Failure Modes
 
 | Condition | Badge | Action |
 |-----------|-------|--------|
-| All SRI attributes match manifest | ✓ Green | Safe to proceed |
+| All checks pass | ✓ Green | Safe to proceed |
 | Manifest signature invalid | ! Red | **Full-screen warning overlay** |
+| **Manifest downgrade detected** | ! Red | **Full-screen warning overlay** |
 | SRI attribute missing | ! Red | **Full-screen warning overlay** |
 | SRI mismatch with manifest | ! Red | **Full-screen warning overlay** |
+| **File hash mismatch** | ! Red | **Full-screen warning overlay** |
 | Inline script detected | ! Red | **Full-screen warning overlay** |
 | External resource detected | ! Red | **Full-screen warning overlay** |
+| Unauthorized same-origin script | ! Red | **Full-screen warning overlay** |
 | Network error fetching manifest | ? Yellow | Retry, inform user |
 | GitHub unavailable | ? Yellow | Cached result or warning |
 | File hash ≠ SRI attribute | N/A | **Browser blocks the file** |

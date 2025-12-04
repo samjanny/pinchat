@@ -41,9 +41,13 @@ OqRJNIZ5zBHCr2HbJsHCtrPQUOKd4cBqfDZlQZ62rzF7ofA39ITBUyLxaA==
 // Official domain - DO NOT MODIFY for official pinchat.io usage
 const OFFICIAL_DOMAIN = 'pinchat.io';
 
+// Official GitHub repository for manifest - DO NOT MODIFY for official pinchat.io usage
+const GITHUB_REPO = 'samjanny/pinchat';
+const GITHUB_BRANCH = 'main';
+
 // Configuration
 const CONFIG = {
-    HASH_LIST_URL: 'https://raw.githubusercontent.com/samjanny/pinchat/main/hashes.json.signed',
+    HASH_LIST_URL: `https://raw.githubusercontent.com/${GITHUB_REPO}/${GITHUB_BRANCH}/hashes.json.signed`,
     SITE_URL: `https://${OFFICIAL_DOMAIN}`,
     PUBLIC_KEY: PINCHAT_PUBLIC_KEY,
     CHECK_INTERVAL_MINUTES: 5,
@@ -53,10 +57,76 @@ const CONFIG = {
 // State management
 let verificationState = {
     status: 'unknown', // 'verified', 'failed', 'error', 'checking', 'unknown'
+    signatureStatus: 'unknown', // 'valid', 'invalid', 'checking', 'error', 'unknown'
+    fileStatus: 'pending', // 'verified', 'failed', 'checking', 'pending', 'error'
     lastCheck: null,
     errors: [],
-    manifest: null  // Store manifest for content scripts
+    manifest: null,  // Store manifest for content scripts
+    debug: {
+        manifestReceived: false,
+        signatureCheckCompleted: false,
+        fileHashCheckRequested: false,
+        fileHashCheckCompleted: false,
+        lastError: null
+    }
 };
+
+let fileVerificationTimeout = null;
+
+/**
+ * Calculate overall verification status from signature and file statuses
+ */
+function calculateOverallStatus() {
+    const { signatureStatus, fileStatus } = verificationState;
+
+    // If either is checking, overall is checking
+    if (signatureStatus === 'checking' || fileStatus === 'checking') {
+        return 'checking';
+    }
+
+    // If signature failed, overall fails (critical)
+    if (signatureStatus === 'invalid') {
+        return 'failed';
+    }
+
+    // If signature errored, overall is error
+    if (signatureStatus === 'error') {
+        return 'error';
+    }
+
+    // If files failed, overall fails
+    if (fileStatus === 'failed') {
+        return 'failed';
+    }
+
+    // If files errored, overall is error
+    if (fileStatus === 'error') {
+        return 'error';
+    }
+
+    // If signature is valid but files still pending, checking
+    if (signatureStatus === 'valid' && fileStatus === 'pending') {
+        return 'checking';
+    }
+
+    // Both valid = verified
+    if (signatureStatus === 'valid' && fileStatus === 'verified') {
+        return 'verified';
+    }
+
+    // Default to unknown
+    return 'unknown';
+}
+
+/**
+ * Update overall status and notify all components
+ */
+async function updateOverallStatus() {
+    verificationState.status = calculateOverallStatus();
+    await updateAllTabsBadges();
+    await notifyContentScripts();
+    await chrome.storage.local.set({ verificationState });
+}
 
 /**
  * Fetch with timeout support
@@ -154,25 +224,55 @@ async function verifySignature(data, signatureBase64, publicKey) {
 }
 
 /**
+ * Check if there are any pinchat.io tabs open
+ */
+async function hasPinChatTabOpen() {
+    try {
+        const tabs = await chrome.tabs.query({ url: [`https://${OFFICIAL_DOMAIN}/*`, `https://www.${OFFICIAL_DOMAIN}/*`] });
+        return tabs.length > 0;
+    } catch {
+        return false;
+    }
+}
+
+/**
  * Main verification function
  * Fetches signed manifest and verifies signature
- * Actual file verification is done by content scripts via SRI
+ * File verification is only done when on pinchat.io (by content scripts)
  */
 async function verifyIntegrity() {
     console.log('[PinChat Verify] Starting verification...');
 
-    verificationState = {
-        status: 'checking',
-        lastCheck: new Date().toISOString(),
-        errors: [],
-        manifest: null
+    // Clear any existing timeout
+    if (fileVerificationTimeout) {
+        clearTimeout(fileVerificationTimeout);
+        fileVerificationTimeout = null;
+    }
+
+    // Check if we're on pinchat.io
+    const onPinChat = await hasPinChatTabOpen();
+
+    // Reset state
+    verificationState.signatureStatus = 'checking';
+    verificationState.fileStatus = onPinChat ? 'pending' : 'verified'; // Skip file check if not on site
+    verificationState.lastCheck = new Date().toISOString();
+    verificationState.errors = [];
+    verificationState.manifest = null;
+    verificationState.fileVerification = undefined;
+    verificationState.debug = {
+        manifestReceived: false,
+        signatureCheckCompleted: false,
+        fileHashCheckRequested: false,
+        fileHashCheckCompleted: !onPinChat, // Already "done" if not on site
+        lastError: null,
+        onPinChat: onPinChat
     };
 
-    await updateAllTabsBadges();
-    await notifyContentScripts();
+    await updateOverallStatus();
 
     try {
         // Fetch signed manifest from GitHub
+        console.log('[PinChat Verify] Fetching manifest from GitHub...');
         const response = await fetchWithTimeout(CONFIG.HASH_LIST_URL, { cache: 'no-store' });
         if (!response.ok) {
             throw new Error(`Failed to fetch hash list: ${response.status}`);
@@ -184,38 +284,91 @@ async function verifyIntegrity() {
             throw new Error('Invalid hash list format');
         }
 
+        verificationState.debug.manifestReceived = true;
+
         // Verify signature
+        console.log('[PinChat Verify] Verifying signature...');
         const publicKey = await importPublicKey(CONFIG.PUBLIC_KEY);
         const dataString = JSON.stringify(signedData.data);
         const isSignatureValid = await verifySignature(dataString, signedData.signature, publicKey);
 
+        verificationState.debug.signatureCheckCompleted = true;
+
         if (!isSignatureValid) {
-            verificationState.status = 'failed';
+            verificationState.signatureStatus = 'invalid';
             verificationState.errors.push('SIGNATURE VERIFICATION FAILED - Manifest may be tampered');
-            await updateAllTabsBadges();
-            await notifyContentScripts();
+            verificationState.debug.lastError = 'Signature invalid';
+            await updateOverallStatus();
             return verificationState;
         }
 
-        // Signature valid - store manifest for content scripts
-        verificationState.manifest = signedData.data;
-        verificationState.status = 'verified';
+        // Signature valid - now check sequence number for anti-downgrade
+        const manifestSequence = signedData.data.sequence || 0;
+        const { lastKnownSequence = 0 } = await chrome.storage.local.get('lastKnownSequence');
 
-        console.log('[PinChat Verify] Manifest signature verified successfully');
-        console.log(`[PinChat Verify] Manifest contains ${signedData.data.files.length} files`);
+        console.log(`[PinChat Verify] Manifest sequence: ${manifestSequence}, Last known: ${lastKnownSequence}`);
+
+        if (manifestSequence < lastKnownSequence) {
+            // Possible downgrade attack!
+            verificationState.signatureStatus = 'invalid';
+            verificationState.errors.push(`DOWNGRADE ATTACK DETECTED - Manifest sequence (${manifestSequence}) < stored sequence (${lastKnownSequence})`);
+            verificationState.debug.lastError = 'Manifest downgrade detected';
+            console.error(`[PinChat Verify] ✗ DOWNGRADE ATTACK: manifest sequence ${manifestSequence} < stored ${lastKnownSequence}`);
+            await updateOverallStatus();
+            return verificationState;
+        }
+
+        // Update stored sequence if new is higher
+        if (manifestSequence > lastKnownSequence) {
+            await chrome.storage.local.set({ lastKnownSequence: manifestSequence });
+            console.log(`[PinChat Verify] Updated stored sequence to ${manifestSequence}`);
+        }
+
+        // Store manifest for content scripts
+        verificationState.manifest = signedData.data;
+        verificationState.signatureStatus = 'valid';
+
+        console.log('[PinChat Verify] ✓ Manifest signature and sequence verified successfully');
+        console.log(`[PinChat Verify] Manifest contains ${signedData.data.files.length} files (sequence: ${manifestSequence})`);
+
+        // Only request file verification if on pinchat.io
+        if (onPinChat) {
+            verificationState.fileStatus = 'checking';
+            console.log('[PinChat Verify] On pinchat.io - requesting SRI verification from content scripts...');
+            verificationState.debug.fileHashCheckRequested = true;
+
+            // Notify content scripts to start file verification
+            await updateOverallStatus();
+
+            // Set timeout for file verification (15 seconds)
+            fileVerificationTimeout = setTimeout(() => {
+                if (verificationState.fileStatus === 'checking' || verificationState.fileStatus === 'pending') {
+                    console.error('[PinChat Verify] File verification timeout - no response from content script');
+                    verificationState.fileStatus = 'error';
+                    verificationState.errors.push('File verification timeout - content script did not respond');
+                    verificationState.debug.lastError = 'File verification timeout';
+                    updateOverallStatus();
+                }
+            }, 15000);
+        } else {
+            // Not on pinchat.io - signature check is sufficient
+            verificationState.fileStatus = 'verified';
+            console.log('[PinChat Verify] Not on pinchat.io - signature verification only (SRI check skipped)');
+            await updateOverallStatus();
+        }
 
     } catch (error) {
-        verificationState.status = 'error';
+        verificationState.signatureStatus = 'error';
+        verificationState.fileStatus = 'error';
         const errorMsg = error.name === 'AbortError' ? 'Request timeout' : error.message;
         verificationState.errors.push(errorMsg);
+        verificationState.debug.lastError = errorMsg;
         console.error('[PinChat Verify] Error:', error);
+        await updateOverallStatus();
     }
 
-    await updateAllTabsBadges();
-    await notifyContentScripts();
-    await chrome.storage.local.set({ verificationState });
-
-    console.log('[PinChat Verify] Verification complete:', verificationState.status);
+    console.log('[PinChat Verify] Signature verification complete:', verificationState.signatureStatus);
+    console.log('[PinChat Verify] File verification status:', verificationState.fileStatus);
     return verificationState;
 }
 
@@ -238,7 +391,7 @@ function isPinChatUrl(url) {
     if (!url) return false;
     try {
         const parsed = new URL(url);
-        return parsed.hostname === 'pinchat.io' || parsed.hostname === 'www.pinchat.io';
+        return parsed.hostname === OFFICIAL_DOMAIN || parsed.hostname === `www.${OFFICIAL_DOMAIN}`;
     } catch {
         return false;
     }
@@ -282,7 +435,7 @@ async function updateAllTabsBadges() {
  */
 async function notifyContentScripts() {
     try {
-        const tabs = await chrome.tabs.query({ url: 'https://pinchat.io/*' });
+        const tabs = await chrome.tabs.query({ url: [`https://${OFFICIAL_DOMAIN}/*`, `https://www.${OFFICIAL_DOMAIN}/*`] });
         for (const tab of tabs) {
             chrome.tabs.sendMessage(tab.id, {
                 type: 'VERIFICATION_STATUS',
@@ -306,6 +459,70 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
     if (message.type === 'VERIFY_NOW') {
         verifyIntegrity().then(sendResponse);
+        return true;
+    }
+
+    // Handle complete file hash verification results from content script
+    if (message.type === 'FILE_HASH_VERIFICATION_COMPLETE') {
+        console.log('[PinChat Verify] Content script reported file verification complete:', message.summary);
+
+        // Clear timeout since we got a response
+        if (fileVerificationTimeout) {
+            clearTimeout(fileVerificationTimeout);
+            fileVerificationTimeout = null;
+        }
+
+        // Store file verification results
+        verificationState.fileVerification = {
+            files: message.files,
+            summary: message.summary,
+            timestamp: new Date().toISOString()
+        };
+
+        verificationState.debug.fileHashCheckCompleted = true;
+
+        if (!message.success) {
+            verificationState.fileStatus = 'failed';
+            verificationState.errors = message.issues.map(i => `${i.path}: ${i.error}`);
+            verificationState.mismatches = message.issues;
+            console.error('[PinChat Verify] ✗ File verification FAILED');
+            console.error('[PinChat Verify] Failed files:', message.issues.map(i => i.path).join(', '));
+        } else {
+            verificationState.fileStatus = 'verified';
+            console.log('[PinChat Verify] ✓ All file hashes verified successfully');
+        }
+
+        updateOverallStatus();
+
+        // Broadcast status update to popup (if open)
+        chrome.runtime.sendMessage({
+            type: 'VERIFICATION_STATUS',
+            state: verificationState
+        }).catch(() => {
+            // Popup might not be open
+        });
+
+        sendResponse({ received: true });
+        return true;
+    }
+
+    // Handle file hash verification failure from content script (legacy support)
+    if (message.type === 'FILE_HASH_VERIFICATION_FAILED') {
+        console.error('[PinChat Verify] Content script reported hash verification failure:', message.issues);
+
+        // Clear timeout since we got a response
+        if (fileVerificationTimeout) {
+            clearTimeout(fileVerificationTimeout);
+            fileVerificationTimeout = null;
+        }
+
+        verificationState.fileStatus = 'failed';
+        verificationState.errors = message.issues.map(i => `${i.path}: ${i.error}`);
+        verificationState.mismatches = message.issues;
+        verificationState.debug.fileHashCheckCompleted = true;
+
+        updateOverallStatus();
+        sendResponse({ received: true });
         return true;
     }
 });

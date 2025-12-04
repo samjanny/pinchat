@@ -9,7 +9,7 @@
     ],
     "host_permissions": [
         "https://pinchat.io/*",
-        "https://raw.githubusercontent.com/*"
+        "https://raw.githubusercontent.com/samjanny/pinchat/*"
     ],
     "background": {
         "service_worker": "background.js",
@@ -36,5 +36,11 @@
         "32": "icons/icon-32.png",
         "48": "icons/icon-48.png",
         "128": "icons/icon-128.png"
-    }
+    },
+    "web_accessible_resources": [
+        {
+            "resources": ["warning.css"],
+            "matches": ["https://pinchat.io/*"]
+        }
+    ]
 }
