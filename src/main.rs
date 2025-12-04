@@ -285,6 +285,17 @@ async fn main() {
 
     // Build the router
 
+    // Build static file service with optional custom website directory
+    // When WEBSITE_DIR is set, files are served from there first, falling back to /static
+    // Note: When no custom dir is set, we use fallback to itself for type consistency
+    // (the overhead is negligible - fallback only triggers on 404)
+    let static_service = if let Some(ref website_dir) = config.website_dir {
+        tracing::info!("Custom website directory: {} (fallback: static/)", website_dir);
+        ServeDir::new(website_dir).fallback(ServeDir::new("static"))
+    } else {
+        ServeDir::new("static").fallback(ServeDir::new("static"))
+    };
+
     // Public routes (no auth required)
     let public_routes = Router::new()
         // Login routes with rate limiting
@@ -299,7 +310,7 @@ async fn main() {
         // CSRF token API (for static login page)
         .route("/api/csrf", get(get_csrf_token))
         // Serve static files (CSS, JS, HTML)
-        .nest_service("/static", ServeDir::new("static"))
+        .nest_service("/static", static_service)
         .with_state(app_state.clone());
 
     // Protected routes (require authentication)

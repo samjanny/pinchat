@@ -276,6 +276,7 @@ Environment variables for customization:
 | `TRUSTED_PROXIES` | _empty_ | Comma-separated proxy IPs/CIDRs for X-Forwarded-For |
 | `REPLAY_CACHE_MAX_PER_ROOM` | `10000` | Max anti-replay entries per room |
 | `MAX_IMAGE_SIZE` | `300KB` | Max image size (bytes or with KB/MB suffix) |
+| `WEBSITE_DIR` | _empty_ | Custom static files directory (fallback: `/static`) |
 
 ### Privacy Modes
 

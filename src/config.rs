@@ -94,6 +94,11 @@ pub struct Config {
     // Useful when running behind a TLS-terminating reverse proxy (nginx, CloudFlare, etc.)
     // SECURITY: Only use this when the proxy handles TLS termination
     pub force_http: bool,
+
+    // Custom website directory for static files
+    // When set, the server looks for static files here first, then falls back to /static
+    // Useful for serving a custom frontend while keeping the default as fallback
+    pub website_dir: Option<String>,
 }
 
 impl Config {
@@ -244,6 +249,13 @@ impl Config {
                 .ok()
                 .map(|v| matches!(v.to_lowercase().as_str(), "true" | "1" | "yes"))
                 .unwrap_or(false),
+
+            // Custom website directory (default: empty/None)
+            // When set, static files are served from this directory first,
+            // falling back to the built-in /static directory
+            website_dir: env::var("WEBSITE_DIR")
+                .ok()
+                .filter(|v| !v.trim().is_empty()),
         };
 
         // Validate configuration
