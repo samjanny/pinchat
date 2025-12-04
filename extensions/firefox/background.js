@@ -72,6 +72,24 @@ let verificationState = {
 };
 
 let fileVerificationTimeout = null;
+let stateRestoredFromStorage = false;
+
+/**
+ * Restore verification state from storage (Firefox Event Pages lose in-memory state)
+ */
+async function restoreStateIfNeeded() {
+    if (stateRestoredFromStorage) return;
+    try {
+        const stored = await browser.storage.local.get('verificationState');
+        if (stored.verificationState && stored.verificationState.status !== 'unknown') {
+            Object.assign(verificationState, stored.verificationState);
+            console.log('[PinChat Verify] Restored state from storage:', verificationState.status);
+        }
+    } catch (e) {
+        console.error('[PinChat Verify] Failed to restore state:', e);
+    }
+    stateRestoredFromStorage = true;
+}
 
 /**
  * Calculate overall verification status from signature and file statuses
@@ -453,8 +471,10 @@ async function notifyContentScripts() {
 // Message handler
 browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message.type === 'GET_STATUS') {
-        // Return full state including manifest
-        sendResponse(verificationState);
+        // Restore state from storage if needed (Firefox Event Pages lose in-memory state)
+        restoreStateIfNeeded().then(() => {
+            sendResponse(verificationState);
+        });
         return true;
     }
 
