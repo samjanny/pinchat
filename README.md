@@ -250,13 +250,32 @@ Environment variables for customization:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `SERVER_HOST` | `0.0.0.0` | Server bind address |
-| `SERVER_PORT` | `3000` | Server port |
+| `HOST` | `127.0.0.1` | Server bind address |
+| `PORT` | `3000` | Server port |
 | `PRIVACY_MODE` | `strict` | Logging level: `strict`, `minimal`, `development` |
 | `FORCE_HTTP` | `false` | Allow HTTP (for reverse proxy setups) |
 | `FORCE_SECURE_COOKIES` | `false` | Force Secure cookie flag |
 | `MAX_TOTAL_ROOMS` | `1000` | Maximum concurrent rooms |
 | `CSP_WS_HOST` | `'self'` | WebSocket CSP origins |
+| `WS_CONN_BURST_SIZE` | `5` | WebSocket connections allowed per period |
+| `WS_CONN_PERIOD_SECS` | `60` | Window for WebSocket connection rate limiting |
+| `ROOM_TOKEN_BURST_SIZE` | `20` | Room/token creations allowed per period |
+| `ROOM_TOKEN_PERIOD_SECS` | `3600` | Window for room/token rate limiting |
+| `MSG_RATE_LIMIT` | `5` | Messages per connection per window |
+| `MSG_RATE_WINDOW_SECS` | `1` | Window length for per-connection message rate limiting |
+| `POW_MIN_DIFFICULTY` | `15` | Minimum PoW difficulty (bits) |
+| `POW_MAX_DIFFICULTY` | `20` | Maximum PoW difficulty (bits) |
+| `CHALLENGE_TTL_SECS` | `300` | Proof-of-work challenge TTL |
+| `JWT_TOKEN_TTL_SECS` | `30` | WebSocket JWT TTL (seconds) |
+| `ROOM_CLEANUP_INTERVAL_SECS` | `60` | Room cleanup interval |
+| `CHALLENGE_CLEANUP_INTERVAL_SECS` | `60` | PoW cache cleanup interval |
+| `PINCHAT_PASSWORD_HASHES` | _empty_ | Semicolon-separated Argon2id hashes; if empty, auth is disabled |
+| `SESSION_TTL_SECS` | `86400` | Session lifetime |
+| `LOGIN_BURST_SIZE` | `5` | Login attempts allowed per period |
+| `LOGIN_PERIOD_SECS` | `900` | Window for login rate limiting |
+| `TRUSTED_PROXIES` | _empty_ | Comma-separated proxy IPs/CIDRs for X-Forwarded-For |
+| `REPLAY_CACHE_MAX_PER_ROOM` | `10000` | Max anti-replay entries per room |
+| `MAX_IMAGE_SIZE` | `300KB` | Max image size (bytes or with KB/MB suffix) |
 
 ### Privacy Modes
 
@@ -342,4 +361,3 @@ It is NOT designed, intended, or warranted for:
 Although it uses modern cryptographic techniques, it has not undergone a formal security review or audit, and MAY CONTAIN SERIOUS VULNERABILITIES.
 
 You use this software entirely at your own risk. The authors and contributors provide it “as is”, without any express or implied warranty, including but not limited to any warranty of security, fitness for a particular purpose, or non-infringement. Under no circumstances shall the authors or contributors be liable for any claim, damages, or other liability arising from, out of, or in connection with the software or its use.
-

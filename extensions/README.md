@@ -128,7 +128,7 @@ If verification fails, a full-screen red overlay appears with:
 - "Leave This Site" button
 - "Dismiss (Unsafe)" button with confirmation
 
-**CSP Compatibility**: The warning overlay uses Shadow DOM with external CSS loaded from the extension's `web_accessible_resources`. This ensures the overlay displays correctly even on pages with strict Content Security Policy (CSP) that blocks inline styles.
+**CSP Compatibility**: The warning overlay uses Shadow DOM with external CSS loaded from the extension's `web_accessible_resources`. This ensures the overlay displays correctly even on pages with strict Content Security Policy (CSP) that blocks inline styles. Firefox MV3 exposes only `warning.css` and restricts it to `https://pinchat.io/*` via `matches`.
 
 ### What the Extension Detects
 
@@ -315,13 +315,13 @@ extensions/
 │   ├── warning.css        # Warning overlay styles (CSP-compliant)
 │   └── icons/             # Extension icons
 └── firefox/
-    ├── manifest.json      # Firefox extension manifest (MV2)
+    ├── manifest.json      # Firefox extension manifest (MV3)
     ├── background.js      # Background script
     ├── content.js         # Content script for overlay
     ├── popup.html         # Extension popup UI
     ├── popup.js           # Popup logic
-    ├── warning.html       # Warning overlay page (web_accessible_resource)
-    ├── warning.css        # Warning overlay styles (CSP-compliant)
+    ├── warning.html       # Warning overlay page
+    ├── warning.css        # Warning overlay styles (web_accessible_resource limited to pinchat.io)
     └── icons/             # Extension icons
 ```
 
