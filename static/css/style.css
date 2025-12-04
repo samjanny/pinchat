@@ -863,10 +863,10 @@ footer::before {
     text-shadow: 0 0 25px rgba(14, 165, 233, 0.5), 0 0 10px rgba(14, 165, 233, 0.3);  /* Enhanced glow */
 }
 
-/* Emoji SAS Grid - 6 emoji in 2 righe da 3 (like Signal) */
+/* Emoji SAS Grid - 8 emoji in 2 righe da 4 */
 .sas-code-emoji {
     display: grid;
-    grid-template-columns: repeat(3, 60px);
+    grid-template-columns: repeat(4, 52px);
     gap: 0.5rem;
     justify-content: center;
     padding: 1rem;
@@ -885,8 +885,8 @@ footer::before {
     display: flex;
     align-items: center;
     justify-content: center;
-    width: 60px;
-    height: 60px;
+    width: 52px;
+    height: 52px;
     font-size: 2.5rem;
     background: rgba(255, 255, 255, 0.05);
     border-radius: 8px;

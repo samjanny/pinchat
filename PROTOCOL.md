@@ -474,7 +474,8 @@ If receivedCounter > expectedCounter:
    - salt = roomId || nonce1 || nonce2 || ts1 || ts2
 5. Derive SAS:
    sas = PBKDF2(password, salt, 100000, SHA-256, 48 bits)
-6. Encode as 6 emoji (64-emoji alphabet, 6 bits each)
+6. Encode as 8 emoji (64-emoji alphabet, 6 bits each)
+   Also display as 12 hex characters (e.g., A3-F7-B2-C9-1D-4E)
 ```
 
 ### Verification Flow
@@ -512,7 +513,7 @@ Alice                                    Bob
 | Chain Key Size | 256 bits |
 | Message Key Size | 256 bits |
 | PBKDF2 Iterations | 100,000 |
-| SAS Output | 36 bits |
+| SAS Output | 48 bits (8 emoji / 12 hex chars) |
 
 ### Protocol Limits
 

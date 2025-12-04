@@ -426,8 +426,8 @@ class ECDHKeyExchange {
     /**
      * Encode bytes to emoji using 64-emoji alphabet (6 bits per emoji)
      * Uses BigInt to avoid JavaScript's 32-bit overflow in bitwise operations
-     * @param {Uint8Array} bytes - Input bytes
-     * @returns {string} Emoji string (always exactly 6 emoji)
+     * @param {Uint8Array} bytes - Input bytes (6 bytes = 48 bits)
+     * @returns {string} Emoji string (always exactly 8 emoji)
      */
     encodeToEmoji(bytes) {
         // Convert bytes to BigInt to avoid 32-bit overflow
@@ -436,9 +436,9 @@ class ECDHKeyExchange {
             value = (value << 8n) | BigInt(byte);
         }
 
-        // HARDCODE: always exactly 6 emoji (36 bits of entropy, like Signal)
+        // Always exactly 8 emoji (48 bits of entropy = 281 trillion combinations)
         let result = '';
-        for (let i = 5; i >= 0; i--) {
+        for (let i = 7; i >= 0; i--) {
             const index = Number((value >> (BigInt(i) * 6n)) & 0x3Fn);
             result += this.EMOJI_ALPHABET[index];
         }
@@ -556,8 +556,8 @@ class ECDHKeyExchange {
             ['deriveBits']
         );
 
-        // Derive 36 bits using PBKDF2 (100K iterations)
-        // 36 bits = 6 emoji (like Signal) = 69 billion combinations
+        // Derive 48 bits using PBKDF2 (100K iterations)
+        // 48 bits = 8 emoji = 281 trillion combinations
         const iterations = 100000;
         const derivedBits = await crypto.subtle.deriveBits(
             {
@@ -567,13 +567,11 @@ class ECDHKeyExchange {
                 hash: 'SHA-256'
             },
             baseKey,
-            48  // WebCrypto requires multiple of 8, derive 48 bits
+            48  // 48 bits = 6 bytes = 8 emoji (6 bits each)
         );
 
-        // Use only first 36 bits (4.5 bytes) for 6 emoji
-        // Take first 5 bytes, encodeToEmoji will produce floor(40/6) = 6 emoji
-        const fullBytes = new Uint8Array(derivedBits);
-        const sasBytes = fullBytes.slice(0, 5);  // 40 bits -> 6 emoji
+        // Use all 48 bits (6 bytes) for 8 emoji
+        const sasBytes = new Uint8Array(derivedBits);
 
         // Generate both emoji and hex formats
         const sasEmoji = this.encodeToEmoji(sasBytes);
@@ -582,7 +580,7 @@ class ECDHKeyExchange {
         const sasObject = {
             emoji: sasEmoji,
             hex: sasHex,
-            bits: 36,
+            bits: 48,
             iterations: iterations
         };
 
