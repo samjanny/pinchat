@@ -38,7 +38,8 @@ const JS_CSS_FILES = [
   '/static/js/login.js',
   '/static/js/nicknames.js',
   '/static/js/pow.js',
-  '/static/js/websocket.js'
+  '/static/js/websocket.js',
+  '/static/js/debug.js'
 ];
 
 const HTML_FILES = [
