@@ -257,14 +257,14 @@ Environment variables for customization:
 | `FORCE_SECURE_COOKIES` | `false` | Force Secure cookie flag |
 | `MAX_TOTAL_ROOMS` | `1000` | Maximum concurrent rooms |
 | `CSP_WS_HOST` | `'self'` | WebSocket CSP origins |
-| `WS_CONN_BURST_SIZE` | `5` | WebSocket connections allowed per period |
+| `WS_CONN_BURST_SIZE` | `30` | WebSocket connections allowed per period |
 | `WS_CONN_PERIOD_SECS` | `60` | Window for WebSocket connection rate limiting |
-| `ROOM_TOKEN_BURST_SIZE` | `20` | Room/token creations allowed per period |
-| `ROOM_TOKEN_PERIOD_SECS` | `3600` | Window for room/token rate limiting |
-| `MSG_RATE_LIMIT` | `5` | Messages per connection per window |
+| `ROOM_TOKEN_BURST_SIZE` | `100` | Room/token creations allowed per period |
+| `ROOM_TOKEN_PERIOD_SECS` | `600` | Window for room/token rate limiting (10 min) |
+| `MSG_RATE_LIMIT` | `30` | Messages per connection per window |
 | `MSG_RATE_WINDOW_SECS` | `1` | Window length for per-connection message rate limiting |
-| `POW_MIN_DIFFICULTY` | `15` | Minimum PoW difficulty (bits) |
-| `POW_MAX_DIFFICULTY` | `20` | Maximum PoW difficulty (bits) |
+| `POW_MIN_DIFFICULTY` | `12` | Minimum PoW difficulty (bits) |
+| `POW_MAX_DIFFICULTY` | `18` | Maximum PoW difficulty (bits) |
 | `CHALLENGE_TTL_SECS` | `300` | Proof-of-work challenge TTL |
 | `JWT_TOKEN_TTL_SECS` | `30` | WebSocket JWT TTL (seconds) |
 | `ROOM_CLEANUP_INTERVAL_SECS` | `60` | Room cleanup interval |

@@ -118,45 +118,45 @@ impl Config {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(3000),
 
-            // WebSocket connection rate limiting (default: 5 connections per minute)
+            // WebSocket connection rate limiting (default: 30 connections per minute)
             ws_conn_burst_size: env::var("WS_CONN_BURST_SIZE")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(5),
+                .unwrap_or(30),
             ws_conn_period_secs: env::var("WS_CONN_PERIOD_SECS")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(60),
 
-            // Room/Token creation rate limiting (default: 20 requests per hour)
+            // Room/Token creation rate limiting (default: 100 requests per 10 minutes)
             room_token_burst_size: env::var("ROOM_TOKEN_BURST_SIZE")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(20),
+                .unwrap_or(100),
             room_token_period_secs: env::var("ROOM_TOKEN_PERIOD_SECS")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(3600),
+                .unwrap_or(600),
 
-            // Per-connection message rate limiting (default: 5 messages per second)
+            // Per-connection message rate limiting (default: 30 messages per second)
             msg_rate_limit: env::var("MSG_RATE_LIMIT")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(5),
+                .unwrap_or(30),
             msg_rate_window_secs: env::var("MSG_RATE_WINDOW_SECS")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(1),
 
-            // Proof-of-Work configuration (default: 15-20 bits)
+            // Proof-of-Work configuration (default: 12-18 bits)
             pow_min_difficulty: env::var("POW_MIN_DIFFICULTY")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(15),
+                .unwrap_or(12),
             pow_max_difficulty: env::var("POW_MAX_DIFFICULTY")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(20),
+                .unwrap_or(18),
 
             // Challenge TTL (default: 300 seconds = 5 minutes)
             challenge_ttl_secs: env::var("CHALLENGE_TTL_SECS")
