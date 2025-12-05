@@ -73,7 +73,7 @@ function encodeAADWithLengthPrefix(fields) {
     const parts = [];
 
     // Debug helper: log AAD fields being encoded for visibility during development
-    console.log('[DEBUG-AAD] Encoding fields:', fields.map(f => ({
+    debugLog('[DEBUG-AAD] Encoding fields:', fields.map(f => ({
         type: Object.keys(AAD_FIELD_TYPES).find(k => AAD_FIELD_TYPES[k] === f.type),
         value: f.value
     })));
@@ -147,7 +147,7 @@ class ChainRatchet {
         this.messageKeyWindow = new Map();  // Sliding window for out-of-order message tolerance
         this.WINDOW_SIZE = 16;              // Pre-derive next 16 keys for resilience
 
-        console.log('[ChainRatchet] Initialized with 32-byte key material');
+        debugLog('[ChainRatchet] Initialized with 32-byte key material');
     }
 
     /**
@@ -187,7 +187,7 @@ class ChainRatchet {
             }
         }
 
-        console.log(`[ChainRatchet] Derived message key #${myCounter} (window: ${myCounter+1}..${myCounter+this.WINDOW_SIZE})`);
+        debugLog(`[ChainRatchet] Derived message key #${myCounter} (window: ${myCounter+1}..${myCounter+this.WINDOW_SIZE})`);
 
         // Return both key and counter (counter needed for AAD binding)
         return { key: messageKey, counter: myCounter };
@@ -209,12 +209,12 @@ class ChainRatchet {
 
         // Check sliding window first (common case)
         if (this.messageKeyWindow.has(counter)) {
-            console.log(`[ChainRatchet] Using pre-derived key from window for #${counter}`);
+            debugLog(`[ChainRatchet] Using pre-derived key from window for #${counter}`);
             return this.messageKeyWindow.get(counter);
         }
 
         // Derive key directly (out-of-order message)
-        console.log(`[ChainRatchet] Deriving key for counter #${counter} (not in window)`);
+        debugLog(`[ChainRatchet] Deriving key for counter #${counter} (not in window)`);
         const currentCounter = this.messageNumber;
         const messageKey = await this._deriveKeyForCounter(counter, currentCounter);
 
@@ -315,7 +315,7 @@ class ChainRatchet {
         this.chainKeyMaterial = new Uint8Array(nextChainKeyRaw);
 
         // NOTE: messageNumber is incremented in deriveMessageKey() to prevent race conditions
-        console.log(`[ChainRatchet] Ratcheted forward (counter now at #${this.messageNumber})`);
+        debugLog(`[ChainRatchet] Ratcheted forward (counter now at #${this.messageNumber})`);
     }
 
     /**
@@ -329,7 +329,7 @@ class ChainRatchet {
             this.chainKeyMaterial = null;
         }
         this.messageNumber = 0;
-        console.log('[ChainRatchet] Reset (chain key destroyed)');
+        debugLog('[ChainRatchet] Reset (chain key destroyed)');
     }
 }
 
@@ -380,7 +380,7 @@ class CryptoManager {
         let keyBase64 = params.get('key');
 
         if (!keyBase64) {
-            console.error('No encryption key found in URL');
+            debugError('No encryption key found in URL');
             return null;
         }
 
@@ -388,7 +388,7 @@ class CryptoManager {
             // Convert Base64url to standard Base64 if needed
             // Detect Base64url format (contains '-' or '_' instead of '+' or '/')
             if (keyBase64.includes('-') || keyBase64.includes('_')) {
-                console.log('Detected Base64url format, converting to standard Base64');
+                debugLog('Detected Base64url format, converting to standard Base64');
                 keyBase64 = base64urlToBase64(keyBase64);
             }
             // Otherwise assume standard Base64 (backward compatibility)
@@ -411,11 +411,11 @@ class CryptoManager {
                 ['encrypt', 'decrypt']
             );
 
-            console.log('✅ Encryption key loaded successfully');
+            debugLog('✅ Encryption key loaded successfully');
             return this.key;
 
         } catch (error) {
-            console.error('Failed to load encryption key:', error);
+            debugError('Failed to load encryption key:', error);
             return null;
         }
     }
@@ -471,8 +471,8 @@ class CryptoManager {
             );
         }
 
-        console.warn(`[ChainRatchet] Desync detected: ${gap} message(s) dropped`);
-        console.warn(`[ChainRatchet] Fast-forwarding from #${lastProcessedCounter} to #${targetCounter}`);
+        debugWarn(`[ChainRatchet] Desync detected: ${gap} message(s) dropped`);
+        debugWarn(`[ChainRatchet] Fast-forwarding from #${lastProcessedCounter} to #${targetCounter}`);
 
         // Fast-forward: advance chain without deriving message keys
         // (Skipped messages are permanently lost - cannot be decrypted)
@@ -492,8 +492,8 @@ class CryptoManager {
             this.receivingChain.messageKeyWindow.set(futureCounter, futureKey);
         }
 
-        console.log(`[ChainRatchet] Resync complete - now at counter #${this.receivingChain.messageNumber}`);
-        console.log(`[ChainRatchet] Sliding window repopulated: [${targetCounter + 1}..${targetCounter + this.receivingChain.WINDOW_SIZE}]`);
+        debugLog(`[ChainRatchet] Resync complete - now at counter #${this.receivingChain.messageNumber}`);
+        debugLog(`[ChainRatchet] Sliding window repopulated: [${targetCounter + 1}..${targetCounter + this.receivingChain.WINDOW_SIZE}]`);
     }
 
     /**
@@ -516,7 +516,7 @@ class CryptoManager {
             throw new Error('Double Ratchet not initialized - cannot encrypt');
         }
 
-        console.log('[CRYPTO] Using Double Ratchet for encryption (PFS + PCS)');
+        debugLog('[CRYPTO] Using Double Ratchet for encryption (PFS + PCS)');
         const result = await this.doubleRatchet.encryptMessage(plaintext, roomId, mySenderId);
         // DoubleRatchet returns {payload, header}
         // Return both for WebSocket message
@@ -549,7 +549,7 @@ class CryptoManager {
             throw new Error('Double Ratchet not initialized - cannot decrypt');
         }
 
-        console.log('[CRYPTO] Using Double Ratchet for decryption (PFS + PCS)');
+        debugLog('[CRYPTO] Using Double Ratchet for decryption (PFS + PCS)');
         const envelope = await this.doubleRatchet.decryptMessage(ciphertextBase64, header, roomId, expectedSenderId);
         // DoubleRatchet returns {ts, text}
         // We need to return just the text for compatibility
@@ -594,7 +594,7 @@ class CryptoManager {
         }
 
         if (cleanedCount > 0) {
-            console.log(`[SECURITY] Cleaned up ${cleanedCount} old message hashes`);
+            debugLog(`[SECURITY] Cleaned up ${cleanedCount} old message hashes`);
         }
     }
 
@@ -622,8 +622,8 @@ class CryptoManager {
      * @param {string|null} otherUserId - Other party's user identifier (optional but recommended)
      */
     async initializeChainRatchet(sessionKeyMaterial, isInitiator, roomId = null, userId = null, otherUserId = null) {
-        console.log('[CRYPTO] Initializing Chain Ratchet for Perfect Forward Secrecy...');
-        console.log(`[CRYPTO] Role: ${isInitiator ? 'Initiator' : 'Responder'}`);
+        debugLog('[CRYPTO] Initializing Chain Ratchet for Perfect Forward Secrecy...');
+        debugLog(`[CRYPTO] Role: ${isInitiator ? 'Initiator' : 'Responder'}`);
 
         if (!(sessionKeyMaterial instanceof Uint8Array) || sessionKeyMaterial.length !== 32) {
             throw new Error('Session key material must be 32 bytes');
@@ -639,9 +639,9 @@ class CryptoManager {
             const saltInput = new TextEncoder().encode(saltContext);
             const saltBuffer = await crypto.subtle.digest('SHA-256', saltInput);
             salt = new Uint8Array(saltBuffer);
-            console.log('[CRYPTO] Using context-bound salt for HKDF (roomId + participant IDs)');
+            debugLog('[CRYPTO] Using context-bound salt for HKDF (roomId + participant IDs)');
         } else {
-            console.log('[CRYPTO] Using default all-zero salt for HKDF (RFC 5869 compliant)');
+            debugLog('[CRYPTO] Using default all-zero salt for HKDF (RFC 5869 compliant)');
         }
 
         // Role-based chain derivation for perfect symmetry:
@@ -671,7 +671,7 @@ class CryptoManager {
 
         this.ratchetActive = true;
 
-        console.log('[CRYPTO] ✅ Chain Ratchet active (Perfect Forward Secrecy enabled)');
+        debugLog('[CRYPTO] ✅ Chain Ratchet active (Perfect Forward Secrecy enabled)');
     }
 
     /**
@@ -690,8 +690,8 @@ class CryptoManager {
      * @param {CryptoKey} theirPublicKey - Peer's ECDH public key from handshake
      */
     async initializeDoubleRatchet(identityManager, sessionKeyMaterial, isInitiator, myKeypair = null, theirPublicKey = null) {
-        console.log('[CRYPTO] Initializing Double Ratchet for Post-Compromise Security...');
-        console.log(`[CRYPTO] Role: ${isInitiator ? 'Initiator' : 'Responder'}`);
+        debugLog('[CRYPTO] Initializing Double Ratchet for Post-Compromise Security...');
+        debugLog(`[CRYPTO] Role: ${isInitiator ? 'Initiator' : 'Responder'}`);
 
         if (!(sessionKeyMaterial instanceof Uint8Array) || sessionKeyMaterial.length !== 32) {
             throw new Error('Session key material must be 32 bytes');
@@ -709,7 +709,7 @@ class CryptoManager {
 
         this.doubleRatchetActive = true;
 
-        console.log('[CRYPTO] ✅ Double Ratchet active (PFS + PCS enabled)');
+        debugLog('[CRYPTO] ✅ Double Ratchet active (PFS + PCS enabled)');
     }
 
     /**
@@ -763,7 +763,7 @@ class CryptoManager {
      * @deprecated Use initializeChainRatchet() instead for true PFS
      */
     setSessionKey(sessionKey) {
-        console.log('[CRYPTO] Switching to session key (ECDH-derived)');
+        debugLog('[CRYPTO] Switching to session key (ECDH-derived)');
         this.sessionKey = sessionKey;
     }
 
@@ -781,7 +781,7 @@ class CryptoManager {
      * - Bootstrap key only protects ECDH public keys (already ephemeral)
      */
     deleteBootstrapKey() {
-        console.log('[CRYPTO] Bootstrap key marked as inactive (Chain Ratchet now active)');
+        debugLog('[CRYPTO] Bootstrap key marked as inactive (Chain Ratchet now active)');
         // NOTE: We intentionally do NOT delete this.key to allow re-handshaking
         // this.key = null;  // ← Commented out to support multiple handshakes
     }
@@ -799,7 +799,7 @@ class CryptoManager {
      * - Messages become incompatible → permanent DoS
      */
     resetToBootstrapKey() {
-        console.log('[CRYPTO] Resetting to bootstrap key (PFS ended, waiting for new handshake)');
+        debugLog('[CRYPTO] Resetting to bootstrap key (PFS ended, waiting for new handshake)');
 
         // Reset chain ratchet
         this.sendingChain.reset();
@@ -837,7 +837,7 @@ class CryptoManager {
             throw new Error('Double Ratchet not initialized - cannot encrypt');
         }
 
-        console.log('[CRYPTO] Encrypting image with Double Ratchet...');
+        debugLog('[CRYPTO] Encrypting image with Double Ratchet...');
 
         // Create image envelope with metadata
         const envelope = {
@@ -852,7 +852,7 @@ class CryptoManager {
         const envelopeJson = JSON.stringify(envelope);
         const result = await this.doubleRatchet.encryptMessage(envelopeJson, roomId, senderId);
 
-        console.log('[CRYPTO] Image encrypted successfully');
+        debugLog('[CRYPTO] Image encrypted successfully');
 
         return {
             payload: result.payload,
@@ -874,7 +874,7 @@ class CryptoManager {
             throw new Error('Double Ratchet not initialized - cannot decrypt');
         }
 
-        console.log('[CRYPTO] Decrypting image with Double Ratchet...');
+        debugLog('[CRYPTO] Decrypting image with Double Ratchet...');
 
         // Use the existing Double Ratchet decryption
         const envelope = await this.doubleRatchet.decryptMessage(payloadBase64, header, roomId, senderId);
@@ -890,7 +890,7 @@ class CryptoManager {
         // Convert base64 back to ArrayBuffer
         const imageData = this.base64ToArrayBuffer(imageEnvelope.data);
 
-        console.log('[CRYPTO] Image decrypted successfully');
+        debugLog('[CRYPTO] Image decrypted successfully');
 
         return {
             data: imageData,

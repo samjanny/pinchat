@@ -39,7 +39,7 @@ class IdentityKeyManager {
      * @returns {Promise<CryptoKeyPair>}
      */
     async generateIdentityKeypair() {
-        console.log('[Identity] Generating ECDSA identity keypair (P-256)...');
+        debugLog('[Identity] Generating ECDSA identity keypair (P-256)...');
 
         // Step 1: Generate keypair with extractable=true (needed to re-import private key)
         const tempKeyPair = await crypto.subtle.generateKey(
@@ -79,7 +79,7 @@ class IdentityKeyManager {
         const clearBuffer = new Uint8Array(privateKeyPkcs8);
         clearBuffer.fill(0);
 
-        console.log('[Identity] ✅ Identity keypair generated (private key non-extractable)');
+        debugLog('[Identity] ✅ Identity keypair generated (private key non-extractable)');
         return this.identityKeyPair;
     }
 
@@ -98,7 +98,7 @@ class IdentityKeyManager {
             this.identityKeyPair.publicKey
         );
 
-        console.log('[Identity] Exported identity public key (65 bytes, uncompressed P-256)');
+        debugLog('[Identity] Exported identity public key (65 bytes, uncompressed P-256)');
         return publicKeyRaw;
     }
 
@@ -112,7 +112,7 @@ class IdentityKeyManager {
      * @returns {Promise<CryptoKey>}
      */
     async importPeerIdentityPublicKey(publicKeyRaw) {
-        console.log('[Identity] Importing peer identity public key...');
+        debugLog('[Identity] Importing peer identity public key...');
 
         this.peerIdentityPublicKey = await crypto.subtle.importKey(
             'raw',
@@ -125,7 +125,7 @@ class IdentityKeyManager {
             ['verify']
         );
 
-        console.log('[Identity] ✅ Peer identity public key imported');
+        debugLog('[Identity] ✅ Peer identity public key imported');
         return this.peerIdentityPublicKey;
     }
 
@@ -142,7 +142,7 @@ class IdentityKeyManager {
             throw new Error('Identity keypair not generated');
         }
 
-        console.log('[Identity] Signing data with identity private key...');
+        debugLog('[Identity] Signing data with identity private key...');
 
         const signature = await crypto.subtle.sign(
             {
@@ -153,7 +153,7 @@ class IdentityKeyManager {
             data
         );
 
-        console.log('[Identity] ✅ Data signed (signature length:', signature.byteLength, 'bytes)');
+        debugLog('[Identity] ✅ Data signed (signature length:', signature.byteLength, 'bytes)');
         return signature;
     }
 
@@ -173,7 +173,7 @@ class IdentityKeyManager {
             throw new Error('Peer identity public key not imported');
         }
 
-        console.log('[Identity] Verifying signature with peer identity public key...');
+        debugLog('[Identity] Verifying signature with peer identity public key...');
 
         const isValid = await crypto.subtle.verify(
             {
@@ -186,11 +186,11 @@ class IdentityKeyManager {
         );
 
         if (!isValid) {
-            console.error('[Identity] ❌ Signature verification FAILED - MITM attack detected!');
+            debugError('[Identity] ❌ Signature verification FAILED - MITM attack detected!');
             throw new Error('🚨 MITM ATTACK DETECTED - Signature verification failed');
         }
 
-        console.log('[Identity] ✅ Signature verified - ephemeral key authenticated');
+        debugLog('[Identity] ✅ Signature verified - ephemeral key authenticated');
         return true;
     }
 
@@ -232,7 +232,7 @@ class IdentityKeyManager {
      */
     markSASVerified() {
         this.sasVerified = true;
-        console.log('[Identity] ✅ SAS marked as verified - identity keys authenticated');
+        debugLog('[Identity] ✅ SAS marked as verified - identity keys authenticated');
     }
 
     /**
@@ -251,14 +251,14 @@ class IdentityKeyManager {
      * entire session to authenticate ratcheting. Only destroy on session end.
      */
     destroy() {
-        console.log('[Identity] Destroying identity keys (session cleanup)...');
+        debugLog('[Identity] Destroying identity keys (session cleanup)...');
 
         this.identityKeyPair = null;
         this.peerIdentityPublicKey = null;
         this.sasVerified = false;
         this.previousPeerIdentity = null;
 
-        console.log('[Identity] ✅ Identity keys destroyed');
+        debugLog('[Identity] ✅ Identity keys destroyed');
     }
 
     /**

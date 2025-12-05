@@ -90,7 +90,7 @@ document.addEventListener('alpine:init', () => {
             }
             this.initialized = true;
 
-            console.log('Initializing chat room:', this.roomId);
+            debugLog('Initializing chat room:', this.roomId);
 
             // Initialize emoji picker categories
             if (window.emojiManager) {
@@ -127,7 +127,7 @@ document.addEventListener('alpine:init', () => {
                 // If PFS was active and this is a reconnection, restart handshake to resync Chain Ratchet
                 // This prevents permanent desynchronization when messages are lost during disconnection
                 if (isReconnection && this.pfsActive) {
-                    console.log('[RECONNECT] Detected reconnection with active PFS → restarting handshake to resync Chain Ratchet');
+                    debugLog('[RECONNECT] Detected reconnection with active PFS → restarting handshake to resync Chain Ratchet');
                     await this.restartECDHHandshake();
                 }
             };
@@ -179,18 +179,18 @@ document.addEventListener('alpine:init', () => {
                     // This prevents URL spoofing attacks where an attacker modifies
                     // type/ttl/max parameters to trigger unintended behavior (e.g., ECDH in group rooms)
                     if (message.room_type) {
-                        console.log('[SECURITY] Using validated room_type from server:', message.room_type);
+                        debugLog('[SECURITY] Using validated room_type from server:', message.room_type);
                         this.roomType = message.room_type;
                     }
                     if (message.ttl_minutes) {
-                        console.log('[SECURITY] Using validated ttl_minutes from server:', message.ttl_minutes);
+                        debugLog('[SECURITY] Using validated ttl_minutes from server:', message.ttl_minutes);
                         this.ttlMinutes = message.ttl_minutes;
                         // Calculate expiration based on server's created_at timestamp (not client connection time)
                         // This ensures countdown is accurate even if client joins late
                         if (message.created_at) {
                             const createdAtMs = new Date(message.created_at).getTime();
                             this.expiresAt = createdAtMs + (this.ttlMinutes * 60 * 1000);
-                            console.log('[COUNTDOWN] Using server created_at:', message.created_at, '→ expires at:', new Date(this.expiresAt).toISOString());
+                            debugLog('[COUNTDOWN] Using server created_at:', message.created_at, '→ expires at:', new Date(this.expiresAt).toISOString());
                         } else {
                             // Fallback to client time if created_at not provided (backwards compatibility)
                             this.expiresAt = Date.now() + (this.ttlMinutes * 60 * 1000);
@@ -198,11 +198,11 @@ document.addEventListener('alpine:init', () => {
                         }
                     }
                     if (message.max_participants) {
-                        console.log('[SECURITY] Using validated max_participants from server:', message.max_participants);
+                        debugLog('[SECURITY] Using validated max_participants from server:', message.max_participants);
                         this.maxParticipants = message.max_participants;
                     }
                     if (message.max_image_size) {
-                        console.log('[CONFIG] Max image size from server:', this.formatFileSize(message.max_image_size));
+                        debugLog('[CONFIG] Max image size from server:', this.formatFileSize(message.max_image_size));
                         this.maxImageSize = message.max_image_size;
                     }
 
@@ -210,13 +210,13 @@ document.addEventListener('alpine:init', () => {
                     if (this.roomType === 'onetoone' && this.participantCount === 2) {
                         // Reset ECDH status if it was stuck on 'aborted' from previous failed handshake
                         if (this.ecdhHandshakeStatus === 'aborted') {
-                            console.log('[ECDH] Resetting status from aborted to none (room ready again)');
+                            debugLog('[ECDH] Resetting status from aborted to none (room ready again)');
                             this.ecdhHandshakeStatus = 'none';
                         }
 
                         // Start handshake if not already started
                         if (this.ecdhHandshakeStatus === 'none') {
-                            console.log('[ECDH] Second participant joined → starting handshake');
+                            debugLog('[ECDH] Second participant joined → starting handshake');
                             await this.startECDHHandshake();
                         }
                     }
@@ -249,13 +249,13 @@ document.addEventListener('alpine:init', () => {
                     if (this.roomType === 'onetoone' && this.participantCount === 2) {
                         // Reset ECDH status if it was stuck on 'aborted' from previous failed handshake
                         if (this.ecdhHandshakeStatus === 'aborted') {
-                            console.log('[ECDH] Resetting status from aborted to none (room ready again)');
+                            debugLog('[ECDH] Resetting status from aborted to none (room ready again)');
                             this.ecdhHandshakeStatus = 'none';
                         }
 
                         // Start handshake if not already started
                         if (this.ecdhHandshakeStatus === 'none') {
-                            console.log('[ECDH] Other participant joined → starting handshake');
+                            debugLog('[ECDH] Other participant joined → starting handshake');
                             await this.startECDHHandshake();
                         }
                     }
@@ -271,20 +271,20 @@ document.addEventListener('alpine:init', () => {
                     if (this.participantCount < 2) {
                         if (this.ecdhHandshakeStatus === 'waiting') {
                             // Handshake was in progress → hard abort (peer left)
-                            console.log('[ECDH] Resetting status to none (handshake aborted, peer left)');
+                            debugLog('[ECDH] Resetting status to none (handshake aborted, peer left)');
                             this.handleECDHAborted(true);  // hardReset: peer is gone
                             // Reset status to 'none' so handshake can restart when room becomes ready again
                             this.ecdhHandshakeStatus = 'none';
                         } else if (this.pfsActive) {
                             // PFS was active → hard abort (peer left, need fresh identity with new peer)
-                            console.log('[ECDH] PFS was active, peer left → hard reset');
+                            debugLog('[ECDH] PFS was active, peer left → hard reset');
                             this.handleECDHAborted(true);  // hardReset: peer is gone
                             this.ecdhHandshakeStatus = 'none';
                             this.sasBackup = null;
                             this.addSystemMessage('⚠️ Secure connection lost (other participant left)');
                         } else if (this.ecdhHandshakeStatus === 'aborted') {
                             // Status was stuck on 'aborted' → reset to 'none'
-                            console.log('[ECDH] Resetting status from aborted to none (room not ready)');
+                            debugLog('[ECDH] Resetting status from aborted to none (room not ready)');
                             this.ecdhHandshakeStatus = 'none';
                             // Reset to bootstrap key for clean state
                             window.cryptoManager.resetToBootstrapKey();
@@ -720,19 +720,19 @@ document.addEventListener('alpine:init', () => {
                 return;
             }
 
-            console.log('[ECDH] Starting handshake for 1:1 room...');
+            debugLog('[ECDH] Starting handshake for 1:1 room...');
 
             try {
                 this.ecdhHandshakeStatus = 'waiting';  // Set immediately to prevent race condition
 
                 // Initialize the identity manager and reuse it across reconnects
                 if (!this.identityManager) {
-                    console.log('[Identity] Initializing identity key manager...');
+                    debugLog('[Identity] Initializing identity key manager...');
                     this.identityManager = new IdentityKeyManager();
                     await this.identityManager.generateIdentityKeypair();
-                    console.log('[Identity] ✅ Identity keypair generated');
+                    debugLog('[Identity] ✅ Identity keypair generated');
                 } else {
-                    console.log('[Identity] Reusing existing identity manager (SAS verified:', this.identityManager.isSASVerified(), ')');
+                    debugLog('[Identity] Reusing existing identity manager (SAS verified:', this.identityManager.isSASVerified(), ')');
                 }
 
                 // Initialize ECDH manager with identity manager
@@ -751,7 +751,7 @@ document.addEventListener('alpine:init', () => {
                     payload: payloadJson  // JSON string with {encryptedKey, timestamp, nonce}
                 });
 
-                console.log('[ECDH] Public key sent with AAD binding, waiting for other participant...');
+                debugLog('[ECDH] Public key sent with AAD binding, waiting for other participant...');
                 this.addSystemMessage('🔐 Establishing secure connection...');
 
                 // Start handshake timeout (30 seconds)
@@ -769,13 +769,13 @@ document.addEventListener('alpine:init', () => {
 
                     // If still 2 participants, could retry automatically
                     if (this.participantCount === 2) {
-                        console.log('[ECDH] Room still has 2 participants, handshake can be retried manually');
+                        debugLog('[ECDH] Room still has 2 participants, handshake can be retried manually');
                     }
                 });
 
                 // Process pending ECDH key if it arrived while we were initializing
                 if (this.pendingECDHKey) {
-                    console.log('[ECDH] Processing pending public key that arrived during initialization...');
+                    debugLog('[ECDH] Processing pending public key that arrived during initialization...');
                     await this.handleECDHPublicKey(this.pendingECDHKey);
                 }
 
@@ -792,7 +792,7 @@ document.addEventListener('alpine:init', () => {
          * This ensures both parties resynchronize their Chain Ratchet state
          */
         async restartECDHHandshake() {
-            console.log('[RECONNECT] Restarting ECDH handshake to resynchronize Chain Ratchet...');
+            debugLog('[RECONNECT] Restarting ECDH handshake to resynchronize Chain Ratchet...');
 
             // Check if we had a verified identity before reconnect
             const hadVerifiedIdentity = this.identityManager && this.identityManager.isSASVerified();
@@ -815,7 +815,7 @@ document.addEventListener('alpine:init', () => {
             if (this.identityManager) {
                 // Store previous peer identity to detect MITM on reconnect
                 this.identityManager.previousPeerIdentity = previousPeerIdentity;
-                console.log('[RECONNECT] Keeping identity manager alive (SAS verified:', hadVerifiedIdentity, ')');
+                debugLog('[RECONNECT] Keeping identity manager alive (SAS verified:', hadVerifiedIdentity, ')');
             }
 
             // Reset Chain Ratchet to bootstrap key
@@ -831,7 +831,7 @@ document.addEventListener('alpine:init', () => {
             if (this.roomType === 'onetoone' && this.participantCount === 2) {
                 await this.startECDHHandshake();
             } else {
-                console.log('[RECONNECT] Room not ready for handshake (roomType:', this.roomType, 'participantCount:', this.participantCount, ')');
+                debugLog('[RECONNECT] Room not ready for handshake (roomType:', this.roomType, 'participantCount:', this.participantCount, ')');
             }
         },
 
@@ -841,7 +841,7 @@ document.addEventListener('alpine:init', () => {
         async handleECDHPublicKey(message) {
             // Ignore our own ECDH public key echo (server broadcasts to all including sender)
             if (message.sender_id === this.userId) {
-                console.log('[ECDH] Ignoring own public key echo');
+                debugLog('[ECDH] Ignoring own public key echo');
                 return;
             }
 
@@ -867,7 +867,7 @@ document.addEventListener('alpine:init', () => {
             // Clear pending key if any (we're processing it now)
             this.pendingECDHKey = null;
 
-            console.log('[ECDH] Received other public key');
+            debugLog('[ECDH] Received other public key');
 
             try {
                 // SECURITY: Parse JSON payload (contains AAD context)
@@ -907,7 +907,7 @@ document.addEventListener('alpine:init', () => {
                         this.identityManager.sasVerified = false;
                         this.addSystemMessage('⚠️ WARNING: Contact\'s identity key changed! Please re-verify the security code.');
                     } else {
-                        console.log('[SECURITY] ✅ Peer identity key unchanged - SAS verification persists');
+                        debugLog('[SECURITY] ✅ Peer identity key unchanged - SAS verification persists');
                     }
                     // Clear previous peer identity after comparison
                     this.identityManager.previousPeerIdentity = null;
@@ -920,7 +920,7 @@ document.addEventListener('alpine:init', () => {
                 // This ensures both parties agree on roles without additional communication
                 const otherUserId = message.sender_id;
                 const isInitiator = this.userId < otherUserId;
-                console.log(`[ECDH] Role determination: ${isInitiator ? 'Initiator' : 'Responder'} (my ID: ${this.userId}, other ID: ${otherUserId})`);
+                debugLog(`[ECDH] Role determination: ${isInitiator ? 'Initiator' : 'Responder'} (my ID: ${this.userId}, other ID: ${otherUserId})`);
 
                 // Initialize Double Ratchet (PFS + PCS) with identity manager and ECDH keypairs
                 await window.cryptoManager.initializeDoubleRatchet(
@@ -939,7 +939,7 @@ document.addEventListener('alpine:init', () => {
                 // Show the SAS modal only when verification is still required
                 // If the identity persisted and was verified, skip the modal because the SAS carries over
                 if (this.identityManager && this.identityManager.isSASVerified()) {
-                    console.log('[SECURITY] ✅ SAS already verified from previous handshake - skipping modal');
+                    debugLog('[SECURITY] ✅ SAS already verified from previous handshake - skipping modal');
                     this.sasVerificationStatus = 'verified';
                 } else {
                     this.sasVerificationStatus = 'pending';  // Show verification modal
@@ -966,9 +966,9 @@ document.addEventListener('alpine:init', () => {
                 this.ecdhHandshakeStatus = 'complete';
                 this.pfsActive = true;
 
-                console.log('[ECDH] ✅ Handshake complete');
-                console.log('[ECDH] 🔐 Double Ratchet active (PFS + PCS)');
-                console.log('[ECDH] SAS (for verification):', this.sas);
+                debugLog('[ECDH] ✅ Handshake complete');
+                debugLog('[ECDH] 🔐 Double Ratchet active (PFS + PCS)');
+                debugLog('[ECDH] SAS (for verification):', this.sas);
 
                 this.addSystemMessage('🔐 Secure connection established (Double Ratchet active - PFS + PCS)');
 
@@ -1063,7 +1063,7 @@ document.addEventListener('alpine:init', () => {
          * Handles SAS verification success (user clicked "Verified")
          */
         handleSasVerified() {
-            console.log('[SECURITY] SAS code verified by user - connection is secure');
+            debugLog('[SECURITY] SAS code verified by user - connection is secure');
 
             // Mark SAS as verified in identity manager (persists for session)
             if (this.identityManager) {
@@ -1082,7 +1082,7 @@ document.addEventListener('alpine:init', () => {
          * Handles user skipping SAS verification (user clicked "I don't want to verify")
          */
         handleSasSkipped() {
-            console.log('[SECURITY] SAS verification skipped by user');
+            debugLog('[SECURITY] SAS verification skipped by user');
 
             // Close SAS verification dialog
             this.sas = null;
@@ -1099,7 +1099,7 @@ document.addEventListener('alpine:init', () => {
             if (this.sasBackup) {
                 this.sas = this.sasBackup;
                 this.sasVerificationStatus = 'pending';
-                console.log('[SECURITY] Reopening SAS verification modal');
+                debugLog('[SECURITY] Reopening SAS verification modal');
             }
         },
 

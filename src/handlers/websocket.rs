@@ -85,6 +85,17 @@ pub async fn ws_handler(
         return (StatusCode::FORBIDDEN, "Token not valid for this room").into_response();
     }
 
+    // SECURITY: Single-use token enforcement (prevents replay attacks)
+    // Token can only be used once within its validity window
+    if !state.consume_token(claims.jti, state.config.jwt_token_ttl_secs as u64) {
+        tracing::warn!(
+            "JWT token replay attempt detected: jti={}, room={}",
+            claims.jti,
+            room_id
+        );
+        return (StatusCode::FORBIDDEN, "Token already used").into_response();
+    }
+
     tracing::info!(
         "WebSocket upgrade authenticated for room {} (connection_id: {})",
         room_id,

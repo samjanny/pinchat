@@ -87,7 +87,7 @@ class DoubleRatchet {
         }
 
         this.isInitiator = isInitiator;
-        console.log(`[DoubleRatchet] Initializing (role: ${isInitiator ? 'initiator' : 'responder'})...`);
+        debugLog(`[DoubleRatchet] Initializing (role: ${isInitiator ? 'initiator' : 'responder'})...`);
 
         // Derive initial root key from shared secret using HKDF
         this.rootKey = await this.hkdf(sharedSecret, new Uint8Array(32), 'DoubleRatchet-RootKey', 32);
@@ -95,7 +95,7 @@ class DoubleRatchet {
         // Store initial DH state from handshake
         if (myKeypair) {
             this.DHs = myKeypair;
-            console.log('[DoubleRatchet] Using provided ECDH keypair');
+            debugLog('[DoubleRatchet] Using provided ECDH keypair');
         } else {
             // Generate new keypair if not provided (backward compatibility)
             this.DHs = await crypto.subtle.generateKey(
@@ -103,7 +103,7 @@ class DoubleRatchet {
                 true,
                 ['deriveKey', 'deriveBits']
             );
-            console.log('[DoubleRatchet] Generated new ECDH keypair');
+            debugLog('[DoubleRatchet] Generated new ECDH keypair');
         }
 
         // Signal Protocol: Only INITIATOR stores peer's public key
@@ -111,11 +111,11 @@ class DoubleRatchet {
         if (isInitiator && theirPublicKey) {
             this.DHr = theirPublicKey;
             this.DHrRaw = await crypto.subtle.exportKey('raw', theirPublicKey);
-            console.log('[DoubleRatchet] Initiator: Stored peer public key as DHr');
+            debugLog('[DoubleRatchet] Initiator: Stored peer public key as DHr');
         } else {
             this.DHr = null;
             this.DHrRaw = null;
-            console.log('[DoubleRatchet] Responder: DHr is null (first message will trigger ratchet)');
+            debugLog('[DoubleRatchet] Responder: DHr is null (first message will trigger ratchet)');
         }
 
         // Role-based chain derivation for proper symmetry:
@@ -141,8 +141,8 @@ class DoubleRatchet {
         this.PN = 0;
         this.ratchetCount = 0;
 
-        console.log('[DoubleRatchet] ✅ Initialized with root key + bidirectional chains');
-        console.log('[DoubleRatchet] ✅ DH ratchet will trigger automatically on direction change');
+        debugLog('[DoubleRatchet] ✅ Initialized with root key + bidirectional chains');
+        debugLog('[DoubleRatchet] ✅ DH ratchet will trigger automatically on direction change');
     }
 
     /**
@@ -168,7 +168,7 @@ class DoubleRatchet {
         // Signal Protocol: Do DH ratchet before sending if we have DHr but haven't ratcheted yet
         // This triggers the first ratchet when responder sends their first message
         if (this.DHr && !this.hasRatchetedSinceReceive) {
-            console.log('[DoubleRatchet] 🔄 Performing send-side DH ratchet (direction change)...');
+            debugLog('[DoubleRatchet] 🔄 Performing send-side DH ratchet (direction change)...');
             await this.performSendSideDHRatchet();
         }
 
@@ -228,7 +228,7 @@ class DoubleRatchet {
         // Increment sending counter
         this.Ns++;
 
-        console.log(`[DoubleRatchet] Message encrypted #${messageNumber} (ratchet: ${this.ratchetCount})`);
+        debugLog(`[DoubleRatchet] Message encrypted #${messageNumber} (ratchet: ${this.ratchetCount})`);
 
         // Return message with header containing DH public key
         // The header allows the receiver to perform DH ratchet if needed
@@ -266,7 +266,7 @@ class DoubleRatchet {
         // Extract header fields
         const { dh: dhPublicKeyBase64, pn: prevChainLength, n: messageNumber, rc: ratchetCount } = header;
 
-        console.log(`[DoubleRatchet] Attempting to decrypt message #${messageNumber} (ratchet: ${ratchetCount})...`);
+        debugLog(`[DoubleRatchet] Attempting to decrypt message #${messageNumber} (ratchet: ${ratchetCount})...`);
 
         // Check if this is a NEW DH public key (triggers DH ratchet)
         const dhPublicKeyRaw = this.base64urlToArrayBuffer(dhPublicKeyBase64);
@@ -277,7 +277,7 @@ class DoubleRatchet {
             // Responder receiving first message from initiator
             // Don't do DH ratchet - just store their public key and use initial chains
             // The initial receivingChain (from handshake) matches initiator's sendingChain
-            console.log('[DoubleRatchet] First message received - storing DHr (no ratchet yet)');
+            debugLog('[DoubleRatchet] First message received - storing DHr (no ratchet yet)');
 
             const newDHr = await crypto.subtle.importKey(
                 'raw',
@@ -292,9 +292,9 @@ class DoubleRatchet {
             // Mark that we need to do a send-side DH ratchet before our next send
             this.hasRatchetedSinceReceive = false;
         } else if (isNewKey) {
-            console.log('[DoubleRatchet] 🔄 New DH public key detected - performing RECEIVE-SIDE DH ratchet...');
-            console.log(`[DoubleRatchet] Old DHr: ${this.arrayBufferToBase64url(this.DHrRaw).substring(0, 20)}...`);
-            console.log(`[DoubleRatchet] New DHr: ${dhPublicKeyBase64.substring(0, 20)}...`);
+            debugLog('[DoubleRatchet] 🔄 New DH public key detected - performing RECEIVE-SIDE DH ratchet...');
+            debugLog(`[DoubleRatchet] Old DHr: ${this.arrayBufferToBase64url(this.DHrRaw).substring(0, 20)}...`);
+            debugLog(`[DoubleRatchet] New DHr: ${dhPublicKeyBase64.substring(0, 20)}...`);
 
             // Skip message keys for out-of-order messages from previous chain
             if (this.receivingChain && prevChainLength > this.Nr) {
@@ -307,9 +307,9 @@ class DoubleRatchet {
             // After receive-side ratchet, we DON'T need another send-side ratchet
             // because performDHRatchetOnReceive already generates new DHs and sendingChain
             this.hasRatchetedSinceReceive = true;
-            console.log('[DoubleRatchet] ✅ Receive-side ratchet complete - new sendingChain ready for reply');
+            debugLog('[DoubleRatchet] ✅ Receive-side ratchet complete - new sendingChain ready for reply');
         } else {
-            console.log('[DoubleRatchet] Same DH public key - no ratchet needed');
+            debugLog('[DoubleRatchet] Same DH public key - no ratchet needed');
         }
 
         // Try to decrypt with current receiving chain
@@ -322,7 +322,7 @@ class DoubleRatchet {
             if (this.skippedKeys.has(skippedKeyId)) {
                 messageKey = this.skippedKeys.get(skippedKeyId);
                 this.skippedKeys.delete(skippedKeyId);
-                console.log(`[DoubleRatchet] Using skipped key for message #${messageNumber}`);
+                debugLog(`[DoubleRatchet] Using skipped key for message #${messageNumber}`);
             } else {
                 messageKey = await this.receivingChain.deriveMessageKeyForCounter(messageNumber);
             }
@@ -353,7 +353,7 @@ class DoubleRatchet {
             );
 
         } catch (error) {
-            console.error('[DoubleRatchet] Decryption failed:', error);
+            debugError('[DoubleRatchet] Decryption failed:', error);
             throw new Error('Message decryption failed - authentication error');
         }
 
@@ -373,7 +373,7 @@ class DoubleRatchet {
         const envelopeJson = decoder.decode(plaintextBytes);
         const envelope = JSON.parse(envelopeJson);
 
-        console.log(`[DoubleRatchet] ✅ Message decrypted #${messageNumber} (ratchet: ${this.ratchetCount})`);
+        debugLog(`[DoubleRatchet] ✅ Message decrypted #${messageNumber} (ratchet: ${this.ratchetCount})`);
 
         return envelope;
     }
@@ -465,9 +465,9 @@ class DoubleRatchet {
         // Increment ratchet count
         this.ratchetCount++;
 
-        console.log(`[DoubleRatchet] ✅ RECEIVE-SIDE DH ratchet #${this.ratchetCount} completed`);
-        console.log('[DoubleRatchet] 🔐 Post-Compromise Security (PCS) checkpoint reached');
-        console.log('[DoubleRatchet] 📤 New sendingChain derived - ready for reply');
+        debugLog(`[DoubleRatchet] ✅ RECEIVE-SIDE DH ratchet #${this.ratchetCount} completed`);
+        debugLog('[DoubleRatchet] 🔐 Post-Compromise Security (PCS) checkpoint reached');
+        debugLog('[DoubleRatchet] 📤 New sendingChain derived - ready for reply');
     }
 
     /**
@@ -528,8 +528,8 @@ class DoubleRatchet {
         // Mark that we've ratcheted
         this.hasRatchetedSinceReceive = true;
 
-        console.log(`[DoubleRatchet] ✅ Send-side DH ratchet #${this.ratchetCount} completed`);
-        console.log('[DoubleRatchet] 🔐 New keypair generated, sending chain updated');
+        debugLog(`[DoubleRatchet] ✅ Send-side DH ratchet #${this.ratchetCount} completed`);
+        debugLog('[DoubleRatchet] 🔐 New keypair generated, sending chain updated');
     }
 
     /**
@@ -557,7 +557,7 @@ class DoubleRatchet {
             this.Nr++;
         }
 
-        console.log(`[DoubleRatchet] Skipped ${until} message keys for out-of-order handling`);
+        debugLog(`[DoubleRatchet] Skipped ${until} message keys for out-of-order handling`);
     }
 
     /**
@@ -599,22 +599,31 @@ class DoubleRatchet {
     }
 
     /**
-     * Compare two Uint8Arrays for equality
+     * Compare two Uint8Arrays for equality (constant-time)
+     *
+     * SECURITY: This implementation is resistant to timing attacks.
+     * It always compares all bytes regardless of where differences occur,
+     * preventing attackers from inferring partial key matches.
+     *
      * @private
      */
     arraysEqual(a, b) {
         if (a.length !== b.length) return false;
+
+        // XOR accumulator - constant-time comparison
+        // All bytes are always compared, result is 0 only if all match
+        let result = 0;
         for (let i = 0; i < a.length; i++) {
-            if (a[i] !== b[i]) return false;
+            result |= a[i] ^ b[i];
         }
-        return true;
+        return result === 0;
     }
 
     /**
      * Destroy Double Ratchet state (session cleanup)
      */
     destroy() {
-        console.log('[DoubleRatchet] Destroying state...');
+        debugLog('[DoubleRatchet] Destroying state...');
 
         // Zero out sensitive key material
         if (this.rootKey) this.rootKey.fill(0);
@@ -627,7 +636,7 @@ class DoubleRatchet {
         this.DHrRaw = null;
         this.skippedKeys.clear();
 
-        console.log('[DoubleRatchet] ✅ State destroyed');
+        debugLog('[DoubleRatchet] ✅ State destroyed');
     }
 
     /**

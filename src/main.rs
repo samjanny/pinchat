@@ -283,6 +283,23 @@ async fn main() {
         tracing::info!("Session cleanup task started (60s interval)");
     }
 
+    // Start consumed JWT tokens cleanup task (single-use enforcement)
+    {
+        let app_state_clone = app_state.clone();
+        let cleanup_interval = 60u64; // Every minute
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(cleanup_interval));
+            loop {
+                interval.tick().await;
+                let cleaned = app_state_clone.cleanup_consumed_tokens();
+                if cleaned > 0 {
+                    tracing::debug!("Cleaned up {} expired consumed tokens", cleaned);
+                }
+            }
+        });
+        tracing::info!("Consumed tokens cleanup task started (60s interval)");
+    }
+
     // Build the router
 
     // Build static file service with optional custom website directory

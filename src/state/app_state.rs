@@ -4,9 +4,11 @@ use crate::models::Room;
 use crate::session::SessionStore;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
+use dashmap::mapref::entry::Entry;
 use rand::RngCore;
 use std::collections::{HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 use uuid::Uuid;
 
 /// Error type for room creation failures
@@ -71,6 +73,11 @@ pub struct AppState {
     /// Secret key for CSRF token signing
     /// Generated randomly on each server boot
     pub csrf_secret: [u8; 32],
+
+    /// Cache of consumed JWT token IDs (jti) for single-use enforcement
+    /// Maps jti -> expiration Instant (for cleanup)
+    /// Prevents token replay attacks within the validity window
+    pub consumed_tokens: Arc<DashMap<Uuid, Instant>>,
 }
 
 impl AppState {
@@ -110,7 +117,44 @@ impl AppState {
             config: Arc::new(config),
             session_store,
             csrf_secret,
+            consumed_tokens: Arc::new(DashMap::new()),
         }
+    }
+
+    /// Attempts to consume a JWT token (single-use enforcement)
+    ///
+    /// Returns true if the token was successfully consumed (first use),
+    /// false if it was already consumed (replay attempt).
+    ///
+    /// # Arguments
+    /// * `jti` - JWT ID to consume
+    /// * `ttl_secs` - Token TTL for cleanup scheduling
+    pub fn consume_token(&self, jti: Uuid, ttl_secs: u64) -> bool {
+        use std::time::Duration;
+
+        let expiration = Instant::now() + Duration::from_secs(ttl_secs);
+
+        // Atomic insert - first writer wins, replays see Occupied immediately
+        match self.consumed_tokens.entry(jti) {
+            Entry::Occupied(_) => false,
+            Entry::Vacant(v) => {
+                v.insert(expiration);
+                true
+            }
+        }
+    }
+
+    /// Cleans up expired consumed tokens
+    ///
+    /// Should be called periodically to prevent memory growth.
+    /// Removes tokens whose expiration time has passed.
+    pub fn cleanup_consumed_tokens(&self) -> usize {
+        let now = Instant::now();
+        let before = self.consumed_tokens.len();
+
+        self.consumed_tokens.retain(|_, expiration| *expiration > now);
+
+        before - self.consumed_tokens.len()
     }
 
     /// Atomically creates a new room with capacity check

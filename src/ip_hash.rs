@@ -162,9 +162,15 @@ pub fn hash_ip(ip: &str, secret: &[u8; 32]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
     #[test]
     fn test_hash_ip_deterministic() {
+        let _env_guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        unsafe { std::env::remove_var("PRIVACY_MODE"); }
+
         let secret = [0u8; 32];
         let ip = "192.168.1.100";
 
@@ -204,7 +210,9 @@ mod tests {
 
     #[test]
     fn test_development_mode() {
-        std::env::set_var("PRIVACY_MODE", "development");
+        let _env_guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        // std::env setters are now unsafe; wrap for explicit opt-in during test
+        unsafe { std::env::set_var("PRIVACY_MODE", "development"); }
 
         let secret = [0u8; 32];
         let ip = "192.168.1.100";
@@ -213,7 +221,7 @@ mod tests {
 
         assert_eq!(result, ip, "Development mode should return cleartext IP");
 
-        std::env::remove_var("PRIVACY_MODE");
+        unsafe { std::env::remove_var("PRIVACY_MODE"); }
     }
 
     #[test]

@@ -69,7 +69,7 @@ class ECDHKeyExchange {
      * @returns {Promise<CryptoKeyPair>}
      */
     async generateKeypair() {
-        console.log('[ECDH] Generating P-256 keypair...');
+        debugLog('[ECDH] Generating P-256 keypair...');
 
         this.keyPair = await crypto.subtle.generateKey(
             {
@@ -80,7 +80,7 @@ class ECDHKeyExchange {
             ['deriveKey', 'deriveBits']  // Add 'deriveBits' for Chain Ratchet raw key export
         );
 
-        console.log('[ECDH] ✅ Keypair generated (ephemeral)');
+        debugLog('[ECDH] ✅ Keypair generated (ephemeral)');
         return this.keyPair;
     }
 
@@ -111,8 +111,8 @@ class ECDHKeyExchange {
             throw new Error('roomId and myConnectionId required for AAD binding');
         }
 
-        console.log('[ECDH] Exporting and encrypting public key with AAD context binding...');
-        console.log(`[ECDH] Context: roomId=${roomId}, myConnectionId=${myConnectionId}`);
+        debugLog('[ECDH] Exporting and encrypting public key with AAD context binding...');
+        debugLog(`[ECDH] Context: roomId=${roomId}, myConnectionId=${myConnectionId}`);
 
         // Export ephemeral public key to raw format
         const publicKeyRaw = await crypto.subtle.exportKey(
@@ -121,9 +121,9 @@ class ECDHKeyExchange {
         );
 
         // Sign the ephemeral public key with the identity private key
-        console.log('[ECDH] Signing ephemeral public key with identity key...');
+        debugLog('[ECDH] Signing ephemeral public key with identity key...');
         const signature = await this.identityManager.sign(publicKeyRaw);
-        console.log('[ECDH] ✅ Ephemeral key signed (MITM protection active)');
+        debugLog('[ECDH] ✅ Ephemeral key signed (MITM protection active)');
 
         // Export the identity public key alongside the ephemeral material
         const identityPublicKeyRaw = await this.identityManager.exportIdentityPublicKey();
@@ -150,7 +150,7 @@ class ECDHKeyExchange {
             {type: AAD_FIELD_TYPES.NONCE, value: nonce}
         ]);
 
-        console.log(`[ECDH] AAD length: ${aad.length} bytes (TLV-encoded: roomId + connectionId + timestamp + nonce)`);
+        debugLog(`[ECDH] AAD length: ${aad.length} bytes (TLV-encoded: roomId + connectionId + timestamp + nonce)`);
 
         // Encrypt public key with bootstrap key + AAD
         const ciphertext = await crypto.subtle.encrypt(
@@ -186,9 +186,9 @@ class ECDHKeyExchange {
             nonce: this.myNonce
         };
 
-        console.log('[ECDH] ✅ Public key encrypted with AAD binding + identity key + signature');
-        console.log(`[ECDH] Timestamp: ${timestamp}, Nonce: ${result.nonce.substring(0, 16)}...`);
-        console.log(`[ECDH] Identity public key: ${identityPublicKey.substring(0, 20)}...`);
+        debugLog('[ECDH] ✅ Public key encrypted with AAD binding + identity key + signature');
+        debugLog(`[ECDH] Timestamp: ${timestamp}, Nonce: ${result.nonce.substring(0, 16)}...`);
+        debugLog(`[ECDH] Identity public key: ${identityPublicKey.substring(0, 20)}...`);
 
         return result;
     }
@@ -222,15 +222,15 @@ class ECDHKeyExchange {
             throw new Error('Signal Protocol requires: identityPublicKey, signature');
         }
 
-        console.log('[ECDH] Decrypting other public key with AAD validation...');
-        console.log(`[ECDH] Expected context: roomId=${expectedRoomId}, sender=${senderConnectionId}`);
-        console.log(`[ECDH] Timestamp: ${timestamp}, Nonce: ${nonceBase64url.substring(0, 16)}...`);
+        debugLog('[ECDH] Decrypting other public key with AAD validation...');
+        debugLog(`[ECDH] Expected context: roomId=${expectedRoomId}, sender=${senderConnectionId}`);
+        debugLog(`[ECDH] Timestamp: ${timestamp}, Nonce: ${nonceBase64url.substring(0, 16)}...`);
 
         // Import peer's identity public key for signature verification
-        console.log('[ECDH] Importing peer identity public key...');
+        debugLog('[ECDH] Importing peer identity public key...');
         const identityPublicKeyRaw = this.base64urlToArrayBuffer(identityPublicKeyBase64);
         await this.identityManager.importPeerIdentityPublicKey(identityPublicKeyRaw);
-        console.log('[ECDH] ✅ Peer identity public key imported');
+        debugLog('[ECDH] ✅ Peer identity public key imported');
 
         // SECURITY: Validate timestamp freshness (max 60 seconds age)
         const now = Date.now();
@@ -246,7 +246,7 @@ class ECDHKeyExchange {
             throw new Error(`ECDH timestamp too old (age: ${age}ms, max: ${MAX_AGE_MS}ms) - possible replay attack`);
         }
 
-        console.log(`[ECDH] ✅ Timestamp freshness validated (age: ${age}ms)`);
+        debugLog(`[ECDH] ✅ Timestamp freshness validated (age: ${age}ms)`);
 
         // Decode nonce from Base64url
         const nonce = this.base64urlToArrayBuffer(nonceBase64url);
@@ -267,7 +267,7 @@ class ECDHKeyExchange {
             {type: AAD_FIELD_TYPES.NONCE, value: nonce}
         ]);
 
-        console.log(`[ECDH] AAD reconstructed (${aad.length} bytes, TLV-encoded)`);
+        debugLog(`[ECDH] AAD reconstructed (${aad.length} bytes, TLV-encoded)`);
 
         // Decode from Base64url
         const combined = this.base64urlToArrayBuffer(encryptedPublicKey);
@@ -289,23 +289,23 @@ class ECDHKeyExchange {
                 this.bootstrapKey,
                 ciphertext
             );
-            console.log('[ECDH] ✅ AAD validation passed (context matches)');
+            debugLog('[ECDH] ✅ AAD validation passed (context matches)');
         } catch (error) {
-            console.error('[ECDH] ❌ AAD validation failed:', error);
+            debugError('[ECDH] ❌ AAD validation failed:', error);
             throw new Error('ECDH AAD validation failed - possible cross-context replay attack or wrong room/sender');
         }
 
         // Verify the signature on the ephemeral public key
         // This is the CRITICAL MITM detection step - if signature verification fails,
         // an attacker has attempted to substitute the ephemeral key
-        console.log('[ECDH] Verifying signature on ephemeral public key...');
+        debugLog('[ECDH] Verifying signature on ephemeral public key...');
         const signature = this.base64urlToArrayBuffer(signatureBase64);
 
         try {
             await this.identityManager.verify(publicKeyRaw, signature);
-            console.log('[ECDH] ✅ Signature verified - ephemeral key authenticated (MITM protection)');
+            debugLog('[ECDH] ✅ Signature verified - ephemeral key authenticated (MITM protection)');
         } catch (error) {
-            console.error('[ECDH] ❌ SIGNATURE VERIFICATION FAILED:', error);
+            debugError('[ECDH] ❌ SIGNATURE VERIFICATION FAILED:', error);
             throw new Error('🚨 MITM ATTACK DETECTED - Ephemeral key signature is invalid');
         }
 
@@ -321,7 +321,7 @@ class ECDHKeyExchange {
             []
         );
 
-        console.log('[ECDH] ✅ Other public key decrypted and imported');
+        debugLog('[ECDH] ✅ Other public key decrypted and imported');
         return this.otherPublicKey;
     }
 
@@ -347,7 +347,7 @@ class ECDHKeyExchange {
             throw new Error('ECDH keypair or other public key missing');
         }
 
-        console.log('[ECDH] Deriving session key material from shared secret...');
+        debugLog('[ECDH] Deriving session key material from shared secret...');
 
         // Derive shared secret using ECDH (as raw bits, not CryptoKey)
         const sharedSecretBits = await crypto.subtle.deriveBits(
@@ -364,8 +364,8 @@ class ECDHKeyExchange {
 
         this.handshakeComplete = true;
 
-        console.log('[ECDH] ✅ Session key material derived (32 bytes)');
-        console.log('[ECDH] 🔐 Ready for Chain Ratchet initialization');
+        debugLog('[ECDH] ✅ Session key material derived (32 bytes)');
+        debugLog('[ECDH] 🔐 Ready for Chain Ratchet initialization');
 
         return sessionKeyMaterial;
     }
@@ -378,7 +378,7 @@ class ECDHKeyExchange {
      * Messages still have Perfect Forward Secrecy via Chain Ratchet.
      */
     deleteBootstrapKey() {
-        console.log('[ECDH] Bootstrap key marked as inactive (Chain Ratchet now active)');
+        debugLog('[ECDH] Bootstrap key marked as inactive (Chain Ratchet now active)');
         // NOTE: We intentionally do NOT delete this.bootstrapKey to support multiple handshakes
         // this.bootstrapKey = null;  // ← Commented out to support re-handshaking
     }
@@ -405,7 +405,7 @@ class ECDHKeyExchange {
             throw new Error('[ECDH] Cannot destroy keys before handshake completion');
         }
 
-        console.log('[ECDH] 🔥 Destroying ephemeral keys (PFS requirement)');
+        debugLog('[ECDH] 🔥 Destroying ephemeral keys (PFS requirement)');
 
         // Nullify ECDH keypair (prevents session key re-derivation)
         this.keyPair = null;
@@ -420,7 +420,7 @@ class ECDHKeyExchange {
         // Mark as destroyed to prevent accidental re-use
         this.keysDestroyed = true;
 
-        console.log('[ECDH] ✅ Ephemeral keys destroyed - PFS guaranteed');
+        debugLog('[ECDH] ✅ Ephemeral keys destroyed - PFS guaranteed');
     }
 
     /**
@@ -491,8 +491,8 @@ class ECDHKeyExchange {
             throw new Error('roomId required for SAS context binding');
         }
 
-        console.log('[ECDH] Generating SAS with PBKDF2 (48-bit, 100K iterations)...');
-        console.log('[ECDH] Using IDENTITY KEYS (not ephemeral keys) for SAS');
+        debugLog('[ECDH] Generating SAS with PBKDF2 (48-bit, 100K iterations)...');
+        debugLog('[ECDH] Using IDENTITY KEYS (not ephemeral keys) for SAS');
 
         // Export identity public keys (non-ephemeral)
         const myPublicKeyRaw = await crypto.subtle.exportKey('raw', this.identityManager.identityKeyPair.publicKey);
@@ -545,7 +545,7 @@ class ECDHKeyExchange {
         salt.set(timestamp1Bytes, offset); offset += timestamp1Bytes.length;
         salt.set(timestamp2Bytes, offset);
 
-        console.log(`[ECDH] PBKDF2 salt length: ${salt.length} bytes (roomId + sorted nonces + sorted timestamps)`);
+        debugLog(`[ECDH] PBKDF2 salt length: ${salt.length} bytes (roomId + sorted nonces + sorted timestamps)`);
 
         // Import combined keys as PBKDF2 base key
         const baseKey = await crypto.subtle.importKey(
@@ -584,7 +584,7 @@ class ECDHKeyExchange {
             iterations: iterations
         };
 
-        console.log('[ECDH] ✅ SAS generated (48-bit, PBKDF2 100K):', sasObject);
+        debugLog('[ECDH] ✅ SAS generated (48-bit, PBKDF2 100K):', sasObject);
         return sasObject;
     }
 
@@ -593,11 +593,11 @@ class ECDHKeyExchange {
      * @param {Function} onTimeout - Callback if handshake times out
      */
     startTimeout(onTimeout) {
-        console.log(`[ECDH] Starting handshake timeout (${this.HANDSHAKE_TIMEOUT_MS}ms)...`);
+        debugLog(`[ECDH] Starting handshake timeout (${this.HANDSHAKE_TIMEOUT_MS}ms)...`);
 
         this.handshakeTimeout = setTimeout(() => {
             if (!this.handshakeComplete) {
-                console.warn('[ECDH] ⏱️ Handshake timeout - falling back to bootstrap key');
+                debugWarn('[ECDH] ⏱️ Handshake timeout - falling back to bootstrap key');
                 onTimeout();
             }
         }, this.HANDSHAKE_TIMEOUT_MS);

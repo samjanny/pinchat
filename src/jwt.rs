@@ -32,6 +32,10 @@ pub struct WsTokenClaims {
     /// Expiration timestamp (Unix epoch seconds)
     /// Tokens are short-lived (30 seconds) to prevent reuse
     pub exp: u64,
+
+    /// JWT ID for single-use enforcement
+    /// Prevents token replay attacks within the validity window
+    pub jti: Uuid,
 }
 
 impl WsTokenClaims {
@@ -50,6 +54,7 @@ impl WsTokenClaims {
             room_id,
             connection_id: Uuid::new_v4(),
             exp: now + (ttl_secs as u64),
+            jti: Uuid::new_v4(),
         }
     }
 }
@@ -135,6 +140,7 @@ mod tests {
             room_id,
             connection_id: Uuid::new_v4(),
             exp: 1, // January 1, 1970
+            jti: Uuid::new_v4(),
         };
 
         let token = sign_token(&expired_claims, &secret).expect("Failed to sign");
@@ -142,5 +148,15 @@ mod tests {
         // Verify should fail due to expiration
         let result = verify_token(&token, &secret);
         assert!(result.is_err(), "Should fail with expired token");
+    }
+
+    #[test]
+    fn test_token_has_unique_jti() {
+        let room_id = Uuid::new_v4();
+        let claims1 = WsTokenClaims::new(room_id, 30);
+        let claims2 = WsTokenClaims::new(room_id, 30);
+
+        // Each token should have a unique JTI
+        assert_ne!(claims1.jti, claims2.jti, "JTI should be unique per token");
     }
 }
