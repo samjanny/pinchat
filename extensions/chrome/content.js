@@ -41,6 +41,7 @@ const ALLOWED_PATHS = [
     '/static/js/emoji.js',
     '/static/js/homepage.js',
     '/static/js/identity.js',
+    '/static/js/legal.js',
     '/static/js/login.js',
     '/static/js/nicknames.js',
     '/static/js/pow.js',

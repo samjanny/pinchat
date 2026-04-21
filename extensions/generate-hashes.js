@@ -35,6 +35,7 @@ const JS_CSS_FILES = [
   '/static/js/emoji.js',
   '/static/js/homepage.js',
   '/static/js/identity.js',
+  '/static/js/legal.js',
   '/static/js/login.js',
   '/static/js/nicknames.js',
   '/static/js/pow.js',
@@ -46,7 +47,9 @@ const JS_CSS_FILES = [
 const HTML_FILES = [
   '/static/index.html',
   '/static/login.html',
-  '/static/chat.html'
+  '/static/chat.html',
+  '/static/terms.html',
+  '/static/privacy.html'
 ];
 
 /**

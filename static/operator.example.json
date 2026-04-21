@@ -1,0 +1,20 @@
+{
+    "_comment": "Example operator config for the legal pages. Copy this file to your WEBSITE_DIR (NOT into the public repo!) as 'operator.json' and fill in your real values. It is intentionally NOT covered by the signed manifest: it is deployment-specific data. Only strings; no HTML or code.",
+
+    "OPERATOR_NAME": "Jane Doe",
+    "OPERATOR_EMAIL_SUPPORT": "support@example.com",
+    "OPERATOR_EMAIL_ABUSE": "abuse@example.com",
+    "OPERATOR_PEC": "jane.doe@pec.example.it",
+
+    "OPERATOR_COUNTRY": "Italy",
+    "OPERATOR_COUNTRY_ADJECTIVE": "Italian",
+    "OPERATOR_DPA_NAME": "Garante per la protezione dei dati personali",
+    "OPERATOR_DPA_URL": "https://www.garanteprivacy.it/",
+
+    "OPERATOR_HOSTING_PROVIDER": "ExampleCloud",
+    "OPERATOR_HOSTING_NOTE": "The hosting VM is located in the European Economic Area; no international transfer applies.",
+
+    "OPERATOR_LOG_RETENTION": "Reverse-proxy access logs (IP, User-Agent, timestamp, URL path) are retained for 24 hours and then rotated out.",
+
+    "LAST_UPDATED": "2026-04-21"
+}

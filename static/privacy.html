@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Privacy Policy — PinChat</title>
+    <meta name="robots" content="noindex, nofollow">
+    <link rel="stylesheet" href="/static/css/style.css" integrity="sha256-9mEYKcEyT58Nd2SavZaADM5GdAEt42IOWhrdLzEsYcs=" crossorigin="anonymous" >
+    <script src="/static/js/theme.js" integrity="sha256-vc83MC35lVoXBnYkFcbi+cE5EgJ+drCEfcjEryWT40A=" crossorigin="anonymous" ></script>
+    <script src="/static/js/legal.js" integrity="sha256-7WjrF4GlIj5wNAQARsHeVKAkDjLbLkZ/lo7hUKxPjeE=" crossorigin="anonymous" ></script>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>Privacy Policy</h1>
+            <p class="subtitle">Last updated: <span data-legal="LAST_UPDATED">not set</span></p>
+        </header>
+
+        <main>
+            <div class="card">
+                <p>This policy explains what personal data is processed when you use PinChat ("the Service"), for what purposes, and on what legal basis under the EU General Data Protection Regulation (Regulation (EU) 2016/679, "GDPR").</p>
+
+                <h2 style="margin-top:1.75rem">1. Data Controller</h2>
+                <p><strong><span data-legal="OPERATOR_NAME">the Operator</span></strong> (the "Controller") operates the Service as a natural person based in <span data-legal="OPERATOR_COUNTRY">the Operator's country</span>. General contact: <a data-legal-mailto="OPERATOR_EMAIL_SUPPORT" href="#"><span data-legal="OPERATOR_EMAIL_SUPPORT">(support contact not configured)</span></a>. For formal or legally binding communications (including data-subject requests under GDPR Chapter III), please use the Controller's certified electronic mail channel, where available: <a data-legal-mailto="OPERATOR_PEC" href="#"><span data-legal="OPERATOR_PEC">(no certified contact configured)</span></a>.</p>
+                <p>No Data Protection Officer is required under Article 37 GDPR for this Service as it is currently operated.</p>
+
+                <h2 style="margin-top:1.75rem">2. Data We Process, and Data We Do Not</h2>
+                <p>PinChat is designed to minimise data processing. What the Service processes and for how long:</p>
+                <ul style="padding-left:1.25rem;margin-top:0.5rem">
+                    <li><strong>IP address and User-Agent string</strong> — unavoidable technical metadata exposed by any HTTPS request. The application itself does not log access in production (strict privacy mode); however, the <em>hosting provider</em> and any reverse proxy in front of the application may retain access logs containing IP and User-Agent for security and abuse-investigation purposes. See §5 for retention.</li>
+                    <li><strong>Session cookie (<code>pinchat_session</code>)</strong> — a random, server-side session identifier set after successful login. Strictly necessary for authenticated access; not shared with third parties. HttpOnly, Secure, SameSite=Strict.</li>
+                    <li><strong>CSRF cookie</strong> — a short-lived, HMAC-signed token used to protect the login form against cross-site request forgery. Strictly necessary; cleared immediately after login.</li>
+                    <li><strong>Room metadata</strong> (room UUID, type, time-to-live, max participants, participant count) — held exclusively in server memory for the life of the room; never written to disk. Deleted automatically when the room expires or becomes empty.</li>
+                    <li><strong>Proof-of-Work challenge cache</strong> — an HMAC over your IP address, stored in memory for a few minutes, used to rate-limit room creation and WebSocket token issuance. Deleted on challenge consumption or expiry.</li>
+                </ul>
+                <p style="margin-top:0.75rem">What the Service does <strong>not</strong> process:</p>
+                <ul style="padding-left:1.25rem;margin-top:0.5rem">
+                    <li><strong>Message content.</strong> Messages are end-to-end encrypted in your browser with a symmetric key that never leaves your device (it is transmitted to other participants only through the room URL fragment, which is never sent to the server by design). The Controller cannot read your messages and does not store them on disk; they live only in server memory for the milliseconds needed to relay them.</li>
+                    <li><strong>Accounts or profile data.</strong> No registration, no name, no phone, no email collected from users of the Service.</li>
+                    <li><strong>Analytics, trackers, or advertising cookies.</strong> None are used.</li>
+                </ul>
+
+                <h2 style="margin-top:1.75rem">3. Purposes and Legal Bases</h2>
+                <ul style="padding-left:1.25rem;margin-top:0.5rem">
+                    <li>Operating the Service and protecting it against abuse (rate limiting, PoW, session authentication) — legal basis: <strong>legitimate interest</strong> (Art. 6(1)(f) GDPR) in providing a functional and secure service.</li>
+                    <li>Responding to abuse reports and valid legal requests — legal basis: <strong>legitimate interest</strong> (Art. 6(1)(f) GDPR) and, where applicable, <strong>legal obligation</strong> (Art. 6(1)(c) GDPR).</li>
+                </ul>
+
+                <h2 style="margin-top:1.75rem">4. Recipients and International Transfers</h2>
+                <p>The only third party that receives technical metadata in the normal course of operation is the <strong>hosting provider</strong> of the virtual machine running the Service: <span data-legal="OPERATOR_HOSTING_PROVIDER">(hosting provider not configured)</span>. <span data-legal="OPERATOR_HOSTING_NOTE">Details about the hosting location, transfer mechanism and, where applicable, the applicable Standard Contractual Clauses or adequacy decision, are provided by the Operator on request.</span></p>
+                <p>No data is shared with advertising networks, analytics providers, or profiling services, because none are in use.</p>
+
+                <h2 style="margin-top:1.75rem">5. Retention</h2>
+                <ul style="padding-left:1.25rem;margin-top:0.5rem">
+                    <li>Rooms and their in-memory metadata: until the TTL you configure (15 minutes to 24 hours) or the last participant disconnects, whichever comes first. No on-disk persistence.</li>
+                    <li>Session cookie: valid for the session duration configured by the Operator (default 24 hours, sliding window), cleared on logout.</li>
+                    <li>Reverse-proxy / hosting-provider access logs: <span data-legal="OPERATOR_LOG_RETENTION">(log retention policy not configured)</span>.</li>
+                    <li>Abuse report correspondence: retained only for as long as needed to investigate and respond to the report.</li>
+                </ul>
+
+                <h2 style="margin-top:1.75rem">6. Your Rights</h2>
+                <p>Under GDPR you have the right to access your personal data, to rectify it, to request erasure, to restrict or object to its processing, and to lodge a complaint with a supervisory authority. Because the Service processes very little personal data and retains most of it only ephemerally in server memory, in practice there is typically no stored record of your usage that can be retrieved beyond what is described in §2.</p>
+                <p>To exercise your rights, contact <a data-legal-mailto="OPERATOR_EMAIL_SUPPORT" href="#"><span data-legal="OPERATOR_EMAIL_SUPPORT">(support contact not configured)</span></a>, or — for a request you want to send through a legally-recognised channel — the Controller's certified mail address <a data-legal-mailto="OPERATOR_PEC" href="#"><span data-legal="OPERATOR_PEC">(no certified contact configured)</span></a>. The competent data-protection supervisory authority for <span data-legal="OPERATOR_COUNTRY">the Operator's country</span> is <a data-legal-href="OPERATOR_DPA_URL" href="#" target="_blank" rel="noopener noreferrer"><span data-legal="OPERATOR_DPA_NAME">(data protection authority not configured)</span></a>.</p>
+
+                <h2 style="margin-top:1.75rem">7. Automated Decision-Making</h2>
+                <p>The Service does not perform profiling or automated decision-making with legal or similarly significant effects within the meaning of Article 22 GDPR.</p>
+
+                <h2 style="margin-top:1.75rem">8. Security</h2>
+                <p>Technical measures in place include: HTTPS/TLS, Argon2id password hashing for beta access, HMAC-signed CSRF tokens with constant-time verification, single-use short-lived JWT tokens for WebSocket upgrade, proof-of-work to limit automated abuse, rate limiting, and end-to-end encryption of message content. The application runs in a container with non-root privileges and dropped Linux capabilities. Despite these measures, as noted on the homepage, the Service has not undergone a formal third-party security audit and may contain vulnerabilities.</p>
+
+                <h2 style="margin-top:1.75rem">9. Changes to This Policy</h2>
+                <p>This policy may be updated to reflect changes in the Service or in applicable law. The "Last updated" date at the top reflects the latest revision. Material changes will be highlighted on the homepage for a reasonable period.</p>
+
+                <h2 style="margin-top:1.75rem">10. Contact</h2>
+                <p>Privacy questions and data subject requests: <a data-legal-mailto="OPERATOR_EMAIL_SUPPORT" href="#"><span data-legal="OPERATOR_EMAIL_SUPPORT">(support contact not configured)</span></a>.<br>
+                Abuse reports: <a data-legal-mailto="OPERATOR_EMAIL_ABUSE" href="#"><span data-legal="OPERATOR_EMAIL_ABUSE">(abuse contact not configured)</span></a>.</p>
+            </div>
+        </main>
+
+        <footer>
+            <p><a href="/">Home</a> · <a href="/static/terms.html">Terms of Service</a> · <a href="https://github.com/samjanny/pinchat" target="_blank" rel="noopener noreferrer">Source on GitHub</a></p>
+        </footer>
+    </div>
+</body>
+</html>
