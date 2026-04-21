@@ -375,7 +375,27 @@ class CryptoManager {
      * @returns {Promise<CryptoKey|null>}
      */
     async extractKeyFromURL() {
-        const fragment = window.location.hash.substring(1);
+        let fragment = window.location.hash.substring(1);
+
+        // Recovery path: websocket.js/homepage.js stash window.location.hash in
+        // sessionStorage before redirecting to /login so the fragment (which carries
+        // the E2E key) never reaches the server. When we return here without a hash,
+        // restore it from sessionStorage and put it back into the URL for any
+        // downstream reader.
+        if (!fragment) {
+            const stashKey = `pinchat_hash:${window.location.pathname}`;
+            const saved = sessionStorage.getItem(stashKey);
+            if (saved) {
+                sessionStorage.removeItem(stashKey);
+                fragment = saved.startsWith('#') ? saved.substring(1) : saved;
+                history.replaceState(
+                    null,
+                    '',
+                    window.location.pathname + window.location.search + '#' + fragment
+                );
+            }
+        }
+
         const params = new URLSearchParams(fragment);
         let keyBase64 = params.get('key');
 

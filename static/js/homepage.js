@@ -92,7 +92,12 @@ document.addEventListener('alpine:init', () => {
             // Authentication required - redirect to login (relative path only)
             if (response.status === 401) {
                 console.log('Authentication required, redirecting to login...');
-                const returnUrl = encodeURIComponent(window.location.pathname + window.location.search + window.location.hash);
+                // SECURITY: never send window.location.hash to the server (could contain
+                // the E2E key on /c/* routes). Stash it in sessionStorage for restoration.
+                if (window.location.hash) {
+                    sessionStorage.setItem(`pinchat_hash:${window.location.pathname}`, window.location.hash);
+                }
+                const returnUrl = encodeURIComponent(window.location.pathname + window.location.search);
                 window.location.href = `/login?redirect=${returnUrl}`;
                 throw new Error('Authentication required');
             }
