@@ -2083,3 +2083,47 @@ footer::before {
         font-size: 16px;
     }
 }
+
+/* Legal pages — minimal article styling within the existing card layout */
+.card h2 {
+    font-size: 1.15rem;
+    font-weight: 600;
+    color: var(--text);
+    margin-top: 1.5rem;
+}
+
+.card p + p {
+    margin-top: 0.75rem;
+}
+
+.card ul li {
+    margin: 0.25rem 0;
+    color: var(--text-medium);
+}
+
+.card a {
+    color: var(--primary);
+}
+
+.card a:hover {
+    color: var(--primary-dark);
+}
+
+/* Login footer — small, centered, unobtrusive */
+.login-footer {
+    margin-top: 2rem;
+    text-align: center;
+    font-size: 0.85rem;
+    color: var(--text-light);
+}
+
+.login-footer a {
+    color: var(--text-light);
+    text-decoration: none;
+    margin: 0 0.1rem;
+}
+
+.login-footer a:hover {
+    color: var(--primary);
+    text-decoration: underline;
+}

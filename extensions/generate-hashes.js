@@ -46,7 +46,9 @@ const JS_CSS_FILES = [
 const HTML_FILES = [
   '/static/index.html',
   '/static/login.html',
-  '/static/chat.html'
+  '/static/chat.html',
+  '/static/terms.html',
+  '/static/privacy.html'
 ];
 
 /**
