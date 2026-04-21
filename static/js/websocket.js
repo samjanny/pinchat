@@ -63,7 +63,14 @@ class WebSocketManager {
             // If 401 Unauthorized, redirect to login with return URL (relative path only)
             if (response.status === 401) {
                 console.log('Authentication required, redirecting to login...');
-                const returnUrl = encodeURIComponent(window.location.pathname + window.location.search + window.location.hash);
+                // SECURITY: Never include window.location.hash in the returnUrl.
+                // The fragment holds the E2E encryption key (#key=...) and must never
+                // leave the client. Stash it in sessionStorage (tab-scoped) so it can
+                // be restored after login; the server-facing redirect carries path+query only.
+                if (window.location.hash) {
+                    sessionStorage.setItem(`pinchat_hash:${window.location.pathname}`, window.location.hash);
+                }
+                const returnUrl = encodeURIComponent(window.location.pathname + window.location.search);
                 window.location.href = `/login?redirect=${returnUrl}`;
                 return null;
             }
@@ -119,7 +126,10 @@ class WebSocketManager {
                     // Handle 401 after PoW (session may have expired)
                     if (response.status === 401) {
                         console.log('Authentication required, redirecting to login...');
-                        const returnUrl = encodeURIComponent(window.location.pathname + window.location.search + window.location.hash);
+                        if (window.location.hash) {
+                            sessionStorage.setItem(`pinchat_hash:${window.location.pathname}`, window.location.hash);
+                        }
+                        const returnUrl = encodeURIComponent(window.location.pathname + window.location.search);
                         window.location.href = `/login?redirect=${returnUrl}`;
                         return null;
                     }
@@ -133,7 +143,10 @@ class WebSocketManager {
                 // Handle 401 (shouldn't reach here, but just in case)
                 if (response.status === 401) {
                     console.log('Authentication required, redirecting to login...');
-                    const returnUrl = encodeURIComponent(window.location.pathname + window.location.search + window.location.hash);
+                    if (window.location.hash) {
+                        sessionStorage.setItem(`pinchat_hash:${window.location.pathname}`, window.location.hash);
+                    }
+                    const returnUrl = encodeURIComponent(window.location.pathname + window.location.search);
                     window.location.href = `/login?redirect=${returnUrl}`;
                     return null;
                 }
