@@ -24,3 +24,6 @@ Thumbs.db
 
 # Imported source tree from legacy private repo (do not commit)
 prichat-main/
+
+# Internal operational runbooks — do not publish by default
+ops/

@@ -122,6 +122,14 @@ async fn add_security_headers(req: axum::extract::Request, next: Next) -> Respon
         HeaderValue::from_static("max-age=31536000; includeSubDomains"),
     );
 
+    // X-Robots-Tag: keep search engines from indexing the service during the beta.
+    // Paired with robots.txt (Disallow: /) and per-page <meta name="robots"> for
+    // defense in depth against crawlers that honour one signal but not the others.
+    headers.insert(
+        header::HeaderName::from_static("x-robots-tag"),
+        HeaderValue::from_static("noindex, nofollow"),
+    );
+
     response
 }
 
@@ -343,6 +351,13 @@ async fn main() {
         .route("/login", post(login_submit).layer(login_rate_limiter))
         // CSRF token API (for static login page)
         .route("/api/csrf", get(get_csrf_token))
+        // Crawler directives: during the beta we tell well-behaved bots to stay away.
+        // The X-Robots-Tag header sent by add_security_headers is the primary control;
+        // robots.txt is the classic companion for bots that only check that file.
+        .route(
+            "/robots.txt",
+            get(|| async { "User-agent: *\nDisallow: /\n" }),
+        )
         // Serve static files (CSS, JS, HTML)
         .nest_service("/static", static_service)
         .with_state(app_state.clone());
