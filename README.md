@@ -332,6 +332,57 @@ See [extensions/README.md](extensions/README.md) for setup and installation inst
 - [SECURITY.md](SECURITY.md) - Detailed threat model and cryptographic specifications
 - [PROTOCOL.md](PROTOCOL.md) - Protocol specification and message formats
 
+## Changelog
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
+Dates are the repository-local commit dates; entries are curated for user-visible impact
+rather than being a 1:1 mirror of `git log`.
+
+### [Unreleased]
+
+#### Added
+- **Proton-style UI refresh** with full light/dark theme toggle. A floating control
+  (top-right on every page) persists the choice in `localStorage`; the OS
+  `prefers-color-scheme` setting is honored when no explicit preference is stored.
+- New design tokens (radius scale, typography scale, softer shadow layers) and an
+  `[data-theme="dark"]` block covering every component.
+
+#### Fixed
+- **E2E encryption key leak via login redirect URL.** When a `/api/ws-token/*` or
+  `/api/rooms` request returned 401, the client previously concatenated
+  `window.location.hash` into the `?redirect=` query parameter. Because the
+  fragment carries the symmetric room key (`#key=…`), this caused the key to be
+  sent to the server — and therefore to any reverse-proxy / CDN / browser-history
+  / `Referer` sink. The redirect now strips the fragment, stashes it in
+  `sessionStorage` (tab-scoped) before navigating, and `extractKeyFromURL()`
+  restores it via `history.replaceState` on the first read after login.
+
+#### Security
+- **Fail-closed startup.** The server now refuses to boot when authentication is
+  not configured unless `ALLOW_ANONYMOUS=true` is set explicitly (outside
+  development), and refuses to boot when `FORCE_HTTP=true` is combined with
+  `FORCE_SECURE_COOKIES` unset in production.
+- `handlers/ws_token.rs`: collapsed three sequential `DashMap` reads into one
+  atomic `get()` to close a read race on room state.
+- `handlers/auth.rs`: stopped logging session IDs, CSRF tokens, and raw cookie
+  headers via `tracing::debug` to avoid secret material reaching log sinks.
+- `jwt.rs` / `handlers/websocket.rs`: widened token TTL from `i64` to `u64`.
+- **Reproducible builds.** Dockerfile pinned to `rust:1.85-bookworm` (was nightly),
+  `Cargo.lock` committed, image built with `cargo build --release --locked`.
+
+### Earlier
+
+- **Extension manifest v1.2.0** with anti-downgrade sequence numbers, ECDSA
+  P-256 signatures, and SRI-in-DOM verification (the extension reads the
+  integrity attributes actually parsed by the browser, not a separate fetch).
+- Comprehensive DoS/DDoS stress-test suite (`stress-tests/`).
+- `WEBSITE_DIR` env var for custom frontends with safe fallback to `/static`.
+- SAS verification entropy raised from 36 to 48 bits.
+- WebSocket heartbeat ping every 30s; non-root container user; fail-closed
+  behaviour on room TTL drift.
+
+See `git log` for a complete per-commit history.
+
 ## License
 
 Copyright 2025 Raffaele Mangiacasale <support@pinchat.io>
