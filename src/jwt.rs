@@ -44,7 +44,7 @@ impl WsTokenClaims {
     /// # Arguments
     /// * `room_id` - Room ID this token is valid for
     /// * `ttl_secs` - Time-to-live in seconds (e.g., 30)
-    pub fn new(room_id: Uuid, ttl_secs: i64) -> Self {
+    pub fn new(room_id: Uuid, ttl_secs: u64) -> Self {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("Time went backwards")
@@ -53,7 +53,7 @@ impl WsTokenClaims {
         Self {
             room_id,
             connection_id: Uuid::new_v4(),
-            exp: now + (ttl_secs as u64),
+            exp: now + ttl_secs,
             jti: Uuid::new_v4(),
         }
     }

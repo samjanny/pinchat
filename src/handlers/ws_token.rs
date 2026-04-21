@@ -157,38 +157,34 @@ pub async fn generate_ws_token(
         }
     }
 
-    // Verify room exists
-    if !state.rooms.contains_key(&room_id) {
+    // Verify room exists and validate state atomically with a single map read
+    // to avoid races between contains/get in concurrent cleanup scenarios.
+    let (room_is_expired, room_is_full) = match state.rooms.get(&room_id) {
+        Some(room) => (room.is_expired(), room.is_full()),
+        None => {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": "Room not found" })),
+            )
+                .into_response());
+        }
+    };
+
+    if room_is_expired {
+        state.remove_room(&room_id);
         return Err((
-            StatusCode::NOT_FOUND,
-            Json(json!({ "error": "Room not found" })),
+            StatusCode::GONE,
+            Json(json!({ "error": "Room has expired" })),
         )
             .into_response());
     }
 
-    // Verify room is not expired
-    {
-        let room = state.rooms.get(&room_id).unwrap();
-        if room.is_expired() {
-            state.remove_room(&room_id);
-            return Err((
-                StatusCode::GONE,
-                Json(json!({ "error": "Room has expired" })),
-            )
-                .into_response());
-        }
-    }
-
-    // Verify room is not full
-    {
-        let room = state.rooms.get(&room_id).unwrap();
-        if room.is_full() {
-            return Err((
-                StatusCode::FORBIDDEN,
-                Json(json!({ "error": "Room is full" })),
-            )
-                .into_response());
-        }
+    if room_is_full {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({ "error": "Room is full" })),
+        )
+            .into_response());
     }
 
     // Generate JWT claims with configurable TTL
@@ -216,6 +212,6 @@ pub async fn generate_ws_token(
     Ok(Json(WsTokenResponse {
         token,
         connection_id,
-        expires_in: ttl_secs as u64,
+        expires_in: ttl_secs,
     }))
 }

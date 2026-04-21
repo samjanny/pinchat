@@ -1,6 +1,7 @@
 # Rust
 target/
-Cargo.lock
+**/Cargo.lock
+!/Cargo.lock
 
 # Certificates (never commit these!)
 certs/
@@ -20,3 +21,6 @@ Thumbs.db
 # Icons
 /extensions/chrome/icons/
 /extensions/firefox/icons/
+
+# Imported source tree from legacy private repo (do not commit)
+prichat-main/

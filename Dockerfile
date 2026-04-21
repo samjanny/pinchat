@@ -1,10 +1,10 @@
 # Build stage
-FROM rustlang/rust:nightly-bookworm AS builder
+FROM rust:1.85-bookworm AS builder
 
 WORKDIR /app
 
 # Copy manifests
-COPY Cargo.toml ./
+COPY Cargo.toml Cargo.lock ./
 
 # Copy source code
 COPY src ./src
@@ -13,7 +13,7 @@ COPY src ./src
 COPY static ./static
 
 # Build for release
-RUN cargo build --release
+RUN cargo build --release --locked
 
 # Runtime stage
 FROM debian:bookworm-slim

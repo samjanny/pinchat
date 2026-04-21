@@ -200,6 +200,23 @@ async fn main() {
     let config = Config::from_env();
     tracing::info!("Configuration loaded: rate limits, PoW difficulty, TTLs");
 
+    // Fail closed by default when authentication is not configured.
+    // Anonymous mode must be explicitly enabled via ALLOW_ANONYMOUS=true
+    // (development mode remains permissive for local workflows).
+    if !config.is_auth_enabled() && !config.allow_anonymous && privacy_mode != "development" {
+        eprintln!("❌ FATAL: Authentication is not configured.");
+        eprintln!("   Set PINCHAT_PASSWORD_HASHES with at least one Argon2id hash, or");
+        eprintln!("   explicitly opt in to anonymous mode with ALLOW_ANONYMOUS=true.");
+        std::process::exit(1);
+    }
+
+    // In reverse-proxy HTTP mode, secure cookies must be forced in production.
+    if config.force_http && !config.force_secure_cookies && privacy_mode != "development" {
+        eprintln!("❌ FATAL: FORCE_HTTP=true requires FORCE_SECURE_COOKIES=true in production.");
+        eprintln!("   This prevents session cookies from being sent over insecure transport.");
+        std::process::exit(1);
+    }
+
     // Initialize the application state
     let app_state = AppState::new(max_rooms, config.clone());
 
@@ -452,7 +469,7 @@ async fn main() {
             tracing::info!("Starting HTTP server on http://{} (FORCE_HTTP=true, TLS handled by reverse proxy)", addr);
             eprintln!("ℹ️  Starting HTTP server (FORCE_HTTP=true)");
             eprintln!("   TLS termination expected to be handled by reverse proxy.");
-            if !config.force_secure_cookies {
+            if !config.force_secure_cookies && privacy_mode == "development" {
                 eprintln!("   ⚠️  FORCE_SECURE_COOKIES not set - cookies may not have Secure flag!");
             }
         } else {

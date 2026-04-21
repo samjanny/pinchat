@@ -87,7 +87,7 @@ pub async fn ws_handler(
 
     // SECURITY: Single-use token enforcement (prevents replay attacks)
     // Token can only be used once within its validity window
-    if !state.consume_token(claims.jti, state.config.jwt_token_ttl_secs as u64) {
+    if !state.consume_token(claims.jti, state.config.jwt_token_ttl_secs) {
         tracing::warn!(
             "JWT token replay attempt detected: jti={}, room={}",
             claims.jti,

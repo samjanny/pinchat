@@ -143,8 +143,7 @@ pub async fn login_submit(
     // Verify CSRF token from cookie matches form field
     let all_cookies = headers.get(header::COOKIE).and_then(|h| h.to_str().ok());
 
-    tracing::debug!("All cookies received: {:?}", all_cookies);
-    tracing::debug!("Form CSRF token: {}", form.csrf_token);
+    tracing::debug!("Processing login submission");
 
     let csrf_cookie = all_cookies.and_then(|cookies| {
         cookies.split(';').find_map(|c| {
@@ -206,9 +205,8 @@ pub async fn login_submit(
 
     let use_secure = should_use_secure_cookies(state.config.force_secure_cookies);
     tracing::info!(
-        "Successful login, session created. Secure cookies: {}, session_id: {}",
-        use_secure,
-        session_id
+        "Successful login, session created. Secure cookies: {}",
+        use_secure
     );
 
     // Create session cookie
@@ -235,9 +233,6 @@ pub async fn login_submit(
 
     let session_cookie_str = session_cookie.to_string();
     let clear_csrf_str = clear_csrf.to_string();
-
-    tracing::debug!("Session cookie header: {}", session_cookie_str);
-    tracing::debug!("Clear CSRF cookie header: {}", clear_csrf_str);
 
     // Determine redirect URL (with security validation)
     // Only allow relative URLs starting with / to prevent open redirect attacks

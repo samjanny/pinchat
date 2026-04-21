@@ -58,7 +58,7 @@ pub struct Config {
 
     // Challenge and token TTLs
     pub challenge_ttl_secs: u64,
-    pub jwt_token_ttl_secs: i64,
+    pub jwt_token_ttl_secs: u64,
 
     // Cleanup intervals
     pub room_cleanup_interval_secs: u64,
@@ -99,6 +99,10 @@ pub struct Config {
     // When set, the server looks for static files here first, then falls back to /static
     // Useful for serving a custom frontend while keeping the default as fallback
     pub website_dir: Option<String>,
+
+    // Explicitly allow anonymous access when no password hashes are configured
+    // SECURITY: defaults to false to avoid accidental fail-open deployments
+    pub allow_anonymous: bool,
 }
 
 impl Config {
@@ -256,6 +260,13 @@ impl Config {
             website_dir: env::var("WEBSITE_DIR")
                 .ok()
                 .filter(|v| !v.trim().is_empty()),
+
+            // Explicitly allow anonymous access (default: false)
+            // Accepts: "true", "1", "yes" (case-insensitive)
+            allow_anonymous: env::var("ALLOW_ANONYMOUS")
+                .ok()
+                .map(|v| matches!(v.to_lowercase().as_str(), "true" | "1" | "yes"))
+                .unwrap_or(false),
         };
 
         // Validate configuration
@@ -314,7 +325,7 @@ impl Config {
         if self.room_token_period_secs == 0 {
             panic!("ROOM_TOKEN_PERIOD_SECS must be greater than 0");
         }
-        if self.msg_rate_window_secs == 0 {
+        if self.msg_rate_window_secs <= 0 {
             panic!("MSG_RATE_WINDOW_SECS must be greater than 0");
         }
 
