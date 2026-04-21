@@ -1,45 +1,134 @@
-/* Reset e variabili - Enterprise Security Design */
+/* Design tokens — Proton-inspired (light by default, dark via [data-theme="dark"]) */
 :root {
-    /* Primary colors - Corporate Trust & Security */
-    --primary: #1e3a8a;          /* Deep navy blue - massima fiducia */
-    --primary-dark: #1e293b;     /* Almost black navy */
-    --primary-light: #3b82f6;    /* Bright blue for accents */
-    --accent: #0ea5e9;           /* Sky blue - tecnologia avanzata */
-    --accent-dark: #0369a1;      /* Darker sky blue */
-    --accent-green: #10b981;     /* Emerald - sicurezza attiva */
+    /* Brand */
+    --primary: #4f46e5;          /* Indigo-600, modern & trust-forward */
+    --primary-dark: #4338ca;     /* Indigo-700 hover */
+    --primary-light: #818cf8;    /* Indigo-400 accents */
+    --accent: #06b6d4;           /* Cyan-500 for info accents */
+    --accent-dark: #0891b2;
+    --accent-green: #10b981;
 
-    /* Semantic colors */
-    --success: #047857;          /* Dark emerald - sicurezza confermata */
-    --success-light: #10b981;    /* Lighter green for badges */
-    --warning: #ea580c;          /* Dark orange - attenzione critica */
-    --warning-dark: #c2410c;     /* Darker orange */
-    --error: #dc2626;            /* Deep red - pericolo massimo */
-    --error-dark: #991b1b;       /* Darker red */
+    /* Semantic */
+    --success: #059669;
+    --success-light: #10b981;
+    --warning: #d97706;
+    --warning-dark: #b45309;
+    --error: #dc2626;
+    --error-dark: #991b1b;
 
-    /* Backgrounds - Professional grays */
-    --bg: #f8fafc;               /* Very light slate - ultra professionale */
-    --bg-secondary: #e2e8f0;     /* Slightly darker slate */
-    --bg-card: #ffffff;          /* Pure white for cards */
-    --bg-dark: #0f172a;          /* Very dark slate - contrasto forte */
-    --bg-dark-secondary: #1e293b;/* Dark slate */
+    /* Surfaces */
+    --bg: #ffffff;               /* page */
+    --bg-secondary: #f5f6fa;     /* subtle surface */
+    --bg-card: #ffffff;          /* elevated card */
+    --bg-dark: #0f172a;          /* legacy token, kept for compat */
+    --bg-dark-secondary: #1e293b;
 
-    /* Text colors */
-    --text: #0f172a;             /* Almost black - massima leggibilità */
-    --text-medium: #334155;      /* Medium slate - strong presence */
-    --text-light: #64748b;       /* Light slate */
-    --text-lighter: #94a3b8;     /* Very light slate */
+    /* Text */
+    --text: #0f1117;
+    --text-medium: #374151;
+    --text-light: #6b7280;
+    --text-lighter: #9ca3af;
 
-    /* Borders - Soft & Professional */
-    --border: #e2e8f0;           /* Light slate border (softened) */
-    --border-medium: #cbd5e1;    /* Medium slate border */
-    --border-strong: #94a3b8;    /* Stronger border (kept for accents only) */
+    /* Borders */
+    --border: #e7e7ee;
+    --border-medium: #d1d5db;
+    --border-strong: #9ca3af;
 
-    /* Shadows - Layered depth for security feel */
-    --shadow-sm: 0 1px 3px rgba(15, 23, 42, 0.12), 0 1px 2px rgba(15, 23, 42, 0.08);
-    --shadow-md: 0 4px 6px rgba(15, 23, 42, 0.15), 0 2px 4px rgba(15, 23, 42, 0.10);
-    --shadow-lg: 0 10px 15px rgba(15, 23, 42, 0.18), 0 4px 6px rgba(15, 23, 42, 0.12);
-    --shadow-xl: 0 20px 25px rgba(15, 23, 42, 0.22), 0 10px 10px rgba(15, 23, 42, 0.15);
-    --shadow-secure: 0 0 0 3px rgba(30, 58, 138, 0.1), 0 4px 6px rgba(15, 23, 42, 0.15);
+    /* Shadows — soft and barely-there */
+    --shadow-sm: 0 1px 2px rgba(15, 17, 23, 0.05);
+    --shadow-md: 0 4px 12px rgba(15, 17, 23, 0.06), 0 1px 2px rgba(15, 17, 23, 0.04);
+    --shadow-lg: 0 10px 24px rgba(15, 17, 23, 0.08), 0 2px 6px rgba(15, 17, 23, 0.04);
+    --shadow-xl: 0 20px 40px rgba(15, 17, 23, 0.10), 0 4px 12px rgba(15, 17, 23, 0.06);
+    --shadow-secure: 0 0 0 3px rgba(79, 70, 229, 0.12), 0 4px 12px rgba(15, 17, 23, 0.06);
+
+    /* Radius */
+    --radius-sm: 6px;
+    --radius-md: 10px;
+    --radius-lg: 14px;
+    --radius-pill: 999px;
+
+    /* Typography */
+    --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI Variable', 'Segoe UI',
+                 system-ui, Roboto, 'Helvetica Neue', Arial, sans-serif;
+    --font-mono: ui-monospace, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace;
+
+    /* Theme toggle color scheme hint for form controls / scrollbars */
+    color-scheme: light;
+}
+
+[data-theme="dark"] {
+    --primary: #818cf8;          /* Indigo-400 — lighter for dark */
+    --primary-dark: #6366f1;
+    --primary-light: #a5b4fc;
+    --accent: #22d3ee;
+    --accent-dark: #06b6d4;
+    --accent-green: #34d399;
+
+    --success: #34d399;
+    --success-light: #6ee7b7;
+    --warning: #f59e0b;
+    --warning-dark: #d97706;
+    --error: #f87171;
+    --error-dark: #ef4444;
+
+    --bg: #0b0d12;
+    --bg-secondary: #13151c;
+    --bg-card: #17191f;
+    --bg-dark: #0b0d12;
+    --bg-dark-secondary: #17191f;
+
+    --text: #ecedf0;
+    --text-medium: #c9ccd4;
+    --text-light: #9ea3b0;
+    --text-lighter: #6b7280;
+
+    --border: #22252e;
+    --border-medium: #2e3240;
+    --border-strong: #4b5563;
+
+    --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
+    --shadow-md: 0 4px 12px rgba(0, 0, 0, 0.45), 0 1px 2px rgba(0, 0, 0, 0.35);
+    --shadow-lg: 0 10px 24px rgba(0, 0, 0, 0.55), 0 2px 6px rgba(0, 0, 0, 0.40);
+    --shadow-xl: 0 20px 40px rgba(0, 0, 0, 0.60), 0 4px 12px rgba(0, 0, 0, 0.45);
+    --shadow-secure: 0 0 0 3px rgba(129, 140, 248, 0.22), 0 4px 12px rgba(0, 0, 0, 0.5);
+
+    color-scheme: dark;
+}
+
+/* Respect OS preference only if the user hasn't explicitly chosen a theme */
+@media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]):not([data-theme="dark"]) {
+        --primary: #818cf8;
+        --primary-dark: #6366f1;
+        --primary-light: #a5b4fc;
+        --accent: #22d3ee;
+        --accent-dark: #06b6d4;
+        --accent-green: #34d399;
+        --success: #34d399;
+        --success-light: #6ee7b7;
+        --warning: #f59e0b;
+        --warning-dark: #d97706;
+        --error: #f87171;
+        --error-dark: #ef4444;
+        --bg: #0b0d12;
+        --bg-secondary: #13151c;
+        --bg-card: #17191f;
+        --bg-dark: #0b0d12;
+        --bg-dark-secondary: #17191f;
+        --text: #ecedf0;
+        --text-medium: #c9ccd4;
+        --text-light: #9ea3b0;
+        --text-lighter: #6b7280;
+        --border: #22252e;
+        --border-medium: #2e3240;
+        --border-strong: #4b5563;
+        --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
+        --shadow-md: 0 4px 12px rgba(0, 0, 0, 0.45), 0 1px 2px rgba(0, 0, 0, 0.35);
+        --shadow-lg: 0 10px 24px rgba(0, 0, 0, 0.55), 0 2px 6px rgba(0, 0, 0, 0.40);
+        --shadow-xl: 0 20px 40px rgba(0, 0, 0, 0.60), 0 4px 12px rgba(0, 0, 0, 0.45);
+        --shadow-secure: 0 0 0 3px rgba(129, 140, 248, 0.22), 0 4px 12px rgba(0, 0, 0, 0.5);
+        color-scheme: dark;
+    }
 }
 
 * {
@@ -49,11 +138,14 @@
 }
 
 body {
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+    font-family: var(--font-sans);
     background: var(--bg);
     color: var(--text);
     line-height: 1.6;
-    font-weight: 450;  /* Slightly heavier for more presence */
+    font-weight: 400;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    transition: background-color 0.2s ease, color 0.2s ease;
 }
 
 /* Container Homepage */
@@ -1745,5 +1837,249 @@ footer::before {
         width: 44px;
         min-width: 44px;
         height: 44px;
+    }
+}
+
+/* ========================================================================
+   Proton-style refinements
+   Layered on top of the legacy rules to modernize the visual language
+   without rewriting every component:
+     - rounded corners where we had sharp/authoritative edges
+     - softer typography (no forced uppercase, lighter weights)
+     - subtle shadows and borders
+     - surface colors that follow the theme tokens
+   ======================================================================== */
+
+/* Rounded corners across primary surfaces */
+.card,
+.info-box,
+.btn,
+.btn-primary,
+.btn-secondary,
+.btn-small,
+.badge,
+.security-badge,
+.login-card,
+.login-btn,
+.password-input,
+.input,
+.select,
+.radio-label {
+    border-radius: var(--radius-md);
+}
+
+.input,
+.select {
+    border-radius: var(--radius-sm);
+}
+
+.badge,
+.security-badge {
+    border-radius: var(--radius-pill);
+    text-transform: none;
+    letter-spacing: 0.01em;
+    font-weight: 600;
+    border-width: 1px;
+    border-style: solid;
+    border-color: transparent;
+    background: color-mix(in srgb, var(--success) 12%, var(--bg-card));
+    color: var(--success);
+    box-shadow: none;
+}
+
+[data-theme="dark"] .security-badge {
+    background: color-mix(in srgb, var(--success) 18%, var(--bg-card));
+    color: var(--success-light);
+}
+
+/* Buttons: drop shouty uppercase, use a confident but quiet weight */
+.btn {
+    text-transform: none;
+    letter-spacing: 0;
+    font-size: 0.95rem;
+    font-weight: 600;
+    transition: transform 0.08s ease, background-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.btn:active:not(:disabled) {
+    transform: translateY(1px);
+}
+
+.btn-primary {
+    border: none;
+    box-shadow: var(--shadow-md);
+}
+
+.btn-primary:hover:not(:disabled) {
+    background: var(--primary-dark);
+    box-shadow: var(--shadow-lg);
+}
+
+/* Remove the shine sweep on buttons for a calmer look */
+.btn::after {
+    display: none;
+}
+
+/* Cards: gentle elevation, soft border, no leading accent bar */
+.card {
+    border: 1px solid var(--border);
+    border-top: 1px solid var(--border);
+    box-shadow: var(--shadow-md);
+}
+
+.card::before {
+    display: none;
+}
+
+.card:hover {
+    border-color: var(--border-medium);
+    box-shadow: var(--shadow-lg);
+}
+
+/* Info boxes: quieter, theme-aware background */
+.info-box {
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--primary);
+    box-shadow: none;
+}
+
+.info-box::before {
+    display: none;
+}
+
+.info-box.warning {
+    background: color-mix(in srgb, var(--warning) 10%, var(--bg-card));
+    border-color: color-mix(in srgb, var(--warning) 30%, var(--border));
+    border-left-color: var(--warning);
+}
+
+[data-theme="dark"] .info-box.warning {
+    background: color-mix(in srgb, var(--warning) 14%, var(--bg-card));
+}
+
+/* Typography: softer headings */
+header h1 {
+    font-weight: 700;
+    letter-spacing: -0.02em;
+    text-shadow: none;
+    color: var(--text);
+}
+
+.room-info h1 {
+    font-weight: 700;
+}
+
+.card h2 {
+    font-weight: 600;
+}
+
+.info-box h3 {
+    font-weight: 600;
+}
+
+/* Inputs: light border, clean focus ring */
+.input,
+.select,
+.password-input {
+    background: var(--bg-card);
+    border: 1px solid var(--border-medium);
+    color: var(--text);
+    transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.input:focus,
+.select:focus,
+.password-input:focus {
+    border-color: var(--primary);
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--primary) 18%, transparent);
+    outline: none;
+}
+
+/* Header divider: thin, theme-aware */
+header {
+    border-bottom: 1px solid var(--border);
+}
+
+header::after {
+    display: none;
+}
+
+/* Footer: thin rule */
+footer {
+    border-top: 1px solid var(--border);
+    font-weight: 500;
+}
+
+footer::before {
+    display: none;
+}
+
+/* Error/info messages */
+.error-message {
+    background: color-mix(in srgb, var(--error) 10%, var(--bg-card));
+    border: 1px solid color-mix(in srgb, var(--error) 35%, var(--border));
+    color: var(--error);
+    border-radius: var(--radius-md);
+}
+
+.info-message {
+    background: color-mix(in srgb, var(--primary) 10%, var(--bg-card));
+    border: 1px solid color-mix(in srgb, var(--primary) 30%, var(--border));
+    color: var(--primary);
+    border-radius: var(--radius-md);
+}
+
+/* Chat header: soft bottom border */
+.chat-header {
+    border-bottom: 1px solid var(--border);
+    box-shadow: none;
+}
+
+/* ---- Theme toggle control ---- */
+.theme-toggle {
+    position: fixed;
+    top: 16px;
+    right: 16px;
+    width: 40px;
+    height: 40px;
+    border-radius: 999px;
+    border: 1px solid var(--border);
+    background: var(--bg-card);
+    color: var(--text-medium);
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 18px;
+    line-height: 1;
+    box-shadow: var(--shadow-sm);
+    transition: color 0.15s ease, background-color 0.15s ease, border-color 0.15s ease, transform 0.1s ease;
+    z-index: 1000;
+}
+
+.theme-toggle:hover {
+    color: var(--primary);
+    border-color: var(--border-medium);
+    box-shadow: var(--shadow-md);
+}
+
+.theme-toggle:active {
+    transform: scale(0.96);
+}
+
+.theme-toggle[aria-pressed="true"] .theme-icon-sun { display: inline; }
+.theme-toggle[aria-pressed="true"] .theme-icon-moon { display: none; }
+.theme-toggle[aria-pressed="false"] .theme-icon-sun { display: none; }
+.theme-toggle[aria-pressed="false"] .theme-icon-moon { display: inline; }
+
+/* Nudge container padding so the fixed toggle doesn't overlap logo on very narrow screens */
+@media (max-width: 420px) {
+    .theme-toggle {
+        top: 10px;
+        right: 10px;
+        width: 36px;
+        height: 36px;
+        font-size: 16px;
     }
 }
