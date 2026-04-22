@@ -312,95 +312,6 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: Uuid, connec
                                 tracing::warn!("⚠️ ECDH message received but payload is missing (connection_id={})", connection_id);
                             }
                         }
-                        // Handle DH Ratchet messages as a blind relay for post-compromise security
-                        else if incoming.msg_type == "dh_ratchet" {
-                            tracing::info!(
-                                "DH Ratchet received from connection_id={} in room={}",
-                                connection_id,
-                                room_id
-                            );
-
-                            // Parse the full DH ratchet message to extract fields
-                            match serde_json::from_str::<serde_json::Value>(&text) {
-                                Ok(value) => {
-                                    // Extract required fields
-                                    if let (
-                                        Some(public_key),
-                                        Some(signature),
-                                        Some(ratchet_count),
-                                        Some(reason),
-                                    ) = (
-                                        value.get("publicKey").and_then(|v| v.as_str()),
-                                        value.get("signature").and_then(|v| v.as_str()),
-                                        value.get("ratchetCount").and_then(|v| v.as_u64()),
-                                        value.get("reason").and_then(|v| v.as_str()),
-                                    ) {
-                                        tracing::debug!(
-                                            "DH Ratchet details: ratchet_count={}, reason={}, signature_len={}",
-                                            ratchet_count, reason, signature.len()
-                                        );
-
-                                        // SECURITY: Validate signature size to prevent DoS
-                                        const MAX_SIGNATURE_SIZE: usize = 512; // ECDSA P-256 signature is ~64-72 bytes
-                                        if signature.len() > MAX_SIGNATURE_SIZE {
-                                            tracing::warn!(
-                                                "⚠️ DH Ratchet signature too large: {} bytes (max {}) - rejecting",
-                                                signature.len(), MAX_SIGNATURE_SIZE
-                                            );
-                                            continue;
-                                        }
-
-                                        // Create DH Ratchet message
-                                        let dh_ratchet_msg = Message::DHRatchet {
-                                            public_key: public_key.to_string(),
-                                            signature: signature.to_string(),
-                                            ratchet_count: ratchet_count as u32,
-                                            reason: reason.to_string(),
-                                            sender_id: connection_id,
-                                        };
-
-                                        match serde_json::to_string(&dh_ratchet_msg) {
-                                            Ok(json) => {
-                                                tracing::debug!("DH Ratchet message serialized, broadcasting...");
-
-                                                // Broadcast to all participants in the room
-                                                if let Some(tx) =
-                                                    state_clone.broadcast_channels.get(&room_id)
-                                                {
-                                                    match tx.send(json) {
-                                                        Ok(receiver_count) => {
-                                                            tracing::info!(
-                                                                "✅ DH Ratchet broadcasted to {} receivers (ratchet #{}, reason: {})",
-                                                                receiver_count, ratchet_count, reason
-                                                            );
-                                                        }
-                                                        Err(e) => {
-                                                            tracing::error!("❌ Failed to broadcast DH Ratchet: {}", e);
-                                                        }
-                                                    }
-                                                } else {
-                                                    tracing::warn!(
-                                                        "⚠️ No broadcast channel for room={}",
-                                                        room_id
-                                                    );
-                                                }
-                                            }
-                                            Err(e) => {
-                                                tracing::error!(
-                                                    "Failed to serialize DH Ratchet message: {}",
-                                                    e
-                                                );
-                                            }
-                                        }
-                                    } else {
-                                        tracing::warn!("⚠️ DH Ratchet message missing required fields (connection_id={})", connection_id);
-                                    }
-                                }
-                                Err(e) => {
-                                    tracing::error!("Failed to parse DH Ratchet message: {}", e);
-                                }
-                            }
-                        }
                         // Handle regular encrypted message (text or image)
                         else if incoming.msg_type == "message" || incoming.msg_type == "image" {
                             if let Some(payload) = incoming.payload {
@@ -420,6 +331,29 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: Uuid, connec
                                     );
                                     continue;
                                 }
+
+                                // Validate header: must be present, v1, and within size bounds.
+                                // The cryptographic signature verification happens client-side
+                                // (server is blind relay), but we enforce shape + DoS caps here.
+                                const MAX_SIG_LEN: usize = 512;
+                                const MAX_DH_LEN: usize = 256;
+                                let hdr = match incoming.header {
+                                    Some(h)
+                                        if h.v == crate::models::PINCHAT_PROTOCOL_VERSION
+                                            && h.sig.len() <= MAX_SIG_LEN
+                                            && h.dh.len() <= MAX_DH_LEN =>
+                                    {
+                                        h
+                                    }
+                                    _ => {
+                                        tracing::warn!(
+                                            "Rejecting {} with missing/invalid v1 header from connection_id={}",
+                                            incoming.msg_type,
+                                            connection_id
+                                        );
+                                        continue;
+                                    }
+                                };
 
                                 // ANTI-REPLAY: Calculate SHA-256 hash of encrypted payload
                                 let payload_hash = {
@@ -509,14 +443,14 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: Uuid, connec
                                 let broadcast_msg = if incoming.msg_type == "image" {
                                     Message::Image {
                                         payload,
-                                        header: incoming.header, // Relay header (contains DH public key)
+                                        header: hdr, // Validated v1 header (no Option)
                                         sender_id: connection_id,
                                         timestamp: now,
                                     }
                                 } else {
                                     Message::Message {
                                         payload,
-                                        header: incoming.header, // Relay header (contains DH public key)
+                                        header: hdr, // Validated v1 header (no Option)
                                         sender_id: connection_id,
                                         timestamp: now,
                                     }
