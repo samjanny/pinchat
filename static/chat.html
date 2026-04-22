@@ -4,13 +4,50 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>PinChat - Secure Chat</title>
-    <link rel="stylesheet" href="/static/css/style.css" integrity="sha256-nnV3+e4PmH7UXboxjEIZ2MsuMsftRhZazZeW6qVaUj4=" crossorigin="anonymous" >
+    <link rel="stylesheet" href="/static/css/style.css" integrity="sha256-6GRxNiwEo5UN71QnyEUTke7LWms9S9LzNITiqO23s9A=" crossorigin="anonymous" >
     <script src="/static/js/theme.js" integrity="sha256-vc83MC35lVoXBnYkFcbi+cE5EgJ+drCEfcjEryWT40A=" crossorigin="anonymous" ></script>
     <script src="/static/js/pow.js" integrity="sha256-4jyDkg400LlXkyi0zC+QbIJhh6pEYjneo43JWuFVRZc=" crossorigin="anonymous" ></script>
     <script src="/static/js/nicknames.js" integrity="sha256-FFlmH12HLY/cK10Uu5ALIabktzw+KiCJdF2p60qlSuc=" crossorigin="anonymous" ></script>
 </head>
 <body class="chat-page">
     <div class="chat-container" x-data="$store.chatRoom">
+
+        <!-- Sidebar (Linear-style rooms nav; hidden on narrow screens) -->
+        <aside class="chat-sidebar">
+            <a class="sidebar-brand" href="/static/index.html" title="New room">
+                <span class="brand-mark">P</span>
+                <b>PinChat</b>
+            </a>
+
+            <div class="sidebar-group">Active room</div>
+            <div class="sidebar-item active" :title="roomId">
+                <span class="dot" :class="pfsActive ? 'on' : 'off'"></span>
+                <span class="sidebar-item-label"><span x-text="myNickname || '…'">…</span></span>
+                <span class="sidebar-item-badge" x-text="roomType === 'onetoone' ? '1:1' : (roomType === 'group' ? 'grp' : '…')">1:1</span>
+            </div>
+
+            <div class="sidebar-group">Session</div>
+            <div class="sidebar-info">
+                <div class="row"><span class="k">Room</span><b x-text="roomId ? roomId.substring(0,8) + '…' : '—'">—</b></div>
+                <div class="row"><span class="k">Time left</span><b x-text="timeRemaining ? formatTime(timeRemaining).replace('⏱️ ', '') : '—'">—</b></div>
+                <div class="row"><span class="k">Participants</span><b><span x-text="participantCount">0</span>/<span x-text="maxParticipants !== null ? maxParticipants : '-'">-</span></b></div>
+                <div class="row"><span class="k">Max image</span><b x-text="maxImageSize ? (Math.round(maxImageSize/1024) + ' KB') : '—'">—</b></div>
+            </div>
+
+            <div class="sidebar-foot">
+                <div class="you">
+                    <span class="avatar" x-text="myNickname ? myNickname.charAt(0).toUpperCase() : '?'">?</span>
+                    <div class="meta">
+                        <b x-text="myNickname || 'You'">You</b>
+                        <small>protocol v1 · <span x-text="sasVerificationStatus === 'verified' ? 'verified' : (pfsActive ? 'encrypted' : 'setup')">setup</span></small>
+                    </div>
+                </div>
+            </div>
+        </aside>
+
+        <!-- Main column wraps everything that already existed -->
+        <div class="chat-main">
+
         <!-- Header -->
         <header class="chat-header">
             <div class="room-info">
@@ -314,7 +351,9 @@
             <button class="fullscreen-close" @click="fullscreenImage = null">×</button>
             <img :src="fullscreenImage" class="fullscreen-image" alt="Full size image" @click.stop>
         </div>
-    </div>
+
+        </div><!-- /.chat-main -->
+    </div><!-- /.chat-container -->
 
     <!-- Include JS modules -->
     <script src="/static/js/debug.js" integrity="sha256-nY3zkFVKF7x6KVbWq1mwcHq4Y/g8O10iOmLAFfiDsJ8=" crossorigin="anonymous" ></script>
