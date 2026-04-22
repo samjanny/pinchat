@@ -148,6 +148,23 @@ document.addEventListener('alpine:init', () => {
             };
 
             this.wsManager.onError = (error) => {
+                const msg = error && error.message;
+                // Terminal auth/protocol mismatch (v1 gate or subprotocol echo):
+                // no auto-reconnect, user must refresh.
+                if (msg === 'PROTOCOL_OR_AUTH_FAILURE' || msg === 'PROTOCOL_MISMATCH') {
+                    this.error = '⚠️ PinChat has been updated. Please refresh the page.';
+                    return;
+                }
+                // Transient transport failure after N retries: distinct message
+                // ("check network", not "protocol mismatch").
+                if (msg === 'CONNECTION_EXHAUSTED') {
+                    this.error = '⚠️ Connection lost — please check your network and try again later.';
+                    return;
+                }
+                if (msg === 'ON_CONNECTED_FAILED') {
+                    this.error = '⚠️ Internal error establishing secure session. Please refresh.';
+                    return;
+                }
                 this.error = '⚠️ Connection error. Retrying automatically...';
             };
 
@@ -666,11 +683,27 @@ document.addEventListener('alpine:init', () => {
         },
 
         /**
-         * Reconnects the WebSocket
+         * User-initiated reconnect.
+         *
+         * UX early return: if the session is in terminal auth/protocol state,
+         * the banner already asks the user to refresh the page — don't show
+         * "Retrying..." or kick connect() (which would be a no-op anyway
+         * thanks to the `_fatalAuthFailure` guard in connect()).
+         *
+         * Otherwise, reset the retry budget so a fresh click after
+         * `CONNECTION_EXHAUSTED` gets the full N retries back, not 0.
          */
         reconnect() {
+            if (this.wsManager && this.wsManager._fatalAuthFailure) {
+                console.warn('Reconnect ignored: session requires page refresh');
+                return;
+            }
             this.connecting = true;
             this.error = '';
+            if (this.wsManager) {
+                this.wsManager.reconnectAttempts = 0;
+                this.wsManager._connectionExhausted = false;
+            }
             this.wsManager.connect();
         },
 

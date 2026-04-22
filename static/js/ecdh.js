@@ -589,7 +589,13 @@ class ECDHKeyExchange {
     }
 
     /**
-     * Start handshake timeout - fallback to bootstrap key if timeout
+     * Start handshake timeout - fallback to bootstrap key if timeout.
+     *
+     * The callback may be async (e.g. app.js passes an async arrow that
+     * awaits handleECDHAborted). We wrap in Promise.resolve().then() so both
+     * async rejections and synchronous throws are caught — no unhandled
+     * promise rejections on the timeout path.
+     *
      * @param {Function} onTimeout - Callback if handshake times out
      */
     startTimeout(onTimeout) {
@@ -598,7 +604,11 @@ class ECDHKeyExchange {
         this.handshakeTimeout = setTimeout(() => {
             if (!this.handshakeComplete) {
                 debugWarn('[ECDH] ⏱️ Handshake timeout - falling back to bootstrap key');
-                onTimeout();
+                Promise.resolve()
+                    .then(() => onTimeout())
+                    .catch((err) => {
+                        console.error('[ECDH] Error in handshake timeout callback:', err);
+                    });
             }
         }, this.HANDSHAKE_TIMEOUT_MS);
     }
