@@ -3308,6 +3308,80 @@ input[type="password"]:focus {
 .sas-modal-content .sas-actions { display: none; }
 .sas-modal-content .btn-centered { display: none; }
 
+/* ==========================================================================
+   Legal link rows — footer (homepage, chat sidebar, login)
+   Shared subtle style: small, muted, underline on hover.
+   ========================================================================== */
+.footer-links {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: center;
+    gap: 6px;
+    font-size: 12.5px;
+    color: var(--text-light);
+    margin-top: 6px;
+}
+.footer-links a {
+    color: var(--text-medium);
+    text-decoration: none;
+    padding: 2px 4px;
+    border-radius: 4px;
+    transition: color 120ms, background-color 120ms;
+}
+.footer-links a:hover {
+    color: var(--text);
+    background: var(--bg-secondary);
+}
+.footer-sep {
+    color: var(--text-lighter);
+    user-select: none;
+}
+
+/* Login footer: horizontal, centered under the card */
+.login-footer {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: center;
+    gap: 8px;
+    margin-top: 18px;
+    font-size: 12.5px;
+    color: var(--text-light);
+}
+.login-footer a {
+    color: var(--text-medium);
+    text-decoration: none;
+    padding: 2px 4px;
+    border-radius: 4px;
+    transition: color 120ms, background-color 120ms;
+}
+.login-footer a:hover {
+    color: var(--text);
+    background: var(--bg-secondary);
+}
+
+/* Chat sidebar legal row: inside sidebar-foot, below the user identity */
+.sidebar-legal {
+    margin-top: 10px;
+    padding-top: 10px;
+    border-top: 1px solid var(--border);
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    font-size: 11.5px;
+    color: var(--text-lighter);
+}
+.sidebar-legal a {
+    color: var(--text-light);
+    text-decoration: none;
+    padding: 1px 4px;
+    border-radius: 4px;
+    transition: color 120ms, background-color 120ms;
+}
+.sidebar-legal a:hover {
+    color: var(--text);
+    background: var(--bg-card);
+}
+
 /* Small viewport adjustments */
 @media (max-width: 480px) {
     .sas-head { padding: 18px 18px 4px; }
