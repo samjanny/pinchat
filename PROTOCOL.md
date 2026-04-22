@@ -2,6 +2,8 @@
 
 This document specifies the PinChat messaging protocol, including message formats, handshake procedures, and cryptographic operations.
 
+**Protocol version: 1** (first explicitly numbered version, introduced in v0.2.0). Pre-release clients that emit headers without a `v` field, or that attempt the WebSocket upgrade with a JWT in the query string, are considered "v0 implicit" and will be rejected.
+
 ## Table of Contents
 
 1. [Protocol Overview](#protocol-overview)
@@ -105,7 +107,10 @@ Per RFC 3986, the URL fragment (everything after `#`) is processed client-side o
 
 **Security Note**: The Bootstrap Key must be shared through a secure channel (encrypted messaging, voice call, in-person). If an attacker obtains both the room URL and the Bootstrap Key, they can join the room and participate in the encrypted conversation.
 
-### WebSocket Connection
+### WebSocket Connection (v1)
+
+JWT is carried in the `Sec-WebSocket-Protocol` header, NOT in the URL query
+string. The token therefore never appears in proxy/referrer/middlebox logs.
 
 ```
 Client                                    Server
@@ -114,12 +119,48 @@ Client                                    Server
    |         Cookie: session=...             |
    |                                         |
    |<------- 200 OK -------------------------|
-   |         {token: "jwt..."}               |
+   |         {token, connection_id,          |
+   |          protocol_version: 1,           |
+   |          supported_subprotocols:        |
+   |            ["pinchat.v1"]}              |
    |                                         |
-   |-------- WS /ws/{room}?token=jwt ------->|
+   |   [Client gates: protocol_version == 1  |
+   |    and "pinchat.v1" in supported list,  |
+   |    else fatal PROTOCOL_OR_AUTH_FAILURE] |
    |                                         |
-   |<------- WebSocket Upgrade --------------|
+   |-------- WS /ws/{room} ----------------->|
+   |   Sec-WebSocket-Protocol:               |
+   |     pinchat.v1, pinchat.v1.jwt.<jwt>    |
    |                                         |
+   |<------- 101 Switching Protocols --------|
+   |         Sec-WebSocket-Protocol:         |
+   |           pinchat.v1                    |
+   |         (token NOT echoed)              |
+   |                                         |
+```
+
+**Server rejection paths** (pre-upgrade, before `on_upgrade`):
+- No `Sec-WebSocket-Protocol` header → **401 Unauthorized**
+- No `pinchat.v1` base offered → **426 Upgrade Required**
+- No `pinchat.v1.jwt.<token>` companion → **401 Unauthorized**
+- Invalid / expired JWT → **401**; wrong room_id → **403**; replayed jti → **403**
+
+### Room Creation Response (v1)
+
+`POST /api/rooms` includes the protocol metadata alongside the creator's
+optional `ws_token` so the creator-optimization path can gate identically:
+
+```json
+{
+  "room_id": "...",
+  "room_type": "...",
+  "ttl_minutes": 60,
+  "max_participants": 2,
+  "ws_token": "...",
+  "connection_id": "...",
+  "protocol_version": 1,
+  "supported_subprotocols": ["pinchat.v1"]
+}
 ```
 
 ---
@@ -312,13 +353,29 @@ Message Envelope (JSON)
   "type": "message",
   "payload": "<base64url>",
   "header": {
-    "dh": "<base64url>",    // Current DH public key
+    "v": 1,                  // Protocol version (required)
+    "dh": "<base64url>",     // Current DH public key
     "pn": 0,                 // Previous chain length
     "n": 5,                  // Message number
-    "rc": 2                  // Ratchet count
+    "rc": 2,                 // Ratchet count
+    "sig": "<base64url>"     // ECDSA signature (see below)
   }
 }
 ```
+
+**`header` is mandatory** for `message` and `image` types in v1. Server rejects any envelope with missing, malformed, or `v != 1` header.
+
+### DH Header Signature (v1)
+
+To defeat live MITM on the Double Ratchet rotations, every outgoing header carries an ECDSA P-256 signature (`sig`) over the canonical byte sequence:
+
+```
+canonical = "pinchat-drheader-v1" || len(dh_raw):u16_be || dh_raw || rc:u32_be
+```
+
+Binding to `rc` means a signature is valid only for its ratchet round; replayed signatures across rounds are rejected. The signature is produced once per DH keypair generation (initialize, receive-side ratchet, send-side ratchet) and reused on every outgoing message in the same chain.
+
+On receive: verify before touching chain state. On failure, throw `SIGNATURE_INVALID`, tear down identity, close WebSocket with 1008 Policy Violation, suppress auto-reconnect (user must refresh).
 
 ### Payload Structure
 
@@ -539,3 +596,18 @@ Alice                                    Bob
 | MESSAGE_NUMBER | 0x05 | 8 bytes (BigUint64) |
 | MESSAGE_TYPE | 0x06 | Variable (UTF-8) |
 | RATCHET_COUNT | 0x07 | 8 bytes (BigUint64) |
+
+---
+
+## Removed in v1
+
+The following legacy mechanisms from the v0 implicit protocol have been removed:
+
+- **`dh_ratchet` message type**: the Double Ratchet rotation no longer
+  requires a dedicated message. DH key rotation piggybacks on every message
+  via the signed `{dh, sig}` fields in the header. The server has been
+  cleaned of the relay branch that used to forward these messages.
+- **JWT in `?token=` query string**: replaced by `Sec-WebSocket-Protocol`
+  subprotocol auth. The query-string path is gone.
+- **Optional `header` on `message`/`image`**: mandatory in v1. Serde rejects
+  any envelope that omits it.

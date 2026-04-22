@@ -76,7 +76,7 @@ pub async fn ws_handler(
     let offered: Vec<&str> = sec_proto.split(',').map(|s| s.trim()).collect();
 
     // Gate: client MUST offer the base `pinchat.v1` subprotocol.
-    if !offered.iter().any(|p| *p == "pinchat.v1") {
+    if !offered.contains(&"pinchat.v1") {
         tracing::warn!("WebSocket upgrade rejected: base pinchat.v1 subprotocol missing");
         return (
             StatusCode::UPGRADE_REQUIRED,
