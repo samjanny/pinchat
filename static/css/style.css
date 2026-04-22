@@ -2086,3 +2086,193 @@ footer::before {
         font-size: 16px;
     }
 }
+
+/* ==========================================================================
+   Linear / SaaS refinements (v0.3.0)
+   Drop-in overrides that soften the previous "enterprise security" look
+   (sharp corners, heavy borders, uppercase CTAs) into the Linear.app idiom
+   (rounded corners, 1px cool-grey borders, subtle shadows, sentence-case
+   buttons). Every selector below matches an existing rule earlier in this
+   file; later-rule-wins in the cascade does the rest. Nothing here touches
+   layout primitives — only visual finish.
+   ========================================================================== */
+
+/* Card: rounded, no gradient top-bar, soft border */
+.card {
+    border-radius: var(--radius-lg);
+    border: 1px solid var(--border);
+    border-top-width: 1px;
+    box-shadow: var(--shadow-md);
+}
+.card::before { display: none; }
+.card:hover {
+    border-color: var(--border);
+    box-shadow: var(--shadow-lg);
+}
+
+/* Buttons: sentence case, 8px radius, no animated shimmer */
+.btn {
+    border-radius: var(--radius-sm);
+    font-weight: 600;
+    font-size: 0.9375rem;
+    letter-spacing: 0;
+    text-transform: none;
+    padding: 0.6875rem 1.125rem;
+}
+.btn::after { display: none; }
+.btn-small {
+    font-size: 0.8125rem;
+    padding: 0.4375rem 0.75rem;
+}
+
+.btn-primary {
+    border: none;
+    box-shadow: 0 1px 0 rgba(255, 255, 255, 0.12) inset,
+                0 4px 14px rgba(110, 93, 240, 0.25);
+}
+.btn-primary:hover:not(:disabled) {
+    box-shadow: 0 1px 0 rgba(255, 255, 255, 0.12) inset,
+                0 6px 20px rgba(110, 93, 240, 0.32);
+    transform: none;
+}
+.btn-primary:active:not(:disabled) {
+    transform: translateY(1px);
+    box-shadow: 0 1px 0 rgba(255, 255, 255, 0.10) inset,
+                0 2px 8px rgba(110, 93, 240, 0.22);
+}
+.btn-primary:disabled {
+    box-shadow: none;
+}
+
+/* Inputs & selects: 8px radius, 1px border, soft focus ring */
+.input,
+.select,
+input[type="text"],
+input[type="password"],
+input[type="number"],
+input[type="email"] {
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--border);
+    font-weight: 500;
+    padding: 0.625rem 0.875rem;
+    background: var(--bg-card);
+    color: var(--text);
+    transition: border-color 120ms ease, box-shadow 120ms ease, background-color 120ms ease;
+}
+.input:focus,
+.select:focus,
+input[type="text"]:focus,
+input[type="password"]:focus {
+    border-color: var(--primary);
+    box-shadow: var(--shadow-secure);
+    background: var(--bg-card);
+}
+
+/* Radio (room type) as segmented control */
+.radio-group {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 6px;
+    padding: 4px;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+}
+.radio-label {
+    border: none;
+    border-radius: calc(var(--radius-md) - 4px);
+    padding: 0.5rem 0.75rem;
+    justify-content: center;
+    background: transparent;
+    font-weight: 500;
+    text-align: center;
+}
+.radio-label:hover {
+    background: var(--bg-card);
+    box-shadow: none;
+    border-color: transparent;
+}
+.radio-label:has(input[type="radio"]:checked) {
+    background: var(--bg-card);
+    box-shadow: var(--shadow-sm);
+    border-color: transparent;
+}
+.radio-label input[type="radio"] {
+    position: absolute;
+    opacity: 0;
+    pointer-events: none;
+}
+
+/* Login error: inline pill, not shouty */
+.login-error-message {
+    background: color-mix(in srgb, var(--error) 10%, transparent);
+    border: 1px solid color-mix(in srgb, var(--error) 35%, transparent);
+    color: var(--error);
+    border-radius: var(--radius-sm);
+    padding: 0.625rem 0.875rem;
+    font-size: 0.875rem;
+    font-weight: 500;
+    box-shadow: none;
+}
+
+/* Chat header: slimmer, 1px border */
+.chat-header {
+    border-bottom: 1px solid var(--border);
+    box-shadow: none;
+    padding: 14px 22px;
+}
+
+/* Message bubbles: slightly rounded, minimal border */
+.message-bubble {
+    border-radius: var(--radius-md);
+    box-shadow: none;
+}
+.message-other .message-bubble {
+    border: 1px solid var(--border);
+}
+.message-own .message-bubble {
+    background: var(--primary);
+    color: #fff;
+    border-color: transparent;
+}
+
+/* Composer area: match Linear chat mock */
+.input-area {
+    border-top: 1px solid var(--border);
+    box-shadow: none;
+}
+.message-input {
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    background: var(--bg-card);
+}
+.message-input:focus {
+    border-color: var(--primary);
+    box-shadow: var(--shadow-secure);
+}
+
+/* Badges in header chips */
+.badge {
+    border-radius: var(--radius-sm);
+    font-weight: 500;
+    letter-spacing: 0;
+}
+
+/* SAS modal: Linear dialog feel — rounded, soft overlay */
+.sas-modal {
+    backdrop-filter: blur(6px);
+    -webkit-backdrop-filter: blur(6px);
+}
+.sas-modal-content {
+    border-radius: var(--radius-lg);
+    border: 1px solid var(--border);
+    box-shadow: var(--shadow-xl);
+}
+.sas-modal-content::before { display: none; }
+
+/* Subtle selection tint */
+::selection {
+    background: color-mix(in srgb, var(--primary) 22%, transparent);
+    color: var(--text);
+}
+
