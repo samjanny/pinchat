@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>PinChat - Secure Chat</title>
-    <link rel="stylesheet" href="/static/css/style.css" integrity="sha256-x3qVKBvaSYexhAduFwpJC4vyyMgQiTcFClvA6kD+l54=" crossorigin="anonymous" >
+    <link rel="stylesheet" href="/static/css/style.css" integrity="sha256-EmKFaacGBmLUYoPLryeD7MsJlCiG4OuD2A+R58YlyD8=" crossorigin="anonymous" >
     <script src="/static/js/theme.js" integrity="sha256-vc83MC35lVoXBnYkFcbi+cE5EgJ+drCEfcjEryWT40A=" crossorigin="anonymous" ></script>
     <script src="/static/js/pow.js" integrity="sha256-4jyDkg400LlXkyi0zC+QbIJhh6pEYjneo43JWuFVRZc=" crossorigin="anonymous" ></script>
     <script src="/static/js/nicknames.js" integrity="sha256-FFlmH12HLY/cK10Uu5ALIabktzw+KiCJdF2p60qlSuc=" crossorigin="anonymous" ></script>
@@ -335,39 +335,77 @@
         </div>
 
         <!-- SAS Verification Modal (MITM detection) -->
-        <div x-show="sas && pfsActive" class="sas-modal">
+        <div x-show="sas && pfsActive" class="sas-modal" role="dialog" aria-modal="true" aria-labelledby="sas-title">
             <div class="sas-modal-content">
-                <h3>🔐 Security Verification</h3>
-                <p>To ensure no man-in-the-middle attack, verify this code matches with your contact:</p>
 
-                <!-- Emoji SAS (Primary) -->
-                <div class="sas-code-emoji" x-html="formatEmojiGrid(sas ? (sas.emoji || '') : '')"></div>
+                <!-- Header: icon badge + title + sub -->
+                <div class="sas-head">
+                    <div class="sas-head-badge">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                            <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
+                            <polyline points="9 12 11 14 15 10"/>
+                        </svg>
+                    </div>
+                    <div class="sas-head-text">
+                        <h3 id="sas-title">Verify your peer</h3>
+                        <p class="sas-sub">Compare these 8 emoji with your peer through a channel you trust — a voice call, Signal, in person. If both of you see the same sequence, there is no man-in-the-middle.</p>
+                    </div>
+                </div>
 
-                <!-- Copy Emoji Button -->
-                <button @click="copySasEmoji()" class="btn btn-copy btn-centered">
-                    <span x-text="sasCopied ? '✓ Copied!' : '📋 Copy Emoji'"></span>
-                </button>
+                <!-- Body -->
+                <div class="sas-body">
 
-                <!-- Hex Fallback (for phone verification) -->
-                <details class="sas-details">
-                    <summary>For phone verification</summary>
-                    <div class="sas-code-hex" x-text="sas ? (sas.hex || '') : ''"></div>
-                </details>
+                    <!-- Peer row -->
+                    <div class="sas-peer-row">
+                        <span class="sas-peer-avatar" x-text="((messages.find(m => m.senderId && m.senderId !== userId && m.nickname) || {}).nickname || 'P').charAt(0).toUpperCase()">P</span>
+                        <div class="sas-peer-meta">
+                            <span class="sas-peer-label">Peer identity</span>
+                            <b class="sas-peer-name" x-text="(messages.find(m => m.senderId && m.senderId !== userId && m.nickname) || {}).nickname || 'stellar wolf'">peer</b>
+                        </div>
+                    </div>
 
-                <p class="sas-hint">This code should be identical on both sides.</p>
+                    <!-- Emoji SAS (Primary) -->
+                    <div class="sas-code-emoji" x-html="formatEmojiGrid(sas ? (sas.emoji || '') : '')" aria-label="Short Authentication String"></div>
 
-                <div class="sas-actions">
-                    <button @click="handleSasVerified()" class="btn btn-primary btn-verified">
-                        ✓ Verified
+                    <!-- Hex + copy inline -->
+                    <div class="sas-hex-row">
+                        <code class="sas-code-hex" x-text="sas ? (sas.hex || '') : ''"></code>
+                        <button @click="copySasEmoji()" class="btn btn-copy">
+                            <span x-text="sasCopied ? 'Copied ✓' : 'Copy'">Copy</span>
+                        </button>
+                    </div>
+
+                    <!-- Info callout -->
+                    <div class="sas-callout">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                            <circle cx="12" cy="12" r="10"/>
+                            <line x1="12" y1="16" x2="12" y2="12"/>
+                            <line x1="12" y1="8" x2="12.01" y2="8"/>
+                        </svg>
+                        <span>Derived from both identity keys via <b>PBKDF2-SHA256</b> · 100k iterations · 48 bits. An attacker would need to find a live collision in the 60s handshake window — not feasible.</span>
+                    </div>
+
+                </div>
+
+                <!-- Footer: 2-col decisive action -->
+                <div class="sas-footer">
+                    <button @click="handleSasMismatch()" class="btn btn-danger sas-btn-mismatch">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg>
+                        Codes don't match
                     </button>
-                    <button @click="handleSasMismatch()" class="btn btn-danger">
-                        ✗ Code doesn't match
+                    <button @click="handleSasVerified()" class="btn btn-primary sas-btn-match">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="20 6 9 17 4 12"/></svg>
+                        They match
                     </button>
                 </div>
 
-                <button @click="handleSasSkipped()" class="btn btn-skip">
-                    I don't want to verify
-                </button>
+                <!-- Skip row -->
+                <div class="sas-skip-row">
+                    <button @click="handleSasSkipped()" class="btn btn-skip">
+                        I don't want to verify now
+                    </button>
+                </div>
+
             </div>
         </div>
 
