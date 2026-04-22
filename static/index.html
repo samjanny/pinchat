@@ -4,88 +4,164 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>PinChat - E2E Encrypted Chat</title>
-    <link rel="stylesheet" href="/static/css/style.css" integrity="sha256-9KAX001aKvzfF8VGUhzbympCo+pLAu2Ca0qU9duGPJY=" crossorigin="anonymous" >
+    <link rel="stylesheet" href="/static/css/style.css" integrity="sha256-wpjoF4OZfycNp6P1s4Hddkx7OPuMzubWYiJ+a9r7q5M=" crossorigin="anonymous" >
     <script src="/static/js/theme.js" integrity="sha256-vc83MC35lVoXBnYkFcbi+cE5EgJ+drCEfcjEryWT40A=" crossorigin="anonymous" ></script>
     <script src="/static/js/pow.js" integrity="sha256-4jyDkg400LlXkyi0zC+QbIJhh6pEYjneo43JWuFVRZc=" crossorigin="anonymous" ></script>
     <script src="/static/js/homepage.js" integrity="sha256-u5WzQejTD9Wd+gwyh3+mDd6oc/cjmZtNRGoikfJLLng=" crossorigin="anonymous" ></script>
     <script src="/static/js/alpine-csp.min.js" integrity="sha256-58hj2liWaS9dR44Q2uCJ5hZP7RxcG2offLv3qbCT8FU=" crossorigin="anonymous" defer></script>
 </head>
-<body>
-    <div class="container" x-data>
-        <header>
-            <h1>🔐 PinChat</h1>
-            <p class="subtitle">End-to-end encrypted, temporary, and anonymous chat</p>
-            <!-- Security Badges -->
-            <div class="security-badges">
-                <span class="security-badge">🔒 E2E Encrypted</span>
-                <span class="security-badge">🚫 Zero-Log</span>
-                <span class="security-badge">⏱️ Auto-Destruct</span>
+<body class="page-home">
+    <div class="container home-container" x-data>
+
+        <nav class="topbar">
+            <div class="brand">
+                <div class="brand-mark">P</div>
+                <span>PinChat</span>
             </div>
-        </header>
+            <div class="spacer"></div>
+            <a class="topbar-link" href="#features">Features</a>
+            <a class="topbar-link" href="#important">Security</a>
+            <a class="topbar-link muted" href="https://github.com/samjanny/pinchat" target="_blank" rel="noopener noreferrer">GitHub&nbsp;↗</a>
+        </nav>
 
-        <main>
-            <div class="card">
-                <h2>Create a new room</h2>
+        <main class="hero">
 
-                <form @submit.prevent="$store.homepage.createRoom()">
-                    <!-- Chat type (hidden - group chats temporarily disabled) -->
-                    <input type="hidden" name="roomType" value="onetoone" x-model="$store.homepage.roomType">
+            <div class="hero-eyebrow">
+                <span class="dot"></span>
+                <span>Protocol v1 · Zero persistence · End-to-end encrypted</span>
+            </div>
 
-                    <!-- TTL -->
-                    <div class="form-group">
-                        <label for="ttl">Room duration:</label>
-                        <select id="ttl" x-model.number="$store.homepage.ttlMinutes" class="select">
-                            <option value="15">15 minutes</option>
-                            <option value="30" selected>30 minutes</option>
-                            <option value="60">1 hour</option>
-                            <option value="180">3 hours</option>
-                            <option value="360">6 hours</option>
-                            <option value="1440">24 hours</option>
-                        </select>
-                        <small>The room will be automatically deleted after this time</small>
+            <h1 class="hero-title">
+                Ephemeral chats,<br>
+                <span class="hero-title-accent">authenticated end-to-end.</span>
+            </h1>
+            <p class="hero-lede">No accounts, no stored messages, no server access to your conversations. Generate a room, share the link out-of-band, and the Double Ratchet takes care of the rest.</p>
+
+            <div class="hero-chips">
+                <span class="hero-chip">🔐 AES-GCM 256</span>
+                <span class="hero-chip">🔄 PFS · PCS</span>
+                <span class="hero-chip">✍ ECDSA-signed DH</span>
+                <span class="hero-chip">⏱ Auto-expire rooms</span>
+                <span class="hero-chip">🕵 No accounts</span>
+            </div>
+
+            <div class="hero-grid">
+
+                <!-- ==== CREATE ROOM CARD ==== -->
+                <div class="card create-room-card">
+                    <h2>Create a new room</h2>
+                    <p class="card-sub">Room metadata lives only in the server's RAM and is wiped when the TTL elapses.</p>
+
+                    <form @submit.prevent="$store.homepage.createRoom()">
+                        <!-- Hidden: group chats are temporarily disabled -->
+                        <input type="hidden" name="roomType" value="onetoone" x-model="$store.homepage.roomType">
+
+                        <!-- Room type (visual segmented control; group is disabled) -->
+                        <div class="form-group">
+                            <label>Room type</label>
+                            <div class="radio-group segmented" role="radiogroup" aria-label="Room type">
+                                <label class="radio-label">
+                                    <input type="radio" name="rtype-visual" value="onetoone" checked>
+                                    <span>1 : 1 <em class="tag">recommended</em></span>
+                                </label>
+                                <label class="radio-label disabled">
+                                    <input type="radio" name="rtype-visual" value="group" disabled>
+                                    <span>Group <em class="tag">disabled</em></span>
+                                </label>
+                            </div>
+                            <small>Group chat is temporarily disabled until a tree-based group key agreement is in place.</small>
+                        </div>
+
+                        <!-- TTL slider -->
+                        <div class="form-group">
+                            <label for="ttl">Session lifetime</label>
+                            <div class="slider-row">
+                                <input type="range" id="ttl" class="slider" min="5" max="1440" step="5" x-model.number="$store.homepage.ttlMinutes">
+                                <div class="slider-val">
+                                    <span x-text="$store.homepage.ttlMinutes < 60 ? $store.homepage.ttlMinutes : Math.floor($store.homepage.ttlMinutes/60)">30</span><small x-text="$store.homepage.ttlMinutes < 60 ? 'min' : ($store.homepage.ttlMinutes % 60 === 0 ? (Math.floor($store.homepage.ttlMinutes/60) === 1 ? 'hour' : 'hours') : 'h')">min</small><span x-show="$store.homepage.ttlMinutes >= 60 && $store.homepage.ttlMinutes % 60 !== 0">&nbsp;<span x-text="$store.homepage.ttlMinutes % 60"></span><small>min</small></span>
+                                </div>
+                            </div>
+                            <small>Between 5 minutes and 24 hours. The server removes the room from memory at expiry.</small>
+                        </div>
+
+                        <!-- Submit -->
+                        <button type="submit" class="btn btn-primary" :disabled="$store.homepage.loading">
+                            <span x-show="!$store.homepage.loading">Create room</span>
+                            <span x-show="$store.homepage.loading" x-text="$store.homepage.loadingMessage">Creating…</span>
+                        </button>
+
+                        <!-- Feedback -->
+                        <div x-show="$store.homepage.powProgress" class="info-message" x-text="$store.homepage.powProgress"></div>
+                        <div x-show="$store.homepage.error" class="error-message" x-text="$store.homepage.error"></div>
+                    </form>
+                </div>
+
+                <!-- ==== SIDE INFO STACK ==== -->
+                <aside class="info-stack" id="security">
+                    <div class="info-card">
+                        <h3>How the link works</h3>
+                        <p>Your room URL looks like <code>/c/&lt;id&gt;#key=&lt;b64&gt;</code>. The fragment after <code>#</code> stays on the client — RFC 3986 — so the server never sees the symmetric key.</p>
                     </div>
+                    <div class="info-card">
+                        <h3>What the server sees</h3>
+                        <p>A room ID, a TTL, and opaque encrypted payloads. No message content, no metadata, no persistent identifier tying sessions together.</p>
+                    </div>
+                    <div class="info-card">
+                        <h3>Identity verification</h3>
+                        <p>Before any message goes through, you'll see a <strong>Short Authentication String</strong> — 8 emoji derived from both parties' identity keys. Confirm it out-of-band to rule out MITM.</p>
+                    </div>
+                </aside>
 
-                    <!-- Create button -->
-                    <button type="submit" class="btn btn-primary" :disabled="$store.homepage.loading">
-                        <span x-show="!$store.homepage.loading">Create Secure Room</span>
-                        <span x-show="$store.homepage.loading" x-text="$store.homepage.loadingMessage">Creating...</span>
-                    </button>
-
-                    <!-- PoW progress -->
-                    <div x-show="$store.homepage.powProgress" class="info-message" x-text="$store.homepage.powProgress"></div>
-
-                    <!-- Error -->
-                    <div x-show="$store.homepage.error" class="error-message" x-text="$store.homepage.error"></div>
-                </form>
             </div>
 
-            <!-- Information -->
-            <div class="info-box">
-                <h3>✨ Features</h3>
-                <ul>
-                    <li><strong>End-to-End Encryption</strong> - Only you and your contacts can read the messages</li>
-                    <li><strong>No accounts</strong> - No registration, no personal data</li>
-                    <li><strong>No persistence</strong> - Messages are never stored on disk</li>
-                    <li><strong>Auto-destruction</strong> - Rooms delete themselves at expiration</li>
-                    <li><strong>Open Source</strong> - Code that can be publicly verified on <a href="https://github.com/samjanny/pinchat" target="_blank" rel="noopener noreferrer">GitHub</a></li>
-                </ul>
-            </div>
+            <!-- ==== FEATURES ==== -->
+            <section id="features" class="feature-grid">
+                <div class="feature">
+                    <div class="feature-icon">🔐</div>
+                    <div class="feature-title">End-to-End Encryption</div>
+                    <div class="feature-desc">Only you and your contacts can read the messages. The server only relays ciphertext.</div>
+                </div>
+                <div class="feature">
+                    <div class="feature-icon">🕵</div>
+                    <div class="feature-title">No accounts</div>
+                    <div class="feature-desc">No registration, no personal data, no persistent identifier across sessions.</div>
+                </div>
+                <div class="feature">
+                    <div class="feature-icon">💾</div>
+                    <div class="feature-title">No persistence</div>
+                    <div class="feature-desc">Messages are never stored on disk. Server keeps only in-RAM state until the room TTL.</div>
+                </div>
+                <div class="feature">
+                    <div class="feature-icon">⏱</div>
+                    <div class="feature-title">Auto-destruction</div>
+                    <div class="feature-desc">Rooms delete themselves at expiration. Short or long — you decide up front.</div>
+                </div>
+                <div class="feature">
+                    <div class="feature-icon">🔎</div>
+                    <div class="feature-title">Open Source</div>
+                    <div class="feature-desc">Code is publicly auditable on <a href="https://github.com/samjanny/pinchat" target="_blank" rel="noopener noreferrer">GitHub</a>. Reproducible Docker builds.</div>
+                </div>
+            </section>
 
-            <div class="info-box warning">
-                <h3>⚠️ Important notes</h3>
-                <ul>
-                    <li>Do not share the room link on public channels</li>
-                    <li>The encryption key is contained in the link (after the # symbol)</li>
-                    <li>If you lose the link, you can no longer access the chat</li>
-                    <li>Messages cannot be recovered after the room expires</li>
-                </ul>
-            </div>
+            <!-- ==== IMPORTANT NOTES / DISCLAIMER ==== -->
+            <section class="disclaimer-stack" id="important">
+                <div class="info-box warning">
+                    <h3>⚠️ Important notes</h3>
+                    <ul>
+                        <li>Do not share the room link on public channels.</li>
+                        <li>The encryption key is contained in the link (after the <code>#</code> symbol).</li>
+                        <li>If you lose the link, you can no longer access the chat.</li>
+                        <li>Messages cannot be recovered after the room expires.</li>
+                    </ul>
+                </div>
 
-            <div class="info-box warning">
-                <h3>⚠️ Experimental software — use at your own risk</h3>
-                <p>PinChat is an experimental prototype provided strictly for educational and research purposes. It is <strong>NOT designed, intended, or warranted</strong> for production use, the protection of real-world sensitive, personal, financial, or confidential data, or safety-critical, life-critical, or mission-critical communications.</p>
-                <p style="margin-top:0.75rem">Although it uses modern cryptographic techniques, it has <strong>not undergone a formal security review or audit</strong>, and may contain serious vulnerabilities. You can audit the code yourself on <a href="https://github.com/samjanny/pinchat" target="_blank" rel="noopener noreferrer">GitHub</a>.</p>
-            </div>
+                <div class="info-box warning">
+                    <h3>⚠️ Experimental software — use at your own risk</h3>
+                    <p>PinChat is an experimental prototype provided strictly for educational and research purposes. It is <strong>NOT designed, intended, or warranted</strong> for production use, the protection of real-world sensitive, personal, financial, or confidential data, or safety-critical, life-critical, or mission-critical communications.</p>
+                    <p style="margin-top:0.75rem">Although it uses modern cryptographic techniques, it has <strong>not undergone a formal security review or audit</strong>, and may contain serious vulnerabilities. You can audit the code yourself on <a href="https://github.com/samjanny/pinchat" target="_blank" rel="noopener noreferrer">GitHub</a>.</p>
+                </div>
+            </section>
+
         </main>
 
         <footer>

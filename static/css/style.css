@@ -2276,3 +2276,325 @@ input[type="password"]:focus {
     color: var(--text);
 }
 
+/* ==========================================================================
+   Homepage — Linear hero, 2-col grid, info cards, feature grid
+   New components introduced by index.html markup refactor in v0.3.0.
+   ========================================================================== */
+
+.page-home {
+    background:
+        radial-gradient(900px 600px at 70% -10%, color-mix(in srgb, var(--primary) 14%, transparent), transparent 50%),
+        radial-gradient(700px 500px at 10% 110%, color-mix(in srgb, var(--accent) 8%, transparent), transparent 55%),
+        var(--bg);
+    background-attachment: fixed;
+    min-height: 100vh;
+}
+
+.home-container {
+    max-width: 1120px;
+    margin: 0 auto;
+    padding: 18px 24px 40px;
+}
+
+/* ---- Topbar ---- */
+.topbar {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    padding: 6px 4px 18px;
+    flex-wrap: wrap;
+}
+.topbar .brand {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-weight: 600;
+    font-size: 15px;
+    letter-spacing: -0.01em;
+    color: var(--text);
+}
+.topbar .brand-mark {
+    width: 28px;
+    height: 28px;
+    border-radius: 8px;
+    background: linear-gradient(135deg, var(--primary), var(--accent));
+    color: #fff;
+    display: grid;
+    place-items: center;
+    font-weight: 700;
+    font-size: 14px;
+    box-shadow: 0 4px 12px color-mix(in srgb, var(--primary) 30%, transparent);
+}
+.topbar .spacer { flex: 1; }
+.topbar .topbar-link {
+    color: var(--text-medium);
+    text-decoration: none;
+    font-size: 13.5px;
+    padding: 6px 10px;
+    border-radius: var(--radius-sm);
+    transition: color 120ms, background-color 120ms;
+}
+.topbar .topbar-link:hover { color: var(--text); background: var(--bg-card); }
+.topbar .topbar-link.muted { color: var(--text-light); }
+
+/* ---- Hero ---- */
+.hero {
+    padding: 18px 0;
+}
+.hero-eyebrow {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 12.5px;
+    color: var(--text-medium);
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    padding: 5px 12px;
+    border-radius: var(--radius-pill);
+    margin-bottom: 20px;
+}
+.hero-eyebrow .dot {
+    width: 6px; height: 6px; border-radius: 50%;
+    background: var(--success);
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--success) 20%, transparent);
+    animation: pinchat-pulse 2.4s ease-in-out infinite;
+}
+@keyframes pinchat-pulse {
+    0%, 100% { box-shadow: 0 0 0 3px color-mix(in srgb, var(--success) 20%, transparent); }
+    50%      { box-shadow: 0 0 0 6px color-mix(in srgb, var(--success) 5%, transparent); }
+}
+
+.hero-title {
+    font-size: 48px;
+    font-weight: 700;
+    letter-spacing: -0.025em;
+    line-height: 1.08;
+    max-width: 780px;
+    color: var(--text);
+}
+.hero-title-accent {
+    background: linear-gradient(135deg, var(--primary), var(--accent));
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+}
+.hero-lede {
+    font-size: 17px;
+    color: var(--text-medium);
+    line-height: 1.55;
+    margin-top: 16px;
+    max-width: 640px;
+}
+
+.hero-chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: 22px;
+}
+.hero-chip {
+    font-size: 12.5px;
+    color: var(--text-medium);
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    padding: 5px 10px;
+    border-radius: var(--radius-sm);
+}
+
+/* Hide the old security-badges block (kept in HTML just in case, but restyled below if used) */
+.security-badges { display: none; }
+
+/* ---- 2-column hero grid (form + info stack) ---- */
+.hero-grid {
+    display: grid;
+    grid-template-columns: minmax(0, 1.1fr) minmax(0, 0.9fr);
+    gap: 28px;
+    margin-top: 40px;
+    align-items: start;
+}
+@media (max-width: 860px) {
+    .hero-grid { grid-template-columns: 1fr; gap: 18px; }
+    .hero-title { font-size: 36px; }
+}
+
+.create-room-card { margin-bottom: 0; }
+.card-sub {
+    font-size: 13.5px;
+    color: var(--text-light);
+    margin-top: -4px;
+    margin-bottom: 18px;
+}
+
+/* Disabled segment in the segmented control */
+.radio-label.disabled {
+    opacity: 0.55;
+    cursor: not-allowed;
+}
+.radio-label.disabled input { pointer-events: none; }
+.tag {
+    font-style: normal;
+    font-size: 10.5px;
+    color: var(--text-light);
+    background: var(--border);
+    padding: 1px 6px;
+    border-radius: 4px;
+    margin-left: 6px;
+    font-weight: 500;
+    letter-spacing: 0;
+}
+
+/* Slider + live value */
+.slider-row {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    gap: 14px;
+    align-items: center;
+    padding: 4px 0;
+}
+.slider {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 100%;
+    height: 4px;
+    background: var(--border);
+    border-radius: 4px;
+    outline: none;
+    padding: 0;
+    border: none;
+}
+.slider::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 16px; height: 16px;
+    border-radius: 50%;
+    background: var(--primary);
+    cursor: pointer;
+    box-shadow: 0 0 0 4px color-mix(in srgb, var(--primary) 18%, transparent);
+    transition: box-shadow 120ms;
+    border: none;
+}
+.slider::-webkit-slider-thumb:hover {
+    box-shadow: 0 0 0 6px color-mix(in srgb, var(--primary) 22%, transparent);
+}
+.slider::-moz-range-thumb {
+    width: 16px; height: 16px;
+    border-radius: 50%;
+    background: var(--primary);
+    cursor: pointer;
+    border: none;
+    box-shadow: 0 0 0 4px color-mix(in srgb, var(--primary) 18%, transparent);
+}
+.slider:focus::-webkit-slider-thumb {
+    box-shadow: 0 0 0 6px color-mix(in srgb, var(--primary) 30%, transparent);
+}
+.slider-val {
+    min-width: 86px;
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+    font-size: 14.5px;
+    font-weight: 600;
+    color: var(--text);
+}
+.slider-val small {
+    font-weight: 400;
+    color: var(--text-light);
+    margin-left: 4px;
+    font-size: 12.5px;
+}
+
+/* ---- Info stack (right column) ---- */
+.info-stack {
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+}
+.info-card {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    padding: 16px 18px;
+}
+.info-card h3 {
+    font-size: 13.5px;
+    font-weight: 600;
+    color: var(--text);
+    margin-bottom: 6px;
+    letter-spacing: 0;
+}
+.info-card p {
+    font-size: 13px;
+    line-height: 1.55;
+    color: var(--text-medium);
+    margin: 0;
+}
+.info-card code {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    padding: 1px 6px;
+    border-radius: 4px;
+    color: var(--text);
+}
+
+/* ---- Feature grid ---- */
+.feature-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 14px;
+    margin-top: 48px;
+}
+.feature {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    padding: 16px 18px;
+}
+.feature-icon { font-size: 22px; margin-bottom: 8px; }
+.feature-title {
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text);
+    margin-bottom: 4px;
+}
+.feature-desc {
+    font-size: 13px;
+    color: var(--text-medium);
+    line-height: 1.5;
+}
+
+/* ---- Disclaimer stack ---- */
+.disclaimer-stack {
+    margin-top: 40px;
+    display: grid;
+    gap: 14px;
+}
+.info-box.warning {
+    border-radius: var(--radius-md);
+    border: 1px solid color-mix(in srgb, var(--warning) 40%, var(--border));
+    background: color-mix(in srgb, var(--warning) 6%, var(--bg-card));
+    padding: 16px 20px;
+}
+.info-box.warning h3 {
+    font-size: 14.5px;
+    font-weight: 600;
+    margin-bottom: 8px;
+    color: var(--text);
+}
+.info-box.warning p,
+.info-box.warning ul {
+    font-size: 13.5px;
+    color: var(--text-medium);
+    line-height: 1.55;
+}
+.info-box.warning ul {
+    margin: 0;
+    padding-left: 20px;
+}
+.info-box.warning li { margin: 3px 0; }
+
+/* Reset the generic .info-box (non-warning) since homepage now uses .info-card */
+.info-box:not(.warning) {
+    display: none;
+}
+
