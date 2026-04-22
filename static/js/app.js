@@ -30,6 +30,8 @@ document.addEventListener('alpine:init', () => {
         connecting: true,
         connectingMessage: 'Connecting...',
         userId: null,
+        peerUserId: null,       // UUID of the other participant in 1:1 rooms (null when alone)
+        peerNickname: null,     // Derived display name from peerUserId via generateNickname()
         myNickname: null,  // User's own nickname (generated from userId)
         initialized: false,
         wasConnectedBefore: false,  // Track if we've connected at least once (for reconnection detection)
@@ -263,6 +265,13 @@ document.addEventListener('alpine:init', () => {
                     this.participantCount = message.participant_count;
                     this.addSystemMessage('👋 A participant joined the chat');
 
+                    // Record peer identity up-front so the sidebar can show the
+                    // correct nickname before the peer's first message arrives.
+                    if (message.user_id && message.user_id !== this.userId) {
+                        this.peerUserId = message.user_id;
+                        this.peerNickname = generateNickname(message.user_id).display;
+                    }
+
                     if (this.roomType === 'onetoone' && this.participantCount === 2) {
                         // Reset ECDH status if it was stuck on 'aborted' from previous failed handshake
                         if (this.ecdhHandshakeStatus === 'aborted') {
@@ -282,6 +291,12 @@ document.addEventListener('alpine:init', () => {
                     this.participantCount = message.participant_count;
                     if (message.user_id !== this.userId) {
                         this.addSystemMessage('👋 A participant left the chat');
+                    }
+
+                    // Clear peer identity when they actually leave
+                    if (message.user_id === this.peerUserId) {
+                        this.peerUserId = null;
+                        this.peerNickname = null;
                     }
 
                     // When participant count drops below 2, cleanup ECDH state
@@ -928,6 +943,16 @@ document.addEventListener('alpine:init', () => {
             if (message.sender_id === this.userId) {
                 debugLog('[ECDH] Ignoring own public key echo');
                 return;
+            }
+
+            // Second-joiner path: we never saw a userjoined event for the peer
+            // (they were already in the room when we connected). Their sender_id
+            // on the ECDH handshake packet is the first authoritative source we
+            // have for their identity — record it so the sidebar can show the
+            // correct nickname immediately.
+            if (!this.peerUserId && message.sender_id) {
+                this.peerUserId = message.sender_id;
+                this.peerNickname = generateNickname(message.sender_id).display;
             }
 
             if (this.ecdhHandshakeStatus === 'complete') {

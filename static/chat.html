@@ -28,11 +28,14 @@
                 <span class="sidebar-item-badge">you</span>
             </div>
 
-            <!-- Peer (other participant, derived from first non-self message) -->
+            <!-- Peer (other participant). peerUserId is populated either on the
+                 userjoined event (when we were already in the room) or on the
+                 first ECDH public-key message (when we joined second). The
+                 nickname is generated deterministically from the userId. -->
             <template x-if="participantCount >= 2">
-                <div class="sidebar-item" :title="(messages.find(m => m.senderId && m.senderId !== userId) || {}).senderId || ''">
+                <div class="sidebar-item" :title="peerUserId || ''">
                     <span class="dot" :class="pfsActive ? 'on' : 'off'"></span>
-                    <span class="sidebar-item-label" x-text="(messages.find(m => m.senderId && m.senderId !== userId && m.nickname) || {}).nickname || 'Peer'">Peer</span>
+                    <span class="sidebar-item-label" x-text="peerNickname || 'Peer'">Peer</span>
                     <span class="sidebar-item-badge" x-show="sasVerificationStatus === 'verified'" title="Identity verified">✓</span>
                 </div>
             </template>
@@ -364,10 +367,10 @@
 
                     <!-- Peer row -->
                     <div class="sas-peer-row">
-                        <span class="sas-peer-avatar" x-text="((messages.find(m => m.senderId && m.senderId !== userId && m.nickname) || {}).nickname || 'P').charAt(0).toUpperCase()">P</span>
+                        <span class="sas-peer-avatar" x-text="(peerNickname || 'P').charAt(0).toUpperCase()">P</span>
                         <div class="sas-peer-meta">
                             <span class="sas-peer-label">Peer identity</span>
-                            <b class="sas-peer-name" x-text="(messages.find(m => m.senderId && m.senderId !== userId && m.nickname) || {}).nickname || 'stellar wolf'">peer</b>
+                            <b class="sas-peer-name" x-text="peerNickname || 'Peer'">peer</b>
                         </div>
                     </div>
 
@@ -433,7 +436,7 @@
     <script src="/static/js/ecdh.js" integrity="sha256-wx5quW6kBmpKtVGOffD3J1UszHYV4y7TpaPYQ6mXxtY=" crossorigin="anonymous" ></script>
     <script src="/static/js/websocket.js" integrity="sha256-UcUdIdoze6mxLgXbxg0pAR6xVTqn6U1TbEkAyWBXbNw=" crossorigin="anonymous" ></script>
     <script src="/static/js/emoji.js" integrity="sha256-50Jl89UVAxsebd+pNB1khjany8UVe0zq3ZoOZcGi6CY=" crossorigin="anonymous" ></script>
-    <script src="/static/js/app.js" integrity="sha256-laTKfmnQoGqEomhcHelQIkonkrDE46hWnqctT1yvUFM=" crossorigin="anonymous" ></script>
+    <script src="/static/js/app.js" integrity="sha256-j+EAmB6VZm5okN1o3l/vZyWS0FMizhPOmQnAG7g8Bw0=" crossorigin="anonymous" ></script>
     <script src="/static/js/alpine-csp.min.js" integrity="sha256-58hj2liWaS9dR44Q2uCJ5hZP7RxcG2offLv3qbCT8FU=" crossorigin="anonymous" defer></script>
 </body>
 </html>
