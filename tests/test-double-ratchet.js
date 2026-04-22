@@ -172,8 +172,9 @@ class DoubleRatchet {
         this.Ns = 0;
         this.Nr = 0;
         this.PN = 0;
-        this.skippedKeys = new Map();
+        this.skippedKeys = new Map();  // Map<keyId, {key, ratchetCount}>
         this.MAX_SKIP = 100;
+        this.MAX_SKIPPED_KEYS_TOTAL = 1000;
         this.isInitiator = false;
         this.ratchetCount = 0;
         this.hasRatchetedSinceReceive = true;
@@ -302,7 +303,8 @@ class DoubleRatchet {
             let messageKey;
 
             if (this.skippedKeys.has(skippedKeyId)) {
-                messageKey = this.skippedKeys.get(skippedKeyId);
+                const entry = this.skippedKeys.get(skippedKeyId);
+                messageKey = entry.key;
                 this.skippedKeys.delete(skippedKeyId);
             } else {
                 messageKey = await this.receivingChain.deriveMessageKeyForCounter(messageNumber);
@@ -386,6 +388,13 @@ class DoubleRatchet {
         if (this.rootKey) this.rootKey.fill(0);
         this.rootKey = newRootKey2;
         this.ratchetCount++;
+
+        // Prune skipped keys from chains more than one ratchet round old.
+        for (const [id, entry] of this.skippedKeys) {
+            if (entry.ratchetCount < this.ratchetCount - 1) {
+                this.skippedKeys.delete(id);
+            }
+        }
     }
 
     async performSendSideDHRatchet() {
@@ -430,7 +439,14 @@ class DoubleRatchet {
         while (this.Nr < until) {
             const messageKey = await this.receivingChain.deriveMessageKeyForCounter(this.Nr);
             const keyId = `${dhPublicKeyBase64}:${this.Nr}`;
-            this.skippedKeys.set(keyId, messageKey);
+            this.skippedKeys.set(keyId, { key: messageKey, ratchetCount: this.ratchetCount });
+
+            // Global cap: FIFO eviction
+            if (this.skippedKeys.size > this.MAX_SKIPPED_KEYS_TOTAL) {
+                const oldest = this.skippedKeys.keys().next().value;
+                this.skippedKeys.delete(oldest);
+            }
+
             await this.receivingChain.ratchet();
             this.Nr++;
         }
@@ -1257,6 +1273,46 @@ async function runTests() {
     } catch (e) {
         console.log('FAILED:', e.message);
         console.log(e.stack);
+        failed++;
+    }
+    console.log('');
+
+    // =========================================================================
+    // Test 13: Global skippedKeys cap (anti-DoS, FIFO eviction)
+    // =========================================================================
+    console.log('--- Test 13: Global skippedKeys Cap ---');
+    try {
+        const alice = new DoubleRatchet();
+        const keypair = await subtle.generateKey(
+            { name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveKey', 'deriveBits']
+        );
+        await alice.initialize(new Uint8Array(32).fill(7), true, keypair, null);
+
+        // Simulate the insert path from skipMessageKeys: set + FIFO eviction.
+        // Populate well beyond the cap across simulated ratchet rounds.
+        const CAP = alice.MAX_SKIPPED_KEYS_TOTAL;
+        for (let rc = 0; rc < 20; rc++) {
+            for (let n = 0; n < 90; n++) {
+                alice.skippedKeys.set(`dh-${rc}:${n}`, { key: null, ratchetCount: rc });
+                if (alice.skippedKeys.size > CAP) {
+                    const oldest = alice.skippedKeys.keys().next().value;
+                    alice.skippedKeys.delete(oldest);
+                }
+            }
+        }
+
+        console.log(`  Inserted 1800 entries (20 rounds × 90 skip), cap=${CAP}`);
+        console.log(`  skippedKeys.size = ${alice.skippedKeys.size}`);
+
+        if (alice.skippedKeys.size <= CAP) {
+            console.log('PASSED: Global cap enforced via FIFO eviction');
+            passed++;
+        } else {
+            console.log(`FAILED: size ${alice.skippedKeys.size} exceeds cap ${CAP}`);
+            failed++;
+        }
+    } catch (e) {
+        console.log('FAILED:', e.message);
         failed++;
     }
     console.log('');

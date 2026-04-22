@@ -362,7 +362,8 @@ class CryptoManager {
         this.lastSenderId = null;                   // Track last message sender for direction-change detection
 
         // Desync protection: Maximum allowed message gap
-        this.MAX_SKIP = 1000;                       // Anti-DoS: prevent memory exhaustion from excessive skips
+        // Aligned with DoubleRatchet.MAX_SKIP and PROTOCOL.md.
+        this.MAX_SKIP = 100;                        // Anti-DoS: prevent memory exhaustion from excessive skips
 
         // Anti-replay: Track seen message hashes
         this.seenMessageHashes = new Set();

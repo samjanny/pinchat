@@ -49,9 +49,12 @@ class DoubleRatchet {
         this.PN = 0;  // Previous sending chain length (for out-of-order handling)
 
         // Skipped message keys (for out-of-order messages)
-        // Map of "ratchetPublicKey:messageNumber" -> messageKey
+        // Map of "ratchetPublicKey:messageNumber" -> {key: CryptoKey, ratchetCount: number}
+        // The ratchetCount is needed to prune entries from chains more than one
+        // round old (PFS: drop keys from past DH ratchets we no longer need).
         this.skippedKeys = new Map();
-        this.MAX_SKIP = 100;  // Maximum messages to skip (DoS protection)
+        this.MAX_SKIP = 100;                  // Maximum messages to skip per chain (DoS protection)
+        this.MAX_SKIPPED_KEYS_TOTAL = 1000;   // Global cap across all ratchet rounds (anti-DoS)
 
         // Ratchet state
         this.isInitiator = false;  // Whether we initiated the handshake
@@ -320,7 +323,8 @@ class DoubleRatchet {
             let messageKey;
 
             if (this.skippedKeys.has(skippedKeyId)) {
-                messageKey = this.skippedKeys.get(skippedKeyId);
+                const entry = this.skippedKeys.get(skippedKeyId);
+                messageKey = entry.key;
                 this.skippedKeys.delete(skippedKeyId);
                 debugLog(`[DoubleRatchet] Using skipped key for message #${messageNumber}`);
             } else {
@@ -465,6 +469,15 @@ class DoubleRatchet {
         // Increment ratchet count
         this.ratchetCount++;
 
+        // Prune skipped keys from chains more than one ratchet round old.
+        // We keep the previous chain (ratchetCount - 1) in case a delayed
+        // message arrives after the ratchet, but drop anything older.
+        for (const [id, entry] of this.skippedKeys) {
+            if (entry.ratchetCount < this.ratchetCount - 1) {
+                this.skippedKeys.delete(id);
+            }
+        }
+
         debugLog(`[DoubleRatchet] ✅ RECEIVE-SIDE DH ratchet #${this.ratchetCount} completed`);
         debugLog('[DoubleRatchet] 🔐 Post-Compromise Security (PCS) checkpoint reached');
         debugLog('[DoubleRatchet] 📤 New sendingChain derived - ready for reply');
@@ -552,7 +565,16 @@ class DoubleRatchet {
         while (this.Nr < until) {
             const messageKey = await this.receivingChain.deriveMessageKeyForCounter(this.Nr);
             const keyId = `${dhPublicKeyBase64}:${this.Nr}`;
-            this.skippedKeys.set(keyId, messageKey);
+            this.skippedKeys.set(keyId, { key: messageKey, ratchetCount: this.ratchetCount });
+
+            // Global cap: FIFO eviction (Map preserves insertion order).
+            // Prevents memory exhaustion across many ratchet rounds.
+            if (this.skippedKeys.size > this.MAX_SKIPPED_KEYS_TOTAL) {
+                const oldest = this.skippedKeys.keys().next().value;
+                this.skippedKeys.delete(oldest);
+                debugLog(`[DoubleRatchet] Evicted oldest skipped key (global cap ${this.MAX_SKIPPED_KEYS_TOTAL})`);
+            }
+
             await this.receivingChain.ratchet();
             this.Nr++;
         }
