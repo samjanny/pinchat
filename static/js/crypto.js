@@ -3,6 +3,13 @@
  */
 
 /**
+ * PinChat wire-protocol version. First explicit numbered version.
+ * Clients before this release are "v0 implicit" and will be rejected.
+ */
+const PINCHAT_PROTOCOL_VERSION = 1;
+window.PINCHAT_PROTOCOL_VERSION = PINCHAT_PROTOCOL_VERSION;
+
+/**
  * Converts standard Base64 to URL-safe Base64url (RFC 4648)
  * @param {string} base64 - Standard Base64 string
  * @returns {string} Base64url string
