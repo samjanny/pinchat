@@ -11,12 +11,14 @@ PinChat is a secure messaging application designed for privacy-first communicati
 - **End-to-End Encryption**: All messages encrypted using AES-GCM 256-bit with keys that never leave the client
 - **Perfect Forward Secrecy**: Compromised keys cannot decrypt past messages (Double Ratchet protocol)
 - **Post-Compromise Security**: Session automatically recovers security after key compromise
+- **Authenticated DH Ratchet**: Every DH public key rotation is signed with the peer's identity key (ECDSA P-256). A live MITM swap triggers a hard session abort (WebSocket close 1008, no auto-reconnect).
 - **Zero Persistence**: All data exists only in memory; nothing is written to disk
 - **Zero Knowledge**: Server cannot decrypt messages, identify users, or correlate sessions
 - **Ephemeral Rooms**: Chat rooms automatically self-destruct after configurable TTL (1-1440 minutes)
 - **Anonymous Access**: No registration, no accounts, no tracking
 - **Encrypted Media**: Image sharing with the same E2E encryption as text messages
 - **MITM Detection**: Short Authentication String (SAS) verification for identity confirmation
+- **Subprotocol-based WebSocket auth**: JWT is carried in `Sec-WebSocket-Protocol`, never in the URL — so it never lands in proxy access logs, referrer headers, or middlebox caches.
 
 ### Communication Modes
 
@@ -41,6 +43,8 @@ The URL fragment (everything after `#`) is never sent to the server per RFC 3986
 3. The key is shared out-of-band (copy/paste, QR code, etc.)
 
 The Bootstrap Key encrypts the initial ECDH key exchange. After the handshake completes, the Double Ratchet takes over for message encryption with Perfect Forward Secrecy.
+
+**Protocol v1 hardening (v0.2.0):** once the Double Ratchet is running the in-memory Bootstrap Key is dropped. On reconnect the key is re-extracted from the URL fragment (which survives transparent WebSocket reconnects). If the fragment is missing — e.g., a browser extension cleared `window.location.hash` — the client surfaces a clear "please re-open the original room link" message instead of attempting a handshake without a bootstrap key.
 
 ### Encryption Architecture
 
@@ -337,6 +341,65 @@ See [extensions/README.md](extensions/README.md) for setup and installation inst
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Dates are the repository-local commit dates; entries are curated for user-visible impact
 rather than being a 1:1 mirror of `git log`.
+
+### [2026-04-22] — v0.2.0 (protocol v1)
+
+**First explicitly numbered wire-protocol version.** Pre-release clients and
+servers are considered "v0 implicit" and are rejected after this release.
+Deploy is atomic (server + static JS + HTML together); see `PROTOCOL.md` for
+the full reject-code matrix.
+
+#### Security (critical)
+
+- **Authenticated DH ratchet.** The claim that "all ephemeral keys are
+  authenticated" in previous `SECURITY.md` was aspirational: the Double Ratchet
+  DH rotations were actually unsigned. They are now ECDSA-signed over
+  `"pinchat-drheader-v1" || len(dh):u16_be || dh || rc:u32_be`, binding the
+  signature to the current ratchet round. A live MITM that swaps the DH
+  header mid-session triggers `SIGNATURE_INVALID` → WebSocket close 1008 →
+  hard identity teardown → no auto-reconnect.
+- **JWT out of the URL.** Previously the WebSocket token travelled in
+  `?token=<jwt>`, so it could land in proxy access logs, referrer headers,
+  and middlebox caches. Now the client offers
+  `Sec-WebSocket-Protocol: pinchat.v1, pinchat.v1.jwt.<token>` and the
+  server echoes back only `pinchat.v1` on the 101. `/api/ws-token` and
+  `/api/rooms` additionally return `protocol_version` and
+  `supported_subprotocols` so a v1 client can reject a v0 server *before*
+  attempting the opaque-failure-modes WebSocket upgrade.
+- **Bootstrap key zeroed after handshake.** The AES-GCM bootstrap key used
+  to be retained in memory for the full session to make re-handshaking
+  convenient. It is now dropped; re-handshake goes through
+  `resetToBootstrapKey()` which re-extracts from the URL fragment.
+  `resetToBootstrapKey()` also destroys the live `DoubleRatchet` instance
+  that previous implementations left alive on peer-leave / reconnect.
+- **`MAX_SKIP` aligned + global cap.** `MAX_SKIP` was 100 in
+  `double-ratchet.js` and `PROTOCOL.md` but 1000 in `crypto.js`. All layers
+  now agree on 100. The `skippedKeys` map gained a 1000-entry global
+  FIFO-evicted cap plus pruning across DH ratchet boundaries (was
+  unbounded across rounds).
+
+#### Added
+
+- Protocol version constant `PINCHAT_PROTOCOL_VERSION = 1` in both Rust and
+  JS; header field `v` is mandatory for `message`/`image` envelopes and
+  serde rejects v0 shapes.
+- `PROTOCOL_OR_AUTH_FAILURE` vs `CONNECTION_EXHAUSTED` separation so the
+  client banner distinguishes "refresh the page" from "check your network".
+- Async error boundary wrappers around `onMessage`, `onConnected`, and the
+  `ECDHKeyExchange.startTimeout` callback — unhandled promise rejections
+  from the new teardown paths can no longer escape silently.
+- Integration tests for the WebSocket upgrade handshake (bound listener +
+  raw TCP): reject paths for missing subprotocol, v0 subprotocol, missing
+  JWT, expired JWT, wrong `room_id`, plus the full 101 success case that
+  asserts the server never echoes the `pinchat.v1.jwt.*` companion.
+
+#### Removed
+
+- `dh_ratchet` message type (the server previously relayed these; dead
+  code after the Signal-style receive-side ratchet). This removed a
+  gratuitous traffic-amplification surface.
+- `?token=` query-string authentication for `/ws/:room_id`.
+- Optional `header` on `message` / `image` envelopes.
 
 ### [2026-04-21]
 
