@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>PinChat - Secure Chat</title>
-    <link rel="stylesheet" href="/static/css/style.css" integrity="sha256-6GRxNiwEo5UN71QnyEUTke7LWms9S9LzNITiqO23s9A=" crossorigin="anonymous" >
+    <link rel="stylesheet" href="/static/css/style.css" integrity="sha256-x3qVKBvaSYexhAduFwpJC4vyyMgQiTcFClvA6kD+l54=" crossorigin="anonymous" >
     <script src="/static/js/theme.js" integrity="sha256-vc83MC35lVoXBnYkFcbi+cE5EgJ+drCEfcjEryWT40A=" crossorigin="anonymous" ></script>
     <script src="/static/js/pow.js" integrity="sha256-4jyDkg400LlXkyi0zC+QbIJhh6pEYjneo43JWuFVRZc=" crossorigin="anonymous" ></script>
     <script src="/static/js/nicknames.js" integrity="sha256-FFlmH12HLY/cK10Uu5ALIabktzw+KiCJdF2p60qlSuc=" crossorigin="anonymous" ></script>
@@ -19,11 +19,36 @@
                 <b>PinChat</b>
             </a>
 
-            <div class="sidebar-group">Active room</div>
-            <div class="sidebar-item active" :title="roomId">
+            <div class="sidebar-group">Participants <span class="sidebar-group-count" x-text="'(' + participantCount + '/' + (maxParticipants !== null ? maxParticipants : '-') + ')'">(0/-)</span></div>
+
+            <!-- You (current user) -->
+            <div class="sidebar-item active" :title="userId">
                 <span class="dot" :class="pfsActive ? 'on' : 'off'"></span>
                 <span class="sidebar-item-label"><span x-text="myNickname || '…'">…</span></span>
-                <span class="sidebar-item-badge" x-text="roomType === 'onetoone' ? '1:1' : (roomType === 'group' ? 'grp' : '…')">1:1</span>
+                <span class="sidebar-item-badge">you</span>
+            </div>
+
+            <!-- Peer (other participant, derived from first non-self message) -->
+            <template x-if="participantCount >= 2">
+                <div class="sidebar-item" :title="(messages.find(m => m.senderId && m.senderId !== userId) || {}).senderId || ''">
+                    <span class="dot" :class="pfsActive ? 'on' : 'off'"></span>
+                    <span class="sidebar-item-label" x-text="(messages.find(m => m.senderId && m.senderId !== userId && m.nickname) || {}).nickname || 'Peer'">Peer</span>
+                    <span class="sidebar-item-badge" x-show="sasVerificationStatus === 'verified'" title="Identity verified">✓</span>
+                </div>
+            </template>
+
+            <!-- Waiting slot when alone -->
+            <template x-if="participantCount < 2">
+                <div class="sidebar-item sidebar-item-muted">
+                    <span class="dot off"></span>
+                    <span class="sidebar-item-label">Waiting for peer…</span>
+                </div>
+            </template>
+
+            <div class="sidebar-group">Room</div>
+            <div class="sidebar-item sidebar-item-static">
+                <span class="sidebar-item-label" x-text="roomType === 'onetoone' ? '1 : 1' : (roomType === 'group' ? 'Group' : '…')">1 : 1</span>
+                <span class="sidebar-item-badge" x-text="roomId ? roomId.substring(0,6) + '…' : '—'">—</span>
             </div>
 
             <div class="sidebar-group">Session</div>

@@ -3016,7 +3016,31 @@ input[type="password"]:focus {
     letter-spacing: 0.1em;
     color: var(--text-light);
     font-weight: 600;
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
 }
+.sidebar-group-count {
+    font-weight: 400;
+    letter-spacing: 0;
+    color: var(--text-lighter);
+    text-transform: none;
+    font-size: 11px;
+    font-variant-numeric: tabular-nums;
+}
+
+/* Muted (placeholder) sidebar item */
+.sidebar-item-muted {
+    color: var(--text-lighter);
+    font-style: italic;
+}
+.sidebar-item-muted .sidebar-item-label { font-weight: 400; }
+
+/* Static sidebar row (not a selectable room, just info) */
+.sidebar-item-static {
+    color: var(--text-medium);
+}
+.sidebar-item-static .sidebar-item-label { font-weight: 500; }
 
 .sidebar-item {
     display: flex;
