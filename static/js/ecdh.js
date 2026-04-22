@@ -371,16 +371,16 @@ class ECDHKeyExchange {
     }
 
     /**
-     * Marks bootstrap key as no longer in use (after handshake)
+     * Drop the bootstrap key reference after handshake completion (protocol v1).
      *
-     * NOTE: We keep the bootstrap key to allow re-handshaking
-     * (e.g., when a user leaves and rejoins, or during reconnection).
-     * Messages still have Perfect Forward Secrecy via Chain Ratchet.
+     * Previously this was a no-op to support re-handshaking without re-reading
+     * the URL fragment. v1 hardening: we null the reference. Re-handshake is
+     * driven from CryptoManager.resetToBootstrapKey() which rebuilds an
+     * ECDHKeyExchange with a freshly-extracted bootstrap key.
      */
     deleteBootstrapKey() {
-        debugLog('[ECDH] Bootstrap key marked as inactive (Chain Ratchet now active)');
-        // NOTE: We intentionally do NOT delete this.bootstrapKey to support multiple handshakes
-        // this.bootstrapKey = null;  // ← Commented out to support re-handshaking
+        debugLog('[ECDH] Dropping bootstrap key reference (v1 hardening)');
+        this.bootstrapKey = null;
     }
 
     /**

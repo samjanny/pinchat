@@ -808,10 +808,18 @@ class CryptoManager {
      * - Handshake can be repeated without re-extracting key from URL
      * - Bootstrap key only protects ECDH public keys (already ephemeral)
      */
+    /**
+     * Drop the bootstrap key reference after handshake completion (protocol v1).
+     *
+     * PFS hardening: previously this method was a no-op to support re-handshaking
+     * without re-reading the URL fragment. That kept the AES-GCM key alive in
+     * memory for the entire session, which meant a later client compromise
+     * could re-derive handshake material. Now we null the reference; re-handshake
+     * goes through `resetToBootstrapKey()` which re-extracts from the URL fragment.
+     */
     deleteBootstrapKey() {
-        debugLog('[CRYPTO] Bootstrap key marked as inactive (Chain Ratchet now active)');
-        // NOTE: We intentionally do NOT delete this.key to allow re-handshaking
-        // this.key = null;  // ← Commented out to support multiple handshakes
+        debugLog('[CRYPTO] Dropping bootstrap key reference (v1 hardening)');
+        this.key = null;
     }
 
     /**
@@ -826,18 +834,44 @@ class CryptoManager {
      * - User C enters and uses bootstrapKey
      * - Messages become incompatible → permanent DoS
      */
-    resetToBootstrapKey() {
-        debugLog('[CRYPTO] Resetting to bootstrap key (PFS ended, waiting for new handshake)');
+    /**
+     * Full reset of ratchet state and re-extraction of the bootstrap key.
+     *
+     * Tear-down covers BOTH the legacy Chain Ratchet path AND the Double Ratchet
+     * instance that is actually in use at runtime. After this call, no key
+     * material from the previous session remains live in memory.
+     *
+     * The bootstrap key is re-extracted from the URL fragment (which survives
+     * WebSocket reconnects because we never navigate). If the fragment is gone
+     * (e.g., a hostile extension cleared window.location.hash), throws
+     * BOOTSTRAP_KEY_LOST so the caller can surface a "please re-open the
+     * original room link" message instead of attempting a handshake without a
+     * bootstrap key.
+     *
+     * @throws {Error} 'BOOTSTRAP_KEY_LOST' if the URL fragment is missing.
+     */
+    async resetToBootstrapKey() {
+        debugLog('[CRYPTO] Full reset → re-extract bootstrap key from URL fragment');
 
-        // Reset chain ratchet
+        // Legacy Chain Ratchet path
         this.sendingChain.reset();
         this.receivingChain.reset();
         this.ratchetActive = false;
-
-        // Clear legacy session key
         this.sessionKey = null;
 
-        // Keep this.key (bootstrap) - it's still needed for next handshake
+        // Double Ratchet (the one actually in use at runtime)
+        if (this.doubleRatchet) {
+            this.doubleRatchet.destroy();
+            this.doubleRatchet = null;
+        }
+        this.doubleRatchetActive = false;
+
+        // Re-extract bootstrap key from URL fragment (survives WS reconnect;
+        // also has a sessionStorage recovery path for the login redirect case).
+        const reExtracted = await this.extractKeyFromURL();
+        if (!reExtracted) {
+            throw new Error('BOOTSTRAP_KEY_LOST');
+        }
     }
 
     /**

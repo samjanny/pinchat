@@ -11,6 +11,15 @@ class WebSocketManager {
         this.reconnectDelay = 1000; // Base delay in ms
         this.isManuallyDisconnected = false;
 
+        // Terminal session flags (v1).
+        // _fatalAuthFailure: explicit protocol/auth mismatch → no auto-reconnect,
+        //                    page refresh required (set by requestWsToken gate,
+        //                    onopen subprotocol mismatch, SIGNATURE_INVALID).
+        // _connectionExhausted: transient transport failure after N retries
+        //                    → user-initiated reconnect gets a fresh budget.
+        this._fatalAuthFailure = false;
+        this._connectionExhausted = false;
+
         // Token caching for reconnection (avoids PoW on every reconnect)
         this.cachedToken = null;
         this.tokenExpiresAt = 0;
@@ -339,6 +348,28 @@ class WebSocketManager {
 
         if (this.ws) {
             this.ws.close(1000, 'Manual disconnect');
+            this.ws = null;
+        }
+    }
+
+    /**
+     * Disconnect with a specific WebSocket close code + reason, and mark the
+     * session as fatal so auto-reconnect is suppressed.
+     *
+     * Used for SIGNATURE_INVALID (1008 Policy Violation) after a detected MITM
+     * attempt: we do NOT want the client to silently reconnect and re-establish
+     * a session with a peer whose identity just failed authentication.
+     */
+    disconnectWithError(code, reason) {
+        this.isManuallyDisconnected = true;
+        this._fatalAuthFailure = true;
+        if (this._boundBeforeUnload) {
+            window.removeEventListener('beforeunload', this._boundBeforeUnload);
+        }
+        if (this.ws) {
+            try {
+                this.ws.close(code, reason);
+            } catch (_) { /* ignore */ }
             this.ws = null;
         }
     }
