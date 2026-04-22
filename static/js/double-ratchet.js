@@ -49,9 +49,16 @@ class DoubleRatchet {
         this.PN = 0;  // Previous sending chain length (for out-of-order handling)
 
         // Skipped message keys (for out-of-order messages)
-        // Map of "ratchetPublicKey:messageNumber" -> messageKey
+        // Map of "ratchetPublicKey:messageNumber" -> {key: CryptoKey, ratchetCount: number}
+        // The ratchetCount is needed to prune entries from chains more than one
+        // round old (PFS: drop keys from past DH ratchets we no longer need).
         this.skippedKeys = new Map();
-        this.MAX_SKIP = 100;  // Maximum messages to skip (DoS protection)
+        this.MAX_SKIP = 100;                  // Maximum messages to skip per chain (DoS protection)
+        this.MAX_SKIPPED_KEYS_TOTAL = 1000;   // Global cap across all ratchet rounds (anti-DoS)
+
+        // Cached signature over the current DHs public key (protocol v1).
+        // Recomputed whenever DHs is generated; reused across messages in the same chain.
+        this.DHsSignature = null;
 
         // Ratchet state
         this.isInitiator = false;  // Whether we initiated the handshake
@@ -62,6 +69,44 @@ class DoubleRatchet {
 
         // Configuration
         this.CURVE = 'P-256';
+    }
+
+    /**
+     * Build the canonical byte sequence that is signed to authenticate the
+     * current DH public key at a given ratchet round. Deterministic and
+     * length-prefixed to avoid concatenation ambiguity.
+     *
+     *   tag || len(dh_raw):u16_be || dh_raw || rc:u32_be
+     *
+     * @private
+     * @param {ArrayBuffer|Uint8Array} dhRaw - raw exported DH public key
+     * @param {number} rc - ratchet count at signing time
+     * @returns {Uint8Array}
+     */
+    _buildCanonicalBytes(dhRaw, rc) {
+        const tag = new TextEncoder().encode('pinchat-drheader-v1');
+        const dhBytes = dhRaw instanceof Uint8Array ? dhRaw : new Uint8Array(dhRaw);
+        const out = new Uint8Array(tag.length + 2 + dhBytes.byteLength + 4);
+        out.set(tag, 0);
+        new DataView(out.buffer).setUint16(tag.length, dhBytes.byteLength, false);
+        out.set(dhBytes, tag.length + 2);
+        new DataView(out.buffer).setUint32(tag.length + 2 + dhBytes.byteLength, rc, false);
+        return out;
+    }
+
+    /**
+     * Sign the current DHs public key with the identity ECDSA key and cache
+     * the base64url signature. Must be invoked after every fresh DHs keypair
+     * generation (initialize, performDHRatchetOnReceive, performSendSideDHRatchet).
+     */
+    async signCurrentDHs() {
+        if (!this.identityManager) {
+            throw new Error('identityManager required for signed DH ratchet (protocol v1)');
+        }
+        const raw = await crypto.subtle.exportKey('raw', this.DHs.publicKey);
+        const canon = this._buildCanonicalBytes(raw, this.ratchetCount);
+        const sigBuf = await this.identityManager.sign(canon);
+        this.DHsSignature = this.arrayBufferToBase64url(sigBuf);
     }
 
     /**
@@ -140,6 +185,9 @@ class DoubleRatchet {
         this.Nr = 0;
         this.PN = 0;
         this.ratchetCount = 0;
+
+        // Sign the initial DHs (protocol v1 authenticated ratchet).
+        await this.signCurrentDHs();
 
         debugLog('[DoubleRatchet] ✅ Initialized with root key + bidirectional chains');
         debugLog('[DoubleRatchet] ✅ DH ratchet will trigger automatically on direction change');
@@ -230,15 +278,22 @@ class DoubleRatchet {
 
         debugLog(`[DoubleRatchet] Message encrypted #${messageNumber} (ratchet: ${this.ratchetCount})`);
 
-        // Return message with header containing DH public key
-        // The header allows the receiver to perform DH ratchet if needed
+        // Return message with header containing DH public key + signature (v1).
+        // The header allows the receiver to (a) verify authenticity of the DH
+        // public key via the cached identity signature, and (b) perform the DH
+        // ratchet when needed.
+        if (!this.DHsSignature) {
+            throw new Error('DHsSignature missing — signCurrentDHs must run after every DHs generation');
+        }
         return {
             payload: payload,
             header: {
-                dh: dhPublicKeyBase64,  // Our current DH public key
-                pn: this.PN,            // Previous chain length (for skipped messages)
-                n: messageNumber,       // Message number in current chain
-                rc: this.ratchetCount   // Ratchet count for debugging
+                v: 1,                      // Protocol version
+                dh: dhPublicKeyBase64,     // Our current DH public key
+                pn: this.PN,               // Previous chain length (for skipped messages)
+                n: messageNumber,          // Message number in current chain
+                rc: this.ratchetCount,     // Ratchet count for debugging
+                sig: this.DHsSignature     // ECDSA signature over (tag || len || dh || rc)
             }
         };
     }
@@ -263,6 +318,19 @@ class DoubleRatchet {
             throw new Error('Double Ratchet not initialized');
         }
 
+        // Protocol v1 header shape validation.
+        if (!header || typeof header !== 'object') {
+            throw new Error('PROTOCOL_MISMATCH');
+        }
+        // Resolve protocol version from globalThis for Node/test harness compatibility.
+        const expectedV = (typeof globalThis !== 'undefined' && globalThis.PINCHAT_PROTOCOL_VERSION) || 1;
+        if (header.v !== expectedV) {
+            throw new Error('PROTOCOL_MISMATCH');
+        }
+        if (!header.sig || typeof header.sig !== 'string') {
+            throw new Error('MISSING_SIGNATURE');
+        }
+
         // Extract header fields
         const { dh: dhPublicKeyBase64, pn: prevChainLength, n: messageNumber, rc: ratchetCount } = header;
 
@@ -270,6 +338,19 @@ class DoubleRatchet {
 
         // Check if this is a NEW DH public key (triggers DH ratchet)
         const dhPublicKeyRaw = this.base64urlToArrayBuffer(dhPublicKeyBase64);
+
+        // Verify identity signature over the canonical (tag || len || dh || rc) tuple.
+        // This is the MITM defense for the DH ratchet: without it, a MITM could swap
+        // the DH public key in the header and hijack the chain direction.
+        try {
+            const sigBytes = this.base64urlToArrayBuffer(header.sig);
+            const canon = this._buildCanonicalBytes(dhPublicKeyRaw, ratchetCount);
+            await this.identityManager.verify(canon, sigBytes);
+        } catch (e) {
+            debugError('[DoubleRatchet] DH header signature INVALID - MITM suspected:', e);
+            throw new Error('SIGNATURE_INVALID');
+        }
+
         const isFirstMessage = !this.DHrRaw;  // Responder's first received message
         const isNewKey = !isFirstMessage && !this.arraysEqual(dhPublicKeyRaw, new Uint8Array(this.DHrRaw));
 
@@ -320,7 +401,8 @@ class DoubleRatchet {
             let messageKey;
 
             if (this.skippedKeys.has(skippedKeyId)) {
-                messageKey = this.skippedKeys.get(skippedKeyId);
+                const entry = this.skippedKeys.get(skippedKeyId);
+                messageKey = entry.key;
                 this.skippedKeys.delete(skippedKeyId);
                 debugLog(`[DoubleRatchet] Using skipped key for message #${messageNumber}`);
             } else {
@@ -465,6 +547,18 @@ class DoubleRatchet {
         // Increment ratchet count
         this.ratchetCount++;
 
+        // Prune skipped keys from chains more than one ratchet round old.
+        // We keep the previous chain (ratchetCount - 1) in case a delayed
+        // message arrives after the ratchet, but drop anything older.
+        for (const [id, entry] of this.skippedKeys) {
+            if (entry.ratchetCount < this.ratchetCount - 1) {
+                this.skippedKeys.delete(id);
+            }
+        }
+
+        // Sign the freshly generated DHs for the new ratchet round.
+        await this.signCurrentDHs();
+
         debugLog(`[DoubleRatchet] ✅ RECEIVE-SIDE DH ratchet #${this.ratchetCount} completed`);
         debugLog('[DoubleRatchet] 🔐 Post-Compromise Security (PCS) checkpoint reached');
         debugLog('[DoubleRatchet] 📤 New sendingChain derived - ready for reply');
@@ -528,6 +622,9 @@ class DoubleRatchet {
         // Mark that we've ratcheted
         this.hasRatchetedSinceReceive = true;
 
+        // Sign the freshly generated DHs (v1 authenticated ratchet).
+        await this.signCurrentDHs();
+
         debugLog(`[DoubleRatchet] ✅ Send-side DH ratchet #${this.ratchetCount} completed`);
         debugLog('[DoubleRatchet] 🔐 New keypair generated, sending chain updated');
     }
@@ -552,7 +649,16 @@ class DoubleRatchet {
         while (this.Nr < until) {
             const messageKey = await this.receivingChain.deriveMessageKeyForCounter(this.Nr);
             const keyId = `${dhPublicKeyBase64}:${this.Nr}`;
-            this.skippedKeys.set(keyId, messageKey);
+            this.skippedKeys.set(keyId, { key: messageKey, ratchetCount: this.ratchetCount });
+
+            // Global cap: FIFO eviction (Map preserves insertion order).
+            // Prevents memory exhaustion across many ratchet rounds.
+            if (this.skippedKeys.size > this.MAX_SKIPPED_KEYS_TOTAL) {
+                const oldest = this.skippedKeys.keys().next().value;
+                this.skippedKeys.delete(oldest);
+                debugLog(`[DoubleRatchet] Evicted oldest skipped key (global cap ${this.MAX_SKIPPED_KEYS_TOTAL})`);
+            }
+
             await this.receivingChain.ratchet();
             this.Nr++;
         }

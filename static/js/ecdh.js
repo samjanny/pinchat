@@ -371,16 +371,16 @@ class ECDHKeyExchange {
     }
 
     /**
-     * Marks bootstrap key as no longer in use (after handshake)
+     * Drop the bootstrap key reference after handshake completion (protocol v1).
      *
-     * NOTE: We keep the bootstrap key to allow re-handshaking
-     * (e.g., when a user leaves and rejoins, or during reconnection).
-     * Messages still have Perfect Forward Secrecy via Chain Ratchet.
+     * Previously this was a no-op to support re-handshaking without re-reading
+     * the URL fragment. v1 hardening: we null the reference. Re-handshake is
+     * driven from CryptoManager.resetToBootstrapKey() which rebuilds an
+     * ECDHKeyExchange with a freshly-extracted bootstrap key.
      */
     deleteBootstrapKey() {
-        debugLog('[ECDH] Bootstrap key marked as inactive (Chain Ratchet now active)');
-        // NOTE: We intentionally do NOT delete this.bootstrapKey to support multiple handshakes
-        // this.bootstrapKey = null;  // ← Commented out to support re-handshaking
+        debugLog('[ECDH] Dropping bootstrap key reference (v1 hardening)');
+        this.bootstrapKey = null;
     }
 
     /**
@@ -589,7 +589,13 @@ class ECDHKeyExchange {
     }
 
     /**
-     * Start handshake timeout - fallback to bootstrap key if timeout
+     * Start handshake timeout - fallback to bootstrap key if timeout.
+     *
+     * The callback may be async (e.g. app.js passes an async arrow that
+     * awaits handleECDHAborted). We wrap in Promise.resolve().then() so both
+     * async rejections and synchronous throws are caught — no unhandled
+     * promise rejections on the timeout path.
+     *
      * @param {Function} onTimeout - Callback if handshake times out
      */
     startTimeout(onTimeout) {
@@ -598,7 +604,11 @@ class ECDHKeyExchange {
         this.handshakeTimeout = setTimeout(() => {
             if (!this.handshakeComplete) {
                 debugWarn('[ECDH] ⏱️ Handshake timeout - falling back to bootstrap key');
-                onTimeout();
+                Promise.resolve()
+                    .then(() => onTimeout())
+                    .catch((err) => {
+                        console.error('[ECDH] Error in handshake timeout callback:', err);
+                    });
             }
         }, this.HANDSHAKE_TIMEOUT_MS);
     }

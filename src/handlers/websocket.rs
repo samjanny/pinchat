@@ -1,14 +1,13 @@
 use axum::{
     extract::{
         ws::{Message as WsMessage, WebSocket},
-        Path, Query, State, WebSocketUpgrade,
+        Path, State, WebSocketUpgrade,
     },
-    http::StatusCode,
+    http::{header::SEC_WEBSOCKET_PROTOCOL, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
 use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
-use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::{HashSet, VecDeque};
 use tokio::time::{interval, Duration};
@@ -43,31 +42,63 @@ fn max_ws_size(max_image_size: usize) -> usize {
     std::cmp::max(MIN_WS_SIZE, (image_payload as f64 * 1.5) as usize)
 }
 
-/// Query parameters for WebSocket upgrade
-#[derive(Deserialize)]
-pub struct WsQuery {
-    /// JWT token for authentication
-    pub token: String,
-}
-
-/// Handler for upgrading the WebSocket connection
+/// Handler for upgrading the WebSocket connection (protocol v1).
 ///
-/// Requires JWT token for authentication (obtained from `/api/ws-token/{room_id}`).
-/// Token must be provided as query parameter: `/ws/{room_id}?token={jwt}`
+/// JWT is carried in the `Sec-WebSocket-Protocol` header rather than a query
+/// string, so it never appears in access logs, proxy logs, or Referer headers.
+/// The client offers two subprotocols in a comma-separated list:
+///   - `pinchat.v1`                (the wire-protocol version; echoed in the 101 response)
+///   - `pinchat.v1.jwt.<token>`    (base64url-encoded single-use JWT)
+///
+/// Both MUST be present. The server echoes only `pinchat.v1` back so the
+/// token never appears in the upgrade response.
 ///
 /// # Security
-/// - Validates JWT signature
-/// - Checks token expiration (30s)
-/// - Verifies room_id matches token claim
-/// - Prevents connection flooding (requires PoW for token)
+/// - Requires explicit `pinchat.v1` subprotocol (gate against v0 clients)
+/// - Validates JWT signature + expiration (30s) + room_id claim + single-use jti
 pub async fn ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
     Path(room_id): Path<Uuid>,
-    Query(query): Query<WsQuery>,
+    headers: HeaderMap,
 ) -> Response {
+    // Read Sec-WebSocket-Protocol; absence = client did not perform a v1 handshake.
+    let sec_proto = match headers
+        .get(SEC_WEBSOCKET_PROTOCOL)
+        .and_then(|h| h.to_str().ok())
+    {
+        Some(s) => s,
+        None => {
+            return (StatusCode::UNAUTHORIZED, "Missing Sec-WebSocket-Protocol").into_response();
+        }
+    };
+
+    let offered: Vec<&str> = sec_proto.split(',').map(|s| s.trim()).collect();
+
+    // Gate: client MUST offer the base `pinchat.v1` subprotocol.
+    if !offered.contains(&"pinchat.v1") {
+        tracing::warn!("WebSocket upgrade rejected: base pinchat.v1 subprotocol missing");
+        return (
+            StatusCode::UPGRADE_REQUIRED,
+            "Protocol pinchat.v1 required",
+        )
+            .into_response();
+    }
+
+    // Extract JWT from the `pinchat.v1.jwt.<token>` companion subprotocol.
+    let token = match offered
+        .iter()
+        .find_map(|p| p.strip_prefix("pinchat.v1.jwt."))
+    {
+        Some(t) => t,
+        None => {
+            tracing::warn!("WebSocket upgrade rejected: JWT subprotocol missing");
+            return (StatusCode::UNAUTHORIZED, "Missing JWT in subprotocol").into_response();
+        }
+    };
+
     // Validate JWT token before accepting the WebSocket upgrade
-    let claims = match verify_token(&query.token, &state.jwt_secret) {
+    let claims = match verify_token(token, &state.jwt_secret) {
         Ok(claims) => claims,
         Err(e) => {
             tracing::warn!("Invalid JWT token for WebSocket: {}", e);
@@ -86,7 +117,6 @@ pub async fn ws_handler(
     }
 
     // SECURITY: Single-use token enforcement (prevents replay attacks)
-    // Token can only be used once within its validity window
     if !state.consume_token(claims.jti, state.config.jwt_token_ttl_secs) {
         tracing::warn!(
             "JWT token replay attempt detected: jti={}, room={}",
@@ -102,14 +132,14 @@ pub async fn ws_handler(
         claims.connection_id
     );
 
-    // Use pre-allocated connection_id from token (ensures uniqueness)
     let connection_id = claims.connection_id;
-
-    // Configure WebSocket limits to prevent memory exhaustion attacks
-    // These limits are enforced before any application logic is invoked
-    // Dynamically sized based on MAX_IMAGE_SIZE config
     let ws_size = max_ws_size(state.config.max_image_size);
-    ws.max_message_size(ws_size)
+
+    // Echo only the base subprotocol back (do NOT echo the jwt.* companion —
+    // the RFC requires the response subprotocol to be one the client offered,
+    // but we pick the non-secret one so the 101 response carries no token).
+    ws.protocols(["pinchat.v1"])
+        .max_message_size(ws_size)
         .max_frame_size(ws_size)
         .on_upgrade(move |socket| handle_socket(socket, state, room_id, connection_id))
 }
@@ -312,95 +342,6 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: Uuid, connec
                                 tracing::warn!("⚠️ ECDH message received but payload is missing (connection_id={})", connection_id);
                             }
                         }
-                        // Handle DH Ratchet messages as a blind relay for post-compromise security
-                        else if incoming.msg_type == "dh_ratchet" {
-                            tracing::info!(
-                                "DH Ratchet received from connection_id={} in room={}",
-                                connection_id,
-                                room_id
-                            );
-
-                            // Parse the full DH ratchet message to extract fields
-                            match serde_json::from_str::<serde_json::Value>(&text) {
-                                Ok(value) => {
-                                    // Extract required fields
-                                    if let (
-                                        Some(public_key),
-                                        Some(signature),
-                                        Some(ratchet_count),
-                                        Some(reason),
-                                    ) = (
-                                        value.get("publicKey").and_then(|v| v.as_str()),
-                                        value.get("signature").and_then(|v| v.as_str()),
-                                        value.get("ratchetCount").and_then(|v| v.as_u64()),
-                                        value.get("reason").and_then(|v| v.as_str()),
-                                    ) {
-                                        tracing::debug!(
-                                            "DH Ratchet details: ratchet_count={}, reason={}, signature_len={}",
-                                            ratchet_count, reason, signature.len()
-                                        );
-
-                                        // SECURITY: Validate signature size to prevent DoS
-                                        const MAX_SIGNATURE_SIZE: usize = 512; // ECDSA P-256 signature is ~64-72 bytes
-                                        if signature.len() > MAX_SIGNATURE_SIZE {
-                                            tracing::warn!(
-                                                "⚠️ DH Ratchet signature too large: {} bytes (max {}) - rejecting",
-                                                signature.len(), MAX_SIGNATURE_SIZE
-                                            );
-                                            continue;
-                                        }
-
-                                        // Create DH Ratchet message
-                                        let dh_ratchet_msg = Message::DHRatchet {
-                                            public_key: public_key.to_string(),
-                                            signature: signature.to_string(),
-                                            ratchet_count: ratchet_count as u32,
-                                            reason: reason.to_string(),
-                                            sender_id: connection_id,
-                                        };
-
-                                        match serde_json::to_string(&dh_ratchet_msg) {
-                                            Ok(json) => {
-                                                tracing::debug!("DH Ratchet message serialized, broadcasting...");
-
-                                                // Broadcast to all participants in the room
-                                                if let Some(tx) =
-                                                    state_clone.broadcast_channels.get(&room_id)
-                                                {
-                                                    match tx.send(json) {
-                                                        Ok(receiver_count) => {
-                                                            tracing::info!(
-                                                                "✅ DH Ratchet broadcasted to {} receivers (ratchet #{}, reason: {})",
-                                                                receiver_count, ratchet_count, reason
-                                                            );
-                                                        }
-                                                        Err(e) => {
-                                                            tracing::error!("❌ Failed to broadcast DH Ratchet: {}", e);
-                                                        }
-                                                    }
-                                                } else {
-                                                    tracing::warn!(
-                                                        "⚠️ No broadcast channel for room={}",
-                                                        room_id
-                                                    );
-                                                }
-                                            }
-                                            Err(e) => {
-                                                tracing::error!(
-                                                    "Failed to serialize DH Ratchet message: {}",
-                                                    e
-                                                );
-                                            }
-                                        }
-                                    } else {
-                                        tracing::warn!("⚠️ DH Ratchet message missing required fields (connection_id={})", connection_id);
-                                    }
-                                }
-                                Err(e) => {
-                                    tracing::error!("Failed to parse DH Ratchet message: {}", e);
-                                }
-                            }
-                        }
                         // Handle regular encrypted message (text or image)
                         else if incoming.msg_type == "message" || incoming.msg_type == "image" {
                             if let Some(payload) = incoming.payload {
@@ -420,6 +361,29 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: Uuid, connec
                                     );
                                     continue;
                                 }
+
+                                // Validate header: must be present, v1, and within size bounds.
+                                // The cryptographic signature verification happens client-side
+                                // (server is blind relay), but we enforce shape + DoS caps here.
+                                const MAX_SIG_LEN: usize = 512;
+                                const MAX_DH_LEN: usize = 256;
+                                let hdr = match incoming.header {
+                                    Some(h)
+                                        if h.v == crate::models::PINCHAT_PROTOCOL_VERSION
+                                            && h.sig.len() <= MAX_SIG_LEN
+                                            && h.dh.len() <= MAX_DH_LEN =>
+                                    {
+                                        h
+                                    }
+                                    _ => {
+                                        tracing::warn!(
+                                            "Rejecting {} with missing/invalid v1 header from connection_id={}",
+                                            incoming.msg_type,
+                                            connection_id
+                                        );
+                                        continue;
+                                    }
+                                };
 
                                 // ANTI-REPLAY: Calculate SHA-256 hash of encrypted payload
                                 let payload_hash = {
@@ -509,14 +473,14 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: Uuid, connec
                                 let broadcast_msg = if incoming.msg_type == "image" {
                                     Message::Image {
                                         payload,
-                                        header: incoming.header, // Relay header (contains DH public key)
+                                        header: hdr, // Validated v1 header (no Option)
                                         sender_id: connection_id,
                                         timestamp: now,
                                     }
                                 } else {
                                     Message::Message {
                                         payload,
-                                        header: incoming.header, // Relay header (contains DH public key)
+                                        header: hdr, // Validated v1 header (no Option)
                                         sender_id: connection_id,
                                         timestamp: now,
                                     }
@@ -591,4 +555,214 @@ async fn send_error(mut socket: WebSocket, error: &str) -> Result<(), axum::Erro
 
     socket.send(WsMessage::Close(None)).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    //! Integration tests for the v1 WebSocket upgrade handshake.
+    //!
+    //! We cannot use `ServiceExt::oneshot` because axum's `WebSocketUpgrade`
+    //! extractor requires a `hyper::upgrade::OnUpgrade` request extension
+    //! that is only installed by a real server during an actual upgrade
+    //! (absence → axum returns 426 before our handler runs). Instead we
+    //! spin up a bound listener and issue raw upgrade requests via reqwest.
+    use super::*;
+    use crate::config::Config;
+    use crate::jwt::{sign_token, WsTokenClaims};
+    use crate::models::{Room, RoomConfig, RoomType};
+    use axum::{routing::get, Router};
+    use std::net::SocketAddr;
+    use uuid::Uuid;
+
+    fn test_config() -> Config {
+        Config {
+            host: [127, 0, 0, 1],
+            port: 0,
+            ws_conn_burst_size: 100,
+            ws_conn_period_secs: 60,
+            room_token_burst_size: 100,
+            room_token_period_secs: 600,
+            msg_rate_limit: 30,
+            msg_rate_window_secs: 1,
+            pow_min_difficulty: 12,
+            pow_max_difficulty: 18,
+            challenge_ttl_secs: 300,
+            jwt_token_ttl_secs: 30,
+            room_cleanup_interval_secs: 60,
+            challenge_cleanup_interval_secs: 60,
+            password_hashes: vec![],
+            session_ttl_secs: 86400,
+            login_burst_size: 5,
+            login_period_secs: 900,
+            trusted_proxies: vec![],
+            replay_cache_max_per_room: 10000,
+            force_secure_cookies: false,
+            max_image_size: 300 * 1024,
+            force_http: false,
+            website_dir: None,
+            allow_anonymous: true,
+        }
+    }
+
+    /// Spawn a bound listener with a minimal router exposing /ws/:room_id and
+    /// return `(base_addr, state, room_id)`. Caller is responsible for issuing
+    /// upgrade requests against `base_addr`.
+    async fn spawn_test_server() -> (SocketAddr, AppState, Uuid) {
+        let state = AppState::new(1000, test_config());
+        let room = Room::new(RoomConfig {
+            room_type: RoomType::OneToOne,
+            ttl_minutes: 60,
+            max_participants: 2,
+        });
+        let room_id = room.id;
+        state.try_create_room(room).unwrap();
+
+        let app: Router = Router::new()
+            .route("/ws/:room_id", get(ws_handler))
+            .with_state(state.clone());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (addr, state, room_id)
+    }
+
+    /// Issue a raw HTTP/1.1 WebSocket upgrade request and return the status line.
+    /// Using raw TCP + manual request so we can avoid pulling a full reqwest
+    /// feature set just for these tests.
+    async fn raw_upgrade(addr: SocketAddr, path: &str, subprotocol: Option<&str>) -> u16 {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let sp_header = match subprotocol {
+            Some(sp) => format!("Sec-WebSocket-Protocol: {}\r\n", sp),
+            None => String::new(),
+        };
+        let req = format!(
+            "GET {path} HTTP/1.1\r\n\
+             Host: {addr}\r\n\
+             Connection: Upgrade\r\n\
+             Upgrade: websocket\r\n\
+             Sec-WebSocket-Version: 13\r\n\
+             Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+             {sp_header}\r\n"
+        );
+        stream.write_all(req.as_bytes()).await.unwrap();
+        let mut buf = [0u8; 256];
+        let n = stream.read(&mut buf).await.unwrap();
+        let head = std::str::from_utf8(&buf[..n]).unwrap_or("");
+        // First line: "HTTP/1.1 <status> <reason>"
+        head.split_whitespace().nth(1).and_then(|s| s.parse().ok()).unwrap_or(0)
+    }
+
+    #[tokio::test]
+    async fn rejects_without_subprotocol_header() {
+        let (addr, _state, room_id) = spawn_test_server().await;
+        let path = format!("/ws/{}", room_id);
+        let status = raw_upgrade(addr, &path, None).await;
+        assert_eq!(status, 401);
+    }
+
+    #[tokio::test]
+    async fn rejects_old_protocol_version() {
+        let (addr, _state, room_id) = spawn_test_server().await;
+        let path = format!("/ws/{}", room_id);
+        // Only a non-v1 subprotocol offered → 426.
+        let status = raw_upgrade(addr, &path, Some("pinchat.v0")).await;
+        assert_eq!(status, 426);
+    }
+
+    #[tokio::test]
+    async fn rejects_missing_jwt_subprotocol() {
+        let (addr, _state, room_id) = spawn_test_server().await;
+        let path = format!("/ws/{}", room_id);
+        // Base pinchat.v1 present, but no companion jwt token → 401.
+        let status = raw_upgrade(addr, &path, Some("pinchat.v1")).await;
+        assert_eq!(status, 401);
+    }
+
+    #[tokio::test]
+    async fn rejects_expired_jwt() {
+        let (addr, state, room_id) = spawn_test_server().await;
+        let expired = WsTokenClaims {
+            room_id,
+            connection_id: Uuid::new_v4(),
+            exp: 1, // 1970
+            jti: Uuid::new_v4(),
+        };
+        let token = sign_token(&expired, &state.jwt_secret).unwrap();
+        let sp = format!("pinchat.v1, pinchat.v1.jwt.{}", token);
+        let path = format!("/ws/{}", room_id);
+        let status = raw_upgrade(addr, &path, Some(&sp)).await;
+        assert_eq!(status, 401);
+    }
+
+    #[tokio::test]
+    async fn rejects_token_for_wrong_room() {
+        let (addr, state, room_id) = spawn_test_server().await;
+        let other_room = Uuid::new_v4();
+        let claims = WsTokenClaims::new(other_room, 30);
+        let token = sign_token(&claims, &state.jwt_secret).unwrap();
+        let sp = format!("pinchat.v1, pinchat.v1.jwt.{}", token);
+        let path = format!("/ws/{}", room_id);
+        let status = raw_upgrade(addr, &path, Some(&sp)).await;
+        assert_eq!(status, 403);
+    }
+
+    #[tokio::test]
+    async fn accepts_valid_subprotocol_and_jwt() {
+        // Full success path: bound listener + valid single-use JWT → 101 + echoed subprotocol.
+        let (addr, state, room_id) = spawn_test_server().await;
+        let claims = WsTokenClaims::new(room_id, 30);
+        let token = sign_token(&claims, &state.jwt_secret).unwrap();
+        let sp = format!("pinchat.v1, pinchat.v1.jwt.{}", token);
+        let path = format!("/ws/{}", room_id);
+
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // Small wait to let axum::serve() start accepting on the listener.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let req = format!(
+            "GET {path} HTTP/1.1\r\n\
+             Host: {addr}\r\n\
+             Connection: Upgrade\r\n\
+             Upgrade: websocket\r\n\
+             Sec-WebSocket-Version: 13\r\n\
+             Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+             Sec-WebSocket-Protocol: {sp}\r\n\r\n"
+        );
+        stream.write_all(req.as_bytes()).await.unwrap();
+
+        // Read until we have the status line + headers (up to \r\n\r\n) or timeout.
+        let mut buf = Vec::new();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let mut chunk = [0u8; 512];
+            let n = tokio::time::timeout_at(deadline, stream.read(&mut chunk))
+                .await
+                .expect("timeout reading upgrade response")
+                .expect("read error");
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+            if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+        }
+        let head = String::from_utf8_lossy(&buf).to_string();
+        assert!(head.starts_with("HTTP/1.1 101"), "expected 101, got: {}", head);
+        // Server must echo only the base subprotocol (NOT the jwt.* companion).
+        let low = head.to_ascii_lowercase();
+        assert!(
+            low.contains("sec-websocket-protocol: pinchat.v1\r\n"),
+            "expected pinchat.v1 echoed, got: {}",
+            head
+        );
+        assert!(
+            !head.contains("pinchat.v1.jwt."),
+            "server must NOT echo the jwt token subprotocol"
+        );
+    }
 }

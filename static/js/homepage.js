@@ -47,11 +47,26 @@ document.addEventListener('alpine:init', () => {
                     max_participants: this.maxParticipants
                 });
 
-                // Save WebSocket token if provided (creator optimization)
-                // This allows the room creator to skip the second PoW challenge
+                // Save WebSocket token if provided (creator optimization).
+                // Also persist the v1 protocol metadata alongside the token so
+                // websocket.js can gate the creator path the same way it gates
+                // fresh tokens from /api/ws-token (otherwise a v0 server that
+                // omits these fields could still reach the upgrade attempt).
                 if (roomData.ws_token && roomData.connection_id) {
                     sessionStorage.setItem(`ws_token_${roomData.room_id}`, roomData.ws_token);
                     sessionStorage.setItem(`ws_connection_${roomData.room_id}`, roomData.connection_id);
+                    if (roomData.protocol_version !== undefined) {
+                        sessionStorage.setItem(
+                            `ws_protocol_version_${roomData.room_id}`,
+                            String(roomData.protocol_version)
+                        );
+                    }
+                    if (Array.isArray(roomData.supported_subprotocols)) {
+                        sessionStorage.setItem(
+                            `ws_subprotocols_${roomData.room_id}`,
+                            JSON.stringify(roomData.supported_subprotocols)
+                        );
+                    }
                     console.log('✅ WebSocket token saved for room creator (no second PoW needed)');
                 }
 

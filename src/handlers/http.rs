@@ -195,6 +195,11 @@ pub async fn create_room(
                 max_participants,
                 connection_id: ws_token.as_ref().map(|_| connection_id),
                 ws_token,
+                // Always advertise protocol version so clients can gate even on
+                // the creator-optimization path (where they would otherwise skip
+                // /api/ws-token and miss the shape check).
+                protocol_version: crate::models::PINCHAT_PROTOCOL_VERSION,
+                supported_subprotocols: vec!["pinchat.v1".to_string()],
             };
 
             Ok(Json(response))

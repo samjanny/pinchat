@@ -148,6 +148,23 @@ document.addEventListener('alpine:init', () => {
             };
 
             this.wsManager.onError = (error) => {
+                const msg = error && error.message;
+                // Terminal auth/protocol mismatch (v1 gate or subprotocol echo):
+                // no auto-reconnect, user must refresh.
+                if (msg === 'PROTOCOL_OR_AUTH_FAILURE' || msg === 'PROTOCOL_MISMATCH') {
+                    this.error = '⚠️ PinChat has been updated. Please refresh the page.';
+                    return;
+                }
+                // Transient transport failure after N retries: distinct message
+                // ("check network", not "protocol mismatch").
+                if (msg === 'CONNECTION_EXHAUSTED') {
+                    this.error = '⚠️ Connection lost — please check your network and try again later.';
+                    return;
+                }
+                if (msg === 'ON_CONNECTED_FAILED') {
+                    this.error = '⚠️ Internal error establishing secure session. Please refresh.';
+                    return;
+                }
                 this.error = '⚠️ Connection error. Retrying automatically...';
             };
 
@@ -272,13 +289,13 @@ document.addEventListener('alpine:init', () => {
                         if (this.ecdhHandshakeStatus === 'waiting') {
                             // Handshake was in progress → hard abort (peer left)
                             debugLog('[ECDH] Resetting status to none (handshake aborted, peer left)');
-                            this.handleECDHAborted(true);  // hardReset: peer is gone
+                            await this.handleECDHAborted(true);  // hardReset: peer is gone
                             // Reset status to 'none' so handshake can restart when room becomes ready again
                             this.ecdhHandshakeStatus = 'none';
                         } else if (this.pfsActive) {
                             // PFS was active → hard abort (peer left, need fresh identity with new peer)
                             debugLog('[ECDH] PFS was active, peer left → hard reset');
-                            this.handleECDHAborted(true);  // hardReset: peer is gone
+                            await this.handleECDHAborted(true);  // hardReset: peer is gone
                             this.ecdhHandshakeStatus = 'none';
                             this.sasBackup = null;
                             this.addSystemMessage('⚠️ Secure connection lost (other participant left)');
@@ -286,8 +303,21 @@ document.addEventListener('alpine:init', () => {
                             // Status was stuck on 'aborted' → reset to 'none'
                             debugLog('[ECDH] Resetting status from aborted to none (room not ready)');
                             this.ecdhHandshakeStatus = 'none';
-                            // Reset to bootstrap key for clean state
-                            window.cryptoManager.resetToBootstrapKey();
+                            // Reset to bootstrap key for clean state.
+                            // resetToBootstrapKey is async and may throw BOOTSTRAP_KEY_LOST
+                            // if the URL fragment is missing; handle it locally so we
+                            // don't leave the session in an inconsistent state.
+                            try {
+                                await window.cryptoManager.resetToBootstrapKey();
+                            } catch (e) {
+                                if (e && e.message === 'BOOTSTRAP_KEY_LOST') {
+                                    this.addSystemMessage('🔒 Cannot reconnect securely — please re-open the original room link.');
+                                    this.ecdhHandshakeStatus = 'failed';
+                                    if (this.wsManager) this.wsManager.disconnect();
+                                } else {
+                                    throw e;
+                                }
+                            }
                             this.sas = null;
                         }
                     }
@@ -337,7 +367,7 @@ document.addEventListener('alpine:init', () => {
                 requestAnimationFrame(() => this.scrollToBottom());
 
             } catch (error) {
-                this.handleSecurityError(error, message.sender_id);
+                await this.handleSecurityError(error, message.sender_id);
             }
         },
 
@@ -547,7 +577,7 @@ document.addEventListener('alpine:init', () => {
                 requestAnimationFrame(() => this.scrollToBottom());
 
             } catch (error) {
-                this.handleSecurityError(error, message.sender_id);
+                await this.handleSecurityError(error, message.sender_id);
             }
         },
 
@@ -582,10 +612,32 @@ document.addEventListener('alpine:init', () => {
         },
 
         /**
-         * Handles security errors from message decryption
+         * Handles security errors from message decryption.
+         *
+         * Async because SIGNATURE_INVALID triggers a full handshake tear-down
+         * (`handleECDHAborted(true)`) which is itself async. Callers MUST `await`
+         * this method (see handleIncomingMessage / handleIncomingImage).
          */
-        handleSecurityError(error, senderId) {
+        async handleSecurityError(error, senderId) {
             console.error('[SECURITY] Message authentication failed:', error);
+
+            // Protocol v1 authenticated ratchet: a signature failure means the
+            // peer's current DH pubkey was not signed by the identity we verified.
+            // This is either a live MITM or irreversible session corruption.
+            // Tear down the session hard and close the WebSocket with 1008
+            // (Policy Violation) so the server and logs record the cause.
+            // No auto-reconnect: the user must refresh to start a fresh session.
+            if (error && error.message === 'SIGNATURE_INVALID') {
+                this.addSystemMessage('🚨 Session integrity violated — connection closed');
+                this.decryptionError = true;
+                try {
+                    await this.handleECDHAborted(true);
+                } catch (_) { /* already surfaced to user */ }
+                if (this.wsManager && typeof this.wsManager.disconnectWithError === 'function') {
+                    this.wsManager.disconnectWithError(1008, 'SIGNATURE_INVALID');
+                }
+                return;
+            }
 
             let warningMessage = '🔐 Security warning: ';
 
@@ -631,11 +683,27 @@ document.addEventListener('alpine:init', () => {
         },
 
         /**
-         * Reconnects the WebSocket
+         * User-initiated reconnect.
+         *
+         * UX early return: if the session is in terminal auth/protocol state,
+         * the banner already asks the user to refresh the page — don't show
+         * "Retrying..." or kick connect() (which would be a no-op anyway
+         * thanks to the `_fatalAuthFailure` guard in connect()).
+         *
+         * Otherwise, reset the retry budget so a fresh click after
+         * `CONNECTION_EXHAUSTED` gets the full N retries back, not 0.
          */
         reconnect() {
+            if (this.wsManager && this.wsManager._fatalAuthFailure) {
+                console.warn('Reconnect ignored: session requires page refresh');
+                return;
+            }
             this.connecting = true;
             this.error = '';
+            if (this.wsManager) {
+                this.wsManager.reconnectAttempts = 0;
+                this.wsManager._connectionExhausted = false;
+            }
             this.wsManager.connect();
         },
 
@@ -755,12 +823,16 @@ document.addEventListener('alpine:init', () => {
                 this.addSystemMessage('🔐 Establishing secure connection...');
 
                 // Start handshake timeout (30 seconds)
-                // If other participant doesn't respond, reset and allow retry
-                this.ecdhManager.startTimeout(() => {
+                // If other participant doesn't respond, reset and allow retry.
+                // The callback is async because handleECDHAborted is async; the
+                // caller (ECDHKeyExchange.startTimeout) is responsible for
+                // handling the returned Promise without leaking unhandled
+                // rejections.
+                this.ecdhManager.startTimeout(async () => {
                     console.warn('[ECDH] ⏱️ Handshake timeout - other participant did not respond');
 
                     // Clean up state
-                    this.handleECDHAborted();
+                    await this.handleECDHAborted();
                     this.ecdhHandshakeStatus = 'none';
                     this.ecdhManager = null;
 
@@ -781,7 +853,7 @@ document.addEventListener('alpine:init', () => {
 
             } catch (error) {
                 console.error('[ECDH] Handshake failed:', error);
-                this.handleECDHAborted();
+                await this.handleECDHAborted();
                 // Reset to 'none' to allow handshake restart if room becomes ready again
                 this.ecdhHandshakeStatus = 'none';
             }
@@ -818,8 +890,21 @@ document.addEventListener('alpine:init', () => {
                 debugLog('[RECONNECT] Keeping identity manager alive (SAS verified:', hadVerifiedIdentity, ')');
             }
 
-            // Reset Chain Ratchet to bootstrap key
-            window.cryptoManager.resetToBootstrapKey();
+            // Full reset of ratchet state and re-extract bootstrap key from URL.
+            // If the fragment is gone (hostile extension / user navigation),
+            // surface a clear message and do NOT attempt a handshake without
+            // a bootstrap key.
+            try {
+                await window.cryptoManager.resetToBootstrapKey();
+            } catch (e) {
+                if (e && e.message === 'BOOTSTRAP_KEY_LOST') {
+                    this.addSystemMessage('🔒 Cannot reconnect securely — please re-open the original room link.');
+                    this.ecdhHandshakeStatus = 'failed';
+                    if (this.wsManager) this.wsManager.disconnect();
+                    return;
+                }
+                throw e;
+            }
 
             // Clear pending key if any (avoid processing stale keys from before reconnection)
             this.pendingECDHKey = null;
@@ -974,7 +1059,7 @@ document.addEventListener('alpine:init', () => {
 
             } catch (error) {
                 console.error('[ECDH] Failed to process public key:', error);
-                this.handleECDHAborted();
+                await this.handleECDHAborted();
                 // Reset to 'none' to allow handshake restart if room becomes ready again
                 this.ecdhHandshakeStatus = 'none';
             }
@@ -997,7 +1082,7 @@ document.addEventListener('alpine:init', () => {
          *                              Use for: user leave, peer change, MITM detection.
          *                              Default false preserves identity for retry.
          */
-        handleECDHAborted(hardReset) {
+        async handleECDHAborted(hardReset) {
             if (hardReset === undefined) hardReset = false;
             console.warn('[ECDH] Handshake aborted (hardReset:', hardReset, ')');
 
@@ -1015,9 +1100,21 @@ document.addEventListener('alpine:init', () => {
                 this.sasVerificationStatus = 'none';
             }
 
-            // Reset to bootstrap key to prevent stale sessionKey
-            // This prevents DoS where old sessionKey is incompatible with new participant
-            window.cryptoManager.resetToBootstrapKey();
+            // Full tear-down of ratchet state + re-extract bootstrap key from URL.
+            // resetToBootstrapKey is async (destroys doubleRatchet and re-reads the
+            // URL fragment); if the fragment is gone, surface a clear message
+            // instead of attempting a handshake without a bootstrap key.
+            try {
+                await window.cryptoManager.resetToBootstrapKey();
+            } catch (e) {
+                if (e && e.message === 'BOOTSTRAP_KEY_LOST') {
+                    this.addSystemMessage('🔒 Cannot reconnect securely — please re-open the original room link.');
+                    this.ecdhHandshakeStatus = 'failed';
+                    if (this.wsManager) this.wsManager.disconnect();
+                    return;
+                }
+                throw e;
+            }
             this.sas = null;
 
             // Show warning to user

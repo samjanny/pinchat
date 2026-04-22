@@ -1,6 +1,6 @@
 [package]
 name = "pinchat"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 
 [dependencies]
@@ -31,6 +31,11 @@ tower-cookies = "0.10"
 axum-extra = { version = "0.9", features = ["cookie"] }
 time = "0.3"
 urlencoding = "2"
+
+[dev-dependencies]
+# Enable tower's "util" feature in tests for `ServiceExt::oneshot`, used by
+# integration-style tests that drive the router without a real listener.
+tower = { version = "0.4", features = ["util"] }
 
 [[bin]]
 name = "generate_hash"

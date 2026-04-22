@@ -37,6 +37,15 @@ pub struct WsTokenResponse {
 
     /// Token expiration (seconds)
     pub expires_in: u64,
+
+    /// Wire-protocol version advertised by this server (v1 gate).
+    /// Clients MUST verify that this matches their compiled-in
+    /// PINCHAT_PROTOCOL_VERSION before attempting a WebSocket upgrade.
+    pub protocol_version: u8,
+
+    /// WebSocket subprotocols the server is willing to negotiate.
+    /// Clients MUST verify their preferred subprotocol is present.
+    pub supported_subprotocols: Vec<String>,
 }
 
 /// Handler for WebSocket token generation
@@ -208,10 +217,12 @@ pub async fn generate_ws_token(
         connection_id
     );
 
-    // Return token response
+    // Return token response (protocol v1 metadata included for client-side gate).
     Ok(Json(WsTokenResponse {
         token,
         connection_id,
         expires_in: ttl_secs,
+        protocol_version: crate::models::PINCHAT_PROTOCOL_VERSION,
+        supported_subprotocols: vec!["pinchat.v1".to_string()],
     }))
 }

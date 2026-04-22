@@ -159,6 +159,14 @@ pub struct CreateRoomResponse {
     /// Matches the connection_id in the JWT token
     #[serde(skip_serializing_if = "Option::is_none")]
     pub connection_id: Option<Uuid>,
+
+    /// Wire-protocol version advertised by this server (v1 gate).
+    /// Always sent, regardless of whether ws_token is present, so the client
+    /// can reject a v0 server even on the creator-optimization path.
+    pub protocol_version: u8,
+
+    /// WebSocket subprotocols the server will negotiate.
+    pub supported_subprotocols: Vec<String>,
 }
 
 #[cfg(test)]

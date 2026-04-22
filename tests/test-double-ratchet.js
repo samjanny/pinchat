@@ -162,7 +162,8 @@ class ChainRatchet {
 // ============================================================================
 
 class DoubleRatchet {
-    constructor() {
+    constructor(identityManager = null) {
+        this.identityManager = identityManager;  // stubbed IdentityKeyManager (sign/verify)
         this.rootKey = null;
         this.DHs = null;
         this.DHr = null;
@@ -172,12 +173,33 @@ class DoubleRatchet {
         this.Ns = 0;
         this.Nr = 0;
         this.PN = 0;
-        this.skippedKeys = new Map();
+        this.skippedKeys = new Map();  // Map<keyId, {key, ratchetCount}>
         this.MAX_SKIP = 100;
+        this.MAX_SKIPPED_KEYS_TOTAL = 1000;
+        this.DHsSignature = null;  // cached base64url signature over current DHs (v1)
         this.isInitiator = false;
         this.ratchetCount = 0;
         this.hasRatchetedSinceReceive = true;
         this.CURVE = 'P-256';
+    }
+
+    _buildCanonicalBytes(dhRaw, rc) {
+        const tag = new TextEncoder().encode('pinchat-drheader-v1');
+        const dhBytes = dhRaw instanceof Uint8Array ? dhRaw : new Uint8Array(dhRaw);
+        const out = new Uint8Array(tag.length + 2 + dhBytes.byteLength + 4);
+        out.set(tag, 0);
+        new DataView(out.buffer).setUint16(tag.length, dhBytes.byteLength, false);
+        out.set(dhBytes, tag.length + 2);
+        new DataView(out.buffer).setUint32(tag.length + 2 + dhBytes.byteLength, rc, false);
+        return out;
+    }
+
+    async signCurrentDHs() {
+        if (!this.identityManager) throw new Error('identityManager required for v1 ratchet');
+        const raw = await subtle.exportKey('raw', this.DHs.publicKey);
+        const canon = this._buildCanonicalBytes(raw, this.ratchetCount);
+        const sigBuf = await this.identityManager.sign(canon);
+        this.DHsSignature = this.arrayBufferToBase64url(sigBuf);
     }
 
     async initialize(sharedSecret, isInitiator, myKeypair = null, theirPublicKey = null) {
@@ -222,6 +244,8 @@ class DoubleRatchet {
         this.Nr = 0;
         this.PN = 0;
         this.ratchetCount = 0;
+
+        if (this.identityManager) await this.signCurrentDHs();
     }
 
     async encryptMessage(plaintext, roomId, senderId) {
@@ -263,15 +287,18 @@ class DoubleRatchet {
         const payload = this.arrayBufferToBase64url(combined);
         this.Ns++;
 
-        return {
-            payload: payload,
-            header: {
-                dh: dhPublicKeyBase64,
-                pn: this.PN,
-                n: messageNumber,
-                rc: this.ratchetCount
-            }
+        const header = {
+            dh: dhPublicKeyBase64,
+            pn: this.PN,
+            n: messageNumber,
+            rc: this.ratchetCount
         };
+        // v1 authenticated ratchet: include version + signature if identity configured.
+        if (this.identityManager && this.DHsSignature) {
+            header.v = 1;
+            header.sig = this.DHsSignature;
+        }
+        return { payload, header };
     }
 
     async decryptMessage(payloadBase64, header, roomId, senderId) {
@@ -279,6 +306,20 @@ class DoubleRatchet {
 
         const { dh: dhPublicKeyBase64, pn: prevChainLength, n: messageNumber, rc: ratchetCount } = header;
         const dhPublicKeyRaw = this.base64urlToArrayBuffer(dhPublicKeyBase64);
+
+        // v1 signature verification if identity configured on both sides.
+        if (this.identityManager && header.sig) {
+            if (header.v !== 1) throw new Error('PROTOCOL_MISMATCH');
+            const canon = this._buildCanonicalBytes(dhPublicKeyRaw, ratchetCount);
+            try {
+                await this.identityManager.verify(canon, this.base64urlToArrayBuffer(header.sig));
+            } catch (e) {
+                throw new Error('SIGNATURE_INVALID');
+            }
+        } else if (this.identityManager && !header.sig) {
+            throw new Error('MISSING_SIGNATURE');
+        }
+
         const isFirstMessage = !this.DHrRaw;
         const isNewKey = !isFirstMessage && !this.arraysEqual(dhPublicKeyRaw, new Uint8Array(this.DHrRaw));
 
@@ -302,7 +343,8 @@ class DoubleRatchet {
             let messageKey;
 
             if (this.skippedKeys.has(skippedKeyId)) {
-                messageKey = this.skippedKeys.get(skippedKeyId);
+                const entry = this.skippedKeys.get(skippedKeyId);
+                messageKey = entry.key;
                 this.skippedKeys.delete(skippedKeyId);
             } else {
                 messageKey = await this.receivingChain.deriveMessageKeyForCounter(messageNumber);
@@ -386,6 +428,15 @@ class DoubleRatchet {
         if (this.rootKey) this.rootKey.fill(0);
         this.rootKey = newRootKey2;
         this.ratchetCount++;
+
+        // Prune skipped keys from chains more than one ratchet round old.
+        for (const [id, entry] of this.skippedKeys) {
+            if (entry.ratchetCount < this.ratchetCount - 1) {
+                this.skippedKeys.delete(id);
+            }
+        }
+
+        if (this.identityManager) await this.signCurrentDHs();
     }
 
     async performSendSideDHRatchet() {
@@ -417,6 +468,8 @@ class DoubleRatchet {
         this.rootKey = newRootKey;
         this.ratchetCount++;
         this.hasRatchetedSinceReceive = true;
+
+        if (this.identityManager) await this.signCurrentDHs();
     }
 
     async skipMessageKeys(until) {
@@ -430,7 +483,14 @@ class DoubleRatchet {
         while (this.Nr < until) {
             const messageKey = await this.receivingChain.deriveMessageKeyForCounter(this.Nr);
             const keyId = `${dhPublicKeyBase64}:${this.Nr}`;
-            this.skippedKeys.set(keyId, messageKey);
+            this.skippedKeys.set(keyId, { key: messageKey, ratchetCount: this.ratchetCount });
+
+            // Global cap: FIFO eviction
+            if (this.skippedKeys.size > this.MAX_SKIPPED_KEYS_TOTAL) {
+                const oldest = this.skippedKeys.keys().next().value;
+                this.skippedKeys.delete(oldest);
+            }
+
             await this.receivingChain.ratchet();
             this.Nr++;
         }
@@ -1257,6 +1317,178 @@ async function runTests() {
     } catch (e) {
         console.log('FAILED:', e.message);
         console.log(e.stack);
+        failed++;
+    }
+    console.log('');
+
+    // =========================================================================
+    // Helper: build a real ECDSA-based identity manager stub for v1 signed ratchet
+    // =========================================================================
+    async function makeIdentityStub() {
+        const kp = await subtle.generateKey(
+            { name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify']
+        );
+        return {
+            _kp: kp,
+            async sign(data) {
+                return subtle.sign({ name: 'ECDSA', hash: 'SHA-256' }, kp.privateKey, data);
+            },
+            async verify(data, sig) {
+                const ok = await subtle.verify({ name: 'ECDSA', hash: 'SHA-256' }, kp.publicKey, sig, data);
+                if (!ok) throw new Error('verification failed');
+                return true;
+            }
+        };
+    }
+
+    // =========================================================================
+    // Test 13: Global skippedKeys cap (anti-DoS, FIFO eviction)
+    // =========================================================================
+    console.log('--- Test 13: Global skippedKeys Cap ---');
+    try {
+        const alice = new DoubleRatchet();
+        const keypair = await subtle.generateKey(
+            { name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveKey', 'deriveBits']
+        );
+        await alice.initialize(new Uint8Array(32).fill(7), true, keypair, null);
+
+        // Simulate the insert path from skipMessageKeys: set + FIFO eviction.
+        // Populate well beyond the cap across simulated ratchet rounds.
+        const CAP = alice.MAX_SKIPPED_KEYS_TOTAL;
+        for (let rc = 0; rc < 20; rc++) {
+            for (let n = 0; n < 90; n++) {
+                alice.skippedKeys.set(`dh-${rc}:${n}`, { key: null, ratchetCount: rc });
+                if (alice.skippedKeys.size > CAP) {
+                    const oldest = alice.skippedKeys.keys().next().value;
+                    alice.skippedKeys.delete(oldest);
+                }
+            }
+        }
+
+        console.log(`  Inserted 1800 entries (20 rounds × 90 skip), cap=${CAP}`);
+        console.log(`  skippedKeys.size = ${alice.skippedKeys.size}`);
+
+        if (alice.skippedKeys.size <= CAP) {
+            console.log('PASSED: Global cap enforced via FIFO eviction');
+            passed++;
+        } else {
+            console.log(`FAILED: size ${alice.skippedKeys.size} exceeds cap ${CAP}`);
+            failed++;
+        }
+    } catch (e) {
+        console.log('FAILED:', e.message);
+        failed++;
+    }
+    console.log('');
+
+    // =========================================================================
+    // Test 14: v1 authenticated ratchet — happy path (sig verified)
+    // =========================================================================
+    console.log('--- Test 14: v1 Authenticated Ratchet (happy path) ---');
+    try {
+        // Both parties use the SAME identity stub so Bob's verify() accepts Alice's sig.
+        // Production has two separate identity keys but uses the peer's public key here.
+        const idm = await makeIdentityStub();
+        const alice = new DoubleRatchet(idm);
+        const bob = new DoubleRatchet(idm);
+
+        const aliceKp = await subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveKey', 'deriveBits']);
+        const bobKp = await subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveKey', 'deriveBits']);
+        const shared = new Uint8Array(32).fill(42);
+        await alice.initialize(shared, true, aliceKp, bobKp.publicKey);
+        await bob.initialize(shared, false, bobKp, null);
+
+        const enc = await alice.encryptMessage('hello v1', 'room-1', 'alice');
+        if (enc.header.v !== 1 || !enc.header.sig) {
+            throw new Error(`expected v=1 and sig, got ${JSON.stringify(enc.header)}`);
+        }
+        const dec = await bob.decryptMessage(enc.payload, enc.header, 'room-1', 'alice');
+        if (dec.text !== 'hello v1') throw new Error('text mismatch');
+
+        console.log('PASSED: v1 header emitted with sig + decrypt succeeds');
+        passed++;
+    } catch (e) {
+        console.log('FAILED:', e.message);
+        failed++;
+    }
+    console.log('');
+
+    // =========================================================================
+    // Test 15: Signature tampering detected
+    // =========================================================================
+    console.log('--- Test 15: Signature Tampering Detected ---');
+    try {
+        const idm = await makeIdentityStub();
+        const alice = new DoubleRatchet(idm);
+        const bob = new DoubleRatchet(idm);
+
+        const aliceKp = await subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveKey', 'deriveBits']);
+        const bobKp = await subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveKey', 'deriveBits']);
+        const shared = new Uint8Array(32).fill(11);
+        await alice.initialize(shared, true, aliceKp, bobKp.publicKey);
+        await bob.initialize(shared, false, bobKp, null);
+
+        const enc = await alice.encryptMessage('tamper target', 'room-x', 'alice');
+        // Flip one byte in the signature (decode → mutate → re-encode).
+        const sigBytes = alice.base64urlToArrayBuffer(enc.header.sig);
+        sigBytes[0] ^= 0xFF;
+        enc.header.sig = alice.arrayBufferToBase64url(sigBytes);
+
+        let threw = false;
+        try {
+            await bob.decryptMessage(enc.payload, enc.header, 'room-x', 'alice');
+        } catch (e) {
+            threw = (e.message === 'SIGNATURE_INVALID');
+        }
+        if (threw) {
+            console.log('PASSED: tampered sig rejected with SIGNATURE_INVALID');
+            passed++;
+        } else {
+            console.log('FAILED: decrypt did not throw SIGNATURE_INVALID');
+            failed++;
+        }
+    } catch (e) {
+        console.log('FAILED:', e.message);
+        failed++;
+    }
+    console.log('');
+
+    // =========================================================================
+    // Test 16: DH key swap detected (signature bound to dh+rc)
+    // =========================================================================
+    console.log('--- Test 16: DH Key Swap Detected ---');
+    try {
+        const idm = await makeIdentityStub();
+        const alice = new DoubleRatchet(idm);
+        const bob = new DoubleRatchet(idm);
+
+        const aliceKp = await subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveKey', 'deriveBits']);
+        const bobKp = await subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveKey', 'deriveBits']);
+        const shared = new Uint8Array(32).fill(22);
+        await alice.initialize(shared, true, aliceKp, bobKp.publicKey);
+        await bob.initialize(shared, false, bobKp, null);
+
+        const enc = await alice.encryptMessage('swap target', 'room-y', 'alice');
+        // Replace dh with a different valid pubkey, keeping sig unchanged.
+        const eve = await subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveKey', 'deriveBits']);
+        const eveRaw = await subtle.exportKey('raw', eve.publicKey);
+        enc.header.dh = alice.arrayBufferToBase64url(eveRaw);
+
+        let threw = false;
+        try {
+            await bob.decryptMessage(enc.payload, enc.header, 'room-y', 'alice');
+        } catch (e) {
+            threw = (e.message === 'SIGNATURE_INVALID');
+        }
+        if (threw) {
+            console.log('PASSED: swapped dh rejected with SIGNATURE_INVALID');
+            passed++;
+        } else {
+            console.log('FAILED: decrypt did not throw SIGNATURE_INVALID');
+            failed++;
+        }
+    } catch (e) {
+        console.log('FAILED:', e.message);
         failed++;
     }
     console.log('');

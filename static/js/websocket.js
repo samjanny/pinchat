@@ -11,6 +11,15 @@ class WebSocketManager {
         this.reconnectDelay = 1000; // Base delay in ms
         this.isManuallyDisconnected = false;
 
+        // Terminal session flags (v1).
+        // _fatalAuthFailure: explicit protocol/auth mismatch → no auto-reconnect,
+        //                    page refresh required (set by requestWsToken gate,
+        //                    onopen subprotocol mismatch, SIGNATURE_INVALID).
+        // _connectionExhausted: transient transport failure after N retries
+        //                    → user-initiated reconnect gets a fresh budget.
+        this._fatalAuthFailure = false;
+        this._connectionExhausted = false;
+
         // Token caching for reconnection (avoids PoW on every reconnect)
         this.cachedToken = null;
         this.tokenExpiresAt = 0;
@@ -157,6 +166,28 @@ class WebSocketManager {
 
             const data = await response.json();
 
+            // v1 gate: verify the server advertises a compatible protocol version
+            // and the pinchat.v1 subprotocol. This catches client-v1-vs-server-v0
+            // mismatches BEFORE we attempt a WebSocket upgrade (where browser
+            // failure modes are opaque — opaque onerror + 1006 close).
+            const expectedV = window.PINCHAT_PROTOCOL_VERSION || 1;
+            if (
+                data.protocol_version !== expectedV ||
+                !Array.isArray(data.supported_subprotocols) ||
+                !data.supported_subprotocols.includes('pinchat.v1')
+            ) {
+                console.error(
+                    '[WS] Server protocol mismatch: got',
+                    data.protocol_version,
+                    data.supported_subprotocols,
+                    'expected v',
+                    expectedV
+                );
+                this._fatalAuthFailure = true;
+                if (this.onError) this.onError(new Error('PROTOCOL_OR_AUTH_FAILURE'));
+                return null;
+            }
+
             // Cache token and expiration for reconnection
             // Use 29s instead of 30s to provide safety margin
             this.cachedToken = data.token;
@@ -182,6 +213,14 @@ class WebSocketManager {
      * to avoid solving PoW on every reconnection attempt.
      */
     async connect() {
+        // Enforcement gate: once we've detected a terminal auth/protocol failure
+        // (v1 gate mismatch, SIGNATURE_INVALID, subprotocol mismatch on onopen),
+        // refuse to attempt a new connection. The user must refresh the page.
+        if (this._fatalAuthFailure) {
+            console.error('[WS] connect() blocked: session is in fatal auth/protocol failure — page refresh required');
+            return;
+        }
+
         if (this.ws && this.ws.readyState === WebSocket.OPEN) {
             console.warn('WebSocket already connected');
             return;
@@ -189,54 +228,117 @@ class WebSocketManager {
 
         this.isManuallyDisconnected = false;
 
-        // Request a WebSocket authentication token
-        // Optimization: Reuse a cached token if still valid or use the creator's token
+        // Helper: drop every creator-optimization entry atomically. Must clear
+        // ALL four keys (token, connection_id, protocol_version, subprotocols)
+        // so a later connect() can't re-trigger the same fatal path by reading
+        // stale v0 metadata.
+        const clearCreatorMetadata = () => {
+            sessionStorage.removeItem(`ws_token_${this.roomId}`);
+            sessionStorage.removeItem(`ws_connection_${this.roomId}`);
+            sessionStorage.removeItem(`ws_protocol_version_${this.roomId}`);
+            sessionStorage.removeItem(`ws_subprotocols_${this.roomId}`);
+        };
+
         let token;
 
-        // Check if we have a cached token from room creation (creator optimization)
+        // PATH 1: Creator optimization — token was pre-issued by /api/rooms.
         const creatorToken = sessionStorage.getItem(`ws_token_${this.roomId}`);
         const creatorConnectionId = sessionStorage.getItem(`ws_connection_${this.roomId}`);
+        const creatorProtoVersion = sessionStorage.getItem(`ws_protocol_version_${this.roomId}`);
+        const creatorSubprotocols = sessionStorage.getItem(`ws_subprotocols_${this.roomId}`);
 
         if (creatorToken && creatorConnectionId) {
+            // Same v1 gate as the /api/ws-token path so a v0 server can't slip
+            // through just because it pre-issued a token on room creation.
+            const expectedV = window.PINCHAT_PROTOCOL_VERSION || 1;
+            const protoOk =
+                creatorProtoVersion !== null &&
+                parseInt(creatorProtoVersion, 10) === expectedV;
+            let subsOk = false;
+            try {
+                const subs = JSON.parse(creatorSubprotocols || '[]');
+                subsOk = Array.isArray(subs) && subs.includes('pinchat.v1');
+            } catch (_) {
+                subsOk = false;
+            }
+
+            if (!protoOk || !subsOk) {
+                // Clear invalid metadata BEFORE surfacing the error; otherwise a
+                // manual reconnect would read the same stale entries and emit
+                // PROTOCOL_OR_AUTH_FAILURE forever without progress.
+                clearCreatorMetadata();
+                console.error('[WS] Creator metadata failed v1 gate; cleared and aborting');
+                this._fatalAuthFailure = true;
+                if (this.onError) this.onError(new Error('PROTOCOL_OR_AUTH_FAILURE'));
+                return;
+            }
+
             console.log('✅ Using creator WebSocket token (no PoW needed)');
             token = creatorToken;
             this.cachedToken = creatorToken;
-            this.tokenExpiresAt = Date.now() + 29000; // Assume fresh token
+            this.tokenExpiresAt = Date.now() + 29000;
+            clearCreatorMetadata();  // success path: single-use
+        } else if (creatorToken || creatorConnectionId) {
+            // Partial/corrupt creator metadata (one key missing): clean up before
+            // falling through to the token-request path.
+            clearCreatorMetadata();
+        }
 
-            // Clear from sessionStorage after first use (security: one-time use)
-            sessionStorage.removeItem(`ws_token_${this.roomId}`);
-            sessionStorage.removeItem(`ws_connection_${this.roomId}`);
-        } else if (this.cachedToken && this.tokenExpiresAt > Date.now()) {
-            console.log('Reusing cached WebSocket token (no PoW required)');
-            token = this.cachedToken;
-        } else {
-            console.log('Requesting new WebSocket token (requires PoW)...');
-            token = await this.requestWsToken();
+        if (!token) {
+            if (this.cachedToken && this.tokenExpiresAt > Date.now()) {
+                console.log('Reusing cached WebSocket token (no PoW required)');
+                token = this.cachedToken;
+            } else {
+                console.log('Requesting new WebSocket token (requires PoW)...');
+                token = await this.requestWsToken();
 
-            if (!token) {
-                console.error('Failed to obtain WebSocket token');
-                if (this.onError) {
-                    this.onError(new Error('Failed to obtain WebSocket token'));
+                if (!token) {
+                    // If requestWsToken already set _fatalAuthFailure and emitted
+                    // PROTOCOL_OR_AUTH_FAILURE, don't overwrite with the generic error.
+                    if (this._fatalAuthFailure) return;
+                    console.error('Failed to obtain WebSocket token');
+                    if (this.onError) {
+                        this.onError(new Error('Failed to obtain WebSocket token'));
+                    }
+                    return;
                 }
-                return;
             }
         }
 
-        // Determine the protocol (ws or wss)
+        // PATH 2: build the WebSocket with JWT carried in Sec-WebSocket-Protocol
+        // rather than the URL (so it never lands in proxy/referrer/middlebox logs).
         const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-        const wsUrl = `${protocol}//${window.location.host}/ws/${this.roomId}?token=${token}`;
+        const wsUrl = `${protocol}//${window.location.host}/ws/${this.roomId}`;
 
-        console.log('Connecting to WebSocket with authenticated token');
+        console.log('Connecting to WebSocket (pinchat.v1 subprotocol auth)');
 
         try {
-            this.ws = new WebSocket(wsUrl);
+            this.ws = new WebSocket(wsUrl, ['pinchat.v1', `pinchat.v1.jwt.${token}`]);
 
             this.ws.onopen = () => {
-                console.log('✅ WebSocket connected');
+                // Subprotocol sanity: server must echo "pinchat.v1" exactly.
+                if (this.ws.protocol !== 'pinchat.v1') {
+                    console.error('[WS] Unexpected negotiated subprotocol:', this.ws.protocol);
+                    try { this.ws.close(1002, 'Protocol mismatch'); } catch (_) {}
+                    this._fatalAuthFailure = true;
+                    if (this.onError) this.onError(new Error('PROTOCOL_MISMATCH'));
+                    return;
+                }
+                console.log('✅ WebSocket connected (pinchat.v1)');
                 this.reconnectAttempts = 0;
+                this._connectionExhausted = false;  // successful connection → restore retry budget
 
+                // onConnected is async in app.js (await restartECDHHandshake).
+                // Wrap with Promise.resolve().then() so both async errors AND
+                // any synchronous throw get surfaced instead of becoming
+                // unhandled rejections.
                 if (this.onConnected) {
-                    this.onConnected();
+                    void Promise.resolve()
+                        .then(() => this.onConnected())
+                        .catch((err) => {
+                            console.error('[WS] Unhandled error in onConnected:', err);
+                            if (this.onError) this.onError(new Error('ON_CONNECTED_FAILED'));
+                        });
                 }
             };
 
@@ -247,8 +349,9 @@ class WebSocketManager {
                     this.onDisconnected();
                 }
 
-                // Automatically attempt reconnection if it wasn't manual
-                if (!this.isManuallyDisconnected) {
+                // Auto-reconnect only for transient drops. Skip on manual
+                // disconnect and on terminal auth/protocol failure.
+                if (!this.isManuallyDisconnected && !this._fatalAuthFailure) {
                     this.attemptReconnect();
                 }
             };
@@ -267,7 +370,14 @@ class WebSocketManager {
                     console.log('WebSocket message received:', message.type);
 
                     if (this.onMessage) {
-                        this.onMessage(message);
+                        // onMessage handler in app.js is async and may throw during
+                        // SIGNATURE_INVALID / handshake teardown paths; wrap so a
+                        // failed path doesn't leak as an unhandled rejection.
+                        void Promise.resolve()
+                            .then(() => this.onMessage(message))
+                            .catch((err) => {
+                                console.error('[WS] Unhandled error in onMessage:', err);
+                            });
                     }
                 } catch (error) {
                     console.error('Failed to parse WebSocket message:', error);
@@ -283,13 +393,26 @@ class WebSocketManager {
     }
 
     /**
-     * Attempts reconnection with exponential backoff
+     * Attempts reconnection with exponential backoff.
+     *
+     * Two kinds of terminal state:
+     *  - `_fatalAuthFailure`: explicit protocol/auth mismatch (v1 gate,
+     *    SIGNATURE_INVALID, subprotocol echo mismatch). No retry at all —
+     *    the user must refresh the page.
+     *  - `_connectionExhausted`: transient transport failure after N retries.
+     *    The banner tells the user to check their network; a manual Reconnect
+     *    click resets the retry budget (see app.js reconnect()).
      */
     attemptReconnect() {
+        if (this._fatalAuthFailure) {
+            console.error('Fatal auth/protocol failure — no auto-reconnect');
+            return;
+        }
         if (this.reconnectAttempts >= this.maxReconnectAttempts) {
             console.error('Max reconnection attempts reached');
+            this._connectionExhausted = true;
             if (this.onError) {
-                this.onError(new Error('Failed to reconnect after multiple attempts'));
+                this.onError(new Error('CONNECTION_EXHAUSTED'));
             }
             return;
         }
@@ -339,6 +462,28 @@ class WebSocketManager {
 
         if (this.ws) {
             this.ws.close(1000, 'Manual disconnect');
+            this.ws = null;
+        }
+    }
+
+    /**
+     * Disconnect with a specific WebSocket close code + reason, and mark the
+     * session as fatal so auto-reconnect is suppressed.
+     *
+     * Used for SIGNATURE_INVALID (1008 Policy Violation) after a detected MITM
+     * attempt: we do NOT want the client to silently reconnect and re-establish
+     * a session with a peer whose identity just failed authentication.
+     */
+    disconnectWithError(code, reason) {
+        this.isManuallyDisconnected = true;
+        this._fatalAuthFailure = true;
+        if (this._boundBeforeUnload) {
+            window.removeEventListener('beforeunload', this._boundBeforeUnload);
+        }
+        if (this.ws) {
+            try {
+                this.ws.close(code, reason);
+            } catch (_) { /* ignore */ }
             this.ws = null;
         }
     }

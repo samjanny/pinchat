@@ -2,6 +2,13 @@
 
 This document provides a comprehensive security analysis of PinChat, including the threat model, cryptographic specifications, and security guarantees.
 
+**Protocol version: 1** (see [PROTOCOL.md](PROTOCOL.md)). Changes in v1 relative to the implicit v0:
+
+- All Double Ratchet DH public keys are now ECDSA-signed by the peer's identity key; a live MITM cannot swap DH keys mid-session.
+- WebSocket authentication uses `Sec-WebSocket-Protocol` subprotocol negotiation; JWT never appears in URLs or logs.
+- Bootstrap key is zeroed after handshake and re-extracted from the URL fragment on reconnect (was retained indefinitely in memory).
+- `SIGNATURE_INVALID` is a hard session abort: WebSocket is closed with 1008 Policy Violation and auto-reconnect is suppressed.
+
 ## Table of Contents
 
 1. [Threat Model](#threat-model)
