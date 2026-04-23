@@ -38,8 +38,8 @@
         if (typeof value !== 'string' || value.length > 2048) return false;
         try {
             var u = new URL(value);
-            // Only https:// to avoid javascript:, data:, file:, etc.
-            return u.protocol === 'https:' || u.protocol === 'http:';
+            // Only https:// to avoid javascript:, data:, file:, http:, etc.
+            return u.protocol === 'https:';
         } catch (e) {
             return false;
         }
