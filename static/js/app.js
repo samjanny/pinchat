@@ -172,11 +172,11 @@ document.addEventListener('alpine:init', () => {
 
             this.wsManager.onPowProgress = (attempts) => {
                 if (attempts === 0) {
-                    this.connectingMessage = '⏳ Computing challenge...';
+                    this.connectingMessage = 'Computing challenge…';
                 } else if (attempts === -1) {
                     this.connectingMessage = '✓ Challenge solved, connecting...';
                 } else {
-                    this.connectingMessage = `⏳ Computing... (${Math.floor(attempts / 100000) * 100}k attempts)`;
+                    this.connectingMessage = `Computing… (${Math.floor(attempts / 100000) * 100}k attempts)`;
                 }
             };
 
@@ -1281,8 +1281,8 @@ document.addEventListener('alpine:init', () => {
         /** Placeholder copy that mirrors the current lock reason. */
         composerPlaceholder() {
             if (!this.connected) return 'Connecting…';
-            if (this.participantCount < 2) return '⌛ Waiting for someone to join this room…';
-            if (this.roomType === 'onetoone' && !this.pfsActive) return '🔐 Establishing secure connection…';
+            if (this.participantCount < 2) return 'Waiting for someone to join this room…';
+            if (this.roomType === 'onetoone' && !this.pfsActive) return 'Establishing secure connection…';
             return 'Write an encrypted message…';
         },
 

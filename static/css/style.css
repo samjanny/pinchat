@@ -2172,30 +2172,52 @@ input[type="password"]:focus {
 .radio-group {
     display: grid;
     grid-template-columns: 1fr 1fr;
-    gap: 6px;
+    gap: 4px;
     padding: 4px;
     background: var(--bg-secondary);
     border: 1px solid var(--border);
     border-radius: var(--radius-md);
 }
-.radio-label {
+.radio-group .radio-label,
+.form-group label.radio-label {
+    position: relative;
     border: none;
     border-radius: calc(var(--radius-md) - 4px);
-    padding: 0.5rem 0.75rem;
+    padding: 10px 12px;
+    display: flex;
     justify-content: center;
+    align-items: center;
     background: transparent;
     font-weight: 500;
     text-align: center;
+    width: 100%;
+    box-sizing: border-box;
+    margin: 0;
+    line-height: 1.2;
+    transition: background-color 120ms ease, color 120ms ease;
 }
-.radio-label:hover {
-    background: var(--bg-card);
+.radio-label > span {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    line-height: 1.2;
+}
+.radio-label > span > .tag { margin-left: 0; }
+.radio-group { align-items: stretch; }
+.radio-label:hover:not(.disabled) {
+    background: color-mix(in srgb, var(--bg-card) 50%, transparent);
     box-shadow: none;
     border-color: transparent;
 }
 .radio-label:has(input[type="radio"]:checked) {
     background: var(--bg-card);
-    box-shadow: var(--shadow-sm);
+    box-shadow: none;
     border-color: transparent;
+    color: var(--text);
+}
+.radio-label.disabled {
+    opacity: 1;
+    color: var(--text-light);
 }
 .radio-label input[type="radio"] {
     position: absolute;
@@ -2427,8 +2449,9 @@ input[type="password"]:focus {
 
 /* Disabled segment in the segmented control */
 .radio-label.disabled {
-    opacity: 0.55;
     cursor: not-allowed;
+    color: var(--text-light);
+    opacity: 1;
 }
 .radio-label.disabled input { pointer-events: none; }
 .tag {
@@ -2625,7 +2648,7 @@ input[type="password"]:focus {
 .chat-header {
     border-bottom: 1px solid var(--border);
     box-shadow: none;
-    padding: 0 18px;
+    padding: 0 72px 0 18px;
     min-height: 61px;
     background: var(--bg);
     gap: 14px;
@@ -2835,15 +2858,26 @@ input[type="password"]:focus {
     display: inline-block;
 }
 
-/* Multi-child (welcome block): plain centered stack, no divider */
+/* Multi-child (welcome block): full-width strip, two fading hairlines.
+   Reusable --fade-rule helper (top+bottom 1px border that fades out at the
+   edges via border-image gradient). No rounded corners, no enclosing box. */
 .system-message:has(> * + *) {
-    padding: 20px 16px;
-    margin: 12px auto;
-    max-width: 540px;
-    background: var(--bg-card);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-md);
+    padding: 22px 16px;
+    margin: 16px 0;
+    max-width: none;
+    background: transparent;
+    border-style: solid;
+    border-width: 1px 0;
+    border-image: linear-gradient(
+        to right,
+        transparent 0%,
+        var(--border) 15%,
+        var(--border) 85%,
+        transparent 100%
+    ) 1;
+    border-radius: 0;
     line-height: 1.55;
+    text-align: center;
 }
 .system-message:has(> * + *) > * {
     display: block;
@@ -2881,16 +2915,17 @@ input[type="password"]:focus {
 }
 
 .message-form {
-    background: var(--bg-card);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-md);
-    padding: 4px 6px;
-    gap: 4px;
-    transition: border-color 120ms, box-shadow 120ms;
+    background: transparent;
+    border: none;
+    border-radius: 0;
+    padding: 0;
+    gap: 6px;
+    box-shadow: none;
+    align-items: center;
 }
 .message-form:focus-within {
-    border-color: var(--primary);
-    box-shadow: var(--shadow-secure);
+    border: none;
+    box-shadow: none;
 }
 .message-input {
     border: none !important;
@@ -2912,8 +2947,16 @@ input[type="password"]:focus {
     background: var(--primary);
     color: #fff;
     border-radius: var(--radius-sm);
-    padding: 6px 12px;
-    min-width: 36px;
+    padding: 0 !important;
+    width: 38px !important;
+    min-width: 38px;
+    height: 38px;
+    flex: 0 0 auto;
+    font-size: 18px;
+    line-height: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
 }
 .input-area .btn-send:disabled {
     opacity: 0.5;
@@ -2951,36 +2994,62 @@ input[type="password"]:focus {
     font-weight: 500;
 }
 
-/* ---- In-chat banners (MITM / unverified / security / group) ---- */
+/* ---- In-chat banners: fade top+bottom border strips (no rounded boxes) ---- */
 .mitm-warning-banner,
 .unverified-warning-banner,
 .security-status-banner,
 .group-chat-warning {
-    border-radius: var(--radius-md);
-    border: 1px solid var(--border);
+    background: transparent;
+    border-style: solid;
+    border-width: 1px 0;
+    border-radius: 0;
     box-shadow: none;
-    padding: 10px 14px;
-    margin-bottom: 10px;
+    padding: 12px 16px;
+    margin: 10px 0;
     font-size: 13px;
+    text-align: center;
+    animation: none;
+    font-weight: 500;
 }
 .mitm-warning-banner {
-    background: color-mix(in srgb, var(--error) 10%, var(--bg-card));
-    border-color: color-mix(in srgb, var(--error) 40%, var(--border));
+    color: var(--error);
+    border-image: linear-gradient(
+        to right,
+        transparent 0%,
+        color-mix(in srgb, var(--error) 55%, transparent) 20%,
+        color-mix(in srgb, var(--error) 55%, transparent) 80%,
+        transparent 100%
+    ) 1;
 }
 .unverified-warning-banner {
-    background: color-mix(in srgb, var(--warning) 10%, var(--bg-card));
-    border-color: color-mix(in srgb, var(--warning) 40%, var(--border));
+    color: var(--warning);
+    border-image: linear-gradient(
+        to right,
+        transparent 0%,
+        color-mix(in srgb, var(--warning) 55%, transparent) 20%,
+        color-mix(in srgb, var(--warning) 55%, transparent) 80%,
+        transparent 100%
+    ) 1;
 }
 .security-status-banner {
-    background: color-mix(in srgb, var(--primary) 10%, var(--bg-card));
-    border-color: color-mix(in srgb, var(--primary) 40%, var(--border));
-    color: var(--text);
-    text-align: left;
+    color: var(--text-medium);
+    border-image: linear-gradient(
+        to right,
+        transparent 0%,
+        color-mix(in srgb, var(--primary) 50%, transparent) 20%,
+        color-mix(in srgb, var(--primary) 50%, transparent) 80%,
+        transparent 100%
+    ) 1;
 }
 .group-chat-warning {
-    background: var(--bg-secondary);
-    border-color: var(--border);
     color: var(--text-medium);
+    border-image: linear-gradient(
+        to right,
+        transparent 0%,
+        var(--border) 15%,
+        var(--border) 85%,
+        transparent 100%
+    ) 1;
 }
 
 /* ---- Chat layout with sidebar (Linear SaaS) ---- */
@@ -3147,21 +3216,27 @@ input[type="password"]:focus {
 .sas-peer-row {
     display: flex;
     align-items: center;
-    gap: 10px;
+    gap: 12px;
     padding: 10px 0 4px;
 }
 .sas-peer-avatar {
-    width: 28px; height: 28px;
+    width: 34px; height: 34px;
     border-radius: var(--radius-sm);
     background: linear-gradient(135deg, var(--accent), var(--success));
     color: #fff;
     display: grid;
     place-items: center;
-    font-size: 12px;
+    font-size: 14px;
     font-weight: 600;
     flex-shrink: 0;
 }
-.sas-peer-meta { line-height: 1.25; }
+.sas-peer-meta {
+    line-height: 1.3;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    gap: 1px;
+}
 .sas-peer-label {
     display: block;
     font-size: 11px;
@@ -3191,10 +3266,17 @@ input[type="password"]:focus {
     background: var(--bg-card);
     border: 1px solid var(--border);
     border-radius: var(--radius-md);
-    padding: 14px 0;
-    text-align: center;
-    font-size: 32px;
+    width: auto;
+    height: auto;
+    aspect-ratio: 1 / 1;
+    align-self: stretch;
+    justify-self: stretch;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 30px;
     line-height: 1;
+    padding: 0;
     user-select: none;
     transition: transform 120ms, border-color 120ms, background-color 120ms;
     cursor: default;
@@ -3287,7 +3369,12 @@ input[type="password"]:focus {
     justify-content: center;
     gap: 8px;
 }
-.sas-footer .btn svg { width: 15px; height: 15px; }
+.sas-footer .btn svg {
+    width: 15px;
+    height: 15px;
+    flex-shrink: 0;
+    stroke-width: 2;
+}
 
 .sas-btn-mismatch {
     background: var(--bg-card);
@@ -3646,4 +3733,267 @@ input[type="password"]:focus {
     .chat-container { grid-template-columns: 1fr; }
     .chat-sidebar { display: none; }
 }
+
+/* ==========================================================================
+   Lucide icon system (ISC licensed) — inline SVG sprite via <use href="#i-*">
+   .icon is a bare inline-block; concrete sizes are set per-context below.
+   ========================================================================== */
+.icon {
+    display: inline-block;
+    width: 1em;
+    height: 1em;
+    fill: none;
+    stroke: currentColor;
+    flex-shrink: 0;
+    vertical-align: -0.15em;
+}
+
+/* Hero chips */
+.hero-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+}
+.hero-chip .icon {
+    width: 14px;
+    height: 14px;
+    color: var(--text-light);
+}
+
+/* Feature icons — larger, primary-tinted */
+.feature-icon {
+    color: var(--primary);
+    line-height: 1;
+}
+.feature-icon .icon {
+    width: 26px;
+    height: 26px;
+}
+
+/* Warning disclaimer headings */
+.info-box.warning h3 {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+.info-box.warning h3 .icon {
+    width: 20px;
+    height: 20px;
+    color: var(--warning);
+}
+
+/* Semantic tints for icons */
+.icon-success { color: var(--success); }
+.icon-warning { color: var(--warning); }
+.icon-error   { color: var(--error); }
+
+/* Chat header chips & participant counter */
+.chat-header .badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+}
+.chat-header .badge .icon {
+    width: 12px;
+    height: 12px;
+}
+.chat-header .participants {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+}
+.chat-header .participants .icon {
+    width: 13px;
+    height: 13px;
+}
+.header-actions .btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+}
+.header-actions .btn .icon {
+    width: 14px;
+    height: 14px;
+}
+
+/* Banners inside chat (waiting / establishing / group / mitm / unverified) */
+.security-status-banner,
+.group-chat-warning,
+.status-banner {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+}
+.security-status-banner .icon,
+.group-chat-warning .icon,
+.status-banner .icon {
+    width: 16px;
+    height: 16px;
+}
+
+/* Welcome / decrypt-error system messages */
+.system-message .icon {
+    width: 16px;
+    height: 16px;
+    vertical-align: -3px;
+    margin-right: 4px;
+}
+
+/* MITM / unverified warning icons (big) */
+.mitm-warning-icon .icon,
+.unverified-warning-icon .icon {
+    width: 22px;
+    height: 22px;
+}
+
+/* Composer buttons */
+.input-area .btn-image,
+.input-area .btn-emoji {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+}
+.input-area .btn-image .icon,
+.input-area .btn-emoji .icon {
+    width: 20px;
+    height: 20px;
+}
+
+/* ==========================================================================
+   De-box pass — flatten rounded containers / fade top+bottom border strips
+   Applied across homepage, login, legal pages for a consistent Linear look.
+   Kept at the bottom of the file so it wins the cascade over earlier rules.
+   ========================================================================== */
+
+/* ---- Homepage: create-room card — flatten (no box, no shadow) ---- */
+.card.create-room-card,
+.card.create-room-card:hover {
+    background: transparent;
+    border: none;
+    border-radius: 0;
+    box-shadow: none;
+    padding: 0;
+}
+.card.create-room-card::before { display: none; }
+.card.create-room-card h2 {
+    font-size: 18px;
+    font-weight: 600;
+    margin-bottom: 6px;
+    letter-spacing: -0.005em;
+}
+.card.create-room-card .form-group {
+    margin-bottom: 2.5rem;
+}
+.card.create-room-card form > .btn-primary {
+    margin-top: 1rem;
+}
+.card.create-room-card h2 {
+    margin-bottom: 10px;
+}
+.card.create-room-card .card-sub {
+    margin-bottom: 32px;
+}
+
+/* ---- Homepage: info-stack (vertical) — fade top+bottom strips ---- */
+.info-stack { gap: 0; }
+.info-card {
+    background: transparent;
+    border-style: solid;
+    border-width: 1px 0;
+    border-radius: 0;
+    box-shadow: none;
+    padding: 36px 4px;
+    border-image: linear-gradient(
+        to right,
+        transparent 0%,
+        var(--border) 15%,
+        var(--border) 85%,
+        transparent 100%
+    ) 1;
+}
+.info-card + .info-card {
+    border-top-width: 0;
+}
+.info-card h3 { margin-bottom: 10px; }
+.info-card p { line-height: 1.7; }
+
+/* ---- Homepage: feature grid — flat tiles, no box ---- */
+.feature-grid {
+    margin-top: 112px;
+    gap: 40px;
+}
+.feature,
+.feature:hover {
+    background: transparent;
+    border: none;
+    border-radius: 0;
+    box-shadow: none;
+    padding: 8px 4px;
+}
+.feature-icon { font-size: 26px; margin-bottom: 14px; }
+.feature-title { margin-bottom: 8px; }
+.feature-desc { line-height: 1.65; }
+
+/* ---- Homepage: disclaimer info-boxes — neutral fade strips ---- */
+.disclaimer-stack { margin-top: 88px; gap: 0; }
+.info-box.warning,
+[data-theme="dark"] .info-box.warning,
+[data-theme="light"] .info-box.warning {
+    background: transparent;
+    border-style: solid;
+    border-width: 1px 0;
+    border-radius: 0;
+    box-shadow: none;
+    padding: 34px 4px;
+    border-image: linear-gradient(
+        to right,
+        transparent 0%,
+        var(--border) 15%,
+        var(--border) 85%,
+        transparent 100%
+    ) 1;
+}
+.info-box.warning::before { display: none; }
+.info-box.warning h3 { margin-bottom: 12px; }
+.info-box.warning p { line-height: 1.7; }
+.disclaimer-stack .info-box.warning + .info-box.warning {
+    border-top-width: 0;
+}
+
+/* ---- Hero grid: more breathing room between form and info stack ---- */
+.hero-grid {
+    margin-top: 80px;
+    gap: 72px;
+}
+.hero-chips { margin-top: 28px; }
+.hero-lede { margin-top: 20px; }
+
+@media (max-width: 860px) {
+    .hero-grid { gap: 12px; margin-top: 56px; }
+    .feature-grid { margin-top: 72px; gap: 28px; }
+    .disclaimer-stack { margin-top: 64px; }
+    .info-card { padding: 28px 4px; }
+    .info-box.warning { padding: 28px 4px; }
+}
+
+/* ---- Login: flatten the centered card ---- */
+.login-card {
+    background: transparent;
+    border: none;
+    border-radius: 0;
+    box-shadow: none;
+    padding: 0;
+}
+
+/* ---- Legal pages (terms / privacy): remove card box — content IS the page ---- */
+.page-legal .card,
+.page-legal .card:hover {
+    background: transparent;
+    border: none;
+    border-radius: 0;
+    box-shadow: none;
+    padding: 0;
+}
+.page-legal .card::before { display: none; }
 
