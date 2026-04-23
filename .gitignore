@@ -27,3 +27,8 @@ prichat-main/
 
 # Internal operational runbooks — do not publish by default
 ops/
+
+# Operator-specific legal data — deployment-specific, never commit.
+# Each host configures its own operator.json (or serves it via WEBSITE_DIR).
+# Only operator.example.json (the schema) lives in the repo.
+/static/operator.json
