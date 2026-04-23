@@ -1,9 +1,10 @@
 use axum::{
     extract::{ConnectInfo, Path, State},
-    http::{HeaderMap, StatusCode},
+    http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Redirect, Response},
     Json,
 };
+use axum_extra::extract::cookie::Cookie;
 use serde_json::json;
 use std::net::SocketAddr;
 use uuid::Uuid;
@@ -12,7 +13,24 @@ use crate::ip_hash::{extract_client_ip_with_proxy, hash_ip};
 use crate::jwt::{sign_token, WsTokenClaims};
 use crate::models::{CreateRoomResponse, Room, RoomConfig};
 use crate::pow::{calculate_difficulty, PowChallenge};
+use crate::pow_session::{pow_cache_key, resolve_pow_session, should_use_secure_pow_cookies};
 use crate::state::AppState;
+
+/// Build a 4xx/5xx response, attaching the given Set-Cookie header when
+/// present. Centralised so every 428 path in the PoW handlers stays consistent.
+fn pow_error_response(
+    status: StatusCode,
+    body: serde_json::Value,
+    cookie: Option<Cookie<'static>>,
+) -> Response {
+    let mut resp = (status, Json(body)).into_response();
+    if let Some(c) = cookie
+        && let Ok(hv) = c.to_string().parse()
+    {
+        resp.headers_mut().append(header::SET_COOKIE, hv);
+    }
+    resp
+}
 
 /// Homepage handler - redirects to static HTML
 pub async fn homepage() -> Redirect {
@@ -36,14 +54,23 @@ pub async fn create_room(
     let client_ip =
         extract_client_ip_with_proxy(&ConnectInfo(addr), &headers, &state.config.trusted_proxies);
     let ip_hash = hash_ip(&client_ip, &state.ip_hash_secret);
+
+    // Resolve PoW session cookie to disambiguate clients behind shared NAT.
+    // A missing/invalid cookie yields a fresh UUID + a Set-Cookie header to
+    // attach on whichever 428 this request emits.
+    let use_secure = should_use_secure_pow_cookies(state.config.force_secure_cookies);
+    let (pow_cookie, fresh_cookie) =
+        resolve_pow_session(&headers, use_secure, state.config.challenge_ttl_secs);
+    let cache_key = pow_cache_key(&ip_hash, &pow_cookie);
+
     // Validate configuration
     if config.ttl_minutes == 0 || config.ttl_minutes > 1440 {
         // Max 24 hours
-        return Err((
+        return Err(pow_error_response(
             StatusCode::BAD_REQUEST,
-            Json(json!({ "error": "TTL must be between 1 and 1440 minutes" })),
-        )
-            .into_response());
+            json!({ "error": "TTL must be between 1 and 1440 minutes" }),
+            fresh_cookie,
+        ));
     }
 
     // Layer 2: Proof-of-Work verification (always required)
@@ -64,35 +91,35 @@ pub async fn create_room(
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .ok_or_else(|| {
-                    (
+                    pow_error_response(
                         StatusCode::BAD_REQUEST,
-                        Json(json!({ "error": "Invalid nonce format" })),
+                        json!({ "error": "Invalid nonce format" }),
+                        fresh_cookie.clone(),
                     )
-                        .into_response()
                 })?;
 
             // Retrieve the issued challenge from cache to enforce one-time use
             // This prevents offline challenge fabrication attacks
-            let cached_challenge = state.challenge_cache.take(&ip_hash).ok_or_else(|| {
-                // No challenge found for this IP - issue a new one
+            let cached_challenge = state.challenge_cache.take(&cache_key).ok_or_else(|| {
+                // No challenge found for this (IP, cookie) pair - issue a new one
                 let new_challenge = PowChallenge::new(difficulty);
                 state
                     .challenge_cache
-                    .store(ip_hash.clone(), new_challenge.clone());
+                    .store(cache_key.clone(), new_challenge.clone());
 
-                tracing::warn!("No cached challenge for IP, issuing new one");
+                tracing::warn!("No cached challenge for PoW session, issuing new one");
 
-                (
-                    StatusCode::PRECONDITION_REQUIRED, // 428
-                    Json(json!({
+                pow_error_response(
+                    StatusCode::PRECONDITION_REQUIRED,
+                    json!({
                         "error": "Challenge not found or expired, new challenge issued",
                         "pow_required": true,
                         "challenge": new_challenge.challenge,
                         "mask": new_challenge.mask,
                         "difficulty": difficulty
-                    })),
+                    }),
+                    fresh_cookie.clone(),
                 )
-                    .into_response()
             })?;
 
             // Verify difficulty matches current requirement (prevent stale challenges)
@@ -100,30 +127,30 @@ pub async fn create_room(
                 let new_challenge = PowChallenge::new(difficulty);
                 state
                     .challenge_cache
-                    .store(ip_hash.clone(), new_challenge.clone());
+                    .store(cache_key.clone(), new_challenge.clone());
 
-                return Err((
-                    StatusCode::PRECONDITION_REQUIRED, // 428
-                    Json(json!({
+                return Err(pow_error_response(
+                    StatusCode::PRECONDITION_REQUIRED,
+                    json!({
                         "error": "Difficulty increased, new challenge required",
                         "pow_required": true,
                         "challenge": new_challenge.challenge,
                         "mask": new_challenge.mask,
                         "difficulty": difficulty
-                    })),
-                )
-                    .into_response());
+                    }),
+                    fresh_cookie,
+                ));
             }
 
             // Verify PoW solution against cached challenge
             if !cached_challenge.verify(nonce) {
                 tracing::warn!("Invalid PoW solution from IP");
 
-                return Err((
+                return Err(pow_error_response(
                     StatusCode::FORBIDDEN,
-                    Json(json!({ "error": "Invalid proof of work solution" })),
-                )
-                    .into_response());
+                    json!({ "error": "Invalid proof of work solution" }),
+                    fresh_cookie,
+                ));
             }
 
             tracing::info!("Valid PoW solution verified (challenge consumed)");
@@ -135,21 +162,21 @@ pub async fn create_room(
             let challenge = PowChallenge::new(difficulty);
             state
                 .challenge_cache
-                .store(ip_hash.clone(), challenge.clone());
+                .store(cache_key.clone(), challenge.clone());
 
             tracing::debug!("PoW challenge issued and cached");
 
-            return Err((
-                StatusCode::PRECONDITION_REQUIRED, // 428
-                Json(json!({
+            return Err(pow_error_response(
+                StatusCode::PRECONDITION_REQUIRED,
+                json!({
                     "error": "Proof of work required",
                     "pow_required": true,
                     "challenge": challenge.challenge,
                     "mask": challenge.mask,
                     "difficulty": difficulty
-                })),
-            )
-                .into_response());
+                }),
+                fresh_cookie,
+            ));
         }
     }
 
