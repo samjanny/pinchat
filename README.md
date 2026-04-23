@@ -226,12 +226,26 @@ openssl req -x509 -newkey rsa:4096 \
     -subj "/CN=localhost"
 ```
 
-3. Build and run:
+3. Provide operator data for the legal pages (Terms / Privacy):
+```bash
+cp static/operator.example.json static/operator.json
+# edit static/operator.json with your real contact, hosting provider, etc.
+```
+
+The legal pages (`/static/terms.html`, `/static/privacy.html`) fetch
+`/static/operator.json` at runtime to fill in operator-specific values
+(support email, DPA, hosting note, last-updated date). The file is
+**gitignored** and deployment-specific — in production it is typically
+served from `WEBSITE_DIR` (see [Configuration](#configuration)) so the
+public repo never contains the operator's contact details. If the file
+is missing, the legal pages still render but show fallback placeholders.
+
+4. Build and run:
 ```bash
 cargo run --release
 ```
 
-4. Access the application:
+5. Access the application:
 ```
 https://localhost:3000
 ```
