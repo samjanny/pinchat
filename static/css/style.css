@@ -2620,12 +2620,16 @@ input[type="password"]:focus {
 }
 
 /* ---- Header ---- */
+/* Height aligned with .sidebar-brand so the two horizontal rules below
+   them form a single continuous line across the whole app chrome. */
 .chat-header {
     border-bottom: 1px solid var(--border);
     box-shadow: none;
-    padding: 10px 18px;
+    padding: 0 18px;
+    min-height: 61px;
     background: var(--bg);
     gap: 14px;
+    box-sizing: border-box;
 }
 
 /* Brand cluster on the left (logo mark + title/subtitle). The legacy h1
@@ -2986,7 +2990,9 @@ input[type="password"]:focus {
     display: flex;
     align-items: center;
     gap: 10px;
-    padding: 16px 18px;
+    padding: 0 18px;
+    min-height: 61px;
+    box-sizing: border-box;
     border-bottom: 1px solid var(--border);
     text-decoration: none;
     color: var(--text);
