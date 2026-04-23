@@ -1,13 +1,13 @@
 {
   "data": {
     "version": "1.2.0",
-    "sequence": 14,
-    "generated": "2026-04-22T10:02:56.024Z",
+    "sequence": 15,
+    "generated": "2026-04-23T09:00:19.420Z",
     "site": "https://pinchat.io",
     "files": [
       {
         "path": "/static/css/style.css",
-        "hash": "f6611829c1324f9f0d77649abd96800cce4674012de3620e5a1add2f312c61cb"
+        "hash": "5116d38f7ab78876349ca475976f8f5256543235102558496c2af65484e8e632"
       },
       {
         "path": "/static/js/alpine-csp.min.js",
@@ -15,7 +15,7 @@
       },
       {
         "path": "/static/js/app.js",
-        "hash": "95a4ca7e69d0a06a84a2685c1de950224a2792b0c4e3a8569ea72d4f5caf5053"
+        "hash": "3edf15473bab16ed201a1fa695ee890361108a4203460e13988da41d618b0401"
       },
       {
         "path": "/static/js/crypto.js",
@@ -71,25 +71,25 @@
       },
       {
         "path": "/static/index.html",
-        "hash": "1b5d303df4595eee57590e558670bc4da6e9b328ab4c1db65350ef1207f85c04"
+        "hash": "0c48f12a16ce521d2313e00f692fab7102d1d6d0277e64a4fe1c1a190c5080d1"
       },
       {
         "path": "/static/login.html",
-        "hash": "f1bb5e41a0f8c0f7034635382c216c31df0a2298387c9e8f501680b29d27318c"
+        "hash": "c69eaaebc0759035fcb4d2d294d2fa7c549ff25744af3bd5cac4018ef9de720f"
       },
       {
         "path": "/static/chat.html",
-        "hash": "73950df9750ea9f4e4f698a186329358b4d318d7b241d2ff9fdec6fa111e2a70"
+        "hash": "bfa885e72758afc330b0a79500b95c8c1245041c1925e33c531f13230e4a1e1c"
       },
       {
         "path": "/static/terms.html",
-        "hash": "bbda6e34f19e7c5e2e95bf3944c05c97124c3bb7aef895dd06efe7c797ac2f85"
+        "hash": "2f4b9e04eb7fd84a7e7d1654dbc54a46a9eea3b579b9fa211ef17c1728622ca9"
       },
       {
         "path": "/static/privacy.html",
-        "hash": "eb2af8b062c1ec707feef6701582ab312a329967189fcd90b7ba0cfaa3e36282"
+        "hash": "84027b5f7df22f874a2cd421d8eb3869bbb2d98d0efbbca0ce0dfe8a03c15163"
       }
     ]
   },
-  "signature": "MEQCIAS3fwrheCTrP78vzVf9nk5KNrQTRdzr+OLa5RefKTLEAiBCyao3QjVmCE8UnVUuUokkK7TwzbolPN3y9ipycBDkJQ=="
+  "signature": "MEQCICtjxYTLFFE+BHQOc2VVqOlwUZBfVEYqiQMq9oNfVmAPAiBCuA7hAqb95bBON3aPFomhxMsGiIv/dq5pmVff0QIgnw=="
 }
