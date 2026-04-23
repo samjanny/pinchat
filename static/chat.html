@@ -10,7 +10,8 @@
     <script src="/static/js/nicknames.js" integrity="sha256-FFlmH12HLY/cK10Uu5ALIabktzw+KiCJdF2p60qlSuc=" crossorigin="anonymous" ></script>
 </head>
 <body class="chat-page">
-    <div class="chat-container" x-data="$store.chatRoom">
+    <div class="chat-container" x-data="$store.chatRoom"
+         @keydown.escape.window="if (emojiPickerOpen) closeEmojiPicker(); else if (fullscreenImage) fullscreenImage = null;">
 
         <!-- Sidebar (Linear-style rooms nav; hidden on narrow screens) -->
         <aside class="chat-sidebar">
