@@ -30,6 +30,8 @@ document.addEventListener('alpine:init', () => {
         connecting: true,
         connectingMessage: 'Connecting...',
         userId: null,
+        peerUserId: null,       // UUID of the other participant in 1:1 rooms (null when alone)
+        peerNickname: null,     // Derived display name from peerUserId via generateNickname()
         myNickname: null,  // User's own nickname (generated from userId)
         initialized: false,
         wasConnectedBefore: false,  // Track if we've connected at least once (for reconnection detection)
@@ -170,11 +172,11 @@ document.addEventListener('alpine:init', () => {
 
             this.wsManager.onPowProgress = (attempts) => {
                 if (attempts === 0) {
-                    this.connectingMessage = '⏳ Computing challenge...';
+                    this.connectingMessage = 'Computing challenge…';
                 } else if (attempts === -1) {
                     this.connectingMessage = '✓ Challenge solved, connecting...';
                 } else {
-                    this.connectingMessage = `⏳ Computing... (${Math.floor(attempts / 100000) * 100}k attempts)`;
+                    this.connectingMessage = `Computing… (${Math.floor(attempts / 100000) * 100}k attempts)`;
                 }
             };
 
@@ -263,6 +265,13 @@ document.addEventListener('alpine:init', () => {
                     this.participantCount = message.participant_count;
                     this.addSystemMessage('👋 A participant joined the chat');
 
+                    // Record peer identity up-front so the sidebar can show the
+                    // correct nickname before the peer's first message arrives.
+                    if (message.user_id && message.user_id !== this.userId) {
+                        this.peerUserId = message.user_id;
+                        this.peerNickname = generateNickname(message.user_id).display;
+                    }
+
                     if (this.roomType === 'onetoone' && this.participantCount === 2) {
                         // Reset ECDH status if it was stuck on 'aborted' from previous failed handshake
                         if (this.ecdhHandshakeStatus === 'aborted') {
@@ -282,6 +291,12 @@ document.addEventListener('alpine:init', () => {
                     this.participantCount = message.participant_count;
                     if (message.user_id !== this.userId) {
                         this.addSystemMessage('👋 A participant left the chat');
+                    }
+
+                    // Clear peer identity when they actually leave
+                    if (message.user_id === this.peerUserId) {
+                        this.peerUserId = null;
+                        this.peerNickname = null;
                     }
 
                     // When participant count drops below 2, cleanup ECDH state
@@ -930,6 +945,16 @@ document.addEventListener('alpine:init', () => {
                 return;
             }
 
+            // Second-joiner path: we never saw a userjoined event for the peer
+            // (they were already in the room when we connected). Their sender_id
+            // on the ECDH handshake packet is the first authoritative source we
+            // have for their identity — record it so the sidebar can show the
+            // correct nickname immediately.
+            if (!this.peerUserId && message.sender_id) {
+                this.peerUserId = message.sender_id;
+                this.peerNickname = generateNickname(message.sender_id).display;
+            }
+
             if (this.ecdhHandshakeStatus === 'complete') {
                 console.warn('[ECDH] Handshake already complete, ignoring');
                 return;
@@ -1214,6 +1239,59 @@ document.addEventListener('alpine:init', () => {
          */
         closeEmojiPicker() {
             this.emojiPickerOpen = false;
+        },
+
+        /**
+         * Global Escape handler. Closes the topmost dismissible overlay:
+         * emoji picker first, then fullscreen image viewer. The SAS modal is
+         * intentionally NOT handled here — dismissing it must be an explicit
+         * "match / don't match / skip" decision by the user.
+         *
+         * Needed as a named method (not an inline expression) because this
+         * project uses the Alpine CSP build, which forbids arbitrary JS in
+         * attribute values.
+         */
+        handleEscape() {
+            if (this.emojiPickerOpen) {
+                this.emojiPickerOpen = false;
+                return;
+            }
+            if (this.fullscreenImage) {
+                this.fullscreenImage = null;
+            }
+        },
+
+        /**
+         * True while the composer (text input, emoji, image, send) must be
+         * disabled: WebSocket not open, not enough participants to talk to,
+         * or the 1:1 ECDH+Double-Ratchet handshake has not completed yet.
+         *
+         * Reading this as a method (instead of duplicating the boolean
+         * expression on every `:disabled` attribute) keeps the template
+         * readable AND CSP-safe — Alpine CSP build only accepts method
+         * calls in directive values, not arbitrary expressions.
+         */
+        isComposerLocked() {
+            if (!this.connected) return true;
+            if (this.participantCount < 2) return true;
+            if (this.roomType === 'onetoone' && !this.pfsActive) return true;
+            return false;
+        },
+
+        /** Placeholder copy that mirrors the current lock reason. */
+        composerPlaceholder() {
+            if (!this.connected) return 'Connecting…';
+            if (this.participantCount < 2) return 'Waiting for someone to join this room…';
+            if (this.roomType === 'onetoone' && !this.pfsActive) return 'Establishing secure connection…';
+            return 'Write an encrypted message…';
+        },
+
+        /** Short tooltip shown on the send button in blocked states. */
+        composerLockedLabel() {
+            if (!this.connected) return 'Not connected';
+            if (this.participantCount < 2) return 'Waiting for peer to join';
+            if (this.roomType === 'onetoone' && !this.pfsActive) return 'Waiting for secure connection…';
+            return 'Send message';
         },
 
         /**

@@ -4,59 +4,149 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>PinChat - Secure Chat</title>
-    <link rel="stylesheet" href="/static/css/style.css" integrity="sha256-9mEYKcEyT58Nd2SavZaADM5GdAEt42IOWhrdLzEsYcs=" crossorigin="anonymous" >
+    <link rel="stylesheet" href="/static/css/style.css" integrity="sha256-URbTj3q3iHY0nKR1l2+PUlZUMjUQJVhJbCr2VITo5jI=" crossorigin="anonymous" >
     <script src="/static/js/theme.js" integrity="sha256-vc83MC35lVoXBnYkFcbi+cE5EgJ+drCEfcjEryWT40A=" crossorigin="anonymous" ></script>
     <script src="/static/js/pow.js" integrity="sha256-4jyDkg400LlXkyi0zC+QbIJhh6pEYjneo43JWuFVRZc=" crossorigin="anonymous" ></script>
     <script src="/static/js/nicknames.js" integrity="sha256-FFlmH12HLY/cK10Uu5ALIabktzw+KiCJdF2p60qlSuc=" crossorigin="anonymous" ></script>
 </head>
 <body class="chat-page">
-    <div class="chat-container" x-data="$store.chatRoom">
+    <div class="chat-container" x-data="$store.chatRoom"
+         @keydown.escape.window="handleEscape()">
+
+        <!-- Sidebar (Linear-style rooms nav; hidden on narrow screens) -->
+        <aside class="chat-sidebar">
+            <a class="sidebar-brand" href="/static/index.html" title="New room">
+                <span class="brand-mark">P</span>
+                <b>PinChat</b>
+            </a>
+
+            <div class="sidebar-group">Participants <span class="sidebar-group-count" x-text="'(' + participantCount + '/' + (maxParticipants !== null ? maxParticipants : '-') + ')'">(0/-)</span></div>
+
+            <!-- You (current user) -->
+            <div class="sidebar-item active" :title="userId">
+                <span class="dot" :class="connected ? 'on' : 'off'"></span>
+                <span class="sidebar-item-label"><span x-text="myNickname || '…'">…</span></span>
+                <span class="sidebar-item-badge">you</span>
+            </div>
+
+            <!-- Peer (other participant). peerUserId is populated either on the
+                 userjoined event (when we were already in the room) or on the
+                 first ECDH public-key message (when we joined second). The
+                 nickname is generated deterministically from the userId. -->
+            <template x-if="participantCount >= 2">
+                <div class="sidebar-item" :title="peerUserId || ''">
+                    <span class="dot" :class="pfsActive ? 'on' : 'off'"></span>
+                    <span class="sidebar-item-label" x-text="peerNickname || 'Peer'">Peer</span>
+                    <span class="sidebar-item-badge" x-show="sasVerificationStatus === 'verified'" title="Identity verified">✓</span>
+                </div>
+            </template>
+
+            <!-- Waiting slot when alone -->
+            <template x-if="participantCount < 2">
+                <div class="sidebar-item sidebar-item-muted">
+                    <span class="dot off"></span>
+                    <span class="sidebar-item-label">Waiting for peer…</span>
+                </div>
+            </template>
+
+            <div class="sidebar-group">Room</div>
+            <div class="sidebar-item sidebar-item-static">
+                <span class="sidebar-item-label" x-text="roomType === 'onetoone' ? '1 : 1' : (roomType === 'group' ? 'Group' : '…')">1 : 1</span>
+                <span class="sidebar-item-badge" x-text="roomId ? roomId.substring(0,6) + '…' : '—'">—</span>
+            </div>
+
+            <div class="sidebar-group">Session</div>
+            <div class="sidebar-info">
+                <div class="row"><span class="k">Room</span><b x-text="roomId ? roomId.substring(0,8) + '…' : '—'">—</b></div>
+                <div class="row"><span class="k">Time left</span><b x-text="timeRemaining ? formatTime(timeRemaining).replace('⏱️ ', '') : '—'">—</b></div>
+                <div class="row"><span class="k">Participants</span><b><span x-text="participantCount">0</span>/<span x-text="maxParticipants !== null ? maxParticipants : '-'">-</span></b></div>
+                <div class="row"><span class="k">Max image</span><b x-text="maxImageSize ? (Math.round(maxImageSize/1024) + ' KB') : '—'">—</b></div>
+            </div>
+
+            <div class="sidebar-foot">
+                <div class="you">
+                    <span class="avatar" x-text="myNickname ? myNickname.charAt(0).toUpperCase() : '?'">?</span>
+                    <div class="meta">
+                        <b x-text="myNickname || 'You'">You</b>
+                        <small>protocol v1 · <span x-text="sasVerificationStatus === 'verified' ? 'verified' : (pfsActive ? 'encrypted' : 'setup')">setup</span></small>
+                    </div>
+                </div>
+                <div class="sidebar-legal">
+                    <a href="/static/terms.html" target="_blank" rel="noopener">Terms</a>
+                    <span class="footer-sep" aria-hidden="true">·</span>
+                    <a href="/static/privacy.html" target="_blank" rel="noopener">Privacy</a>
+                    <span class="footer-sep" aria-hidden="true">·</span>
+                    <a href="https://github.com/samjanny/pinchat" target="_blank" rel="noopener noreferrer">GitHub&nbsp;↗</a>
+                </div>
+            </div>
+        </aside>
+
+        <!-- Main column wraps everything that already existed -->
+        <div class="chat-main">
+
         <!-- Header -->
         <header class="chat-header">
             <div class="room-info">
-                <h1>🔐 Secure Chat</h1>
+                <div class="room-brand">
+                    <div class="room-brand-mark">P</div>
+                    <div class="room-brand-text">
+                        <h1>Secure chat</h1>
+                        <small class="room-brand-sub"><span x-text="roomType === 'onetoone' ? '1 : 1' : 'Group'">1 : 1</span> · end-to-end encrypted</small>
+                    </div>
+                </div>
                 <div class="room-details">
                     <!-- Show loading state until server sends room config -->
-                    <span class="badge" x-text="roomType ? (roomType === 'onetoone' ? '1:1' : 'Group') : '🔄 Loading...'"></span>
-                    <span class="participants">👥 <span x-text="participantCount"></span>/<span x-text="maxParticipants !== null ? maxParticipants : '-'"></span></span>
-                    <span class="ttl-countdown" x-show="timeRemaining" x-text="formatTime(timeRemaining)"></span>
+                    <span class="badge" x-text="roomType ? (roomType === 'onetoone' ? '1:1' : 'Group') : 'Loading…'"></span>
+                    <span class="participants"><svg class="icon" aria-hidden="true"><use href="#i-users"/></svg><span x-text="participantCount"></span>/<span x-text="maxParticipants !== null ? maxParticipants : '-'"></span></span>
+                    <span class="ttl-countdown" x-show="timeRemaining" x-text="formatTime(timeRemaining).replace('⏱️ ', '')"></span>
 
                     <!-- User's nickname -->
                     <span x-show="myNickname" class="badge badge-info" :title="'Your session identifier: ' + userId">
-                        👤 <span x-text="myNickname"></span>
+                        <svg class="icon" aria-hidden="true"><use href="#i-user"/></svg><span x-text="myNickname"></span>
                     </span>
 
                     <!-- PFS & PCS Status Badges -->
                     <span x-show="pfsActive" class="badge badge-success" title="Perfect Forward Secrecy active - Past messages protected">
-                        🔐 PFS
+                        <svg class="icon" aria-hidden="true"><use href="#i-lock"/></svg>PFS
                     </span>
                     <span x-show="pfsActive" class="badge badge-success" title="Post-Compromise Security active - Future messages protected via Double Ratchet">
-                        🔄 PCS
+                        <svg class="icon" aria-hidden="true"><use href="#i-refresh"/></svg>PCS
                     </span>
                     <!-- Verified Key Badge (subtle indicator when verified) -->
                     <span x-show="sasVerificationStatus === 'verified'" class="badge badge-verified" title="Key verified - Identity confirmed via SAS code">
-                        ✓ Verified
+                        <svg class="icon" aria-hidden="true"><use href="#i-check"/></svg>Verified
                     </span>
                     <span x-show="roomType === 'onetoone' && participantCount < 2 && connected" class="badge badge-info" title="Waiting for other participant">
-                        ⏱️ Waiting
+                        <svg class="icon" aria-hidden="true"><use href="#i-clock"/></svg>Waiting
                     </span>
                     <span x-show="(roomType !== 'onetoone' && connected) || ecdhHandshakeStatus === 'aborted'" class="badge badge-warning" title="Encrypted, but no Forward Secrecy">
-                        🔐 Encrypted
+                        <svg class="icon" aria-hidden="true"><use href="#i-lock"/></svg>Encrypted
                     </span>
                 </div>
             </div>
 
             <div class="header-actions">
                 <button @click="copyLink" class="btn btn-small" title="Copy link">
-                    📋 <span x-text="copied ? 'Copied!' : 'Copy link'"></span>
+                    <svg class="icon" aria-hidden="true"><use href="#i-copy"/></svg><span x-text="copied ? 'Copied!' : 'Copy link'"></span>
                 </button>
             </div>
         </header>
 
+        <!-- Context strip: static room metadata shown once handshake is complete -->
+        <div class="chat-context-strip" x-show="connected && roomId">
+            <span class="kv"><span class="k">Room</span> <b x-text="roomId ? roomId.substring(0,8) + '…' : ''"></b></span>
+            <span class="sep"></span>
+            <span class="kv"><span class="k">TTL</span> <b x-text="ttlMinutes ? (ttlMinutes < 60 ? ttlMinutes + 'm' : (ttlMinutes % 60 === 0 ? (ttlMinutes/60) + 'h' : Math.floor(ttlMinutes/60) + 'h ' + (ttlMinutes%60) + 'm')) : '—'"></b></span>
+            <span class="sep"></span>
+            <span class="kv"><span class="k">Participants</span> <b><span x-text="participantCount"></span>/<span x-text="maxParticipants !== null ? maxParticipants : '-'"></span></b></span>
+            <span class="sep"></span>
+            <span class="kv"><span class="k">Max image</span> <b x-text="maxImageSize ? (Math.round(maxImageSize/1024) + ' KB') : '—'"></b></span>
+        </div>
+
         <!-- Status -->
         <div x-show="!connected" class="status-banner warning">
             <span x-show="connecting" x-text="connectingMessage || 'Connecting...'"></span>
-            <span x-show="!connecting && !connected">⚠️ Disconnected - <button @click="reconnect" class="link-button">Reconnect</button></span>
+            <span x-show="!connecting && !connected"><svg class="icon" aria-hidden="true"><use href="#i-alert"/></svg> Disconnected — <button @click="reconnect" class="link-button">Reconnect</button></span>
         </div>
 
         <div x-show="error" class="status-banner error">
@@ -68,7 +158,7 @@
             <div class="messages">
                 <!-- Welcome message -->
                 <div class="system-message" x-show="messages.length === 0 && connected">
-                    <p>✅ Connected to the secure chat</p>
+                    <p><svg class="icon icon-success" aria-hidden="true"><use href="#i-check-circle"/></svg> Connected to the secure chat</p>
                     <p>Messages are end-to-end encrypted. No one else, not even the server, can read them.</p>
                     <p><strong>Share the link</strong> to invite more participants.</p>
                 </div>
@@ -110,7 +200,7 @@
 
                 <!-- Failed decryption indicator -->
                 <div x-show="decryptionError" class="system-message error">
-                    ⚠️ Unable to decrypt some messages. Make sure you have the correct link with the encryption key.
+                    <svg class="icon icon-warning" aria-hidden="true"><use href="#i-alert"/></svg> Unable to decrypt some messages. Make sure you have the correct link with the encryption key.
                 </div>
             </div>
         </div>
@@ -120,7 +210,7 @@
             <!-- MITM Warning Banner (Keys don't match) -->
             <div x-show="sasVerificationStatus === 'mismatch'" class="mitm-warning-banner">
                 <div class="mitm-warning-content">
-                    <span class="mitm-warning-icon">⚠️</span>
+                    <span class="mitm-warning-icon"><svg class="icon" aria-hidden="true"><use href="#i-alert"/></svg></span>
                     <div class="mitm-warning-text">
                         <strong>WARNING: Possible MITM attack!</strong>
                         <p>Keys do not match. It is strongly recommended to start a new chat.</p>
@@ -132,7 +222,7 @@
             <!-- Unverified Key Warning Banner -->
             <div x-show="sasVerificationStatus === 'skipped'" class="unverified-warning-banner">
                 <div class="unverified-warning-content">
-                    <span class="unverified-warning-icon">🔓</span>
+                    <span class="unverified-warning-icon"><svg class="icon" aria-hidden="true"><use href="#i-unlock"/></svg></span>
                     <div class="unverified-warning-text">
                         <strong>Key not verified</strong>
                         <p>Connection security has not been confirmed.</p>
@@ -141,14 +231,19 @@
                 <button @click="reopenSasVerification()" class="btn btn-verify-now">Verify now</button>
             </div>
 
-            <!-- PFS Handshake Status Banner (1:1 chats only) -->
+            <!-- Waiting-for-peer banner (alone in the room) -->
+            <div x-show="connected && participantCount < 2" class="security-status-banner">
+                <svg class="icon" aria-hidden="true"><use href="#i-clock"/></svg> Waiting for another participant to join the room. Share the link to invite someone.
+            </div>
+
+            <!-- PFS Handshake Status Banner (1:1 chats only, peer present) -->
             <div x-show="connected && roomType === 'onetoone' && participantCount === 2 && !pfsActive" class="security-status-banner">
-                🔐 Establishing secure end-to-end encryption... Please wait.
+                <svg class="icon" aria-hidden="true"><use href="#i-lock"/></svg> Establishing secure end-to-end encryption… Please wait.
             </div>
 
             <!-- Group Chat Security Warning (3+ participants OR non-1:1 room types) -->
             <div x-show="connected && roomType !== 'onetoone'" class="group-chat-warning">
-                ℹ️ <strong>Group chats</strong> currently use bootstrap encryption. Perfect Forward Secrecy for group chats is planned for future implementation.
+                <svg class="icon" aria-hidden="true"><use href="#i-info"/></svg> <strong>Group chats</strong> currently use bootstrap encryption. Perfect Forward Secrecy for group chats is planned for future implementation.
             </div>
 
             <!-- Image Preview (shown when image is selected or being sent) -->
@@ -164,7 +259,7 @@
                 <button
                     @click="sendImage()"
                     class="btn btn-primary btn-send-image"
-                    :disabled="!connected || (roomType === 'onetoone' && participantCount === 2 && !pfsActive) || sendingImage">
+                    :disabled="isComposerLocked() || sendingImage">
                     <span x-show="!sendingImage">Send Image</span>
                     <span x-show="sendingImage">Sending...</span>
                 </button>
@@ -184,9 +279,9 @@
                     type="button"
                     @click="$refs.imageInput.click()"
                     class="btn btn-image"
-                    :disabled="!connected || (roomType === 'onetoone' && participantCount === 2 && !pfsActive)"
-                    title="Send image">
-                    📷
+                    :disabled="isComposerLocked()"
+                    :title="isComposerLocked() ? composerLockedLabel() : 'Send image'">
+                    <svg class="icon" aria-hidden="true"><use href="#i-image"/></svg>
                 </button>
                 <!-- Emoji picker button and container -->
                 <div class="emoji-picker-container">
@@ -195,9 +290,9 @@
                         @click="toggleEmojiPicker()"
                         class="btn btn-emoji"
                         :class="{ 'active': emojiPickerOpen }"
-                        :disabled="!connected || (roomType === 'onetoone' && participantCount === 2 && !pfsActive)"
-                        title="Emoji">
-                        😊
+                        :disabled="isComposerLocked()"
+                        :title="isComposerLocked() ? composerLockedLabel() : 'Emoji'">
+                        <svg class="icon" aria-hidden="true"><use href="#i-smile"/></svg>
                     </button>
                     <!-- Emoji Picker Panel -->
                     <div x-show="emojiPickerOpen" class="emoji-picker" @click.outside="closeEmojiPicker()">
@@ -234,56 +329,99 @@
                     type="text"
                     x-model="messageInput"
                     x-ref="messageInputField"
-                    :placeholder="(roomType === 'onetoone' && participantCount === 2 && !pfsActive) ? '🔐 Establishing secure connection...' : 'Write an encrypted message...'"
+                    :placeholder="composerPlaceholder()"
                     class="message-input"
-                    :disabled="!connected || (roomType === 'onetoone' && participantCount === 2 && !pfsActive)"
+                    :disabled="isComposerLocked()"
                     maxlength="1000"
                 >
                 <button
                     type="submit"
                     class="btn btn-primary btn-send"
-                    :disabled="!connected || (roomType === 'onetoone' && participantCount === 2 && !pfsActive) || !messageInput.trim()"
-                    :title="(roomType === 'onetoone' && participantCount === 2 && !pfsActive) ? 'Waiting for secure connection...' : 'Send message'">
-                    <span x-show="!(roomType === 'onetoone' && participantCount === 2 && !pfsActive)">↑</span>
-                    <span x-show="roomType === 'onetoone' && participantCount === 2 && !pfsActive">⏳</span>
+                    :disabled="isComposerLocked() || !messageInput.trim()"
+                    :title="composerLockedLabel()">
+                    <span x-show="!isComposerLocked()">↑</span>
+                    <span x-show="isComposerLocked()"><svg class="icon" aria-hidden="true"><use href="#i-clock"/></svg></span>
                 </button>
             </form>
+
+            <!-- Composer hint (keyboard shortcuts) -->
+            <div class="composer-hint" x-show="!pendingImage && !sendingImage && connected">
+                <kbd>↵</kbd> to send · <kbd>Esc</kbd> to close emoji picker · messages are authenticated and auto-deleted on expiry
+            </div>
         </div>
 
         <!-- SAS Verification Modal (MITM detection) -->
-        <div x-show="sas && pfsActive" class="sas-modal">
+        <div x-show="sas && pfsActive" class="sas-modal" role="dialog" aria-modal="true" aria-labelledby="sas-title">
             <div class="sas-modal-content">
-                <h3>🔐 Security Verification</h3>
-                <p>To ensure no man-in-the-middle attack, verify this code matches with your contact:</p>
 
-                <!-- Emoji SAS (Primary) -->
-                <div class="sas-code-emoji" x-html="formatEmojiGrid(sas ? (sas.emoji || '') : '')"></div>
+                <!-- Header: icon badge + title + sub -->
+                <div class="sas-head">
+                    <div class="sas-head-badge">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                            <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
+                            <polyline points="9 12 11 14 15 10"/>
+                        </svg>
+                    </div>
+                    <div class="sas-head-text">
+                        <h3 id="sas-title">Verify your peer</h3>
+                        <p class="sas-sub">Compare these 8 emoji with your peer through a channel you trust — a voice call, Signal, in person. If both of you see the same sequence, there is no man-in-the-middle.</p>
+                    </div>
+                </div>
 
-                <!-- Copy Emoji Button -->
-                <button @click="copySasEmoji()" class="btn btn-copy btn-centered">
-                    <span x-text="sasCopied ? '✓ Copied!' : '📋 Copy Emoji'"></span>
-                </button>
+                <!-- Body -->
+                <div class="sas-body">
 
-                <!-- Hex Fallback (for phone verification) -->
-                <details class="sas-details">
-                    <summary>For phone verification</summary>
-                    <div class="sas-code-hex" x-text="sas ? (sas.hex || '') : ''"></div>
-                </details>
+                    <!-- Peer row -->
+                    <div class="sas-peer-row">
+                        <span class="sas-peer-avatar" x-text="(peerNickname || 'P').charAt(0).toUpperCase()">P</span>
+                        <div class="sas-peer-meta">
+                            <span class="sas-peer-label">Peer identity</span>
+                            <b class="sas-peer-name" x-text="peerNickname || 'Peer'">peer</b>
+                        </div>
+                    </div>
 
-                <p class="sas-hint">This code should be identical on both sides.</p>
+                    <!-- Emoji SAS (Primary) -->
+                    <div class="sas-code-emoji" x-html="formatEmojiGrid(sas ? (sas.emoji || '') : '')" aria-label="Short Authentication String"></div>
 
-                <div class="sas-actions">
-                    <button @click="handleSasVerified()" class="btn btn-primary btn-verified">
-                        ✓ Verified
+                    <!-- Hex + copy inline -->
+                    <div class="sas-hex-row">
+                        <code class="sas-code-hex" x-text="sas ? (sas.hex || '') : ''"></code>
+                        <button @click="copySasEmoji()" class="btn btn-copy">
+                            <span x-text="sasCopied ? 'Copied ✓' : 'Copy'">Copy</span>
+                        </button>
+                    </div>
+
+                    <!-- Info callout -->
+                    <div class="sas-callout">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                            <circle cx="12" cy="12" r="10"/>
+                            <line x1="12" y1="16" x2="12" y2="12"/>
+                            <line x1="12" y1="8" x2="12.01" y2="8"/>
+                        </svg>
+                        <span>Derived from both identity keys via <b>PBKDF2-SHA256</b> · 100k iterations · 48 bits. An attacker would need to find a live collision in the 60s handshake window — not feasible.</span>
+                    </div>
+
+                </div>
+
+                <!-- Footer: 2-col decisive action -->
+                <div class="sas-footer">
+                    <button @click="handleSasMismatch()" class="btn btn-danger sas-btn-mismatch">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg>
+                        Codes don't match
                     </button>
-                    <button @click="handleSasMismatch()" class="btn btn-danger">
-                        ✗ Code doesn't match
+                    <button @click="handleSasVerified()" class="btn btn-primary sas-btn-match">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="20 6 9 17 4 12"/></svg>
+                        They match
                     </button>
                 </div>
 
-                <button @click="handleSasSkipped()" class="btn btn-skip">
-                    I don't want to verify
-                </button>
+                <!-- Skip row -->
+                <div class="sas-skip-row">
+                    <button @click="handleSasSkipped()" class="btn btn-skip">
+                        I don't want to verify now
+                    </button>
+                </div>
+
             </div>
         </div>
 
@@ -292,7 +430,9 @@
             <button class="fullscreen-close" @click="fullscreenImage = null">×</button>
             <img :src="fullscreenImage" class="fullscreen-image" alt="Full size image" @click.stop>
         </div>
-    </div>
+
+        </div><!-- /.chat-main -->
+    </div><!-- /.chat-container -->
 
     <!-- Include JS modules -->
     <script src="/static/js/debug.js" integrity="sha256-nY3zkFVKF7x6KVbWq1mwcHq4Y/g8O10iOmLAFfiDsJ8=" crossorigin="anonymous" ></script>
@@ -302,7 +442,71 @@
     <script src="/static/js/ecdh.js" integrity="sha256-wx5quW6kBmpKtVGOffD3J1UszHYV4y7TpaPYQ6mXxtY=" crossorigin="anonymous" ></script>
     <script src="/static/js/websocket.js" integrity="sha256-UcUdIdoze6mxLgXbxg0pAR6xVTqn6U1TbEkAyWBXbNw=" crossorigin="anonymous" ></script>
     <script src="/static/js/emoji.js" integrity="sha256-50Jl89UVAxsebd+pNB1khjany8UVe0zq3ZoOZcGi6CY=" crossorigin="anonymous" ></script>
-    <script src="/static/js/app.js" integrity="sha256-laTKfmnQoGqEomhcHelQIkonkrDE46hWnqctT1yvUFM=" crossorigin="anonymous" ></script>
+    <script src="/static/js/app.js" integrity="sha256-Pt8VRzurFu0gGh+mle6JA2EQikIDRg4TmI2kHWGLBAE=" crossorigin="anonymous" ></script>
     <script src="/static/js/alpine-csp.min.js" integrity="sha256-58hj2liWaS9dR44Q2uCJ5hZP7RxcG2offLv3qbCT8FU=" crossorigin="anonymous" defer></script>
+
+    <!-- Lucide icon sprite (ISC license, https://lucide.dev) -->
+    <svg xmlns="http://www.w3.org/2000/svg" style="display:none" aria-hidden="true">
+        <symbol id="i-lock" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <rect width="18" height="11" x="3" y="11" rx="2" ry="2"/>
+            <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
+        </symbol>
+        <symbol id="i-refresh" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/>
+            <path d="M21 3v5h-5"/>
+            <path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/>
+            <path d="M8 16H3v5"/>
+        </symbol>
+        <symbol id="i-alert" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3Z"/>
+            <path d="M12 9v4"/>
+            <path d="M12 17h.01"/>
+        </symbol>
+        <symbol id="i-copy" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <rect width="14" height="14" x="8" y="8" rx="2" ry="2"/>
+            <path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/>
+        </symbol>
+        <symbol id="i-check-circle" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="12" cy="12" r="10"/>
+            <path d="m9 12 2 2 4-4"/>
+        </symbol>
+        <symbol id="i-unlock" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <rect width="18" height="11" x="3" y="11" rx="2" ry="2"/>
+            <path d="M7 11V7a5 5 0 0 1 9.9-1"/>
+        </symbol>
+        <symbol id="i-clock" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="12" cy="12" r="10"/>
+            <polyline points="12 6 12 12 16 14"/>
+        </symbol>
+        <symbol id="i-info" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="12" cy="12" r="10"/>
+            <path d="M12 16v-4"/>
+            <path d="M12 8h.01"/>
+        </symbol>
+        <symbol id="i-image" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <rect width="18" height="18" x="3" y="3" rx="2" ry="2"/>
+            <circle cx="9" cy="9" r="2"/>
+            <path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21"/>
+        </symbol>
+        <symbol id="i-smile" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="12" cy="12" r="10"/>
+            <path d="M8 14s1.5 2 4 2 4-2 4-2"/>
+            <line x1="9" x2="9.01" y1="9" y2="9"/>
+            <line x1="15" x2="15.01" y1="9" y2="9"/>
+        </symbol>
+        <symbol id="i-users" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/>
+            <circle cx="9" cy="7" r="4"/>
+            <path d="M22 21v-2a4 4 0 0 0-3-3.87"/>
+            <path d="M16 3.13a4 4 0 0 1 0 7.75"/>
+        </symbol>
+        <symbol id="i-user" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/>
+            <circle cx="12" cy="7" r="4"/>
+        </symbol>
+        <symbol id="i-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M20 6 9 17l-5-5"/>
+        </symbol>
+    </svg>
 </body>
 </html>
