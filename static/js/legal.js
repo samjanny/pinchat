@@ -20,6 +20,9 @@
  *     → text replaced with operator.OPERATOR_NAME
  *   <a data-legal-mailto="OPERATOR_EMAIL_SUPPORT" href="#">...</a>
  *     → href replaced with "mailto:" + operator.OPERATOR_EMAIL_SUPPORT
+ *   <p data-legal-optional="OPERATOR_FOO">...</p>
+ *     → element is removed entirely when operator.OPERATOR_FOO is missing
+ *       or an empty string, so the page does not render orphan paragraphs.
  *
  * If operator.json cannot be fetched or does not contain a requested key,
  * the template's fallback text (or the inert "#" href) remains, so the
@@ -47,6 +50,15 @@
 
     function applyOperatorData(op) {
         if (!op || typeof op !== 'object') return;
+
+        document.querySelectorAll('[data-legal-optional]').forEach(function (el) {
+            var key = el.getAttribute('data-legal-optional');
+            if (!key) return;
+            var value = op[key];
+            if (typeof value !== 'string' || value.length === 0) {
+                el.parentNode && el.parentNode.removeChild(el);
+            }
+        });
 
         document.querySelectorAll('[data-legal]').forEach(function (el) {
             var key = el.getAttribute('data-legal');

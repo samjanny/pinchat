@@ -14,7 +14,25 @@
     "OPERATOR_HOSTING_PROVIDER": "ExampleCloud",
     "OPERATOR_HOSTING_NOTE": "The hosting VM is located in the European Economic Area; no international transfer applies.",
 
-    "OPERATOR_LOG_RETENTION": "Reverse-proxy access logs (IP, User-Agent, timestamp, URL path) are retained for 24 hours and then rotated out.",
+    "OPERATOR_LOG_RETENTION": "The application and its reverse proxy are configured not to retain persistent access logs. No IP addresses, User-Agent strings, or request metadata are written to disk. IP addresses may be held transiently in server memory during active connections for rate limiting and abuse prevention, then discarded.",
 
-    "LAST_UPDATED": "2026-04-21"
+    "OPERATOR_HOSTING_PROVIDER_LOG_NOTE": "The hosting provider may independently retain infrastructure-level network logs (e.g., netflow, connection metadata) in accordance with its own policies; such processing is outside the Operator's direct control.",
+
+    "OPERATOR_MIN_AGE": "16",
+
+    "OPERATOR_LIABILITY_LOCAL_LAW_NOTE": "This limitation applies to the fullest extent permitted under Italian law, including Articles 1218 and 1229 of the Italian Civil Code.",
+
+    "OPERATOR_DPO_NOTE": "Based on the current scale and nature of this Service, no Data Protection Officer is believed to be required under Article 37 GDPR. This assessment will be reviewed if the Service's scope or data processing activities change materially.",
+
+    "OPERATOR_ABUSE_REPORT_RETENTION": "twelve (12) months",
+
+    "OPERATOR_LEGAL_CLASSIFICATION_NOTE": "The Service constitutes a number-independent interpersonal communications service (NI-ICS) within the meaning of the applicable electronic communications framework. It is not subject to a general authorisation requirement. The Operator cooperates with competent judicial authorities to the extent technically feasible given the data actually held at the time of the request.",
+
+    "OPERATOR_LEGAL_FRAMEWORK_NOTE": "PinChat is a number-independent interpersonal communications service (NI-ICS) within the meaning of Article 2 of the Italian Electronic Communications Code (D.Lgs. 259/2003, as amended by D.Lgs. 207/2021 and D.Lgs. 48/2024). As an NI-ICS, the Service is exempt from the general authorisation requirement (Art. 11(2) CCE) and falls within the subjective scope of Art. 3, second sentence, of the Ministerial Decree of 28 December 2017 (implementing Art. 57(1) CCE). The Service is not subject to lawful interception obligations under Art. 57(2) CCE, which apply only to entities holding a general authorisation, nor to cyber-threat monitoring obligations under Art. 57(4) CCE (same prerequisite). The Service is excluded from the definition of 'online platform' under the Digital Services Act (Regulation (EU) 2022/2065, Art. 2(4)(b)). No general obligation exists under Italian law for a non-telecom, non-ISP service operator to routinely retain web access logs. The Provvedimento Amministratori di Sistema (Garante, 27/11/2008) does not apply in the case of a sole operator who is also the only system administrator. The data retention obligations under Art. 132 of the Codice Privacy (D.Lgs. 196/2003) apply to providers that possess traffic data and subscriber information; the Service generates neither by design. This does not mean that log retention would be unlawful — rather, for this specific deployment, no legitimate proportionate purpose has been identified that would outweigh the data minimisation principle.",
+
+    "OPERATOR_JUDICIAL_COOPERATION_NOTE": "The Operator cooperates fully with the Italian judicial authorities and national security agencies within the limits of the data actually held. The encryption is not 'adopted by the operator' (server-side TLS where the operator holds the keys) but is end-to-end between users, with symmetric keys that never transit through the server (they are shared exclusively via the URL fragment, which by design is not sent to the server). In response to judicial requests, the Operator is technically able to confirm the existence of the Service and its management structure, but cannot provide communication content or identifying metadata, as such data are not generated or retained.",
+
+    "OPERATOR_LEGAL_RISKS_NOTE": "A future Ministerial Decree under Art. 57(6) CCE (as amended by D.Lgs. 48/2024) may detail architectural obligations (capability to intercept) rather than mere execution obligations (deliver what you have). No such decree currently exists for NI-ICS/OTT services. The clause 'regardless of the encryption techniques adopted by the operator' in the DM 2017 has not been judicially interpreted in Italy with respect to zero-knowledge E2EE. The EU ePrivacy Regulation remains under revision; nothing currently in force requires breaking E2EE.",
+
+    "LAST_UPDATED": "2026-04-23"
 }
