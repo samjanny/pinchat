@@ -43,6 +43,17 @@ pub struct AppState {
     /// Prevents bandwidth exhaustion and client-side decryption DoS
     pub connection_message_timestamps: Arc<DashMap<Uuid, VecDeque<DateTime<Utc>>>>,
 
+    /// Per-connection global frame timestamps.
+    /// Applied to EVERY text frame (ECDH, message, image, unknown, malformed),
+    /// so attackers cannot bypass the stricter message/image rate limiter by
+    /// flooding handshake or garbage frames.
+    pub connection_frame_timestamps: Arc<DashMap<Uuid, VecDeque<DateTime<Utc>>>>,
+
+    /// Per-connection protocol-error counter.
+    /// Incremented on parse failures, unknown msg_type, and oversized ECDH
+    /// payloads. Connection is closed past `config.protocol_error_limit`.
+    pub connection_protocol_errors: Arc<DashMap<Uuid, u32>>,
+
     /// PoW challenge cache indexed by HMAC(IP)
     /// Prevents offline challenge fabrication attacks
     pub challenge_cache: Arc<ChallengeCache>,
@@ -109,6 +120,8 @@ impl AppState {
             broadcast_channels: Arc::new(DashMap::new()),
             seen_message_hashes: Arc::new(DashMap::new()),
             connection_message_timestamps: Arc::new(DashMap::new()),
+            connection_frame_timestamps: Arc::new(DashMap::new()),
+            connection_protocol_errors: Arc::new(DashMap::new()),
             challenge_cache: Arc::new(ChallengeCache::new(config.challenge_ttl_secs, 10_000)),
             ip_hash_secret,
             jwt_secret,
@@ -248,6 +261,8 @@ impl AppState {
 
             // Cleanup rate limiting timestamps for this connection
             self.connection_message_timestamps.remove(connection_id);
+            self.connection_frame_timestamps.remove(connection_id);
+            self.connection_protocol_errors.remove(connection_id);
 
             Some(room_id)
         } else {
