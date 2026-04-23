@@ -231,7 +231,12 @@
                 <button @click="reopenSasVerification()" class="btn btn-verify-now">Verify now</button>
             </div>
 
-            <!-- PFS Handshake Status Banner (1:1 chats only) -->
+            <!-- Waiting-for-peer banner (alone in the room) -->
+            <div x-show="connected && participantCount < 2" class="security-status-banner">
+                ⌛ Waiting for another participant to join the room. Share the link to invite someone.
+            </div>
+
+            <!-- PFS Handshake Status Banner (1:1 chats only, peer present) -->
             <div x-show="connected && roomType === 'onetoone' && participantCount === 2 && !pfsActive" class="security-status-banner">
                 🔐 Establishing secure end-to-end encryption... Please wait.
             </div>
@@ -254,7 +259,7 @@
                 <button
                     @click="sendImage()"
                     class="btn btn-primary btn-send-image"
-                    :disabled="!connected || (roomType === 'onetoone' && participantCount === 2 && !pfsActive) || sendingImage">
+                    :disabled="isComposerLocked() || sendingImage">
                     <span x-show="!sendingImage">Send Image</span>
                     <span x-show="sendingImage">Sending...</span>
                 </button>
@@ -274,8 +279,8 @@
                     type="button"
                     @click="$refs.imageInput.click()"
                     class="btn btn-image"
-                    :disabled="!connected || (roomType === 'onetoone' && participantCount === 2 && !pfsActive)"
-                    title="Send image">
+                    :disabled="isComposerLocked()"
+                    :title="isComposerLocked() ? composerLockedLabel() : 'Send image'">
                     📷
                 </button>
                 <!-- Emoji picker button and container -->
@@ -285,8 +290,8 @@
                         @click="toggleEmojiPicker()"
                         class="btn btn-emoji"
                         :class="{ 'active': emojiPickerOpen }"
-                        :disabled="!connected || (roomType === 'onetoone' && participantCount === 2 && !pfsActive)"
-                        title="Emoji">
+                        :disabled="isComposerLocked()"
+                        :title="isComposerLocked() ? composerLockedLabel() : 'Emoji'">
                         😊
                     </button>
                     <!-- Emoji Picker Panel -->
@@ -324,18 +329,18 @@
                     type="text"
                     x-model="messageInput"
                     x-ref="messageInputField"
-                    :placeholder="(roomType === 'onetoone' && participantCount === 2 && !pfsActive) ? '🔐 Establishing secure connection...' : 'Write an encrypted message...'"
+                    :placeholder="composerPlaceholder()"
                     class="message-input"
-                    :disabled="!connected || (roomType === 'onetoone' && participantCount === 2 && !pfsActive)"
+                    :disabled="isComposerLocked()"
                     maxlength="1000"
                 >
                 <button
                     type="submit"
                     class="btn btn-primary btn-send"
-                    :disabled="!connected || (roomType === 'onetoone' && participantCount === 2 && !pfsActive) || !messageInput.trim()"
-                    :title="(roomType === 'onetoone' && participantCount === 2 && !pfsActive) ? 'Waiting for secure connection...' : 'Send message'">
-                    <span x-show="!(roomType === 'onetoone' && participantCount === 2 && !pfsActive)">↑</span>
-                    <span x-show="roomType === 'onetoone' && participantCount === 2 && !pfsActive">⏳</span>
+                    :disabled="isComposerLocked() || !messageInput.trim()"
+                    :title="composerLockedLabel()">
+                    <span x-show="!isComposerLocked()">↑</span>
+                    <span x-show="isComposerLocked()">⏳</span>
                 </button>
             </form>
 
@@ -437,7 +442,7 @@
     <script src="/static/js/ecdh.js" integrity="sha256-wx5quW6kBmpKtVGOffD3J1UszHYV4y7TpaPYQ6mXxtY=" crossorigin="anonymous" ></script>
     <script src="/static/js/websocket.js" integrity="sha256-UcUdIdoze6mxLgXbxg0pAR6xVTqn6U1TbEkAyWBXbNw=" crossorigin="anonymous" ></script>
     <script src="/static/js/emoji.js" integrity="sha256-50Jl89UVAxsebd+pNB1khjany8UVe0zq3ZoOZcGi6CY=" crossorigin="anonymous" ></script>
-    <script src="/static/js/app.js" integrity="sha256-W1C5t9VkyElRfrWShFQzb+SQh0lRWEOkiKNdGOHEjXE=" crossorigin="anonymous" ></script>
+    <script src="/static/js/app.js" integrity="sha256-DKafMY87xbliHeqbncx4f8ezArQ8tapcw/Ku1bBRtFk=" crossorigin="anonymous" ></script>
     <script src="/static/js/alpine-csp.min.js" integrity="sha256-58hj2liWaS9dR44Q2uCJ5hZP7RxcG2offLv3qbCT8FU=" crossorigin="anonymous" defer></script>
 </body>
 </html>

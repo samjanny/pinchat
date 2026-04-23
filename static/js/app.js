@@ -1262,6 +1262,39 @@ document.addEventListener('alpine:init', () => {
         },
 
         /**
+         * True while the composer (text input, emoji, image, send) must be
+         * disabled: WebSocket not open, not enough participants to talk to,
+         * or the 1:1 ECDH+Double-Ratchet handshake has not completed yet.
+         *
+         * Reading this as a method (instead of duplicating the boolean
+         * expression on every `:disabled` attribute) keeps the template
+         * readable AND CSP-safe — Alpine CSP build only accepts method
+         * calls in directive values, not arbitrary expressions.
+         */
+        isComposerLocked() {
+            if (!this.connected) return true;
+            if (this.participantCount < 2) return true;
+            if (this.roomType === 'onetoone' && !this.pfsActive) return true;
+            return false;
+        },
+
+        /** Placeholder copy that mirrors the current lock reason. */
+        composerPlaceholder() {
+            if (!this.connected) return 'Connecting…';
+            if (this.participantCount < 2) return '⌛ Waiting for someone to join this room…';
+            if (this.roomType === 'onetoone' && !this.pfsActive) return '🔐 Establishing secure connection…';
+            return 'Write an encrypted message…';
+        },
+
+        /** Short tooltip shown on the send button in blocked states. */
+        composerLockedLabel() {
+            if (!this.connected) return 'Not connected';
+            if (this.participantCount < 2) return 'Waiting for peer to join';
+            if (this.roomType === 'onetoone' && !this.pfsActive) return 'Waiting for secure connection…';
+            return 'Send message';
+        },
+
+        /**
          * Select emoji category
          */
         selectEmojiCategory(category) {
