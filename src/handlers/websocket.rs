@@ -144,6 +144,31 @@ pub async fn ws_handler(
         .on_upgrade(move |socket| handle_socket(socket, state, room_id, connection_id))
 }
 
+/// Increments the per-connection protocol-error counter. Returns true once the
+/// counter reaches `config.protocol_error_limit`, signalling the recv loop to
+/// close the connection. Counts parse failures, unknown msg_type, and ECDH
+/// oversize — categories a well-behaved client never produces.
+fn bump_protocol_error(state: &AppState, connection_id: Uuid) -> bool {
+    let limit = state.config.protocol_error_limit;
+    let mut entry = state
+        .connection_protocol_errors
+        .entry(connection_id)
+        .or_insert(0);
+    *entry = entry.saturating_add(1);
+    let current = *entry;
+    if current >= limit {
+        tracing::warn!(
+            "Connection {} exceeded protocol error limit ({}/{}), closing",
+            connection_id,
+            current,
+            limit
+        );
+        true
+    } else {
+        false
+    }
+}
+
 /// Handles the WebSocket connection
 ///
 /// # Arguments
@@ -269,6 +294,31 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: Uuid, connec
                     break; // Close connection
                 }
 
+                // GLOBAL FRAME RATE LIMIT: counts every text frame regardless of
+                // msg_type. Prevents attackers from flooding ECDH/unknown/malformed
+                // frames to bypass the stricter message/image limiter below.
+                {
+                    let frame_limit = state_clone.config.frame_rate_limit;
+                    let window = state_clone.config.msg_rate_window_secs;
+                    let now = Utc::now();
+                    let cutoff = now - chrono::Duration::seconds(window);
+                    let mut ts = state_clone
+                        .connection_frame_timestamps
+                        .entry(connection_id)
+                        .or_default();
+                    ts.retain(|&t| t > cutoff);
+                    if ts.len() >= frame_limit {
+                        tracing::warn!(
+                            "Connection {} exceeded frame rate limit ({}/{}s), disconnecting",
+                            connection_id,
+                            ts.len(),
+                            window
+                        );
+                        break;
+                    }
+                    ts.push_back(now);
+                }
+
                 // Parse the incoming message
                 match serde_json::from_str::<IncomingMessage>(&text) {
                     Ok(incoming) => {
@@ -292,9 +342,10 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: Uuid, connec
                                         connection_id
                                     );
 
-                                    // Note: We don't send error message to client to avoid giving
-                                    // attackers feedback on DoS attempts. Just log and skip.
-                                    continue; // Skip processing this message
+                                    if bump_protocol_error(&state_clone, connection_id) {
+                                        break;
+                                    }
+                                    continue;
                                 }
 
                                 // Create ECDH public key message
@@ -498,11 +549,27 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: Uuid, connec
                                     room.update_activity();
                                 }
                             }
+                        } else {
+                            // Unknown msg_type: counts as a protocol error.
+                            // A well-behaved v1 client only sends the three
+                            // known types above.
+                            #[cfg(debug_assertions)]
+                            tracing::debug!(
+                                "Unknown msg_type '{}' from connection_id={}",
+                                incoming.msg_type,
+                                connection_id
+                            );
+                            if bump_protocol_error(&state_clone, connection_id) {
+                                break;
+                            }
                         }
                     }
                     Err(_e) => {
                         #[cfg(debug_assertions)]
                         tracing::debug!("Failed to parse message: {}", _e);
+                        if bump_protocol_error(&state_clone, connection_id) {
+                            break;
+                        }
                     }
                 }
             } else if let WsMessage::Close(_) = msg {
@@ -584,6 +651,8 @@ mod tests {
             room_token_period_secs: 600,
             msg_rate_limit: 30,
             msg_rate_window_secs: 1,
+            frame_rate_limit: 120,
+            protocol_error_limit: 10,
             pow_min_difficulty: 12,
             pow_max_difficulty: 18,
             challenge_ttl_secs: 300,

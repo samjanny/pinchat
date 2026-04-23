@@ -52,6 +52,17 @@ pub struct Config {
     pub msg_rate_limit: usize,
     pub msg_rate_window_secs: i64,
 
+    // Per-connection global frame rate limit (applies to EVERY text frame,
+    // including handshakes, unknown types, and malformed JSON, not just
+    // message/image). Acts as an anti-flood ceiling that sits above the
+    // stricter message/image limit above.
+    pub frame_rate_limit: usize,
+
+    // Per-connection protocol-error threshold. Counts parse failures,
+    // unknown msg_type values, and oversized ECDH payloads. Connection
+    // is closed once this many protocol errors accumulate.
+    pub protocol_error_limit: u32,
+
     // Proof-of-Work configuration
     pub pow_min_difficulty: u8,
     pub pow_max_difficulty: u8,
@@ -151,6 +162,21 @@ impl Config {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(1),
+
+            // Global frame rate limit (default: 4x msg_rate_limit, same window).
+            // Applied to every text frame regardless of msg_type so ECDH,
+            // unknown types, and malformed JSON cannot bypass the quota.
+            frame_rate_limit: env::var("FRAME_RATE_LIMIT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(120),
+
+            // Protocol-error threshold (default: 10). A connection emitting
+            // more than this many malformed/unknown frames is closed.
+            protocol_error_limit: env::var("PROTOCOL_ERROR_LIMIT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(10),
 
             // Proof-of-Work configuration (default: 12-18 bits)
             pow_min_difficulty: env::var("POW_MIN_DIFFICULTY")
@@ -316,6 +342,18 @@ impl Config {
         }
         if self.msg_rate_limit == 0 {
             panic!("MSG_RATE_LIMIT must be greater than 0");
+        }
+        if self.frame_rate_limit == 0 {
+            panic!("FRAME_RATE_LIMIT must be greater than 0");
+        }
+        if self.frame_rate_limit < self.msg_rate_limit {
+            panic!(
+                "FRAME_RATE_LIMIT ({}) must be >= MSG_RATE_LIMIT ({})",
+                self.frame_rate_limit, self.msg_rate_limit
+            );
+        }
+        if self.protocol_error_limit == 0 {
+            panic!("PROTOCOL_ERROR_LIMIT must be greater than 0");
         }
 
         // Validate periods are non-zero
