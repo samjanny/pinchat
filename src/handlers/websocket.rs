@@ -177,12 +177,23 @@ fn bump_protocol_error(state: &AppState, connection_id: Uuid) -> bool {
 /// * `room_id` - Room ID (already validated by ws_handler)
 /// * `connection_id` - Pre-allocated connection ID from JWT token (ensures uniqueness)
 async fn handle_socket(socket: WebSocket, state: AppState, room_id: Uuid, connection_id: Uuid) {
-    // Verify that the room exists
-    let room_exists = state.rooms.contains_key(&room_id);
-    if !room_exists {
-        #[cfg(debug_assertions)]
-        tracing::debug!("WebSocket connection attempt to non-existent room");
-        return;
+    // Verify that the room exists AND is not expired.
+    // Without the is_expired() gate, a room past its hard TTL can still accept
+    // new WebSocket connections until the next cleanup tick (default 60s).
+    let room_status = state.rooms.get(&room_id).map(|r| r.is_expired());
+    match room_status {
+        Some(false) => {}
+        Some(true) => {
+            #[cfg(debug_assertions)]
+            tracing::debug!("WebSocket connection attempt to expired room");
+            state.remove_room(&room_id);
+            return;
+        }
+        None => {
+            #[cfg(debug_assertions)]
+            tracing::debug!("WebSocket connection attempt to non-existent room");
+            return;
+        }
     }
 
     // connection_id is pre-allocated from JWT token (not generated here)
@@ -251,7 +262,10 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: Uuid, connec
     };
 
     // Task that receives broadcast messages and forwards them to the client
-    // Also sends heartbeat pings every 30 seconds to keep the connection alive
+    // Also sends heartbeat pings every 30 seconds to keep the connection alive,
+    // and re-validates room TTL to enforce the hard expiry deadline even on
+    // connections opened just before the TTL boundary.
+    let send_state = state.clone();
     let mut send_task = tokio::spawn(async move {
         let mut ping_interval = interval(Duration::from_secs(30));
 
@@ -268,6 +282,21 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: Uuid, connec
                     }
                 }
                 _ = ping_interval.tick() => {
+                    // Enforce room TTL at every ping tick (~30s). Without this,
+                    // a connection can outlive its room up to the cleanup tick
+                    // (default 60s) after the hard expiry.
+                    let expired = send_state
+                        .rooms
+                        .get(&room_id)
+                        .map(|r| r.is_expired())
+                        .unwrap_or(true);
+                    if expired {
+                        #[cfg(debug_assertions)]
+                        tracing::debug!("Room TTL expired on live connection, closing");
+                        send_state.remove_room(&room_id);
+                        let _ = sender.send(WsMessage::Close(None)).await;
+                        break;
+                    }
                     if sender.send(WsMessage::Ping(vec![])).await.is_err() {
                         break;
                     }
