@@ -8,6 +8,7 @@ mod ip_hash;
 mod jwt;
 mod models;
 mod pow;
+mod pow_session;
 mod rate_limit_extractor;
 mod session;
 mod state;
