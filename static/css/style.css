@@ -2807,7 +2807,10 @@ input[type="password"]:focus {
 }
 .message-own .message-time { color: color-mix(in srgb, #fff 72%, transparent); }
 
-/* System messages: centered divider with pill */
+/* System messages: centered divider with pill (single-line case).
+   The pill-inside-a-rule visual only makes sense when the content is a
+   single short line (a relay notice, a ratchet event, etc.). The welcome
+   message is multiple paragraphs and must stack normally. */
 .system-message {
     text-align: center;
     font-size: 12px;
@@ -2816,7 +2819,8 @@ input[type="password"]:focus {
     margin: 6px 0;
     position: relative;
 }
-.system-message::before {
+/* Single-child: divider-through-pill */
+.system-message:not(:has(> * + *))::before {
     content: "";
     position: absolute;
     left: 0; right: 0; top: 50%;
@@ -2824,11 +2828,32 @@ input[type="password"]:focus {
     background: var(--border);
     z-index: 0;
 }
-.system-message > * {
+.system-message:not(:has(> * + *)) > * {
     position: relative;
     background: var(--bg);
     padding: 0 12px;
     display: inline-block;
+}
+
+/* Multi-child (welcome block): plain centered stack, no divider */
+.system-message:has(> * + *) {
+    padding: 20px 16px;
+    margin: 12px auto;
+    max-width: 540px;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    line-height: 1.55;
+}
+.system-message:has(> * + *) > * {
+    display: block;
+    background: transparent;
+    padding: 3px 0;
+}
+.system-message:has(> * + *) > *:first-child {
+    color: var(--text);
+    font-weight: 500;
+    font-size: 13px;
 }
 
 /* ---- Status banners ---- */
