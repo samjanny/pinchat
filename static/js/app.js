@@ -1242,6 +1242,26 @@ document.addEventListener('alpine:init', () => {
         },
 
         /**
+         * Global Escape handler. Closes the topmost dismissible overlay:
+         * emoji picker first, then fullscreen image viewer. The SAS modal is
+         * intentionally NOT handled here — dismissing it must be an explicit
+         * "match / don't match / skip" decision by the user.
+         *
+         * Needed as a named method (not an inline expression) because this
+         * project uses the Alpine CSP build, which forbids arbitrary JS in
+         * attribute values.
+         */
+        handleEscape() {
+            if (this.emojiPickerOpen) {
+                this.emojiPickerOpen = false;
+                return;
+            }
+            if (this.fullscreenImage) {
+                this.fullscreenImage = null;
+            }
+        },
+
+        /**
          * Select emoji category
          */
         selectEmojiCategory(category) {

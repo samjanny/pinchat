@@ -11,7 +11,7 @@
 </head>
 <body class="chat-page">
     <div class="chat-container" x-data="$store.chatRoom"
-         @keydown.escape.window="if (emojiPickerOpen) closeEmojiPicker(); else if (fullscreenImage) fullscreenImage = null;">
+         @keydown.escape.window="handleEscape()">
 
         <!-- Sidebar (Linear-style rooms nav; hidden on narrow screens) -->
         <aside class="chat-sidebar">
@@ -437,7 +437,7 @@
     <script src="/static/js/ecdh.js" integrity="sha256-wx5quW6kBmpKtVGOffD3J1UszHYV4y7TpaPYQ6mXxtY=" crossorigin="anonymous" ></script>
     <script src="/static/js/websocket.js" integrity="sha256-UcUdIdoze6mxLgXbxg0pAR6xVTqn6U1TbEkAyWBXbNw=" crossorigin="anonymous" ></script>
     <script src="/static/js/emoji.js" integrity="sha256-50Jl89UVAxsebd+pNB1khjany8UVe0zq3ZoOZcGi6CY=" crossorigin="anonymous" ></script>
-    <script src="/static/js/app.js" integrity="sha256-j+EAmB6VZm5okN1o3l/vZyWS0FMizhPOmQnAG7g8Bw0=" crossorigin="anonymous" ></script>
+    <script src="/static/js/app.js" integrity="sha256-W1C5t9VkyElRfrWShFQzb+SQh0lRWEOkiKNdGOHEjXE=" crossorigin="anonymous" ></script>
     <script src="/static/js/alpine-csp.min.js" integrity="sha256-58hj2liWaS9dR44Q2uCJ5hZP7RxcG2offLv3qbCT8FU=" crossorigin="anonymous" defer></script>
 </body>
 </html>
