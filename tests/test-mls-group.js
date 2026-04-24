@@ -1,0 +1,206 @@
+#!/usr/bin/env node
+
+/**
+ * MLS Group orchestrator — steady-state application message flow.
+ *
+ * This commit lands Group.create + encrypt/decrypt but not yet the
+ * Add/Commit/Welcome epoch-transition path, so two-member tests need to
+ * *synthesise* a shared state between Alice and Bob. We do that by:
+ *
+ *   1. Alice calls Group.create() as leaf 0.
+ *   2. We synthetically add Bob's LeafNode at index 1 in Alice's
+ *      ratchet tree (skipping UpdatePath cryptography), then derive the
+ *      epoch-0 secrets one more time so Alice is aware of the 2-leaf
+ *      shape.
+ *   3. Bob gets the same state via Group.fromState() — this mirrors
+ *      what a Welcome would give him once the Add/Commit/Welcome flow
+ *      lands. The init_secret used for derivation has to match on both
+ *      sides, so we capture Alice's and reuse it for Bob.
+ *
+ * Then:
+ *   - Alice encrypts an application message; Bob decrypts it.
+ *   - Bob encrypts a reply; Alice decrypts it.
+ *   - Alice encrypts several messages in sequence; Bob decrypts them in
+ *     order (the per-sender generation chain advances monotonically).
+ *   - A tampered ciphertext must fail authentication.
+ *
+ * This covers everything in group.js except the epoch-transition path.
+ */
+
+const path = require('path');
+
+const Group = require(path.join(__dirname, '..', 'static', 'js', 'mls', 'group.js'));
+const Signature = require(path.join(__dirname, '..', 'static', 'js', 'mls', 'signature.js'));
+const HPKE = require(path.join(__dirname, '..', 'static', 'js', 'mls', 'hpke.js'));
+const Nodes = require(path.join(__dirname, '..', 'static', 'js', 'mls', 'nodes.js'));
+const TreeHash = require(path.join(__dirname, '..', 'static', 'js', 'mls', 'tree-hash.js'));
+const KeySchedule = require(path.join(__dirname, '..', 'static', 'js', 'mls', 'key-schedule.js'));
+
+let passed = 0;
+let failed = 0;
+
+function assert(cond, name, detail) {
+    if (cond) {
+        console.log(`  OK   ${name}`);
+        passed += 1;
+    } else {
+        console.log(`  FAIL ${name}${detail ? `  — ${detail}` : ''}`);
+        failed += 1;
+    }
+}
+
+function hex(u8) { return Buffer.from(u8).toString('hex'); }
+
+async function freshIdentity() {
+    const kp = await Signature.generateKeyPair();
+    return {
+        signaturePrivateKey: kp.privateKey,
+        signaturePublicKeyBytes: kp.publicKeyBytes,
+    };
+}
+
+async function buildSynthetic2LeafGroup() {
+    // Alice creates a 1-leaf group.
+    const aliceId = await freshIdentity();
+    const bobId = await freshIdentity();
+    const bobEncKp = await HPKE.generateKeyPair();
+
+    const alice = await Group.Group.create({ identity: aliceId });
+
+    // Build Bob's LeafNode and insert it at node index 2 (leaf 1 in a
+    // 2-leaf tree). We need a parent node at index 1 to make the tree
+    // valid; we leave it blanked (null) which is fine for the secret-
+    // tree ratchet and for tree_hash as long as both members agree.
+    const bobLeaf = Group.buildSelfLeaf({
+        encryptionKeyBytes: bobEncKp.publicKeyBytes,
+        signatureKeyBytes: bobId.signaturePublicKeyBytes,
+        credentialIdentity: bobId.signaturePublicKeyBytes,
+        leafNodeSource: Nodes.LeafNodeSource.KEY_PACKAGE,
+    });
+    bobLeaf.signature = await Group.signLeafNodeForKeyPackage(
+        bobId.signaturePrivateKey, bobLeaf,
+    );
+
+    // Grow Alice's tree: width goes from 1 → 3 (leaf 0, parent 1, leaf 2).
+    alice.ratchetTree = [
+        alice.ratchetTree[0],        // leaf 0 — Alice
+        null,                        // parent 1 — blank (would be set by Commit)
+        { nodeType: Nodes.NodeType.LEAF, leaf: bobLeaf },
+    ];
+    alice.nLeaves = 2;
+    alice.treeHash = await TreeHash.hashRoot(alice.ratchetTree);
+
+    // Re-derive epoch 0 with the new group_context (tree_hash changed).
+    // init_secret, commit_secret, psk_secret are all zero here — the
+    // point is just that Alice and Bob end up with identical epoch
+    // secrets, so any shared-zero seed works.
+    const initSecretSeed = new Uint8Array(HPKE.Nh);
+    const epochOut = await KeySchedule.deriveEpoch({
+        initSecretPrev: initSecretSeed,
+        commitSecret: new Uint8Array(HPKE.Nh),
+        pskSecret: new Uint8Array(HPKE.Nh),
+        groupContext: alice._groupContextBytes(),
+    });
+    alice.epochSecrets = epochOut;
+
+    // Bob gets the mirror state. Bob's view differs from Alice's in
+    // identity / leafKeyPair / myLeafIndex / senderRatchetGeneration,
+    // but shares ratchetTree + epochSecrets + groupId + epoch.
+    const bob = Group.Group.fromState({
+        cipherSuite: alice.cipherSuite,
+        groupId: alice.groupId,
+        epoch: alice.epoch,
+        ratchetTree: alice.ratchetTree,
+        nLeaves: alice.nLeaves,
+        myLeafIndex: 1,
+        identity: bobId,
+        leafKeyPair: bobEncKp,
+        senderRatchetGeneration: 0,
+        interimTranscriptHash: alice.interimTranscriptHash,
+        confirmedTranscriptHash: alice.confirmedTranscriptHash,
+        treeHash: alice.treeHash,
+        epochSecrets: alice.epochSecrets,
+    });
+
+    return { alice, bob };
+}
+
+async function main() {
+    console.log('# Group.create — single-leaf group basic sanity');
+    {
+        const identity = await freshIdentity();
+        const group = await Group.Group.create({ identity });
+        assert(group.nLeaves === 1, 'fresh group has 1 leaf');
+        assert(group.myLeafIndex === 0, 'creator is leaf 0');
+        assert(group.epoch === 0n, 'fresh group is at epoch 0');
+        assert(group.groupId instanceof Uint8Array && group.groupId.length === 32,
+            'groupId defaulted to 32 random bytes');
+        assert(
+            group.epochSecrets && group.epochSecrets.encryptionSecret.length === 32,
+            'epoch 0 secrets derived'
+        );
+        // A single-member group can still encrypt to itself (loopback).
+        const ct = await group.encryptApplicationMessage('hello self');
+        assert(ct instanceof Uint8Array && ct.length > 0, 'encrypt returns bytes');
+        const pt = await group.decryptApplicationMessage(ct);
+        assert(
+            new TextDecoder().decode(pt) === 'hello self',
+            'single-leaf loopback encrypt → decrypt'
+        );
+    }
+
+    console.log('# Group — Alice ↔ Bob application messages (synthesised 2-leaf)');
+    {
+        const { alice, bob } = await buildSynthetic2LeafGroup();
+
+        assert(
+            hex(alice.epochSecrets.encryptionSecret)
+                === hex(bob.epochSecrets.encryptionSecret),
+            'Alice and Bob share encryption_secret'
+        );
+
+        // Alice → Bob
+        const m1 = 'hey bob from alice';
+        const wire1 = await alice.encryptApplicationMessage(m1);
+        const got1 = new TextDecoder().decode(await bob.decryptApplicationMessage(wire1));
+        assert(got1 === m1, 'Alice → Bob message 0 decrypts');
+
+        // Bob → Alice
+        const m2 = 'hey alice from bob';
+        const wire2 = await bob.encryptApplicationMessage(m2);
+        const got2 = new TextDecoder().decode(await alice.decryptApplicationMessage(wire2));
+        assert(got2 === m2, 'Bob → Alice message 0 decrypts');
+
+        // Sequential messages — generation chain advances.
+        const messages = ['one', 'two', 'three', 'four'];
+        const wires = [];
+        for (const m of messages) {
+            wires.push(await alice.encryptApplicationMessage(m));
+        }
+        // All four must decrypt in order.
+        for (let i = 0; i < wires.length; i += 1) {
+            const pt = new TextDecoder().decode(await bob.decryptApplicationMessage(wires[i]));
+            assert(pt === messages[i], `sequential message ${i} decrypts`);
+        }
+
+        // Tamper with a ciphertext: must throw.
+        const tampered = new Uint8Array(wire1);
+        tampered[tampered.length - 5] ^= 0x01;
+        let threw = false;
+        try {
+            await bob.decryptApplicationMessage(tampered);
+        } catch (_e) {
+            threw = true;
+        }
+        assert(threw, 'tampered ciphertext rejected');
+    }
+
+    console.log('');
+    console.log(`group: ${passed} passed, ${failed} failed`);
+    process.exit(failed === 0 ? 0 : 1);
+}
+
+main().catch((err) => {
+    console.error('fatal:', err);
+    process.exit(2);
+});
