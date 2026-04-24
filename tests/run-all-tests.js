@@ -58,6 +58,11 @@ const TEST_SUITES = {
         name: 'MLS transcript hashes',
         file: 'test-mls-transcript-hashes.js',
         description: 'Confirmed/interim transcript hash chain (RFC 9420 §5.3 + §8.2)'
+    },
+    'mls-tree-hash': {
+        name: 'MLS tree hash + node structs',
+        file: 'test-mls-tree-hash.js',
+        description: 'LeafNode/ParentNode serde + tree-hash vs IETF tree-validation vectors'
     }
 };
 
@@ -112,7 +117,7 @@ async function main() {
         suitesToRun = args.filter(arg => TEST_SUITES[arg]);
         if (suitesToRun.length === 0) {
             console.log('');
-            console.log('Usage: node run-all-tests.js [chain|double|mls-tree-math|mls-codec|mls-hpke|mls-key-schedule|mls-crypto-basics|mls-transcript-hashes]');
+            console.log('Usage: node run-all-tests.js [chain|double|mls-tree-math|mls-codec|mls-hpke|mls-key-schedule|mls-crypto-basics|mls-transcript-hashes|mls-tree-hash]');
             console.log('');
             console.log('Available test suites:');
             for (const [key, suite] of Object.entries(TEST_SUITES)) {
