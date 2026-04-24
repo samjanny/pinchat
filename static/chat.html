@@ -440,6 +440,39 @@
     <script src="/static/js/identity.js" integrity="sha256-VeiPWNZTvV4zKphiwPBCoP92H/6lV+Db0swimDx8avA=" crossorigin="anonymous" ></script>
     <script src="/static/js/double-ratchet.js" integrity="sha256-AWOKSY8Z0iYUXWJ5DEu5ydcXn/Mvb+G3Qu8gcvjDNEM=" crossorigin="anonymous" ></script>
     <script src="/static/js/ecdh.js" integrity="sha256-wx5quW6kBmpKtVGOffD3J1UszHYV4y7TpaPYQ6mXxtY=" crossorigin="anonymous" ></script>
+    <!--
+      MLS (RFC 9420) custom implementation — loaded in topological dependency
+      order. Each module attaches its exports to window.MLS. The signed
+      hash manifest under hashes.json.signed is regenerated separately;
+      SRI attributes will be re-added when the branch stabilises.
+    -->
+    <script src="/static/js/mls/codec.js"></script>
+    <script src="/static/js/mls/tree-math.js"></script>
+    <script src="/static/js/mls/p256.js"></script>
+    <script src="/static/js/mls/ciphersuite.js"></script>
+    <script src="/static/js/mls/hpke.js"></script>
+    <script src="/static/js/mls/signature.js"></script>
+    <script src="/static/js/mls/labeled.js"></script>
+    <script src="/static/js/mls/key-schedule.js"></script>
+    <script src="/static/js/mls/transcript-hashes.js"></script>
+    <script src="/static/js/mls/nodes.js"></script>
+    <script src="/static/js/mls/tree-hash.js"></script>
+    <script src="/static/js/mls/ratchet-tree.js"></script>
+    <script src="/static/js/mls/tree-kem.js"></script>
+    <script src="/static/js/mls/group-context.js"></script>
+    <script src="/static/js/mls/key-package.js"></script>
+    <script src="/static/js/mls/mls-message.js"></script>
+    <script src="/static/js/mls/group-info.js"></script>
+    <script src="/static/js/mls/welcome.js"></script>
+    <script src="/static/js/mls/framing.js"></script>
+    <script src="/static/js/mls/proposal.js"></script>
+    <script src="/static/js/mls/commit.js"></script>
+    <script src="/static/js/mls/public-message.js"></script>
+    <script src="/static/js/mls/secret-tree.js"></script>
+    <script src="/static/js/mls/private-message.js"></script>
+    <script src="/static/js/mls/group.js"></script>
+    <script src="/static/js/mls-session.js"></script>
+    <!-- end MLS -->
     <script src="/static/js/websocket.js" integrity="sha256-UcUdIdoze6mxLgXbxg0pAR6xVTqn6U1TbEkAyWBXbNw=" crossorigin="anonymous" ></script>
     <script src="/static/js/emoji.js" integrity="sha256-50Jl89UVAxsebd+pNB1khjany8UVe0zq3ZoOZcGi6CY=" crossorigin="anonymous" ></script>
     <script src="/static/js/app.js" integrity="sha256-Pt8VRzurFu0gGh+mle6JA2EQikIDRg4TmI2kHWGLBAE=" crossorigin="anonymous" ></script>
