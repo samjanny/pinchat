@@ -28,6 +28,21 @@ const TEST_SUITES = {
         name: 'Double Ratchet',
         file: 'test-double-ratchet.js',
         description: 'DH + Symmetric ratchet for PFS + Post-Compromise Security (PCS)'
+    },
+    'mls-tree-math': {
+        name: 'MLS tree math',
+        file: 'test-mls-tree-math.js',
+        description: 'Left-balanced binary tree arithmetic (RFC 9420 §4.1)'
+    },
+    'mls-codec': {
+        name: 'MLS wire-format codec',
+        file: 'test-mls-codec.js',
+        description: 'QUIC varint + opaque/vector round-trip (RFC 9420 §2)'
+    },
+    'mls-hpke': {
+        name: 'MLS HPKE',
+        file: 'test-mls-hpke.js',
+        description: 'DHKEM(P-256)+HKDF-SHA256+AES-128-GCM (RFC 9180)'
     }
 };
 
@@ -82,7 +97,7 @@ async function main() {
         suitesToRun = args.filter(arg => TEST_SUITES[arg]);
         if (suitesToRun.length === 0) {
             console.log('');
-            console.log('Usage: node run-all-tests.js [chain|double]');
+            console.log('Usage: node run-all-tests.js [chain|double|mls-tree-math|mls-codec|mls-hpke]');
             console.log('');
             console.log('Available test suites:');
             for (const [key, suite] of Object.entries(TEST_SUITES)) {
