@@ -64,6 +64,12 @@ document.addEventListener('alpine:init', () => {
         // WebSocket Manager
         wsManager: null,
 
+        // MLS session (only used when roomType === 'group'; null otherwise).
+        // The MLSSession wrapper holds the stateful Group, KeyPackage
+        // bundle and dispatches incoming `mls` envelopes.
+        mlsSession: null,
+        mlsReady: false,   // true once we've joined (creator after commit, joiner after welcome)
+
         // ECDH Key Exchange (for 1:1 rooms with PFS)
         identityManager: null,      // Identity key manager used for authenticated handshakes
         ecdhManager: null,
@@ -225,6 +231,14 @@ document.addEventListener('alpine:init', () => {
                         this.maxImageSize = message.max_image_size;
                     }
 
+                    // Group room: spin up an MLS session. The creator
+                    // starts immediately so it is listening for the
+                    // joiner's KeyPackage; the joiner waits until the
+                    // creator is visible in the room.
+                    if (this.roomType === 'group') {
+                        await this._ensureMlsSession();
+                    }
+
                     // Use the validated room type for ECDH logic
                     if (this.roomType === 'onetoone' && this.participantCount === 2) {
                         // Reset ECDH status if it was stuck on 'aborted' from previous failed handshake
@@ -243,6 +257,18 @@ document.addEventListener('alpine:init', () => {
 
                 case 'ecdh_public_key':
                     await this.handleECDHPublicKey(message);
+                    break;
+
+                case 'mls':
+                    // Group-room MLS envelope. Ignore our own echoes.
+                    if (message.sender_id !== this.userId && this.mlsSession) {
+                        try {
+                            await this.mlsSession.onRelayEnvelope(message);
+                        } catch (err) {
+                            console.error('[MLS] Failed to process envelope:', err);
+                            this.error = '⚠️ Group crypto error: ' + err.message;
+                        }
+                    }
                     break;
 
                 // NOTE: dh_ratchet message type removed - Signal Protocol
@@ -284,6 +310,13 @@ document.addEventListener('alpine:init', () => {
                             debugLog('[ECDH] Other participant joined → starting handshake');
                             await this.startECDHHandshake();
                         }
+                    }
+
+                    // Group rooms: spin up / announce presence once the
+                    // session exists. Joiner publishes its KeyPackage on
+                    // first start; creator starts listening at connect.
+                    if (this.roomType === 'group') {
+                        await this._ensureMlsSession();
                     }
                     break;
 
@@ -400,6 +433,35 @@ document.addEventListener('alpine:init', () => {
                 return;
             }
 
+            // Group room: route through MLSSession. Requires the MLS
+            // handshake to have completed ('joined' state).
+            if (this.roomType === 'group') {
+                if (!this.mlsSession || !this.mlsReady) {
+                    this.error = '⚠️ Secure group not yet ready. Please wait.';
+                    return;
+                }
+                try {
+                    this.messages.push({
+                        id: this.nextMessageId++,
+                        type: 'message',
+                        text,
+                        timestamp: new Date(),
+                        isOwn: true,
+                        nickname: this.myNickname,
+                        senderId: this.userId,
+                    });
+                    this.messageInput = '';
+                    requestAnimationFrame(() => this.scrollToBottom());
+                    await this.mlsSession.sendMessage(text);
+                } catch (error) {
+                    console.error('[MLS] Failed to send:', error);
+                    this.messages.pop();
+                    this.messageInput = text;
+                    this.error = '⚠️ Unable to send the group message: ' + error.message;
+                }
+                return;
+            }
+
             try {
                 this.messages.push({
                     id: this.nextMessageId++,
@@ -440,6 +502,67 @@ document.addEventListener('alpine:init', () => {
             } catch (error) {
                 console.error('Failed to send message:', error);
                 this.error = '⚠️ Error encrypting the message.';
+            }
+        },
+
+        /**
+         * Initialise the MLSSession on first use for a group room. Role
+         * is determined by the presence of a creator ws_token in
+         * sessionStorage (same signal homepage.js uses to avoid a second
+         * PoW challenge on the creator path).
+         *
+         * Idempotent — safe to call from 'connected' and 'userjoined'.
+         */
+        async _ensureMlsSession() {
+            if (this.mlsSession) return;
+
+            const creatorTokenKey = `ws_token_${this.roomId}`;
+            const role = sessionStorage.getItem(creatorTokenKey) ? 'creator' : 'joiner';
+
+            const self = this;
+            this.mlsSession = new window.MLSSession({
+                role,
+                send: (envelope) => self.wsManager.send(envelope),
+                onEvent: (event) => self._handleMlsEvent(event),
+            });
+            try {
+                await this.mlsSession.start();
+                debugLog('[MLS] Session started, role=', role);
+            } catch (err) {
+                console.error('[MLS] Failed to start session:', err);
+                this.error = '⚠️ Unable to start the group session: ' + err.message;
+            }
+        },
+
+        _handleMlsEvent(event) {
+            switch (event.kind) {
+                case 'keypackage-published':
+                    this.addSystemMessage('🔑 KeyPackage published; waiting for Welcome…');
+                    break;
+                case 'welcome-sent':
+                    this.mlsReady = true;
+                    this.addSystemMessage('✅ Secure group established');
+                    break;
+                case 'joined':
+                    this.mlsReady = true;
+                    this.addSystemMessage('✅ Joined secure group');
+                    break;
+                case 'message':
+                    this.messages.push({
+                        id: this.nextMessageId++,
+                        type: 'message',
+                        text: event.text,
+                        timestamp: new Date(),
+                        isOwn: false,
+                        nickname: 'Peer',
+                        senderId: null,
+                    });
+                    requestAnimationFrame(() => this.scrollToBottom());
+                    break;
+                case 'error':
+                    console.error('[MLS]', event.reason);
+                    this.error = '⚠️ ' + event.reason;
+                    break;
             }
         },
 

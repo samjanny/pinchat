@@ -53,23 +53,24 @@
                     <p class="card-sub">Room metadata lives only in the server's RAM and is wiped when the TTL elapses.</p>
 
                     <form @submit.prevent="$store.homepage.createRoom()">
-                        <!-- Hidden: group chats are temporarily disabled -->
-                        <input type="hidden" name="roomType" value="onetoone" x-model="$store.homepage.roomType">
-
-                        <!-- Room type (visual segmented control; group is disabled) -->
+                        <!-- Room type (visual segmented control). Group rooms
+                             use the MLS / TreeKEM implementation under
+                             static/js/mls/ (RFC 9420 ciphersuite 0x0002). -->
                         <div class="form-group">
                             <label>Room type</label>
                             <div class="radio-group segmented" role="radiogroup" aria-label="Room type">
                                 <label class="radio-label">
-                                    <input type="radio" name="rtype-visual" value="onetoone" checked>
+                                    <input type="radio" name="rtype" value="onetoone"
+                                        x-model="$store.homepage.roomType" checked>
                                     <span>1 : 1 <em class="tag">recommended</em></span>
                                 </label>
-                                <label class="radio-label disabled">
-                                    <input type="radio" name="rtype-visual" value="group" disabled>
-                                    <span>Group <em class="tag">disabled</em></span>
+                                <label class="radio-label">
+                                    <input type="radio" name="rtype" value="group"
+                                        x-model="$store.homepage.roomType">
+                                    <span>Group <em class="tag tag-experimental">experimental</em></span>
                                 </label>
                             </div>
-                            <small>Group chat is temporarily disabled until a tree-based group key agreement is in place.</small>
+                            <small>Group rooms run a custom MLS/TreeKEM implementation verified against the IETF reference vectors for ciphersuite <code>MLS_128_DHKEMP256_AES128GCM_SHA256_P256</code>. MVP scope is 2 members per room while 3+-member support stabilises.</small>
                         </div>
 
                         <!-- TTL slider -->
