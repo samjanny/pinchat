@@ -205,6 +205,44 @@
         return new Uint8Array(raw);
     }
 
+    /**
+     * Import an ECDH P-256 private key from a raw 32-byte scalar plus the
+     * corresponding 65-byte uncompressed public point. WebCrypto only
+     * imports private EC keys from JWK (or PKCS#8), so we build a JWK
+     * with { d, x, y } from the raw inputs.
+     */
+    async function importPrivateKey(rawScalarBytes, rawPubBytes) {
+        if (!(rawScalarBytes instanceof Uint8Array) || rawScalarBytes.length !== 32) {
+            throw new Error('hpke: private scalar must be 32 bytes');
+        }
+        if (!(rawPubBytes instanceof Uint8Array) || rawPubBytes.length !== Npk || rawPubBytes[0] !== 0x04) {
+            throw new Error('hpke: public point must be uncompressed 65 bytes');
+        }
+        const x = rawPubBytes.slice(1, 33);
+        const y = rawPubBytes.slice(33, 65);
+
+        // Minimal base64url encoder — we don't want to require the Codec
+        // module here (would create a circular dependency with labeled.js).
+        const b64url = (u8) => {
+            let binary = '';
+            for (let i = 0; i < u8.length; i += 1) binary += String.fromCharCode(u8[i]);
+            const base64 = typeof btoa !== 'undefined'
+                ? btoa(binary)
+                : Buffer.from(u8).toString('base64');
+            return base64.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+        };
+
+        const jwk = {
+            kty: 'EC', crv: 'P-256',
+            d: b64url(rawScalarBytes),
+            x: b64url(x), y: b64url(y),
+            ext: true,
+        };
+        return getSubtle().importKey(
+            'jwk', jwk, { name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveBits']
+        );
+    }
+
     async function ensurePublicKey(pk) {
         if (pk instanceof Uint8Array) return deserializePublicKey(pk);
         return pk;
@@ -360,6 +398,7 @@
         generateKeyPair,
         deserializePublicKey,
         serializePublicKey,
+        importPrivateKey,
         encap,
         decap,
         // HPKE single-shot

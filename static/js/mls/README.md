@@ -26,6 +26,7 @@ See [`ciphersuite.js`](ciphersuite.js) for the full profile.
 | [`codec.js`](codec.js)                   |   ✅   | [`test-mls-codec.js`](../../../tests/test-mls-codec.js)                                |
 | [`hpke.js`](hpke.js)                     |   ✅   | [`test-mls-hpke.js`](../../../tests/test-mls-hpke.js)                                  |
 | [`key-schedule.js`](key-schedule.js)     |   ✅   | [`test-mls-key-schedule.js`](../../../tests/test-mls-key-schedule.js) (IETF vectors)        |
+| [`signature.js`](signature.js)           |   ✅   | [`test-mls-crypto-basics.js`](../../../tests/test-mls-crypto-basics.js) (IETF vectors)      |
 | [`labeled.js`](labeled.js)               |   ✅   | [`test-mls-crypto-basics.js`](../../../tests/test-mls-crypto-basics.js) (IETF vectors)      |
 | [`transcript-hashes.js`](transcript-hashes.js) | ✅ | [`test-mls-transcript-hashes.js`](../../../tests/test-mls-transcript-hashes.js) (IETF vectors) |
 

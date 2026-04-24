@@ -22,12 +22,16 @@
  */
 (function (root, factory) {
     if (typeof module !== 'undefined' && module.exports) {
-        module.exports = factory(require('./codec.js'));
+        module.exports = factory(
+            require('./codec.js'),
+            require('./signature.js'),
+            require('./hpke.js'),
+        );
     } else {
         root.MLS = root.MLS || {};
-        root.MLS.Labeled = factory(root.MLS.Codec);
+        root.MLS.Labeled = factory(root.MLS.Codec, root.MLS.Signature, root.MLS.HPKE);
     }
-})(typeof self !== 'undefined' ? self : this, function (Codec) {
+})(typeof self !== 'undefined' ? self : this, function (Codec, Signature, HPKE) {
     'use strict';
 
     const enc = new TextEncoder();
@@ -71,9 +75,96 @@
         return sha256(encoder.bytes());
     }
 
+    /**
+     * Serialize a SignContent for §5.1.1 SignWithLabel / VerifyWithLabel:
+     *
+     *   struct {
+     *       opaque label<V>;    // "MLS 1.0 " || Label
+     *       opaque content<V>;
+     *   } SignContent;
+     */
+    function signContentBytes(label, content) {
+        const encoder = new Codec.Encoder();
+        encoder.writeOpaque(enc.encode(MLS_LABEL_PREFIX + label));
+        encoder.writeOpaque(content);
+        return encoder.bytes();
+    }
+
+    /**
+     * SignWithLabel(SignatureKey, Label, Content):
+     *   Sign(SignatureKey, serialize(SignContent{"MLS 1.0 "||Label, Content}))
+     *
+     * Returns the DER-encoded ECDSA signature bytes.
+     */
+    async function signWithLabel(privateKey, label, content) {
+        return Signature.sign(privateKey, signContentBytes(label, content));
+    }
+
+    /**
+     * VerifyWithLabel(VerificationKey, Label, Content, SignatureValue):
+     *   Verify(VerificationKey,
+     *          serialize(SignContent{"MLS 1.0 "||Label, Content}),
+     *          SignatureValue)
+     *
+     * `signatureValue` is DER-encoded (as emitted by signWithLabel and as
+     * carried on the wire). Returns a boolean.
+     */
+    async function verifyWithLabel(publicKey, label, content, signatureValue) {
+        return Signature.verify(publicKey, signContentBytes(label, content), signatureValue);
+    }
+
+    /**
+     * Serialize an EncryptContext for §5.1.2:
+     *
+     *   struct {
+     *       opaque label<V>;       // "MLS 1.0 " || Label
+     *       opaque context<V>;
+     *   } EncryptContext;
+     */
+    function encryptContextBytes(label, context) {
+        const encoder = new Codec.Encoder();
+        encoder.writeOpaque(enc.encode(MLS_LABEL_PREFIX + label));
+        encoder.writeOpaque(context);
+        return encoder.bytes();
+    }
+
+    /**
+     * EncryptWithLabel(PublicKey, Label, Context, Plaintext):
+     *   encrypt_context = EncryptContext{"MLS 1.0 "||Label, Context}
+     *   HPKE-SealBase(PublicKey, encrypt_context, aad="", Plaintext)
+     *
+     * `publicKey` may be either raw uncompressed 65-byte P-256 bytes or a
+     * CryptoKey. Returns { kemOutput, ciphertext }.
+     */
+    async function encryptWithLabel(publicKey, label, context, plaintext) {
+        const info = encryptContextBytes(label, context);
+        const { enc: kemOutput, ct } = await HPKE.seal(publicKey, info, new Uint8Array(0), plaintext);
+        return { kemOutput, ciphertext: ct };
+    }
+
+    /**
+     * DecryptWithLabel(PrivateKey, Label, Context, KEMOutput, Ciphertext):
+     *   encrypt_context = EncryptContext{"MLS 1.0 "||Label, Context}
+     *   HPKE-OpenBase(PrivateKey, KEMOutput, encrypt_context, "", Ciphertext)
+     *
+     * `privateKey` is the recipient's ECDH P-256 CryptoKey (deriveBits
+     * capable). `publicKeyBytes` is the recipient's public key as bytes
+     * — required by HPKE's key-schedule context.
+     */
+    async function decryptWithLabel(privateKey, publicKeyBytes, label, context, kemOutput, ciphertext) {
+        const info = encryptContextBytes(label, context);
+        return HPKE.open(kemOutput, privateKey, publicKeyBytes, info, new Uint8Array(0), ciphertext);
+    }
+
     return Object.freeze({
         refHash,
         sha256,
+        signWithLabel,
+        verifyWithLabel,
+        signContentBytes,
+        encryptWithLabel,
+        decryptWithLabel,
+        encryptContextBytes,
         MLS_LABEL_PREFIX,
     });
 });
