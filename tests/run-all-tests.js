@@ -48,6 +48,16 @@ const TEST_SUITES = {
         name: 'MLS key schedule',
         file: 'test-mls-key-schedule.js',
         description: 'Epoch secret chain + derived secrets (RFC 9420 §8, vs IETF vectors)'
+    },
+    'mls-crypto-basics': {
+        name: 'MLS labeled ops (RefHash, DeriveSecret, ExpandWithLabel)',
+        file: 'test-mls-crypto-basics.js',
+        description: 'RFC 9420 §5.1 / §5.2 labeled operations vs IETF vectors'
+    },
+    'mls-transcript-hashes': {
+        name: 'MLS transcript hashes',
+        file: 'test-mls-transcript-hashes.js',
+        description: 'Confirmed/interim transcript hash chain (RFC 9420 §5.3 + §8.2)'
     }
 };
 
@@ -102,7 +112,7 @@ async function main() {
         suitesToRun = args.filter(arg => TEST_SUITES[arg]);
         if (suitesToRun.length === 0) {
             console.log('');
-            console.log('Usage: node run-all-tests.js [chain|double|mls-tree-math|mls-codec|mls-hpke|mls-key-schedule]');
+            console.log('Usage: node run-all-tests.js [chain|double|mls-tree-math|mls-codec|mls-hpke|mls-key-schedule|mls-crypto-basics|mls-transcript-hashes]');
             console.log('');
             console.log('Available test suites:');
             for (const [key, suite] of Object.entries(TEST_SUITES)) {

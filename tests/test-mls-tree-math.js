@@ -9,6 +9,7 @@
 
 const path = require('path');
 const TreeMath = require(path.join(__dirname, '..', 'static', 'js', 'mls', 'tree-math.js'));
+const IETF_VECTORS = require(path.join(__dirname, 'vectors', 'mls', 'tree-math.json'));
 
 let passed = 0;
 let failed = 0;
@@ -152,6 +153,41 @@ console.log('# leafDescendants');
 eq(TreeMath.leafDescendants(3, 4), [0, 1, 2, 3], 'leafDescendants(root, n=4)');
 eq(TreeMath.leafDescendants(1, 4), [0, 1], 'leafDescendants(node 1, n=4)');
 eq(TreeMath.leafDescendants(3, 3), [0, 1, 2], 'leafDescendants(root, n=3) — truncated');
+
+// ---------------------------------------------------------------------------
+// IETF reference vectors (mlswg/mls-implementations test-vectors/tree-math.json)
+// ---------------------------------------------------------------------------
+// Each vector entry gives the full {left, right, parent, sibling} arrays
+// indexed by node index, for a tree of n_leaves leaves. A `null` entry
+// means the operation is undefined (children of a leaf, parent of the
+// root, sibling of the root). Our implementation throws in those cases;
+// we catch and treat the throw as null.
+console.log('# IETF tree-math.json vectors');
+(function () {
+    let vectorAsserts = 0;
+    let vectorFails = 0;
+    const tryOp = (fn) => { try { return fn(); } catch (_e) { return null; } };
+
+    for (const entry of IETF_VECTORS) {
+        const n = entry.n_leaves;
+        const w = entry.n_nodes;
+
+        if (TreeMath.nodeWidth(n) !== w) vectorFails += 1; else vectorAsserts += 1;
+        if (TreeMath.root(n) !== entry.root) vectorFails += 1; else vectorAsserts += 1;
+
+        for (let x = 0; x < w; x += 1) {
+            if (tryOp(() => TreeMath.left(x)) !== entry.left[x]) vectorFails += 1; else vectorAsserts += 1;
+            if (tryOp(() => TreeMath.right(x, n)) !== entry.right[x]) vectorFails += 1; else vectorAsserts += 1;
+            if (tryOp(() => TreeMath.parent(x, n)) !== entry.parent[x]) vectorFails += 1; else vectorAsserts += 1;
+            if (tryOp(() => TreeMath.sibling(x, n)) !== entry.sibling[x]) vectorFails += 1; else vectorAsserts += 1;
+        }
+    }
+    assert(
+        vectorFails === 0,
+        `IETF vectors: ${vectorAsserts} assertions across ${IETF_VECTORS.length} trees`,
+        vectorFails === 0 ? null : `${vectorFails} failures`
+    );
+})();
 
 // ---------------------------------------------------------------------------
 // Summary
