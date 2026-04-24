@@ -73,6 +73,11 @@ const TEST_SUITES = {
         name: 'MLS TreeKEM path-secret chain',
         file: 'test-mls-treekem.js',
         description: 'P-256 scalar-mul, HPKE DeriveKeyPair, path-secret derivation (RFC 9420 §7.5)'
+    },
+    'mls-update-path': {
+        name: 'MLS UpdatePath wire-format',
+        file: 'test-mls-update-path.js',
+        description: 'UpdatePath/UpdatePathNode/HPKECiphertext round-trip vs IETF vectors'
     }
 };
 
@@ -127,7 +132,7 @@ async function main() {
         suitesToRun = args.filter(arg => TEST_SUITES[arg]);
         if (suitesToRun.length === 0) {
             console.log('');
-            console.log('Usage: node run-all-tests.js [chain|double|mls-tree-math|mls-codec|mls-hpke|mls-key-schedule|mls-crypto-basics|mls-transcript-hashes|mls-tree-hash|mls-ratchet-tree|mls-treekem]');
+            console.log('Usage: node run-all-tests.js [chain|double|mls-tree-math|mls-codec|mls-hpke|mls-key-schedule|mls-crypto-basics|mls-transcript-hashes|mls-tree-hash|mls-ratchet-tree|mls-treekem|mls-update-path]');
             console.log('');
             console.log('Available test suites:');
             for (const [key, suite] of Object.entries(TEST_SUITES)) {

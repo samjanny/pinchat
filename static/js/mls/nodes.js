@@ -359,6 +359,74 @@
         return out;
     }
 
+    // --- HPKECiphertext + UpdatePath (RFC 9420 §6.3) -----------------------
+    //
+    //   struct {
+    //       opaque kem_output<V>;
+    //       opaque ciphertext<V>;
+    //   } HPKECiphertext;
+    //
+    //   struct {
+    //       HPKEPublicKey encryption_key;         // opaque<V>
+    //       HPKECiphertext encrypted_path_secret<V>;
+    //   } UpdatePathNode;
+    //
+    //   struct {
+    //       LeafNode leaf_node;
+    //       UpdatePathNode nodes<V>;
+    //   } UpdatePath;
+
+    function writeHPKECiphertext(encoder, hpkeCt) {
+        encoder.writeOpaque(hpkeCt.kemOutput);
+        encoder.writeOpaque(hpkeCt.ciphertext);
+    }
+
+    function readHPKECiphertext(decoder) {
+        return {
+            kemOutput: decoder.readOpaque(),
+            ciphertext: decoder.readOpaque(),
+        };
+    }
+
+    function writeUpdatePathNode(encoder, node) {
+        encoder.writeOpaque(node.encryptionKey);
+        encoder.writeVector(node.encryptedPathSecret, writeHPKECiphertext);
+    }
+
+    function readUpdatePathNode(decoder) {
+        return {
+            encryptionKey: decoder.readOpaque(),
+            encryptedPathSecret: decoder.readVector(readHPKECiphertext),
+        };
+    }
+
+    function writeUpdatePath(encoder, up) {
+        writeLeafNode(encoder, up.leafNode);
+        encoder.writeVector(up.nodes, writeUpdatePathNode);
+    }
+
+    function readUpdatePath(decoder) {
+        return {
+            leafNode: readLeafNode(decoder),
+            nodes: decoder.readVector(readUpdatePathNode),
+        };
+    }
+
+    function updatePathBytes(up) {
+        const encoder = new Codec.Encoder();
+        writeUpdatePath(encoder, up);
+        return encoder.bytes();
+    }
+
+    function parseUpdatePath(bytes) {
+        const decoder = new Codec.Decoder(bytes);
+        const up = readUpdatePath(decoder);
+        if (decoder.remaining() !== 0) {
+            throw new Error(`update_path: ${decoder.remaining()} trailing bytes`);
+        }
+        return up;
+    }
+
     return Object.freeze({
         // Enums
         CredentialType,
@@ -394,5 +462,13 @@
         ratchetTreeBytes,
         parseRatchetTree,
         padRatchetTree,
+        writeHPKECiphertext,
+        readHPKECiphertext,
+        writeUpdatePathNode,
+        readUpdatePathNode,
+        writeUpdatePath,
+        readUpdatePath,
+        updatePathBytes,
+        parseUpdatePath,
     });
 });
