@@ -118,6 +118,11 @@ const TEST_SUITES = {
         name: 'MLS Group orchestrator (steady state)',
         file: 'test-mls-group.js',
         description: 'Group.create + app-message encrypt/decrypt between two members'
+    },
+    'mls-group-add': {
+        name: 'MLS Group Add/Commit/Welcome flow',
+        file: 'test-mls-group-add.js',
+        description: 'Alice adds Bob via Welcome; both exchange messages at epoch 1'
     }
 };
 
@@ -172,7 +177,7 @@ async function main() {
         suitesToRun = args.filter(arg => TEST_SUITES[arg]);
         if (suitesToRun.length === 0) {
             console.log('');
-            console.log('Usage: node run-all-tests.js [chain|double|mls-tree-math|mls-codec|mls-hpke|mls-key-schedule|mls-crypto-basics|mls-transcript-hashes|mls-tree-hash|mls-ratchet-tree|mls-treekem|mls-update-path|mls-key-package|mls-welcome|mls-secret-tree|mls-framing|mls-proposal|mls-public-message|mls-private-message|mls-group]');
+            console.log('Usage: node run-all-tests.js [chain|double|mls-tree-math|mls-codec|mls-hpke|mls-key-schedule|mls-crypto-basics|mls-transcript-hashes|mls-tree-hash|mls-ratchet-tree|mls-treekem|mls-update-path|mls-key-package|mls-welcome|mls-secret-tree|mls-framing|mls-proposal|mls-public-message|mls-private-message|mls-group|mls-group-add]');
             console.log('');
             console.log('Available test suites:');
             for (const [key, suite] of Object.entries(TEST_SUITES)) {
