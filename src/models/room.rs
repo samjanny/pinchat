@@ -16,8 +16,8 @@ pub enum RoomType {
 pub struct RoomConfig {
     pub room_type: RoomType,
     pub ttl_minutes: u32,
-    /// Planned for future group chat expansion
-    #[allow(dead_code)]
+    /// Requested maximum participants. Clamped to `[2, 20]` for Group
+    /// rooms and always forced to `2` for OneToOne rooms.
     #[serde(default = "default_max_participants")]
     pub max_participants: usize,
 }
@@ -39,11 +39,20 @@ pub struct Room {
 }
 
 impl Room {
-    /// Creates a new room
+    /// Creates a new room.
+    ///
+    /// One-to-one rooms are always capped at 2 participants regardless of the
+    /// `max_participants` field in the config.
+    ///
+    /// Group rooms rely on the custom MLS / TreeKEM implementation in
+    /// `static/js/mls/` (RFC 9420 ciphersuite 0x0002). The caller's requested
+    /// `max_participants` is honoured, clamped to the 1..=20 range we tested
+    /// against the IETF reference vectors.
     pub fn new(config: RoomConfig) -> Self {
-        // Group chat support will be enabled after introducing secure group key exchange.
-        // Until then, rooms are limited to two participants.
-        let max_participants = 2;
+        let max_participants = match config.room_type {
+            RoomType::OneToOne => 2,
+            RoomType::Group => config.max_participants.clamp(2, 20),
+        };
 
         let now = Utc::now();
 
@@ -197,6 +206,51 @@ mod tests {
         assert!(
             !room.is_expired(),
             "Newly created group room should not be expired"
+        );
+    }
+
+    #[test]
+    fn group_rooms_honour_requested_max_participants_within_bounds() {
+        // Group rooms must keep the caller's requested max_participants,
+        // clamped to [2, 20]. Previously group rooms were silently capped
+        // to 2; the MLS / TreeKEM implementation lifts that cap.
+        for requested in [2usize, 5, 10, 20] {
+            let cfg = RoomConfig {
+                room_type: RoomType::Group,
+                ttl_minutes: 30,
+                max_participants: requested,
+            };
+            let room = Room::new(cfg);
+            assert_eq!(
+                room.max_participants, requested,
+                "group room honours requested max_participants={}",
+                requested,
+            );
+        }
+
+        // Clamp: below 2 → 2, above 20 → 20.
+        let low = Room::new(RoomConfig {
+            room_type: RoomType::Group,
+            ttl_minutes: 30,
+            max_participants: 1,
+        });
+        assert_eq!(low.max_participants, 2, "group room clamps min to 2");
+        let high = Room::new(RoomConfig {
+            room_type: RoomType::Group,
+            ttl_minutes: 30,
+            max_participants: 100,
+        });
+        assert_eq!(high.max_participants, 20, "group room clamps max to 20");
+
+        // OneToOne still pinned to 2 regardless of input.
+        let one_to_one = Room::new(RoomConfig {
+            room_type: RoomType::OneToOne,
+            ttl_minutes: 30,
+            max_participants: 15,
+        });
+        assert_eq!(
+            one_to_one.max_participants, 2,
+            "one_to_one rooms are always 2 participants",
         );
     }
 

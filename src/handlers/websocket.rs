@@ -422,6 +422,143 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: Uuid, connec
                                 tracing::warn!("⚠️ ECDH message received but payload is missing (connection_id={})", connection_id);
                             }
                         }
+                        // MLS envelope (RFC 9420). Blind relay: the server never
+                        // parses the wire format. DoS caps + anti-replay + rate
+                        // limit apply identically to "message" / "image".
+                        else if incoming.msg_type == "mls" {
+                            let payload = match incoming.payload {
+                                Some(p) => p,
+                                None => {
+                                    tracing::warn!(
+                                        "mls envelope without payload from connection_id={}",
+                                        connection_id
+                                    );
+                                    if bump_protocol_error(&state_clone, connection_id) {
+                                        break;
+                                    }
+                                    continue;
+                                }
+                            };
+                            let wire_format = match incoming.wire_format {
+                                Some(w) => w,
+                                None => {
+                                    tracing::warn!(
+                                        "mls envelope without wire_format from connection_id={}",
+                                        connection_id
+                                    );
+                                    if bump_protocol_error(&state_clone, connection_id) {
+                                        break;
+                                    }
+                                    continue;
+                                }
+                            };
+
+                            // Upper bound: Welcome + ratchet_tree can be large
+                            // for 20-member groups. Cap at the same image
+                            // ceiling so one mls envelope cannot exceed the
+                            // AEAD-framed image budget.
+                            let max_size =
+                                max_image_payload_size(state_clone.config.max_image_size);
+                            if payload.len() > max_size
+                                || incoming
+                                    .ratchet_tree
+                                    .as_ref()
+                                    .map(|s| s.len())
+                                    .unwrap_or(0)
+                                    > max_size
+                            {
+                                tracing::warn!(
+                                    "mls envelope too large from connection_id={} (payload={}, rt={})",
+                                    connection_id,
+                                    payload.len(),
+                                    incoming
+                                        .ratchet_tree
+                                        .as_ref()
+                                        .map(|s| s.len())
+                                        .unwrap_or(0)
+                                );
+                                if bump_protocol_error(&state_clone, connection_id) {
+                                    break;
+                                }
+                                continue;
+                            }
+
+                            // Anti-replay by payload hash, same pattern as the
+                            // 1:1 relay — a retransmitted MLS envelope is
+                            // silently discarded rather than broadcast twice.
+                            let payload_hash = {
+                                let mut hasher = Sha256::new();
+                                hasher.update(payload.as_bytes());
+                                format!("{:x}", hasher.finalize())
+                            };
+                            let mut seen_hashes = state_clone
+                                .seen_message_hashes
+                                .entry(room_id)
+                                .or_insert_with(HashSet::new);
+                            let room_ttl_minutes = state_clone
+                                .rooms
+                                .get(&room_id)
+                                .map(|r| r.ttl_minutes)
+                                .unwrap_or(60);
+                            let cutoff = Utc::now()
+                                - chrono::Duration::minutes(room_ttl_minutes as i64);
+                            seen_hashes.retain(|(_, ts)| *ts > cutoff);
+                            let now = Utc::now();
+                            if seen_hashes.iter().any(|(h, _)| h == &payload_hash) {
+                                continue;
+                            }
+                            let max_entries =
+                                state_clone.config.replay_cache_max_per_room;
+                            if seen_hashes.len() >= max_entries {
+                                let mut entries: Vec<_> =
+                                    seen_hashes.iter().cloned().collect();
+                                entries.sort_by(|a, b| b.1.cmp(&a.1));
+                                entries.truncate(max_entries - 1);
+                                seen_hashes.clear();
+                                for entry in entries {
+                                    seen_hashes.insert(entry);
+                                }
+                            }
+                            seen_hashes.insert((payload_hash, now));
+
+                            // Per-connection rate limit (same cadence).
+                            let max_messages = state_clone.config.msg_rate_limit;
+                            let rate_window_secs =
+                                state_clone.config.msg_rate_window_secs;
+                            let mut timestamps = state_clone
+                                .connection_message_timestamps
+                                .entry(connection_id)
+                                .or_insert_with(VecDeque::new);
+                            let rate_cutoff =
+                                now - chrono::Duration::seconds(rate_window_secs);
+                            timestamps.retain(|&ts| ts > rate_cutoff);
+                            if timestamps.len() >= max_messages {
+                                tracing::warn!(
+                                    "Connection {} exceeded rate limit on mls, disconnecting",
+                                    connection_id
+                                );
+                                break;
+                            }
+                            timestamps.push_back(now);
+
+                            let broadcast_msg = Message::Mls {
+                                payload,
+                                wire_format,
+                                ratchet_tree: incoming.ratchet_tree,
+                                sender_id: connection_id,
+                            };
+                            if let Ok(json) = serde_json::to_string(&broadcast_msg) {
+                                if let Some(tx) =
+                                    state_clone.broadcast_channels.get(&room_id)
+                                {
+                                    let _ = tx.send(json);
+                                }
+                            }
+
+                            if let Some(mut room) = state_clone.rooms.get_mut(&room_id) {
+                                room.update_activity();
+                            }
+                        }
                         // Handle regular encrypted message (text or image)
                         else if incoming.msg_type == "message" || incoming.msg_type == "image" {
                             if let Some(payload) = incoming.payload {

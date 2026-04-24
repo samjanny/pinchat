@@ -96,19 +96,56 @@ pub enum Message {
         /// Connection ID of the sender
         sender_id: Uuid,
     },
+
+    /// MLS (RFC 9420) envelope relayed as opaque bytes.
+    ///
+    /// The server never parses the MLS wire format — it is a blind relay.
+    /// The client inspects `wire_format` (matching the `WireFormat`
+    /// discriminant inside the embedded MLSMessage) to route the payload
+    /// to its KeyPackage intake, Welcome processor, Commit handler, or
+    /// PrivateMessage decryptor.
+    ///
+    /// `ratchet_tree` is a narrow side-channel used by the MVP Add flow
+    /// so a joiner can verify tree_hash without a dedicated extension in
+    /// GroupInfo. It carries the serialised ratchet-tree bytes for
+    /// `mls_welcome` envelopes only; all other wire formats MUST leave it
+    /// `None`. When the GroupInfo `ratchet_tree` extension is added, this
+    /// field becomes optional and will eventually be deprecated.
+    #[serde(rename = "mls")]
+    Mls {
+        /// Base64url-encoded MLSMessage bytes
+        payload: String,
+        /// Wire format of the embedded MLSMessage (RFC 9420 §15.1):
+        ///   1 = mls_public_message
+        ///   2 = mls_private_message
+        ///   3 = mls_welcome
+        ///   5 = mls_key_package
+        wire_format: u16,
+        /// Optional ratchet-tree side-channel for `mls_welcome` only.
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        ratchet_tree: Option<String>,
+        /// Connection ID of the sender (same framing as ecdh_public_key).
+        sender_id: Uuid,
+    },
 }
 
 /// Incoming message from the client (before parsing).
 ///
-/// `header` is kept optional at this stage because `ecdh_public_key` messages
-/// legitimately omit it. The websocket handler enforces header presence and
-/// protocol version for `message`/`image` variants.
+/// `header` is kept optional at this stage because `ecdh_public_key` and `mls`
+/// messages legitimately omit it. The websocket handler enforces header
+/// presence and protocol version for `message`/`image` variants.
 #[derive(Debug, Deserialize)]
 pub struct IncomingMessage {
     #[serde(rename = "type")]
     pub msg_type: String,
     pub payload: Option<String>,
-    pub header: Option<MessageHeader>, // Signal Protocol header
+    pub header: Option<MessageHeader>, // Signal Protocol header (1:1 only)
+    /// MLS wire_format hint for `mls` envelopes. Ignored for other types.
+    #[serde(default)]
+    pub wire_format: Option<u16>,
+    /// MLS ratchet-tree side-channel for `mls` welcome envelopes only.
+    #[serde(default)]
+    pub ratchet_tree: Option<String>,
 }
 
 #[cfg(test)]
