@@ -393,14 +393,35 @@ class DoubleRatchet {
             debugLog('[DoubleRatchet] Same DH public key - no ratchet needed');
         }
 
+        // Decide which path derives the message key, and whether the chain
+        // state should be advanced afterwards.
+        //   - skipped-key path: already past this counter, do NOT touch chain state
+        //   - forward-jump path: messageNumber > Nr, store intermediate keys first
+        //   - replay/too-old path: messageNumber < Nr with no stored key → reject
+        //   - in-order path: messageNumber === Nr (after skip), derive and advance once
+        const skippedKeyId = `${dhPublicKeyBase64}:${messageNumber}`;
+        const isSkippedKey = this.skippedKeys.has(skippedKeyId);
+
+        if (!isSkippedKey && messageNumber < this.Nr) {
+            // Already advanced past this counter and no skipped key stored.
+            // Treat as replay / out-of-window to preserve PFS.
+            debugError(`[DoubleRatchet] Message #${messageNumber} is behind Nr=${this.Nr} and not in skipped keys`);
+            throw new Error('Message decryption failed - authentication error');
+        }
+
+        if (!isSkippedKey && messageNumber > this.Nr) {
+            // Forward jump within the current chain: store keys for Nr..messageNumber-1
+            // so delayed messages can still be decrypted. After this call, Nr has
+            // advanced to messageNumber and the chain is positioned at messageNumber.
+            await this.skipMessageKeys(messageNumber);
+        }
+
         // Try to decrypt with current receiving chain
         let plaintextBytes;
         try {
-            // Check if we have a skipped key for this message
-            const skippedKeyId = `${dhPublicKeyBase64}:${messageNumber}`;
             let messageKey;
 
-            if (this.skippedKeys.has(skippedKeyId)) {
+            if (isSkippedKey) {
                 const entry = this.skippedKeys.get(skippedKeyId);
                 messageKey = entry.key;
                 this.skippedKeys.delete(skippedKeyId);
@@ -439,16 +460,15 @@ class DoubleRatchet {
             throw new Error('Message decryption failed - authentication error');
         }
 
-        // Ratchet receiving chain to match processed message position
-        // This accounts for any skipped messages (e.g., if we received #1 without #0)
-        // Chain must advance to state (messageNumber + 1) to be ready for next message
-        const newPosition = messageNumber + 1;
-        const numRatchets = newPosition - this.Nr;
-        for (let i = 0; i < numRatchets; i++) {
+        if (!isSkippedKey) {
+            // In-order (or just caught up via skip): ratchet exactly once past
+            // messageNumber so the chain is ready for messageNumber+1.
             await this.receivingChain.ratchet();
+            this.Nr = messageNumber + 1;
+            this.receivingChain.messageNumber = this.Nr;
         }
-        this.Nr = newPosition;
-        this.receivingChain.messageNumber = this.Nr;
+        // Skipped-key path: chain state is already well ahead of messageNumber,
+        // leave Nr and chain untouched.
 
         // Parse envelope
         const decoder = new TextDecoder();
@@ -660,6 +680,10 @@ class DoubleRatchet {
             }
 
             await this.receivingChain.ratchet();
+            // Keep chain.messageNumber aligned with chainKeyMaterial's position,
+            // so the next deriveMessageKeyForCounter() computes stepsAhead from
+            // the true chain position rather than a stale baseline.
+            this.receivingChain.messageNumber++;
             this.Nr++;
         }
 
@@ -733,6 +757,13 @@ class DoubleRatchet {
 
         // Zero out sensitive key material
         if (this.rootKey) this.rootKey.fill(0);
+
+        // Reset chains first: this zeroes chainKeyMaterial and drops every
+        // pre-derived message key in messageKeyWindow before we let the chain
+        // references go. Without this, pre-derived AES-GCM CryptoKey handles
+        // would linger until GC.
+        if (this.sendingChain) this.sendingChain.reset();
+        if (this.receivingChain) this.receivingChain.reset();
 
         this.rootKey = null;
         this.sendingChain = null;

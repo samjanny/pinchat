@@ -50,9 +50,9 @@ class ChainRatchet {
             this.messageKeyWindow.set(futureCounter, futureKey);
         }
 
-        // Cleanup old keys
+        // PFS: drop any entry at or behind the counter we just consumed.
         for (const [counter] of this.messageKeyWindow) {
-            if (counter < myCounter) {
+            if (counter < this.messageNumber) {
                 this.messageKeyWindow.delete(counter);
             }
         }
@@ -66,7 +66,10 @@ class ChainRatchet {
         }
 
         if (this.messageKeyWindow.has(counter)) {
-            return this.messageKeyWindow.get(counter);
+            // Single-use: remove on read
+            const key = this.messageKeyWindow.get(counter);
+            this.messageKeyWindow.delete(counter);
+            return key;
         }
 
         const currentCounter = this.messageNumber;
@@ -131,6 +134,8 @@ class ChainRatchet {
 
         const nextChainKeyRaw = await subtle.sign('HMAC', hmacKey, info);
         this.chainKeyMaterial = new Uint8Array(nextChainKeyRaw);
+        // PFS: drop message keys tied to the pre-ratchet chain state.
+        this.messageKeyWindow.clear();
     }
 
     reset() {

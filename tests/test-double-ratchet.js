@@ -95,8 +95,9 @@ class ChainRatchet {
             this.messageKeyWindow.set(futureCounter, futureKey);
         }
 
+        // PFS: drop any entry at or behind the counter we just consumed.
         for (const [counter] of this.messageKeyWindow) {
-            if (counter < myCounter) this.messageKeyWindow.delete(counter);
+            if (counter < this.messageNumber) this.messageKeyWindow.delete(counter);
         }
 
         return { key: messageKey, counter: myCounter };
@@ -106,7 +107,10 @@ class ChainRatchet {
         if (!this.chainKeyMaterial) throw new Error('Chain ratchet not initialized');
 
         if (this.messageKeyWindow.has(counter)) {
-            return this.messageKeyWindow.get(counter);
+            // Single-use: remove on read
+            const key = this.messageKeyWindow.get(counter);
+            this.messageKeyWindow.delete(counter);
+            return key;
         }
 
         const currentCounter = this.messageNumber;
@@ -145,6 +149,8 @@ class ChainRatchet {
             { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
         const nextChainKeyRaw = await subtle.sign('HMAC', hmacKey, info);
         this.chainKeyMaterial = new Uint8Array(nextChainKeyRaw);
+        // PFS: drop message keys tied to the pre-ratchet chain state.
+        this.messageKeyWindow.clear();
     }
 
     reset() {
@@ -337,12 +343,26 @@ class DoubleRatchet {
             this.hasRatchetedSinceReceive = true;
         }
 
+        const skippedKeyId = `${dhPublicKeyBase64}:${messageNumber}`;
+        const isSkippedKey = this.skippedKeys.has(skippedKeyId);
+
+        if (!isSkippedKey && messageNumber < this.Nr) {
+            // Replay / out-of-window: chain already advanced past this counter
+            // and no skipped key stored. Reject to preserve PFS.
+            throw new Error('Message decryption failed - authentication error');
+        }
+
+        if (!isSkippedKey && messageNumber > this.Nr) {
+            // Forward jump within the current chain: store keys for Nr..messageNumber-1
+            // so delayed messages can still be decrypted.
+            await this.skipMessageKeys(messageNumber);
+        }
+
         let plaintextBytes;
         try {
-            const skippedKeyId = `${dhPublicKeyBase64}:${messageNumber}`;
             let messageKey;
 
-            if (this.skippedKeys.has(skippedKeyId)) {
+            if (isSkippedKey) {
                 const entry = this.skippedKeys.get(skippedKeyId);
                 messageKey = entry.key;
                 this.skippedKeys.delete(skippedKeyId);
@@ -371,13 +391,13 @@ class DoubleRatchet {
             throw new Error('Message decryption failed - authentication error');
         }
 
-        const newPosition = messageNumber + 1;
-        const numRatchets = newPosition - this.Nr;
-        for (let i = 0; i < numRatchets; i++) {
+        if (!isSkippedKey) {
+            // In-order (or just caught up via skip): ratchet once past messageNumber.
             await this.receivingChain.ratchet();
+            this.Nr = messageNumber + 1;
+            this.receivingChain.messageNumber = this.Nr;
         }
-        this.Nr = newPosition;
-        this.receivingChain.messageNumber = this.Nr;
+        // Skipped-key path: chain state is already ahead, do not touch Nr or chain.
 
         const decoder = new TextDecoder();
         return JSON.parse(decoder.decode(plaintextBytes));
@@ -492,6 +512,10 @@ class DoubleRatchet {
             }
 
             await this.receivingChain.ratchet();
+            // Keep chain.messageNumber aligned with chainKeyMaterial's position,
+            // so the next deriveMessageKeyForCounter() computes stepsAhead from
+            // the true chain position rather than a stale baseline.
+            this.receivingChain.messageNumber++;
             this.Nr++;
         }
     }
@@ -1156,9 +1180,9 @@ async function runTests() {
     console.log('');
 
     // -------------------------------------------------------------------------
-    // Test 11b: Out-of-Order Within Same Chain (Known Limitation)
+    // Test 11b: Out-of-Order Within Same Chain (Skipped-Key Recovery)
     // -------------------------------------------------------------------------
-    console.log('--- Test 11b: Out-of-Order Within Same Chain (Known Limitation) ---');
+    console.log('--- Test 11b: Out-of-Order Within Same Chain (Skipped-Key Recovery) ---');
     try {
         const sharedSecret = hexToBytes('aabbccddaabbccddaabbccddaabbccddaabbccddaabbccddaabbccddaabbccdd');
 
@@ -1187,33 +1211,31 @@ async function runTests() {
             messages[2].payload, messages[2].header, ROOM_ID, ALICE_ID);
         console.log(`  Bob received msg 2 first: "${dec2.text}"`);
 
-        // Now Bob tries to receive message 0 (should fail - no skipped key storage within chain)
-        let msg0Failed = false;
+        // Bob now receives the delayed messages 0 and 1 — both must decrypt
+        // from stored skipped keys.
+        const dec0 = await bob.decryptMessage(
+            messages[0].payload, messages[0].header, ROOM_ID, ALICE_ID);
+        console.log(`  Bob received delayed msg 0: "${dec0.text}"`);
+
+        const dec1 = await bob.decryptMessage(
+            messages[1].payload, messages[1].header, ROOM_ID, ALICE_ID);
+        console.log(`  Bob received delayed msg 1: "${dec1.text}"`);
+
+        // A replay of msg 0 (already consumed from skippedKeys) must be rejected.
+        let replayRejected = false;
         try {
             await bob.decryptMessage(
                 messages[0].payload, messages[0].header, ROOM_ID, ALICE_ID);
         } catch (e) {
-            msg0Failed = true;
-            console.log(`  Msg 0 failed (expected - no backward key recovery): ${e.message}`);
+            replayRejected = true;
+            console.log(`  Msg 0 replay rejected (expected): ${e.message}`);
         }
 
-        // Bob tries to receive message 1 (should also fail)
-        let msg1Failed = false;
-        try {
-            await bob.decryptMessage(
-                messages[1].payload, messages[1].header, ROOM_ID, ALICE_ID);
-        } catch (e) {
-            msg1Failed = true;
-            console.log(`  Msg 1 failed (expected - no backward key recovery): ${e.message}`);
-        }
-
-        if (msg0Failed && msg1Failed) {
-            console.log('PASSED: Out-of-order within same chain correctly rejected');
-            console.log('  NOTE: This is a known limitation. Messages must be received');
-            console.log('        in order within the same DH epoch, or skipped keys are lost.');
+        if (dec0.text === 'Msg0' && dec1.text === 'Msg1' && dec2.text === 'Msg2' && replayRejected) {
+            console.log('PASSED: Same-chain out-of-order recovered via skipped keys; replay rejected');
             passed++;
         } else {
-            console.log('FAILED: Expected messages to fail (backward key recovery not implemented)');
+            console.log('FAILED: Expected 0/1/2 to decrypt and replay to be rejected');
             failed++;
         }
     } catch (e) {

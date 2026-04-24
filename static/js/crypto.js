@@ -187,9 +187,11 @@ class ChainRatchet {
             this.messageKeyWindow.set(futureCounter, futureKey);
         }
 
-        // Remove keys that have fallen outside the sliding window to preserve PFS
+        // PFS: remove any key at or behind the counter we just consumed.
+        // Using this.messageNumber (= myCounter + 1) as cutoff also drops the
+        // just-consumed counter if it ever lingered in the window.
         for (const [counter] of this.messageKeyWindow) {
-            if (counter < myCounter) {
+            if (counter < this.messageNumber) {
                 this.messageKeyWindow.delete(counter);
             }
         }
@@ -214,10 +216,13 @@ class ChainRatchet {
             throw new Error('Chain ratchet not initialized');
         }
 
-        // Check sliding window first (common case)
+        // Check sliding window first (common case). Single-use: remove on read
+        // so a consumed message key cannot be reused and is dropped from memory.
         if (this.messageKeyWindow.has(counter)) {
             debugLog(`[ChainRatchet] Using pre-derived key from window for #${counter}`);
-            return this.messageKeyWindow.get(counter);
+            const key = this.messageKeyWindow.get(counter);
+            this.messageKeyWindow.delete(counter);
+            return key;
         }
 
         // Derive key directly (out-of-order message)
@@ -321,6 +326,11 @@ class ChainRatchet {
         // Overwrite old chain key material to keep the ratchet one-way
         this.chainKeyMaterial = new Uint8Array(nextChainKeyRaw);
 
+        // PFS: drop any pre-derived message keys pinned to the pre-ratchet chain
+        // state. They represented future counters that are no longer reachable
+        // from the post-ratchet chain key.
+        this.messageKeyWindow.clear();
+
         // NOTE: messageNumber is incremented in deriveMessageKey() to prevent race conditions
         debugLog(`[ChainRatchet] Ratcheted forward (counter now at #${this.messageNumber})`);
     }
@@ -336,6 +346,12 @@ class ChainRatchet {
             this.chainKeyMaterial = null;
         }
         this.messageNumber = 0;
+        // Drop all pre-derived message keys (AES-GCM CryptoKey handles). JS
+        // cannot zero the underlying key bytes, but dropping references lets
+        // the runtime reclaim them and prevents reuse after reset.
+        if (this.messageKeyWindow) {
+            this.messageKeyWindow.clear();
+        }
         debugLog('[ChainRatchet] Reset (chain key destroyed)');
     }
 }
