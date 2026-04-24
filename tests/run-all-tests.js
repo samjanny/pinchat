@@ -63,6 +63,11 @@ const TEST_SUITES = {
         name: 'MLS tree hash + node structs',
         file: 'test-mls-tree-hash.js',
         description: 'LeafNode/ParentNode serde + tree-hash vs IETF tree-validation vectors'
+    },
+    'mls-ratchet-tree': {
+        name: 'MLS ratchet-tree container',
+        file: 'test-mls-ratchet-tree.js',
+        description: 'Resolution (RFC 9420 §7.7) vs IETF tree-validation.resolutions'
     }
 };
 
@@ -117,7 +122,7 @@ async function main() {
         suitesToRun = args.filter(arg => TEST_SUITES[arg]);
         if (suitesToRun.length === 0) {
             console.log('');
-            console.log('Usage: node run-all-tests.js [chain|double|mls-tree-math|mls-codec|mls-hpke|mls-key-schedule|mls-crypto-basics|mls-transcript-hashes|mls-tree-hash]');
+            console.log('Usage: node run-all-tests.js [chain|double|mls-tree-math|mls-codec|mls-hpke|mls-key-schedule|mls-crypto-basics|mls-transcript-hashes|mls-tree-hash|mls-ratchet-tree]');
             console.log('');
             console.log('Available test suites:');
             for (const [key, suite] of Object.entries(TEST_SUITES)) {
