@@ -88,6 +88,11 @@ const TEST_SUITES = {
         name: 'MLS Welcome / GroupInfo end-to-end',
         file: 'test-mls-welcome.js',
         description: 'Full joiner flow: unwrap → HPKE-decrypt → AES-decrypt → verify GroupInfo'
+    },
+    'mls-secret-tree': {
+        name: 'MLS secret tree + per-leaf AEAD ratchet',
+        file: 'test-mls-secret-tree.js',
+        description: 'Application/handshake chains + sender_data (RFC 9420 §9) vs IETF vectors'
     }
 };
 
@@ -142,7 +147,7 @@ async function main() {
         suitesToRun = args.filter(arg => TEST_SUITES[arg]);
         if (suitesToRun.length === 0) {
             console.log('');
-            console.log('Usage: node run-all-tests.js [chain|double|mls-tree-math|mls-codec|mls-hpke|mls-key-schedule|mls-crypto-basics|mls-transcript-hashes|mls-tree-hash|mls-ratchet-tree|mls-treekem|mls-update-path|mls-key-package|mls-welcome]');
+            console.log('Usage: node run-all-tests.js [chain|double|mls-tree-math|mls-codec|mls-hpke|mls-key-schedule|mls-crypto-basics|mls-transcript-hashes|mls-tree-hash|mls-ratchet-tree|mls-treekem|mls-update-path|mls-key-package|mls-welcome|mls-secret-tree]');
             console.log('');
             console.log('Available test suites:');
             for (const [key, suite] of Object.entries(TEST_SUITES)) {
