@@ -19,59 +19,69 @@ See [`ciphersuite.js`](ciphersuite.js) for the full profile.
 
 ## Foundation (landed)
 
-| Module                                   | Status | Tests                                        |
-| ---------------------------------------- | :----: | -------------------------------------------- |
-| [`ciphersuite.js`](ciphersuite.js)       |   ✅   | —                                            |
-| [`tree-math.js`](tree-math.js)           |   ✅   | [`test-mls-tree-math.js`](../../../tests/test-mls-tree-math.js) |
-| [`codec.js`](codec.js)                   |   ✅   | [`test-mls-codec.js`](../../../tests/test-mls-codec.js)         |
-| [`hpke.js`](hpke.js)                     |   ✅   | [`test-mls-hpke.js`](../../../tests/test-mls-hpke.js)           |
+| Module                                   | Status | Tests                                                                                  |
+| ---------------------------------------- | :----: | -------------------------------------------------------------------------------------- |
+| [`ciphersuite.js`](ciphersuite.js)       |   ✅   | —                                                                                      |
+| [`tree-math.js`](tree-math.js)           |   ✅   | [`test-mls-tree-math.js`](../../../tests/test-mls-tree-math.js)                        |
+| [`codec.js`](codec.js)                   |   ✅   | [`test-mls-codec.js`](../../../tests/test-mls-codec.js)                                |
+| [`hpke.js`](hpke.js)                     |   ✅   | [`test-mls-hpke.js`](../../../tests/test-mls-hpke.js)                                  |
+| [`key-schedule.js`](key-schedule.js)     |   ✅   | [`test-mls-key-schedule.js`](../../../tests/test-mls-key-schedule.js) (IETF vectors)   |
 
 The codec matches RFC 9000 QUIC varint vectors; HKDF-SHA256 matches the
 RFC 5869 §A.1 vector; DHKEM is validated by Encap/Decap symmetry plus HPKE
-Seal/Open AEAD tamper tests.
+Seal/Open AEAD tamper tests. The key schedule is verified byte-for-byte
+against the IETF reference vectors in
+[`tests/vectors/mls/key-schedule.json`](../../../tests/vectors/mls/key-schedule.json) —
+5 epochs × 12 secrets per epoch, all matching for ciphersuite 0x0002.
 
 ## Roadmap
 
 Ordered so that each step only depends on what precedes it.
 
-1. **Key schedule** (`key-schedule.js`) — RFC 9420 §8.
-   Epoch secret chain: joiner_secret → welcome_secret → epoch_secret →
-   {sender_data, encryption, exporter, external, confirmation, membership,
-   resumption, init} secrets via `MLS-v1` labeled expand.
-
-2. **Credential + KeyPackage** (`key-package.js`) — RFC 9420 §5, §10.
+1. **Credential + KeyPackage** (`key-package.js`) — RFC 9420 §5, §10.
    A KeyPackage binds an HPKE init key, a signature key (ECDSA P-256), and
    a credential. Signature-chained and serializable via the codec.
 
-3. **Ratchet tree** (`ratchet-tree.js`) — RFC 9420 §7.
+2. **Ratchet tree** (`ratchet-tree.js`) — RFC 9420 §7.
    Array-backed tree of LeafNode / ParentNode, with blanking, resolution,
-   parent-hash and tree-hash. Tree-hash tests will use RFC 9420 §I vectors.
+   parent-hash and tree-hash. Verified against the IETF
+   `tree-math.json` / `tree-validation.json` vectors.
 
-4. **TreeKEM UpdatePath** (`update-path.js`) — RFC 9420 §7.5–§7.6.
-   Path-secret chain + HPKE Seal along the copath resolution.
+3. **TreeKEM UpdatePath** (`update-path.js`) — RFC 9420 §7.5–§7.6.
+   Path-secret chain + HPKE Seal along the copath resolution; verified
+   against `treekem.json`.
 
-5. **Welcome / joining** (`welcome.js`) — RFC 9420 §12.4.
-   Group-info encryption to the new member's HPKE init key.
+4. **Welcome / joining** (`welcome.js`) — RFC 9420 §12.4.
+   Group-info encryption to the new member's HPKE init key; verified
+   against `welcome.json`.
 
-6. **Proposals + Commit + framing** (`framing.js`, `proposal.js`) —
+5. **Proposals + Commit + framing** (`framing.js`, `proposal.js`) —
    RFC 9420 §6, §12. PublicMessage / PrivateMessage framing with the
    confirmation + membership tags.
 
-7. **Application messages / secret tree** (`secret-tree.js`) — RFC 9420 §9.
-   Per-leaf AEAD nonce/key derivation for encryption of application data.
+6. **Application messages / secret tree** (`secret-tree.js`) — RFC 9420 §9.
+   Per-leaf AEAD nonce/key derivation for encryption of application data;
+   verified against `secret-tree.json`.
 
-8. **Server relay**. The Rust server gains new broadcast envelope types
+7. **Server relay**. The Rust server gains new broadcast envelope types
    (`group_commit`, `group_welcome`, `group_proposal`, `group_app_message`)
    but remains a blind relay: no key material, no decryption, no membership
    tracking beyond the existing room participant set.
 
-9. **UI wiring**. `chat.html` + `app.js` + `mls-session.js` orchestrator.
-   Re-enable group rooms in [`src/models/room.rs`](../../../src/models/room.rs) once
-   the crypto + relay are both in place.
+8. **UI wiring**. `chat.html` + `app.js` + `mls-session.js` orchestrator.
+   Re-enable group rooms in [`src/models/room.rs`](../../../src/models/room.rs)
+   once the crypto + relay are both in place.
+
+## Test vectors
+
+IETF-maintained MLS test vectors are cached under
+[`tests/vectors/mls/`](../../../tests/vectors/mls/) so the suite runs offline.
+Upstream: `mlswg/mls-implementations` on GitHub (directory `test-vectors/`).
 
 ## Running the tests
 
-    node tests/run-all-tests.js                   # everything
-    node tests/run-all-tests.js mls-tree-math     # single suite
+    node tests/run-all-tests.js                      # everything
+    node tests/run-all-tests.js mls-tree-math        # single suite
     node tests/run-all-tests.js mls-codec
     node tests/run-all-tests.js mls-hpke
+    node tests/run-all-tests.js mls-key-schedule

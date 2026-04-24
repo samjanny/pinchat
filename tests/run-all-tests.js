@@ -43,6 +43,11 @@ const TEST_SUITES = {
         name: 'MLS HPKE',
         file: 'test-mls-hpke.js',
         description: 'DHKEM(P-256)+HKDF-SHA256+AES-128-GCM (RFC 9180)'
+    },
+    'mls-key-schedule': {
+        name: 'MLS key schedule',
+        file: 'test-mls-key-schedule.js',
+        description: 'Epoch secret chain + derived secrets (RFC 9420 §8, vs IETF vectors)'
     }
 };
 
@@ -97,7 +102,7 @@ async function main() {
         suitesToRun = args.filter(arg => TEST_SUITES[arg]);
         if (suitesToRun.length === 0) {
             console.log('');
-            console.log('Usage: node run-all-tests.js [chain|double|mls-tree-math|mls-codec|mls-hpke]');
+            console.log('Usage: node run-all-tests.js [chain|double|mls-tree-math|mls-codec|mls-hpke|mls-key-schedule]');
             console.log('');
             console.log('Available test suites:');
             for (const [key, suite] of Object.entries(TEST_SUITES)) {
