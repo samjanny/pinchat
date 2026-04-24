@@ -52,6 +52,14 @@ const HTML_FILES = [
   '/static/privacy.html'
 ];
 
+// Deployment-specific data files: hashed (hex) for integrity but not
+// SRI-injected. Not tracked in the public repo — each operator keeps
+// a local copy at static/operator.json matching what the server serves
+// at /static/operator.json, then re-signs the manifest on change.
+const DATA_FILES = [
+  '/static/operator.json'
+];
+
 /**
  * Convert URL path to filesystem path relative to static directory
  */
@@ -451,6 +459,23 @@ async function main() {
             hexHash = hashFileHex(fullPath);
         }
 
+        files.push({ path: urlPath, hash: hexHash });
+        console.log(`  ${urlPath}: ${hexHash.substring(0, 16)}...`);
+    }
+
+    // Step 4b: Calculate data file hashes (no SRI injection)
+    console.log('\nStep 4b: Calculating data file hashes...');
+    for (const urlPath of DATA_FILES) {
+        const fsPath = urlPathToFilePath(urlPath);
+        const fullPath = path.join(options.staticDir, fsPath);
+
+        if (!fs.existsSync(fullPath)) {
+            console.error(`  Warning: Data file not found: ${urlPath}`);
+            errorCount++;
+            continue;
+        }
+
+        const hexHash = hashFileHex(fullPath);
         files.push({ path: urlPath, hash: hexHash });
         console.log(`  ${urlPath}: ${hexHash.substring(0, 16)}...`);
     }
