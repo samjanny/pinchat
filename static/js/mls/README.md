@@ -43,6 +43,7 @@ See [`ciphersuite.js`](ciphersuite.js) for the full profile.
 | [`framing.js`](framing.js)               |   ✅   | [`test-mls-framing.js`](../../../tests/test-mls-framing.js)                                   |
 | [`proposal.js`](proposal.js)             |   ✅   | [`test-mls-proposal.js`](../../../tests/test-mls-proposal.js) (IETF vectors)                  |
 | [`commit.js`](commit.js)                 |   ✅   | [`test-mls-proposal.js`](../../../tests/test-mls-proposal.js) (IETF vectors)                  |
+| [`public-message.js`](public-message.js) |   ✅   | [`test-mls-public-message.js`](../../../tests/test-mls-public-message.js) (IETF end-to-end)   |
 
 The codec matches RFC 9000 QUIC varint vectors; HKDF-SHA256 matches the
 RFC 5869 §A.1 vector; DHKEM is validated by Encap/Decap symmetry plus HPKE
