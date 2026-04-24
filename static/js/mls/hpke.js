@@ -29,12 +29,12 @@
  */
 (function (root, factory) {
     if (typeof module !== 'undefined' && module.exports) {
-        module.exports = factory();
+        module.exports = factory(require('./p256.js'));
     } else {
         root.MLS = root.MLS || {};
-        root.MLS.HPKE = factory();
+        root.MLS.HPKE = factory(root.MLS.P256);
     }
-})(typeof self !== 'undefined' ? self : this, function () {
+})(typeof self !== 'undefined' ? self : this, function (P256) {
     'use strict';
 
     // --- WebCrypto surface (browser + node) ---------------------------------
@@ -189,6 +189,50 @@
         );
         const raw = await getSubtle().exportKey('raw', keyPair.publicKey);
         return { privateKey: keyPair.privateKey, publicKey: keyPair.publicKey, publicKeyBytes: new Uint8Array(raw) };
+    }
+
+    /**
+     * DHKEM DeriveKeyPair for P-256 — RFC 9180 §7.1.3 "rejection sampling".
+     *
+     *   dkp_prk = LabeledExtract("", "dkp_prk", ikm)
+     *   for counter = 0..255:
+     *       bytes = LabeledExpand(dkp_prk, "candidate", I2OSP(counter, 1), Nsk)
+     *       bitmask = 0xFF   (P-256 scalar is 256 bits; no bits to clear)
+     *       bytes[0] &= bitmask
+     *       sk = OS2IP(bytes)
+     *       if 0 < sk < order: return (sk, sk*G)
+     *
+     * Returns an ECDH CryptoKey private/public pair (imported via JWK)
+     * alongside the raw 32-byte scalar and 65-byte uncompressed public
+     * key. Throws if 256 consecutive candidates are out of range (the
+     * probability is astronomically small).
+     *
+     * `P256.scalarBaseMul` computes sk*G in pure JS since WebCrypto
+     * cannot derive the public point from a known scalar.
+     */
+    async function deriveKeyPair(ikm) {
+        const dkpPrk = await labeledExtract(new Uint8Array(0), KEM_SUITE_ID, 'dkp_prk', ikm);
+        for (let counter = 0; counter < 256; counter += 1) {
+            const cand = await labeledExpand(
+                dkpPrk, KEM_SUITE_ID, 'candidate', new Uint8Array([counter]), 32,
+            );
+            // P-256: bitmask = 0xFF, so no masking is needed. Kept explicit
+            // to match the RFC 9180 pseudocode exactly.
+            cand[0] &= 0xff;
+            const scalar = P256.bytesToBigInt(cand);
+            if (scalar > 0n && scalar < P256.N) {
+                const pubBytes = P256.scalarBaseMul(scalar);
+                const privateKey = await importPrivateKey(cand, pubBytes);
+                const publicKey = await deserializePublicKey(pubBytes);
+                return {
+                    scalar: new Uint8Array(cand),
+                    privateKey,
+                    publicKey,
+                    publicKeyBytes: pubBytes,
+                };
+            }
+        }
+        throw new Error('hpke: DeriveKeyPair exhausted counter');
     }
 
     async function deserializePublicKey(bytes) {
@@ -396,6 +440,7 @@
     return Object.freeze({
         // KEM
         generateKeyPair,
+        deriveKeyPair,
         deserializePublicKey,
         serializePublicKey,
         importPrivateKey,
