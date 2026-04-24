@@ -1,9 +1,9 @@
-# MLS / TreeKEM — implementazione custom
+# MLS / TreeKEM — custom implementation
 
 Branch: `experimental-groups-custom`
 
-Questo branch è dedicato a un'implementazione **da zero** di MLS / TreeKEM,
-senza librerie esterne scaricate, per mantenere il codice più pulito e
-auditabile rispetto a `experimental-groups`.
+This branch is dedicated to a **from-scratch** implementation of MLS / TreeKEM,
+without any downloaded external libraries, to keep the code cleaner and more
+auditable than `experimental-groups`.
 
-Nessun codice ancora: solo placeholder.
+No code yet: placeholder only.
