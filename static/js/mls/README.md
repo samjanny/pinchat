@@ -40,7 +40,9 @@ See [`ciphersuite.js`](ciphersuite.js) for the full profile.
 | [`group-info.js`](group-info.js)         |   ✅   | [`test-mls-welcome.js`](../../../tests/test-mls-welcome.js) (IETF vectors, signature verify) |
 | [`welcome.js`](welcome.js)               |   ✅   | [`test-mls-welcome.js`](../../../tests/test-mls-welcome.js) (IETF vectors, end-to-end decrypt) |
 | [`secret-tree.js`](secret-tree.js)       |   ✅   | [`test-mls-secret-tree.js`](../../../tests/test-mls-secret-tree.js) (IETF vectors, 334 asserts) |
-| [`framing.js`](framing.js)               |   🟡   | [`test-mls-framing.js`](../../../tests/test-mls-framing.js) — application content type only  |
+| [`framing.js`](framing.js)               |   ✅   | [`test-mls-framing.js`](../../../tests/test-mls-framing.js)                                   |
+| [`proposal.js`](proposal.js)             |   ✅   | [`test-mls-proposal.js`](../../../tests/test-mls-proposal.js) (IETF vectors)                  |
+| [`commit.js`](commit.js)                 |   ✅   | [`test-mls-proposal.js`](../../../tests/test-mls-proposal.js) (IETF vectors)                  |
 
 The codec matches RFC 9000 QUIC varint vectors; HKDF-SHA256 matches the
 RFC 5869 §A.1 vector; DHKEM is validated by Encap/Decap symmetry plus HPKE
