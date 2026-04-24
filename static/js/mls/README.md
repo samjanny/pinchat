@@ -34,6 +34,9 @@ See [`ciphersuite.js`](ciphersuite.js) for the full profile.
 | [`ratchet-tree.js`](ratchet-tree.js)     |   ✅   | [`test-mls-ratchet-tree.js`](../../../tests/test-mls-ratchet-tree.js) (IETF vectors)         |
 | [`p256.js`](p256.js)                     |   ✅   | [`test-mls-treekem.js`](../../../tests/test-mls-treekem.js) (WebCrypto round-trip)           |
 | [`tree-kem.js`](tree-kem.js)             |   🟡   | [`test-mls-treekem.js`](../../../tests/test-mls-treekem.js) — path-secret chain only         |
+| [`group-context.js`](group-context.js)   |   ✅   | [`test-mls-key-package.js`](../../../tests/test-mls-key-package.js) (IETF vectors)           |
+| [`key-package.js`](key-package.js)       |   ✅   | [`test-mls-key-package.js`](../../../tests/test-mls-key-package.js) (IETF vectors)           |
+| [`mls-message.js`](mls-message.js)       |   ✅   | [`test-mls-key-package.js`](../../../tests/test-mls-key-package.js)                          |
 
 The codec matches RFC 9000 QUIC varint vectors; HKDF-SHA256 matches the
 RFC 5869 §A.1 vector; DHKEM is validated by Encap/Decap symmetry plus HPKE
