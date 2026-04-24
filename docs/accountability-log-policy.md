@@ -16,6 +16,14 @@
 
 {{OPERATOR_LEGAL_FRAMEWORK_NOTE}}
 
+### 1.1 NIS2 classification
+
+{{OPERATOR_NIS2_NOTE}}
+
+### 1.2 Digital Services Act classification
+
+{{OPERATOR_DSA_NOTE}}
+
 ## 2. Decision on logging
 
 The Service does not ordinarily retain persistent access logs,
@@ -63,6 +71,27 @@ rights to privacy, given:
 
 {{OPERATOR_JUDICIAL_COOPERATION_NOTE}}
 
+### 3.5 Relevant case law
+
+{{OPERATOR_CASE_LAW_NOTE}}
+
+PinChat is designed so that decryption keys remain client-side and
+are not transmitted to the server. Rooms are ephemeral and
+server-side persistence is intentionally minimised. As a result, the
+service is not architected to provide retrospective access to
+plaintext content or to server-side key material that it does not
+possess.
+
+### 3.6 Absence of a general log retention obligation
+
+No general obligation exists under the applicable law of the
+Controller's jurisdiction for a non-telecom, non-ISP service
+operator to routinely retain web access logs. This does not mean
+that log retention would be unlawful — an operator with a
+legitimate, proportionate purpose could retain minimal logs.
+Rather, for this specific Service, no such purpose has been
+identified that would outweigh the data minimisation principle.
+
 ## 4. Alternative measures
 
 In lieu of persistent logging, the following security measures are
@@ -78,7 +107,8 @@ in place:
 - Single-use short-lived JWT tokens for WebSocket upgrade
 - Containerised deployment with non-root privileges and dropped
   Linux capabilities
-- End-to-end encryption of all message content
+- End-to-end encryption of all message content (itself a
+  conformity measure under Art. 21(2)(h) of the NIS2 Directive)
 
 ## 5. Hosting provider caveat
 
