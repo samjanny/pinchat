@@ -41,7 +41,36 @@ const JS_CSS_FILES = [
   '/static/js/pow.js',
   '/static/js/theme.js',
   '/static/js/websocket.js',
-  '/static/js/debug.js'
+  '/static/js/debug.js',
+
+  // MLS / TreeKEM bundle (RFC 9420, ciphersuite 0x0002)
+  // Listed in load order for readability — hashing itself is order-insensitive.
+  '/static/js/mls/codec.js',
+  '/static/js/mls/tree-math.js',
+  '/static/js/mls/p256.js',
+  '/static/js/mls/ciphersuite.js',
+  '/static/js/mls/hpke.js',
+  '/static/js/mls/signature.js',
+  '/static/js/mls/labeled.js',
+  '/static/js/mls/key-schedule.js',
+  '/static/js/mls/transcript-hashes.js',
+  '/static/js/mls/nodes.js',
+  '/static/js/mls/tree-hash.js',
+  '/static/js/mls/ratchet-tree.js',
+  '/static/js/mls/tree-kem.js',
+  '/static/js/mls/group-context.js',
+  '/static/js/mls/key-package.js',
+  '/static/js/mls/mls-message.js',
+  '/static/js/mls/group-info.js',
+  '/static/js/mls/welcome.js',
+  '/static/js/mls/framing.js',
+  '/static/js/mls/proposal.js',
+  '/static/js/mls/commit.js',
+  '/static/js/mls/public-message.js',
+  '/static/js/mls/secret-tree.js',
+  '/static/js/mls/private-message.js',
+  '/static/js/mls/group.js',
+  '/static/js/mls-session.js'
 ];
 
 const HTML_FILES = [

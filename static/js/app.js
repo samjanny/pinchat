@@ -69,6 +69,9 @@ document.addEventListener('alpine:init', () => {
         // bundle and dispatches incoming `mls` envelopes.
         mlsSession: null,
         mlsReady: false,   // true once we've joined (creator after commit, joiner after welcome)
+        // Captured at init() before wsManager.connect() consumes the creator
+        // token from sessionStorage. 'creator' | 'joiner' | null.
+        mlsRole: null,
 
         // ECDH Key Exchange (for 1:1 rooms with PFS)
         identityManager: null,      // Identity key manager used for authenticated handshakes
@@ -99,6 +102,16 @@ document.addEventListener('alpine:init', () => {
             this.initialized = true;
 
             debugLog('Initializing chat room:', this.roomId);
+
+            // Capture MLS role BEFORE wsManager.connect() — the WS layer
+            // clears `ws_token_<roomId>` from sessionStorage on first use
+            // (single-use creator token), so reading it later loses the
+            // creator signal. Note: we capture unconditionally because
+            // `this.roomType` is set later by the server's 'connected'
+            // message; checking it here would always see null.
+            this.mlsRole = sessionStorage.getItem(`ws_token_${this.roomId}`)
+                ? 'creator' : 'joiner';
+            debugLog('[MLS] Role captured at init:', this.mlsRole);
 
             // Initialize emoji picker categories
             if (window.emojiManager) {
@@ -507,17 +520,16 @@ document.addEventListener('alpine:init', () => {
 
         /**
          * Initialise the MLSSession on first use for a group room. Role
-         * is determined by the presence of a creator ws_token in
-         * sessionStorage (same signal homepage.js uses to avoid a second
-         * PoW challenge on the creator path).
+         * was captured at init() time — WebSocketManager.connect() wipes
+         * the ws_token side-channel on first use, so reading it here would
+         * always resolve to 'joiner'.
          *
          * Idempotent — safe to call from 'connected' and 'userjoined'.
          */
         async _ensureMlsSession() {
             if (this.mlsSession) return;
 
-            const creatorTokenKey = `ws_token_${this.roomId}`;
-            const role = sessionStorage.getItem(creatorTokenKey) ? 'creator' : 'joiner';
+            const role = this.mlsRole || 'joiner';
 
             const self = this;
             this.mlsSession = new window.MLSSession({

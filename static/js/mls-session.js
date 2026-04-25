@@ -163,6 +163,9 @@
             const payload = base64UrlDecode(envelope.payload);
             const wireFormat = envelope.wire_format;
 
+            console.log('[MLS] envelope wire_format=', wireFormat,
+                'role=', this.role, 'state=', this._state);
+
             if (wireFormat === MLS.MLSMessage.WireFormat.MLS_KEY_PACKAGE
                 && this.role === 'creator' && this._state === 'awaiting-keypackage') {
                 await this._handleIncomingKeyPackage(payload);
@@ -195,12 +198,23 @@
             }
         }
 
-        async _handleIncomingKeyPackage(mlsMessageBytes) {
-            const frame = MLS.MLSMessage.parseMLSMessage(mlsMessageBytes);
-            const kpBytes = frame.body;
-            const { commitMessage, welcomeMessage } = await this.group.commitAddMember({
-                keyPackageBytes: kpBytes,
-            });
+        async _handleIncomingKeyPackage(kpBytes) {
+            // The envelope payload is the raw KeyPackage body — wire_format
+            // rides as a separate envelope field, so the bytes are NOT wrapped
+            // in MLSMessage framing. Pass them straight to commitAddMember
+            // which calls KeyPackage.parseKeyPackage internally.
+            console.log('[MLS] creator: received KeyPackage (', kpBytes.length, 'bytes), committing Add…');
+            let commitMessage, welcomeMessage;
+            try {
+                ({ commitMessage, welcomeMessage } = await this.group.commitAddMember({
+                    keyPackageBytes: kpBytes,
+                }));
+            } catch (err) {
+                console.error('[MLS] commitAddMember failed:', err);
+                this.onEvent({ kind: 'error', reason: `commitAddMember failed: ${err.message}` });
+                return;
+            }
+            console.log('[MLS] creator: Add committed, broadcasting Commit + Welcome');
             const ratchetTreeBytes = MLS.Nodes.ratchetTreeBytes(this.group.ratchetTree);
 
             // Broadcast commit + welcome. We ship the ratchet_tree as a
