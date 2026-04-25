@@ -116,6 +116,28 @@ loss-of-access.
   `Update` commits (member-initiated key rotation without membership
   change) are not yet implemented; PCS therefore advances on every
   Add/Remove rather than on a separate cadence.
+- **Joiner-side transcript-hash re-derivation (RFC §5.3).** A new
+  joiner cannot independently re-derive
+  `confirmed_transcript_hash[n]` because they don't have
+  `interim_transcript_hash[n-1]` — that depends on the prior epoch's
+  state, which they never observed. The joiner therefore TRUSTS the
+  CTH carried in the GroupInfo, gated only by the M-1 binding
+  (`GroupInfo.signer === Commit.sender`). A creator that equivocates
+  by sending different CTH values to members vs. joiners will be
+  detected at the next Commit's transcript-hash chaining, but not at
+  Welcome time. This is a fundamental limitation of MLS Welcome.
+- **Constant-time HMAC compare.** `verifyMembershipTag` and the
+  `confirmation_tag` check use byte-XOR/OR loops that are
+  intent-constant-time but JS engines and JIT make zero guarantees.
+  WebCrypto offers no `timingSafeEqual` in browsers; this is
+  unfixable without a native primitive. Practical exploitation
+  requires sub-microsecond timing over a noisy network.
+- **Replay state across page reload.** `consumedByLeaf` lives in
+  memory only. On reload, the user re-establishes the MLS session
+  with a fresh KeyPackage → fresh Welcome → fresh epoch state, so
+  the previous epoch's `(leaf, generation)` tuples become irrelevant
+  (the encryption_secret has changed). Replay across reload is moot
+  in our architecture because we don't survive reloads, we re-join.
 - **Tree pruning.** After `Remove`, the target leaf and its direct
   path are blanked but the tree width (`nLeaves`) is not trimmed. A
   subsequent `Add` will fill the next free slot to the right of the

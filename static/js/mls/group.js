@@ -1298,6 +1298,7 @@
     Group.joinFromWelcomeWithTree = async function joinFromWelcomeWithTree({
         welcomeMessage, keyPackageBytes, initPrivateKey, identity,
         leafEncKeyPair, ratchetTreeBytes, pskSecret,
+        expectedSignerLeafIndex,
     }) {
         const psk = pskSecret || new Uint8Array(HPKE.Nh);
         if (psk.length !== HPKE.Nh) {
@@ -1357,6 +1358,19 @@
             || signerLeafIndex >= nLeaves) {
             throw new Error(
                 `group.join: signer leaf_index ${signerLeafIndex} out of range [0,${nLeaves})`,
+            );
+        }
+        // M-1 (RFC §12.4.3.1): GroupInfo MUST be signed by the
+        // member that committed the epoch this Welcome introduces.
+        // The orchestrator extracts the Commit's FramedContent
+        // sender_leaf_index and passes it as expectedSignerLeafIndex;
+        // a null value means the orchestrator couldn't observe a
+        // Commit (degraded mode) and the binding is not enforced.
+        if (expectedSignerLeafIndex !== null
+            && expectedSignerLeafIndex !== undefined
+            && expectedSignerLeafIndex !== signerLeafIndex) {
+            throw new Error(
+                `group.join: GroupInfo.signer ${signerLeafIndex} != Commit sender ${expectedSignerLeafIndex}`,
             );
         }
         const signerLeaf = RatchetTree.leafFor(tree, signerLeafIndex);

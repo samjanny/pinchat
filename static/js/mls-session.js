@@ -165,6 +165,15 @@
             // key can neither construct nor consume valid Welcomes/Commits
             // even if they reach the relay first.
             this.pskSecret = pskSecret || null;
+            // Buffered Commit envelope while we're in 'awaiting-welcome'.
+            // The committer broadcasts Commit + Welcome atomically; we
+            // ignore the Commit while we don't yet have a group state,
+            // but capturing it lets us bind groupInfo.signer to the
+            // Commit's FramedContent sender_leaf_index when the Welcome
+            // arrives (RFC §12.4.3.1). Without this binding, a creator
+            // who commits and signs a forged GroupInfo claiming a
+            // different leaf "minted" the epoch would go undetected.
+            this._pendingCommitBytes = null;
             // Per-sender_id → leafIndex map maintained by the creator.
             // We commit at most one KeyPackage per WebSocket sender_id;
             // a second KeyPackage from the same sender (or a sender
@@ -262,11 +271,16 @@
             // Existing members (creator or already-joined joiners) process
             // incoming Commit broadcasts to advance their epoch state.
             // The creator filters their own echoes upstream via sender_id;
-            // joiners-still-awaiting-welcome ignore commits because their
-            // group state isn't built yet (Welcome is the catch-up path).
+            // joiners-still-awaiting-welcome buffer the most recent Commit
+            // so the Welcome handler can bind groupInfo.signer to it.
             if (wireFormat === MLS.MLSMessage.WireFormat.MLS_PUBLIC_MESSAGE
                 && this._state === 'joined') {
                 await this._handleIncomingCommit(payload);
+                return;
+            }
+            if (wireFormat === MLS.MLSMessage.WireFormat.MLS_PUBLIC_MESSAGE
+                && this.role === 'joiner' && this._state === 'awaiting-welcome') {
+                this._pendingCommitBytes = payload;
                 return;
             }
 
@@ -327,6 +341,44 @@
             const wrapped = MLS.MLSMessage.serializeMLSMessage(
                 MLS.MLSMessage.WireFormat.MLS_WELCOME, mlsMessageBytes,
             );
+
+            // M-1 (RFC §12.4.3.1): bind GroupInfo.signer to the
+            // FramedContent sender of the Commit that produced this
+            // epoch. Extract the Commit's sender_leaf_index from the
+            // buffered PublicMessage and pass it to the join routine.
+            // Without a buffered Commit we degrade to "not enforced" —
+            // valid for our creator-only architecture today, since the
+            // creator's leaf signs both, but the binding becomes
+            // load-bearing when Update / non-creator commits land.
+            let expectedSignerLeafIndex = null;
+            if (this._pendingCommitBytes) {
+                try {
+                    const commitWrapped = MLS.MLSMessage.serializeMLSMessage(
+                        MLS.MLSMessage.WireFormat.MLS_PUBLIC_MESSAGE,
+                        this._pendingCommitBytes,
+                    );
+                    const frame = MLS.MLSMessage.parseMLSMessage(commitWrapped);
+                    const pm = MLS.PublicMessage.parsePublicMessage(
+                        frame.body,
+                        (decoder, ct) => {
+                            // We only need the FramedContent header; skip
+                            // body parsing by returning an opaque object.
+                            if (ct === MLS.Framing.ContentType.COMMIT) return null;
+                            return null;
+                        },
+                    );
+                    if (pm.content && pm.content.sender
+                        && pm.content.sender.senderType === MLS.Framing.SenderType.MEMBER) {
+                        expectedSignerLeafIndex = pm.content.sender.leafIndex;
+                    }
+                } catch (err) {
+                    console.warn('[MLS] failed to extract Commit sender_leaf_index:', err);
+                    // Don't fail the join — leave expectedSignerLeafIndex
+                    // null so the binding check is skipped (degraded mode).
+                }
+                this._pendingCommitBytes = null;
+            }
+
             this.group = await MLS.Group.Group.joinFromWelcomeWithTree({
                 welcomeMessage: wrapped,
                 keyPackageBytes: this.keyPackageBundle.keyPackageBytes,
@@ -335,6 +387,7 @@
                 leafEncKeyPair: this.keyPackageBundle.leafEncKeyPair,
                 ratchetTreeBytes,
                 pskSecret: this.pskSecret,
+                expectedSignerLeafIndex,
             });
             this._state = 'joined';
             this.onEvent({ kind: 'joined' });

@@ -415,6 +415,44 @@ async function main() {
         assert(threwNoPsk, 'absent PSK rejected when creator bound a non-zero PSK');
     }
 
+    // ---- M-1: GroupInfo.signer must match Commit sender (RFC §12.4.3.1) ----
+    console.log('# GroupInfo.signer ↔ Commit sender binding');
+    {
+        const aliceM1 = await Group.Group.create({ identity: await freshIdentity() });
+        const bobM1 = await buildKeyPackage();
+        const r = await aliceM1.commitAddMember({ keyPackageBytes: bobM1.keyPackageBytes });
+        const treeM1 = Nodes.ratchetTreeBytes(aliceM1.ratchetTree);
+
+        // Matching signer (alice's leaf 0 commits + signs GroupInfo): OK.
+        const okGroup = await Group.Group.joinFromWelcomeWithTree({
+            welcomeMessage: r.welcomeMessage,
+            keyPackageBytes: bobM1.keyPackageBytes,
+            initPrivateKey: bobM1.initKp.privateKey,
+            identity: bobM1.identity,
+            leafEncKeyPair: bobM1.leafEncKp,
+            ratchetTreeBytes: treeM1,
+            expectedSignerLeafIndex: 0,
+        });
+        assert(okGroup.epoch === 1n, 'matching expectedSignerLeafIndex accepted');
+
+        // Mismatched signer: rejected with explicit error.
+        let mismatchThrew = false;
+        let mismatchErr = '';
+        try {
+            await Group.Group.joinFromWelcomeWithTree({
+                welcomeMessage: r.welcomeMessage,
+                keyPackageBytes: bobM1.keyPackageBytes,
+                initPrivateKey: bobM1.initKp.privateKey,
+                identity: bobM1.identity,
+                leafEncKeyPair: bobM1.leafEncKp,
+                ratchetTreeBytes: treeM1,
+                expectedSignerLeafIndex: 99,
+            });
+        } catch (err) { mismatchThrew = true; mismatchErr = err.message; }
+        assert(mismatchThrew && mismatchErr.includes('GroupInfo.signer'),
+            'mismatched expectedSignerLeafIndex rejected', mismatchErr);
+    }
+
     // ---- Replay rejection ------------------------------------------------
     // After a (leafIndex, generation) tuple has been consumed, a second
     // attempt to decrypt the same ciphertext within the same epoch must
