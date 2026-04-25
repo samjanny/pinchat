@@ -45,7 +45,7 @@ See [`ciphersuite.js`](ciphersuite.js) for the full profile.
 | [`commit.js`](commit.js)                 |   ✅   | [`test-mls-proposal.js`](../../../tests/test-mls-proposal.js) (IETF vectors)                  |
 | [`public-message.js`](public-message.js) |   ✅   | [`test-mls-public-message.js`](../../../tests/test-mls-public-message.js) (IETF end-to-end)   |
 | [`private-message.js`](private-message.js) | ✅   | [`test-mls-private-message.js`](../../../tests/test-mls-private-message.js) (IETF end-to-end) |
-| [`group.js`](group.js)                   |   ✅   | [`test-mls-group.js`](../../../tests/test-mls-group.js) + [`test-mls-group-add.js`](../../../tests/test-mls-group-add.js) + [`test-mls-group-add-3leaf.js`](../../../tests/test-mls-group-add-3leaf.js) (N-leaf end-to-end) |
+| [`group.js`](group.js)                   |   ✅   | [`test-mls-group.js`](../../../tests/test-mls-group.js) + [`test-mls-group-add.js`](../../../tests/test-mls-group-add.js) + [`test-mls-group-add-3leaf.js`](../../../tests/test-mls-group-add-3leaf.js) + [`test-mls-group-remove.js`](../../../tests/test-mls-group-remove.js) (N-leaf Add/Remove + PSK binding) |
 
 The codec matches RFC 9000 QUIC varint vectors; HKDF-SHA256 matches the
 RFC 5869 §A.1 vector; DHKEM is validated by Encap/Decap symmetry plus HPKE
@@ -62,16 +62,32 @@ The browser-facing flow runs entirely over MLS for group rooms:
   Creator commits each new member; existing members apply incoming Commits
   via `Group.processCommit`, walking the UpdatePath from the LCA up to root
   and storing parent keypairs for subsequent epochs.
+- **Remove** commits invoked by the creator on `userleft` blank the
+  departing member's leaf and its full direct path, then re-key the
+  committer's path. The removed member's stale state cannot decrypt
+  any subsequent epoch traffic. `processCommit` surfaces a distinct
+  `removed from group` error if our own leaf was blanked.
+- **Bootstrap-key binding via PSK.** The URL fragment is HKDF-derived
+  into a 32-byte PSK that's injected into every epoch transition
+  (`KeySchedule.deriveEpoch.pskSecret` and `Welcome.deriveWelcomeSecret`).
+  A joiner without the URL key fails the Welcome AEAD tag and never
+  reaches GroupInfo, so the relay cannot bootstrap an attacker-only
+  group inside a victim's room.
 - The orchestrator (`mls-session.js`) tags every application payload with
   one byte (`0x01` text / `0x02` image), so images travel the same MLS
-  path as text without falling back to the 1:1 Double Ratchet.
+  path as text without falling back to the 1:1 Double Ratchet. KeyPackages
+  are bound to the relay's `sender_id` (one leaf per WebSocket sender)
+  and incoming application messages reject duplicate `(leaf, generation)`
+  tuples within an epoch.
 - The Rust server stays a blind relay: it forwards a single `mls`
   envelope kind with `wire_format` and an optional `ratchet_tree`
   side-channel, never inspecting the body.
 
-Verified by `tests/test-mls-group-add-3leaf.js`: a 4-member group is
-built one member at a time; every (sender → receiver) pair exchanges
-text application messages at every epoch.
+Verified by `tests/test-mls-group-add-3leaf.js` (N-leaf Add) and
+`tests/test-mls-group-remove.js` (Remove + post-remove Add). Together
+these exercise PSK rejection, replay rejection, group_id mismatch,
+KeyPackage tamper rejection, removal-blanks-leaf, and removed-member
+loss-of-access.
 
 ## Known gaps (post-MVP)
 
@@ -95,18 +111,15 @@ text application messages at every epoch.
   scenario the filter collapses to the full path (every parent on the
   creator's direct path has at least one non-blank receiver subtree),
   so the wire bytes are byte-identical in practice.
-- **Update / Remove proposals.** Only `Add` is wired through. PCS
-  currently happens at every join (the whole tree re-keys); periodic
-  `Update` commits and explicit `Remove` for departing members are not
-  implemented. A member who leaves the room therefore retains the
-  current epoch's secrets until the next `Add` re-keys the tree.
-- **Bootstrap-key binding.** The URL fragment key authenticates the
-  1:1 ratchet path but is *not* injected into the MLS key schedule
-  (e.g. as a PSK). For group rooms, MLS authentication relies on the
-  joiner's KeyPackage signature alone — the relay cannot tamper with
-  it, but it could in principle let an off-list attacker who reaches
-  the room before legitimate participants race a Welcome of their
-  own. PSK-binding the URL fragment is the planned hardening.
+- **Update proposals.** `Add` and `Remove` are wired through end-to-end
+  with tree blanking and re-keying on the committer's path. Periodic
+  `Update` commits (member-initiated key rotation without membership
+  change) are not yet implemented; PCS therefore advances on every
+  Add/Remove rather than on a separate cadence.
+- **Tree pruning.** After `Remove`, the target leaf and its direct
+  path are blanked but the tree width (`nLeaves`) is not trimmed. A
+  subsequent `Add` will fill the next free slot to the right of the
+  blank, growing the tree rather than reusing the blanked index.
 - **Proposal-by-reference.** All proposals travel inline inside their
   Commit; the proposal store + RefHash dispatch is not wired.
 - **`ratchet_tree` GroupInfo extension.** The new joiner currently

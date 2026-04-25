@@ -373,6 +373,17 @@ document.addEventListener('alpine:init', () => {
                         this.groupPeers = this.groupPeers.filter(
                             (p) => p.userId !== message.user_id,
                         );
+                        // Creator-only: emit an MLS Remove commit so the
+                        // departing peer's epoch keys are invalidated.
+                        // The session ignores the call when we never had
+                        // a leaf for this sender, when we're the joiner,
+                        // or when we haven't joined yet.
+                        if (this.mlsSession) {
+                            this.mlsSession.removeMemberBySenderId(message.user_id)
+                                .catch((err) => console.error(
+                                    '[MLS] removeMemberBySenderId failed:', err,
+                                ));
+                        }
                     }
 
                     // When participant count drops below 2, cleanup ECDH state
@@ -561,11 +572,25 @@ document.addEventListener('alpine:init', () => {
 
             const role = this.mlsRole || 'joiner';
 
+            // Bind MLS to the URL invite fragment via the derived PSK.
+            // Without this, MLS would happily admit any party who can
+            // talk to the relay; with it, the AES-GCM tag on every
+            // Welcome and the commit_secret derivation depend on the
+            // joiner having the same fragment as the creator.
+            const pskSecret = window.cryptoManager
+                ? window.cryptoManager.mlsPskSecret
+                : null;
+            if (!pskSecret) {
+                this.error = '⚠️ MLS bootstrap PSK missing — cannot start group session securely';
+                return;
+            }
+
             const self = this;
             this.mlsSession = new window.MLSSession({
                 role,
                 send: (envelope) => self.wsManager.send(envelope),
                 onEvent: (event) => self._handleMlsEvent(event),
+                pskSecret,
             });
             try {
                 await this.mlsSession.start();
@@ -624,8 +649,13 @@ document.addEventListener('alpine:init', () => {
                     break;
                 }
                 case 'commit-applied':
-                    // No UI surface yet — keep silent. The participant
-                    // count update below already reflects the new member.
+                    if (event.removedLeafIndex !== null
+                        && event.removedLeafIndex !== undefined) {
+                        this.addSystemMessage('🔁 A participant was removed; group re-keyed');
+                    }
+                    break;
+                case 'remove-committed':
+                    this.addSystemMessage('🔁 Group re-keyed (departing member removed)');
                     break;
                 case 'error':
                     console.error('[MLS]', event.reason);

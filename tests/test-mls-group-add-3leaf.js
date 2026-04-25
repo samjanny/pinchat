@@ -252,6 +252,67 @@ async function main() {
         assert(threw2, 'tampered KeyPackage signature rejected');
     }
 
+    // ---- Bootstrap-PSK binding -------------------------------------------
+    // A joiner whose PSK doesn't match the creator's MUST fail Welcome
+    // decryption. This is the URL-fragment binding: relay or any party
+    // who lacks the URL key cannot construct or open a valid Welcome.
+    console.log('# Bootstrap-PSK binding');
+    {
+        const psk = new Uint8Array(32);
+        for (let i = 0; i < 32; i += 1) psk[i] = i + 1;
+        const wrongPsk = new Uint8Array(32);
+        for (let i = 0; i < 32; i += 1) wrongPsk[i] = (i + 1) ^ 0xFF;
+
+        const aliceX = await Group.Group.create({
+            identity: await freshIdentity(), pskSecret: psk,
+        });
+        const bobKp = await buildKeyPackage();
+        const rX = await aliceX.commitAddMember({ keyPackageBytes: bobKp.keyPackageBytes });
+        const tx = Nodes.ratchetTreeBytes(aliceX.ratchetTree);
+
+        // Sanity: matching PSK joins fine.
+        const bobOk = await Group.Group.joinFromWelcomeWithTree({
+            welcomeMessage: rX.welcomeMessage,
+            keyPackageBytes: bobKp.keyPackageBytes,
+            initPrivateKey: bobKp.initKp.privateKey,
+            identity: bobKp.identity,
+            leafEncKeyPair: bobKp.initKp,
+            ratchetTreeBytes: tx,
+            pskSecret: psk,
+        });
+        assert(bobOk.epoch === 1n, 'matching PSK joins (sanity)');
+
+        // Wrong PSK → Welcome AEAD tag fails.
+        let threwPsk = false;
+        try {
+            await Group.Group.joinFromWelcomeWithTree({
+                welcomeMessage: rX.welcomeMessage,
+                keyPackageBytes: bobKp.keyPackageBytes,
+                initPrivateKey: bobKp.initKp.privateKey,
+                identity: bobKp.identity,
+                leafEncKeyPair: bobKp.initKp,
+                ratchetTreeBytes: tx,
+                pskSecret: wrongPsk,
+            });
+        } catch (_) { threwPsk = true; }
+        assert(threwPsk, 'wrong PSK rejected by Welcome decryption');
+
+        // Default (no PSK passed) → also fails when creator used a non-zero PSK.
+        let threwNoPsk = false;
+        try {
+            await Group.Group.joinFromWelcomeWithTree({
+                welcomeMessage: rX.welcomeMessage,
+                keyPackageBytes: bobKp.keyPackageBytes,
+                initPrivateKey: bobKp.initKp.privateKey,
+                identity: bobKp.identity,
+                leafEncKeyPair: bobKp.initKp,
+                ratchetTreeBytes: tx,
+                // pskSecret omitted → defaults to zeros, which mismatches `psk`
+            });
+        } catch (_) { threwNoPsk = true; }
+        assert(threwNoPsk, 'absent PSK rejected when creator bound a non-zero PSK');
+    }
+
     // ---- Replay rejection ------------------------------------------------
     // After a (leafIndex, generation) tuple has been consumed, a second
     // attempt to decrypt the same ciphertext within the same epoch must

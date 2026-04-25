@@ -356,9 +356,36 @@ class ChainRatchet {
     }
 }
 
+/**
+ * Derive a 32-byte MLS PSK from the raw URL-fragment bytes via HKDF-SHA256.
+ *   salt = empty (RFC 5869 default — IKM is already 256 bits of entropy)
+ *   info = "PinChat MLS PSK v1" (domain-separation label per RFC 5869 §3.2)
+ *
+ * Per RFC 5869 the `info` field is the canonical domain-separator across
+ * different uses of the same IKM; salts are intended to amplify low-entropy
+ * IKM. Our IKM is a freshly-generated 256-bit key, so an empty salt is
+ * appropriate.
+ *
+ * The output is independent of the AES-GCM key the 1:1 ratchet uses, so
+ * exposing it as `cryptoManager.mlsPskSecret` doesn't degrade the AES-GCM
+ * key's strength. It's the MLS-side binding to the URL invite secret.
+ */
+async function deriveMlsPsk(rawKeyBytes) {
+    const info = new TextEncoder().encode('PinChat MLS PSK v1');
+    const ikm = await crypto.subtle.importKey(
+        'raw', rawKeyBytes, { name: 'HKDF' }, false, ['deriveBits'],
+    );
+    const bits = await crypto.subtle.deriveBits(
+        { name: 'HKDF', hash: 'SHA-256', salt: new Uint8Array(0), info },
+        ikm, 256,
+    );
+    return new Uint8Array(bits);
+}
+
 class CryptoManager {
     constructor() {
         this.key = null;                  // Bootstrap key (from URL)
+        this.mlsPskSecret = null;         // 32-byte PSK derived from URL key for MLS
         this.sessionKey = null;           // ECDH-derived session key (DEPRECATED - use chain ratchet)
         this.algorithm = {
             name: 'AES-GCM',
@@ -454,6 +481,15 @@ class CryptoManager {
                 false,  // Non-extractable: prevents key theft even if XSS occurs
                 ['encrypt', 'decrypt']
             );
+
+            // Derive a 32-byte PSK from the URL fragment for the MLS key
+            // schedule. We HKDF-Extract with a domain-separation salt so
+            // this output is independent of the AES-GCM key used by the
+            // 1:1 ratchet path. Without this, a relay (or any party who
+            // can talk to the room before legitimate joiners) could
+            // bootstrap their own MLS group inside the same room, since
+            // MLS itself doesn't otherwise know the URL fragment exists.
+            this.mlsPskSecret = await deriveMlsPsk(keyBuffer);
 
             debugLog('✅ Encryption key loaded successfully');
             return this.key;
@@ -836,6 +872,10 @@ class CryptoManager {
     deleteBootstrapKey() {
         debugLog('[CRYPTO] Dropping bootstrap key reference (v1 hardening)');
         this.key = null;
+        if (this.mlsPskSecret) {
+            this.mlsPskSecret.fill(0);
+            this.mlsPskSecret = null;
+        }
     }
 
     /**

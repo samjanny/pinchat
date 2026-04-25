@@ -128,6 +128,11 @@ const TEST_SUITES = {
         name: 'MLS Group N-leaf flow (processCommit + multi-Add)',
         file: 'test-mls-group-add-3leaf.js',
         description: 'Sequential adds up to 4 members; existing members process Commit'
+    },
+    'mls-group-remove': {
+        name: 'MLS Group Remove flow',
+        file: 'test-mls-group-remove.js',
+        description: 'Remove proposal + tree blanking; removed member loses access'
     }
 };
 

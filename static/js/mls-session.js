@@ -138,7 +138,7 @@
          * @param {(envelope: object) => void} opts.send
          * @param {(event: object) => void} opts.onEvent
          */
-        constructor({ role, send, onEvent }) {
+        constructor({ role, send, onEvent, pskSecret }) {
             if (role !== 'creator' && role !== 'joiner') {
                 throw new Error(`mls-session: invalid role "${role}"`);
             }
@@ -149,6 +149,12 @@
             this.identity = null;
             this.keyPackageBundle = null;
             this._state = 'idle';
+            // 32-byte PSK derived from the URL invite fragment. Bound into
+            // every epoch transition (Group.create, joinFromWelcomeWithTree,
+            // commitAddMember, processCommit) so a party without the URL
+            // key can neither construct nor consume valid Welcomes/Commits
+            // even if they reach the relay first.
+            this.pskSecret = pskSecret || null;
             // Per-sender_id → leafIndex map maintained by the creator.
             // We commit at most one KeyPackage per WebSocket sender_id;
             // a second KeyPackage from the same sender (or a sender
@@ -170,7 +176,10 @@
             if (this.role === 'creator') {
                 const id = await this._freshIdentity();
                 this.identity = id;
-                this.group = await MLS.Group.Group.create({ identity: id });
+                this.group = await MLS.Group.Group.create({
+                    identity: id,
+                    pskSecret: this.pskSecret,
+                });
                 this._state = 'awaiting-keypackage';
             } else {
                 const bundle = await buildKeyPackage();
@@ -315,6 +324,7 @@
                 identity: this.identity,
                 leafEncKeyPair: this.keyPackageBundle.initKeyPair,
                 ratchetTreeBytes,
+                pskSecret: this.pskSecret,
             });
             this._state = 'joined';
             this.onEvent({ kind: 'joined' });
@@ -408,6 +418,39 @@
          */
         async sendImage(imageBytes, mimeType) {
             await this._sendApplicationPayload(encodeImagePayload(imageBytes, mimeType));
+        }
+
+        /**
+         * Creator-only: emit a Remove commit for a peer that left the
+         * room. Bound to a sender_id from the relay so we can map the
+         * disconnected peer to their leaf index. Silently no-ops if we
+         * never saw a KeyPackage from this sender (the peer was the
+         * creator's own previous tab, or never published a KP).
+         */
+        async removeMemberBySenderId(senderId) {
+            if (this.role !== 'creator') return;
+            if (this._state !== 'joined') return;
+            if (!this._leafBySenderId.has(senderId)) return;
+            const leafIndex = this._leafBySenderId.get(senderId);
+            this._leafBySenderId.delete(senderId);
+
+            let commitMessage;
+            try {
+                ({ commitMessage } = await this.group.commitRemoveMember({
+                    removedLeafIndex: leafIndex,
+                }));
+            } catch (err) {
+                console.error('[MLS] commitRemoveMember failed:', err);
+                this.onEvent({ kind: 'error',
+                    reason: `commitRemoveMember failed: ${err.message}` });
+                return;
+            }
+            this.send({
+                type: 'mls',
+                payload: base64UrlEncode(stripMlsWrapper(commitMessage)),
+                wire_format: MLS.MLSMessage.WireFormat.MLS_PUBLIC_MESSAGE,
+            });
+            this.onEvent({ kind: 'remove-committed', removedLeafIndex: leafIndex });
         }
 
         async _sendApplicationPayload(payloadBytes) {

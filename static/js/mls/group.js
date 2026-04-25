@@ -161,7 +161,7 @@
          *                         Credential(basic) field (defaults to
          *                         signaturePublicKeyBytes)
          */
-        static async create({ identity, groupId, credentialIdentity }) {
+        static async create({ identity, groupId, credentialIdentity, pskSecret }) {
             const gid = groupId || randomBytes(32);
             const encKeyPair = await HPKE.generateKeyPair();
 
@@ -180,6 +180,16 @@
             const treeHashBytes = await TreeHash.hashRoot(ratchetTree);
             const initSecret = randomBytes(HPKE.Nh);
 
+            // PSK injected into every epoch transition. Defaults to zeros
+            // for backwards compatibility / unit tests; for production we
+            // derive it from the URL fragment so an attacker without the
+            // invite cannot craft a valid Welcome or Commit even with a
+            // compromised relay.
+            const psk = pskSecret || new Uint8Array(HPKE.Nh);
+            if (psk.length !== HPKE.Nh) {
+                throw new Error(`group: pskSecret must be ${HPKE.Nh} bytes (got ${psk.length})`);
+            }
+
             const state = {
                 cipherSuite: CIPHERSUITE,
                 groupId: gid,
@@ -193,16 +203,18 @@
                 interimTranscriptHash: new Uint8Array(0),
                 confirmedTranscriptHash: new Uint8Array(0),
                 treeHash: treeHashBytes,
+                pskSecret: psk,
             };
             const group = new Group(state);
 
-            // Derive epoch 0 secrets. commit_secret and psk_secret are
-            // zero for the initial epoch; init_secret_[-1] is freshly
-            // random as §12.3 prescribes.
+            // Derive epoch 0 secrets. commit_secret is zero for the
+            // initial epoch (no UpdatePath has run yet); init_secret_[-1]
+            // is freshly random as §12.3 prescribes. psk_secret carries
+            // the URL-fragment binding when set.
             await group._deriveEpoch({
                 initSecretPrev: initSecret,
                 commitSecret: new Uint8Array(HPKE.Nh),
-                pskSecret: new Uint8Array(HPKE.Nh),
+                pskSecret: psk,
             });
             return group;
         }
@@ -583,7 +595,7 @@
         const epochSecrets = await KeySchedule.deriveEpoch({
             initSecretPrev: this.epochSecrets.initSecret,
             commitSecret: await TreeKEM.commitSecret(rootChainEntry.pathSecret),
-            pskSecret: new Uint8Array(HPKE.Nh),
+            pskSecret: this.pskSecret,
             groupContext: epochGroupContextBytes,
         });
 
@@ -620,7 +632,7 @@
         const giBytes = GroupInfo.groupInfoBytes(groupInfo);
 
         const welcomeSecret = await Welcome.deriveWelcomeSecret(
-            epochSecrets.joinerSecret, new Uint8Array(HPKE.Nh),
+            epochSecrets.joinerSecret, this.pskSecret,
         );
         const { key: wKey, nonce: wNonce } = await Welcome.welcomeKeyNonce(welcomeSecret);
         const encryptedGroupInfo = await Welcome.sealEncryptedGroupInfo(wKey, wNonce, giBytes);
@@ -695,20 +707,237 @@
     };
 
     /**
+     * Commit a Remove proposal: blank the target leaf, blank every
+     * parent on its direct path, then re-key the committer's direct
+     * path so the removed member can no longer derive any subsequent
+     * epoch secret. Returns { commitMessage } (no Welcome — Remove
+     * doesn't admit anyone). The removed leaf's index slot stays in
+     * place (we don't prune the tree); other members converge to the
+     * same blanked-tree shape via processCommit.
+     */
+    Group.prototype.commitRemoveMember = async function commitRemoveMember({ removedLeafIndex }) {
+        if (typeof removedLeafIndex !== 'number' || removedLeafIndex < 0
+            || removedLeafIndex >= this.nLeaves) {
+            throw new Error(`commitRemoveMember: invalid leaf_index ${removedLeafIndex}`);
+        }
+        if (removedLeafIndex === this.myLeafIndex) {
+            throw new Error('commitRemoveMember: cannot remove self');
+        }
+        const removedLeafNode = TreeMath.leafToNode(removedLeafIndex);
+        if (!this.ratchetTree[removedLeafNode]
+            || this.ratchetTree[removedLeafNode].nodeType !== Nodes.NodeType.LEAF) {
+            throw new Error(`commitRemoveMember: leaf ${removedLeafIndex} already blank or non-leaf`);
+        }
+
+        // ---- 1. Build new tree: blank the removed leaf and its ancestors ----
+        const newNLeaves = this.nLeaves;
+        const newWidth = TreeMath.nodeWidth(newNLeaves);
+        const newTree = Nodes.padRatchetTree(this.ratchetTree.slice(), newWidth);
+        newTree[removedLeafNode] = null;
+        const removedDirectPath = TreeMath.directPathWithRoot(removedLeafNode, newNLeaves);
+        for (const nodeIdx of removedDirectPath) {
+            newTree[nodeIdx] = null;
+        }
+
+        // ---- 2. Generate fresh leaf_secret + path-secret chain for committer ----
+        const leafSecret = randomBytes(HPKE.Nh);
+        const leafNodePair = await TreeKEM.leafKeyPairFromSecret(leafSecret, this.myLeafIndex);
+        const chain = await TreeKEM.pathSecretChain(leafSecret, this.myLeafIndex, newNLeaves);
+        const committerDirectPath = TreeMath.directPathWithRoot(
+            TreeMath.leafToNode(this.myLeafIndex), newNLeaves,
+        );
+        if (chain.length !== committerDirectPath.length) {
+            throw new Error(
+                `commitRemoveMember: chain length ${chain.length} != direct path ${committerDirectPath.length}`,
+            );
+        }
+
+        // ---- 3. Build NEW committer leaf (commit-source) ----
+        const committerNewLeafPreSign = buildSelfLeaf({
+            encryptionKeyBytes: leafNodePair.keyPair.publicKeyBytes,
+            signatureKeyBytes: this.identity.signaturePublicKeyBytes,
+            credentialIdentity: this.identity.signaturePublicKeyBytes,
+            leafNodeSource: Nodes.LeafNodeSource.COMMIT,
+        });
+        committerNewLeafPreSign.parentHash = new Uint8Array(0);
+        committerNewLeafPreSign.signature = await signLeafNodeInCommit(
+            this.identity.signaturePrivateKey,
+            committerNewLeafPreSign,
+            this.groupId,
+            this.myLeafIndex,
+        );
+        newTree[TreeMath.leafToNode(this.myLeafIndex)] = {
+            nodeType: Nodes.NodeType.LEAF, leaf: committerNewLeafPreSign,
+        };
+
+        // ---- 4. Set new parent encryption_keys on committer's direct path ----
+        for (let i = 0; i < committerDirectPath.length; i += 1) {
+            newTree[committerDirectPath[i]] = {
+                nodeType: Nodes.NodeType.PARENT,
+                parent: {
+                    encryptionKey: chain[i].keyPair.publicKeyBytes,
+                    parentHash: new Uint8Array(0),
+                    unmergedLeaves: [],
+                },
+            };
+        }
+
+        // ---- 5. New tree hash + provisional GroupContext ----
+        const newTreeHash = await TreeHash.hashRoot(newTree);
+        const newEpoch = this.epoch + 1n;
+        const provisionalGroupContext = {
+            version: PROTOCOL_VERSION,
+            cipherSuite: CIPHERSUITE,
+            groupId: this.groupId,
+            epoch: newEpoch,
+            treeHash: newTreeHash,
+            confirmedTranscriptHash: this.confirmedTranscriptHash,
+            extensions: [],
+        };
+        const provisionalGroupContextBytes =
+            GroupContext.groupContextBytes(provisionalGroupContext);
+
+        // ---- 6. Encrypt path_secrets to filtered resolution(copath_sibling) ----
+        // The removed leaf is now blank, so it naturally falls out of every
+        // resolution that would have included it. The remaining members in
+        // the copath subtree still receive their share.
+        const updatePathNodes = [];
+        for (let i = 0; i < committerDirectPath.length; i += 1) {
+            const childOnPath = i === 0
+                ? TreeMath.leafToNode(this.myLeafIndex)
+                : committerDirectPath[i - 1];
+            const copathSibling = TreeMath.sibling(childOnPath, newNLeaves);
+            const res = RatchetTree.resolution(newTree, copathSibling);
+            const ciphertexts = [];
+            for (const targetNode of res) {
+                const targetSlot = newTree[targetNode];
+                if (!targetSlot) {
+                    throw new Error(
+                        `commitRemoveMember: resolution target ${targetNode} unexpectedly blank`,
+                    );
+                }
+                const encKey = targetSlot.nodeType === Nodes.NodeType.LEAF
+                    ? targetSlot.leaf.encryptionKey
+                    : targetSlot.parent.encryptionKey;
+                const { kemOutput, ciphertext } = await Labeled.encryptWithLabel(
+                    encKey, 'UpdatePathNode',
+                    provisionalGroupContextBytes, chain[i].pathSecret,
+                );
+                ciphertexts.push({ kemOutput, ciphertext });
+            }
+            updatePathNodes.push({
+                encryptionKey: chain[i].keyPair.publicKeyBytes,
+                encryptedPathSecret: ciphertexts,
+            });
+        }
+        const updatePath = {
+            leafNode: committerNewLeafPreSign,
+            nodes: updatePathNodes,
+        };
+
+        // ---- 7. Commit struct: Remove proposal + UpdatePath ----
+        const removeProposal = {
+            proposalType: Proposal.ProposalType.REMOVE,
+            removed: removedLeafIndex,
+        };
+        const commitStruct = {
+            proposals: [{
+                type: Proposal.ProposalOrRefType.PROPOSAL,
+                proposal: removeProposal,
+            }],
+            path: updatePath,
+        };
+        const commitBodyBytes = Commit.commitBytes(commitStruct);
+
+        // ---- 8. FramedContent + signature (under OLD context) ----
+        const content = {
+            groupId: this.groupId,
+            epoch: this.epoch,
+            sender: { senderType: Framing.SenderType.MEMBER, leafIndex: this.myLeafIndex },
+            authenticatedData: new Uint8Array(0),
+            contentType: Framing.ContentType.COMMIT,
+            payload: commitBodyBytes,
+        };
+        const wireFormat = MLSMessage.WireFormat.MLS_PUBLIC_MESSAGE;
+        const signature = await PublicMessage.signFramedContent(
+            this.identity.signaturePrivateKey,
+            wireFormat, content, this._buildGroupContextStruct(),
+        );
+
+        // ---- 9. Transcript + new epoch secrets ----
+        const cthInput = new Codec.Encoder();
+        cthInput.writeU16(wireFormat);
+        Framing.writeFramedContent(cthInput, content);
+        cthInput.writeOpaque(signature);
+        const newConfirmedTranscriptHash = await TranscriptHashes.confirmedTranscriptHash(
+            this.interimTranscriptHash, cthInput.bytes(),
+        );
+        const epochGroupContext = {
+            ...provisionalGroupContext,
+            confirmedTranscriptHash: newConfirmedTranscriptHash,
+        };
+        const epochGroupContextBytes = GroupContext.groupContextBytes(epochGroupContext);
+
+        const rootChainEntry = chain[chain.length - 1];
+        const epochSecrets = await KeySchedule.deriveEpoch({
+            initSecretPrev: this.epochSecrets.initSecret,
+            commitSecret: await TreeKEM.commitSecret(rootChainEntry.pathSecret),
+            pskSecret: this.pskSecret,
+            groupContext: epochGroupContextBytes,
+        });
+
+        const confirmationTag = await TranscriptHashes.confirmationTag(
+            epochSecrets.confirmationKey, newConfirmedTranscriptHash,
+        );
+        const newInterimTranscriptHash = await TranscriptHashes.interimTranscriptHash(
+            newConfirmedTranscriptHash, confirmationTag,
+        );
+        const auth = { signature, confirmationTag };
+
+        // ---- 10. PublicMessage with membership_tag ----
+        const membershipTag = await PublicMessage.computeMembershipTag(
+            this.epochSecrets.membershipKey, wireFormat, content, auth,
+            this._buildGroupContextStruct(),
+        );
+        const pm = { content, auth, membershipTag };
+        const pmBytes = PublicMessage.publicMessageBytes(pm);
+        const commitMessage = MLSMessage.serializeMLSMessage(wireFormat, pmBytes);
+
+        // ---- 11. Apply commit to local state ----
+        this.ratchetTree = newTree;
+        this.epoch = newEpoch;
+        this.treeHash = newTreeHash;
+        this.confirmedTranscriptHash = newConfirmedTranscriptHash;
+        this.interimTranscriptHash = newInterimTranscriptHash;
+        this.epochSecrets = epochSecrets;
+        this.senderRatchetGeneration = 0;
+        this.leafKeyPair = {
+            privateKey: leafNodePair.keyPair.privateKey,
+            publicKey: leafNodePair.keyPair.publicKey,
+            publicKeyBytes: leafNodePair.keyPair.publicKeyBytes,
+        };
+        this.parentKeyPairs = new Map();
+        for (let i = 0; i < committerDirectPath.length; i += 1) {
+            this.parentKeyPairs.set(committerDirectPath[i], chain[i].keyPair);
+        }
+        this.consumedByLeaf = new Map();
+
+        return { commitMessage };
+    };
+
+    /**
      * Process a Commit broadcast by another member. Inputs:
      *   commitMessageBytes : MLSMessage(mls_public_message) bytes
      *
      * Verifies the FramedContent signature + membership_tag, applies
-     * Add proposals, walks the UpdatePath to recover our share of the
-     * new path_secret chain, and advances the local epoch state.
+     * inline Add/Remove proposals, walks the UpdatePath to recover our
+     * share of the new path_secret chain, and advances the local epoch
+     * state.
      *
      * Scope:
-     *   - Inline proposals only (Add). Proposal-by-reference (which
-     *     would require a local proposal cache) is not implemented.
-     *   - Single Add per commit. Multi-Add commits are accepted by the
-     *     parser but only the last new leaf index is reported back —
-     *     more than one would still apply correctly in tree terms but
-     *     hasn't been verified end-to-end yet.
+     *   - Inline proposals only (Add, Remove). Proposal-by-reference is
+     *     not implemented.
+     *   - Update proposals are not yet handled.
      */
     Group.prototype.processCommit = async function processCommit(commitMessageBytes) {
         const frame = MLSMessage.parseMLSMessage(commitMessageBytes);
@@ -757,29 +986,58 @@
 
         const commit = content.parsed;
 
-        // ---- Apply Add proposals (insert new leaves) ----
+        // ---- Apply Add / Remove proposals ----
+        // Adds insert at the next free leaf and grow the tree; Removes
+        // blank the target leaf AND every parent on its direct path so
+        // the removed member can no longer derive any subsequent epoch
+        // secret. nLeaves stays unchanged on Remove (we don't prune).
         let newTree = this.ratchetTree.slice();
         let newNLeaves = this.nLeaves;
         let lastAddedLeafIndex = null;
+        let lastRemovedLeafIndex = null;
         for (const por of commit.proposals) {
             if (por.type !== Proposal.ProposalOrRefType.PROPOSAL) {
                 throw new Error('processCommit: proposal-by-reference not supported');
             }
             const proposal = por.proposal;
-            if (proposal.proposalType !== Proposal.ProposalType.ADD) {
+            if (proposal.proposalType === Proposal.ProposalType.ADD) {
+                const addLeafIndex = newNLeaves;
+                newNLeaves += 1;
+                const newWidth = TreeMath.nodeWidth(newNLeaves);
+                newTree = Nodes.padRatchetTree(newTree, newWidth);
+                newTree[TreeMath.leafToNode(addLeafIndex)] = {
+                    nodeType: Nodes.NodeType.LEAF, leaf: proposal.keyPackage.leafNode,
+                };
+                lastAddedLeafIndex = addLeafIndex;
+            } else if (proposal.proposalType === Proposal.ProposalType.REMOVE) {
+                const rmIdx = proposal.removed;
+                if (typeof rmIdx !== 'number' || rmIdx < 0 || rmIdx >= newNLeaves) {
+                    throw new Error(`processCommit: invalid removed leaf_index ${rmIdx}`);
+                }
+                if (rmIdx === senderLeafIndex) {
+                    throw new Error('processCommit: committer cannot remove themself');
+                }
+                const rmNode = TreeMath.leafToNode(rmIdx);
+                if (!newTree[rmNode] || newTree[rmNode].nodeType !== Nodes.NodeType.LEAF) {
+                    throw new Error(`processCommit: leaf ${rmIdx} already blank`);
+                }
+                newTree[rmNode] = null;
+                for (const ancestor of TreeMath.directPathWithRoot(rmNode, newNLeaves)) {
+                    newTree[ancestor] = null;
+                }
+                lastRemovedLeafIndex = rmIdx;
+            } else {
                 throw new Error(`processCommit: unsupported proposal_type ${proposal.proposalType}`);
             }
-            const addLeafIndex = newNLeaves;
-            newNLeaves += 1;
-            const newWidth = TreeMath.nodeWidth(newNLeaves);
-            newTree = Nodes.padRatchetTree(newTree, newWidth);
-            newTree[TreeMath.leafToNode(addLeafIndex)] = {
-                nodeType: Nodes.NodeType.LEAF, leaf: proposal.keyPackage.leafNode,
-            };
-            lastAddedLeafIndex = addLeafIndex;
         }
 
         // ---- Apply UpdatePath ----
+        // If WE are the leaf being removed, our key material is no longer
+        // useful — surface a distinct error so the orchestrator can tear
+        // the session down rather than chase phantom decrypt failures.
+        if (lastRemovedLeafIndex === this.myLeafIndex) {
+            throw new Error('processCommit: removed from group');
+        }
         const updatePath = commit.path;
         if (!updatePath) {
             throw new Error('processCommit: commit without path is not supported (Add+Path only)');
@@ -951,7 +1209,7 @@
         const newEpochSecrets = await KeySchedule.deriveEpoch({
             initSecretPrev: this.epochSecrets.initSecret,
             commitSecret: commitSecretBytes,
-            pskSecret: new Uint8Array(HPKE.Nh),
+            pskSecret: this.pskSecret,
             groupContext: epochGroupContextBytes,
         });
 
@@ -1000,6 +1258,7 @@
 
         return {
             addedLeafIndex: lastAddedLeafIndex,
+            removedLeafIndex: lastRemovedLeafIndex,
             committerLeafIndex: senderLeafIndex,
         };
     };
@@ -1022,8 +1281,13 @@
      */
     Group.joinFromWelcomeWithTree = async function joinFromWelcomeWithTree({
         welcomeMessage, keyPackageBytes, initPrivateKey, identity,
-        leafEncKeyPair, ratchetTreeBytes,
+        leafEncKeyPair, ratchetTreeBytes, pskSecret,
     }) {
+        const psk = pskSecret || new Uint8Array(HPKE.Nh);
+        if (psk.length !== HPKE.Nh) {
+            throw new Error(`group.join: pskSecret must be ${HPKE.Nh} bytes (got ${psk.length})`);
+        }
+
         const frame = MLSMessage.parseMLSMessage(welcomeMessage);
         const welcome = Welcome.parseWelcome(frame.body);
 
@@ -1038,8 +1302,11 @@
         const gs = await Welcome.decryptGroupSecrets(
             entry.encryptedGroupSecrets, initPrivateKey, kp.initKey, welcome.encryptedGroupInfo,
         );
+        // Welcome AEAD is keyed off (joiner_secret, psk_secret). A joiner
+        // with the wrong PSK will fail the AES-GCM auth tag here, which
+        // is exactly the bootstrap-key gating we want.
         const welcomeSecret = await Welcome.deriveWelcomeSecret(
-            gs.joinerSecret, new Uint8Array(HPKE.Nh),
+            gs.joinerSecret, psk,
         );
         const { key: wKey, nonce: wNonce } = await Welcome.welcomeKeyNonce(welcomeSecret);
         const giBytes = await Welcome.openEncryptedGroupInfo(wKey, wNonce, welcome.encryptedGroupInfo);
@@ -1128,8 +1395,9 @@
         }
 
         // Derive epoch secrets using gs.joinerSecret as the joiner_secret.
+        // psk_secret is the URL-fragment-derived PSK (zeros in tests).
         const memberSecret = await HPKE.hkdfExtract(
-            gs.joinerSecret, new Uint8Array(HPKE.Nh),
+            gs.joinerSecret, psk,
         );
         const epochSecretRaw = await KeySchedule.expandWithLabel(
             memberSecret, 'epoch',
@@ -1186,6 +1454,7 @@
             confirmedTranscriptHash: groupInfo.groupContext.confirmedTranscriptHash,
             treeHash: groupInfo.groupContext.treeHash,
             epochSecrets,
+            pskSecret: psk,
         };
         return new Group(state);
     };
