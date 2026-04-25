@@ -32,6 +32,10 @@ document.addEventListener('alpine:init', () => {
         userId: null,
         peerUserId: null,       // UUID of the other participant in 1:1 rooms (null when alone)
         peerNickname: null,     // Derived display name from peerUserId via generateNickname()
+        // Group rooms: ordered list of currently connected peers ({ userId,
+        // nickname }). The sidebar iterates over this to render one row per
+        // peer. 1:1 rooms keep peerUserId/peerNickname above and ignore this.
+        groupPeers: [],
         myNickname: null,  // User's own nickname (generated from userId)
         initialized: false,
         wasConnectedBefore: false,  // Track if we've connected at least once (for reconnection detection)
@@ -275,6 +279,17 @@ document.addEventListener('alpine:init', () => {
                 case 'mls':
                     // Group-room MLS envelope. Ignore our own echoes.
                     if (message.sender_id !== this.userId && this.mlsSession) {
+                        // Discover peers we never got a userjoined for —
+                        // a member who joins late never sees join events
+                        // for the existing participants, so we backfill
+                        // the sidebar from the envelope's sender_id.
+                        if (this.roomType === 'group' && message.sender_id
+                            && !this.groupPeers.find((p) => p.userId === message.sender_id)) {
+                            this.groupPeers.push({
+                                userId: message.sender_id,
+                                nickname: generateNickname(message.sender_id).display,
+                            });
+                        }
                         try {
                             await this.mlsSession.onRelayEnvelope(message);
                         } catch (err) {
@@ -309,6 +324,16 @@ document.addEventListener('alpine:init', () => {
                     if (message.user_id && message.user_id !== this.userId) {
                         this.peerUserId = message.user_id;
                         this.peerNickname = generateNickname(message.user_id).display;
+
+                        // Group rooms maintain a list — append if not already
+                        // tracked. Idempotent so reconnects don't double-add.
+                        if (this.roomType === 'group'
+                            && !this.groupPeers.find((p) => p.userId === message.user_id)) {
+                            this.groupPeers.push({
+                                userId: message.user_id,
+                                nickname: generateNickname(message.user_id).display,
+                            });
+                        }
                     }
 
                     if (this.roomType === 'onetoone' && this.participantCount === 2) {
@@ -343,6 +368,11 @@ document.addEventListener('alpine:init', () => {
                     if (message.user_id === this.peerUserId) {
                         this.peerUserId = null;
                         this.peerNickname = null;
+                    }
+                    if (this.roomType === 'group' && message.user_id) {
+                        this.groupPeers = this.groupPeers.filter(
+                            (p) => p.userId !== message.user_id,
+                        );
                     }
 
                     // When participant count drops below 2, cleanup ECDH state
@@ -559,17 +589,43 @@ document.addEventListener('alpine:init', () => {
                     this.mlsReady = true;
                     this.addSystemMessage('✅ Joined secure group');
                     break;
-                case 'message':
+                case 'message': {
+                    const nickname = event.senderId
+                        ? generateNickname(event.senderId).display
+                        : 'Peer';
                     this.messages.push({
                         id: this.nextMessageId++,
                         type: 'message',
                         text: event.text,
                         timestamp: new Date(),
                         isOwn: false,
-                        nickname: 'Peer',
-                        senderId: null,
+                        nickname,
+                        senderId: event.senderId || null,
                     });
                     requestAnimationFrame(() => this.scrollToBottom());
+                    break;
+                }
+                case 'image': {
+                    const nicknameImg = event.senderId
+                        ? generateNickname(event.senderId).display
+                        : 'Peer';
+                    const blob = new Blob([event.data], { type: event.mimeType });
+                    const imageUrl = URL.createObjectURL(blob);
+                    this.messages.push({
+                        id: this.nextMessageId++,
+                        type: 'image',
+                        imageUrl,
+                        timestamp: new Date(),
+                        isOwn: false,
+                        nickname: nicknameImg,
+                        senderId: event.senderId || null,
+                    });
+                    requestAnimationFrame(() => this.scrollToBottom());
+                    break;
+                }
+                case 'commit-applied':
+                    // No UI surface yet — keep silent. The participant
+                    // count update below already reflects the new member.
                     break;
                 case 'error':
                     console.error('[MLS]', event.reason);
@@ -635,55 +691,61 @@ document.addEventListener('alpine:init', () => {
         },
 
         /**
-         * Sends the pending image
+         * Sends the pending image. For 1:1 rooms this goes through the
+         * Double Ratchet path (encryptImage); for group rooms it gets
+         * wrapped as an MLS application_data with PAYLOAD_IMAGE tag and
+         * delivered via the MLSSession transport.
          */
         async sendImage() {
             if (!this.pendingImage || !this.connected || this.sendingImage) {
                 return;
             }
+            if (this.roomType === 'group' && (!this.mlsSession || !this.mlsReady)) {
+                this.error = '⚠️ Secure group not yet ready. Please wait.';
+                return;
+            }
 
             this.sendingImage = true;
 
+            // Optimistic UI: append locally before the network round-trip
+            // so the sender sees their own image immediately.
+            const localImageUrl = this.pendingImage.dataUrl;
+            this.messages.push({
+                id: this.nextMessageId++,
+                type: 'image',
+                imageUrl: localImageUrl,
+                timestamp: new Date(),
+                isOwn: true,
+                nickname: this.myNickname,
+                senderId: this.userId
+            });
+            requestAnimationFrame(() => this.scrollToBottom());
+
             try {
-                // Add image message to local list immediately
-                const localImageUrl = this.pendingImage.dataUrl;
-                this.messages.push({
-                    id: this.nextMessageId++,
-                    type: 'image',
-                    imageUrl: localImageUrl,
-                    timestamp: new Date(),
-                    isOwn: true,
-                    nickname: this.myNickname,
-                    senderId: this.userId
-                });
-
-                // Scroll to bottom
-                requestAnimationFrame(() => this.scrollToBottom());
-
-                // Encrypt image data
-                const encrypted = await window.cryptoManager.encryptImage(
-                    this.pendingImage.arrayBuffer,
-                    this.pendingImage.mimeType,
-                    this.roomId,
-                    this.userId
-                );
-
-                // Send via WebSocket
-                const sent = this.wsManager.send({
-                    type: 'image',
-                    payload: encrypted.payload,
-                    header: encrypted.header
-                });
-
-                if (!sent) {
-                    // Remove local message on failure
-                    this.messages.pop();
-                    this.error = '⚠️ Unable to send image. Please try again.';
+                if (this.roomType === 'group') {
+                    await this.mlsSession.sendImage(
+                        new Uint8Array(this.pendingImage.arrayBuffer),
+                        this.pendingImage.mimeType,
+                    );
+                } else {
+                    const encrypted = await window.cryptoManager.encryptImage(
+                        this.pendingImage.arrayBuffer,
+                        this.pendingImage.mimeType,
+                        this.roomId,
+                        this.userId
+                    );
+                    const sent = this.wsManager.send({
+                        type: 'image',
+                        payload: encrypted.payload,
+                        header: encrypted.header
+                    });
+                    if (!sent) {
+                        this.messages.pop();
+                        this.error = '⚠️ Unable to send image. Please try again.';
+                        return;
+                    }
                 }
-
-                // Clear pending image
                 this.pendingImage = null;
-
             } catch (error) {
                 console.error('Failed to send image:', error);
                 this.messages.pop();

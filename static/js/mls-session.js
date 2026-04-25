@@ -46,6 +46,38 @@
         return MLS.Codec.base64UrlToBytes(str);
     }
 
+    // Application-payload tag bytes. Every MLS application_data we send
+    // begins with one of these so the receiver can route between text and
+    // images (and, later, additional payload kinds) without sniffing.
+    // The tag is OUTSIDE the MLS framing — it's the first byte of the
+    // ciphertext-protected payload.
+    const PAYLOAD_TEXT = 0x01;
+    const PAYLOAD_IMAGE = 0x02;
+
+    function encodeTextPayload(text) {
+        const utf8 = new TextEncoder().encode(String(text));
+        const out = new Uint8Array(1 + utf8.length);
+        out[0] = PAYLOAD_TEXT;
+        out.set(utf8, 1);
+        return out;
+    }
+
+    function encodeImagePayload(imageBytes, mimeType) {
+        const mimeUtf8 = new TextEncoder().encode(String(mimeType || 'application/octet-stream'));
+        if (mimeUtf8.length > 255) {
+            throw new Error('mls-session: mime type longer than 255 bytes');
+        }
+        const data = imageBytes instanceof Uint8Array
+            ? imageBytes
+            : new Uint8Array(imageBytes);
+        const out = new Uint8Array(2 + mimeUtf8.length + data.length);
+        out[0] = PAYLOAD_IMAGE;
+        out[1] = mimeUtf8.length;
+        out.set(mimeUtf8, 2);
+        out.set(data, 2 + mimeUtf8.length);
+        return out;
+    }
+
     function envelopeFromMlsMessage(wireFormat, mlsMessageBytes, ratchetTreeBytes = null) {
         const out = {
             type: 'mls',
@@ -201,7 +233,7 @@
 
             if (wireFormat === MLS.MLSMessage.WireFormat.MLS_PRIVATE_MESSAGE
                 && this._state === 'joined') {
-                await this._handleApplication(payload);
+                await this._handleApplication(payload, envelope.sender_id);
                 return;
             }
 
@@ -263,17 +295,55 @@
             this.onEvent({ kind: 'joined' });
         }
 
-        async _handleApplication(mlsMessageBytes) {
+        async _handleApplication(mlsMessageBytes, senderId) {
             const wrapped = MLS.MLSMessage.serializeMLSMessage(
                 MLS.MLSMessage.WireFormat.MLS_PRIVATE_MESSAGE, mlsMessageBytes,
             );
+            let pt;
             try {
-                const pt = await this.group.decryptApplicationMessage(wrapped);
-                this.onEvent({ kind: 'message', text: new TextDecoder().decode(pt) });
+                pt = await this.group.decryptApplicationMessage(wrapped);
             } catch (err) {
                 this.onEvent({ kind: 'error',
                     reason: `decrypt failed: ${err.message}` });
+                return;
             }
+            if (pt.length === 0) {
+                this.onEvent({ kind: 'error', reason: 'empty application payload' });
+                return;
+            }
+            const tag = pt[0];
+            if (tag === PAYLOAD_TEXT) {
+                this.onEvent({
+                    kind: 'message',
+                    text: new TextDecoder().decode(pt.subarray(1)),
+                    senderId,
+                });
+                return;
+            }
+            if (tag === PAYLOAD_IMAGE) {
+                if (pt.length < 2) {
+                    this.onEvent({ kind: 'error', reason: 'truncated image payload' });
+                    return;
+                }
+                const mimeLen = pt[1];
+                if (pt.length < 2 + mimeLen) {
+                    this.onEvent({ kind: 'error', reason: 'truncated image mime header' });
+                    return;
+                }
+                const mimeType = new TextDecoder().decode(pt.subarray(2, 2 + mimeLen));
+                const data = pt.subarray(2 + mimeLen);
+                this.onEvent({
+                    kind: 'image',
+                    mimeType,
+                    data,
+                    senderId,
+                });
+                return;
+            }
+            this.onEvent({
+                kind: 'error',
+                reason: `unknown application payload tag 0x${tag.toString(16)}`,
+            });
         }
 
         /**
@@ -300,14 +370,28 @@
         }
 
         /**
-         * Encrypt and broadcast an application message. Throws if we
-         * haven't joined the group yet.
+         * Encrypt and broadcast an application text message. Throws if
+         * we haven't joined the group yet.
          */
         async sendMessage(text) {
+            await this._sendApplicationPayload(encodeTextPayload(text));
+        }
+
+        /**
+         * Encrypt and broadcast an image. `imageBytes` is the raw image
+         * data (Uint8Array or ArrayBuffer); `mimeType` is the MIME string
+         * (e.g. "image/png"). Both fields end up inside the AEAD-protected
+         * MLS application_data, so the relay never sees them.
+         */
+        async sendImage(imageBytes, mimeType) {
+            await this._sendApplicationPayload(encodeImagePayload(imageBytes, mimeType));
+        }
+
+        async _sendApplicationPayload(payloadBytes) {
             if (this._state !== 'joined') {
                 throw new Error(`mls-session: cannot send in state "${this._state}"`);
             }
-            const wrapped = await this.group.encryptApplicationMessage(text);
+            const wrapped = await this.group.encryptApplicationMessage(payloadBytes);
             const body = stripMlsWrapper(wrapped);
             this.send({
                 type: 'mls',
