@@ -86,6 +86,15 @@ text application messages at every epoch.
   vector cache. Fixing it requires implementing
   `original_sibling_tree_hash` plus the top-down chain walk in both
   `commitAddMember` and `processCommit`.
+- **Filtered direct path on the wire (§7.6).** `commitAddMember` emits
+  the *full* direct path with empty `encrypted_path_secret` lists where
+  the copath sibling resolution is empty, instead of dropping those
+  entries entirely. Our `processCommit` accepts that shape symmetrically.
+  The IETF reference ships filtered paths, so we'd diverge if we ever
+  interop with another MLS implementation. For our creator-only-add
+  scenario the filter collapses to the full path (every parent on the
+  creator's direct path has at least one non-blank receiver subtree),
+  so the wire bytes are byte-identical in practice.
 - **Update / Remove proposals.** Only `Add` is wired through. PCS
   currently happens at every join (the whole tree re-keys); periodic
   `Update` commits and explicit `Remove` for departing members are not
