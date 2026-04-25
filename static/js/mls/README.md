@@ -98,7 +98,15 @@ text application messages at every epoch.
 - **Update / Remove proposals.** Only `Add` is wired through. PCS
   currently happens at every join (the whole tree re-keys); periodic
   `Update` commits and explicit `Remove` for departing members are not
-  implemented.
+  implemented. A member who leaves the room therefore retains the
+  current epoch's secrets until the next `Add` re-keys the tree.
+- **Bootstrap-key binding.** The URL fragment key authenticates the
+  1:1 ratchet path but is *not* injected into the MLS key schedule
+  (e.g. as a PSK). For group rooms, MLS authentication relies on the
+  joiner's KeyPackage signature alone — the relay cannot tamper with
+  it, but it could in principle let an off-list attacker who reaches
+  the room before legitimate participants race a Welcome of their
+  own. PSK-binding the URL fragment is the planned hardening.
 - **Proposal-by-reference.** All proposals travel inline inside their
   Commit; the proposal store + RefHash dispatch is not wired.
 - **`ratchet_tree` GroupInfo extension.** The new joiner currently

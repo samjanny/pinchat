@@ -149,6 +149,13 @@
             this.identity = null;
             this.keyPackageBundle = null;
             this._state = 'idle';
+            // Per-sender_id → leafIndex map maintained by the creator.
+            // We commit at most one KeyPackage per WebSocket sender_id;
+            // a second KeyPackage from the same sender (or a sender
+            // already represented in the tree) is rejected. Without this
+            // a single peer can publish many KeyPackages, growing the
+            // tree arbitrarily and exhausting committer resources.
+            this._leafBySenderId = new Map();
         }
 
         /**
@@ -202,7 +209,23 @@
             if (wireFormat === MLS.MLSMessage.WireFormat.MLS_KEY_PACKAGE
                 && this.role === 'creator'
                 && (this._state === 'awaiting-keypackage' || this._state === 'joined')) {
-                await this._handleIncomingKeyPackage(payload);
+                // Bind the KeyPackage to the relay's sender_id. A peer
+                // who already has a leaf cannot publish a second one;
+                // an envelope without sender_id (legacy/relay bug) is
+                // rejected so attackers can't bypass the per-sender
+                // quota by spoofing the field's absence.
+                const senderId = envelope.sender_id;
+                if (!senderId) {
+                    this.onEvent({ kind: 'error',
+                        reason: 'KeyPackage envelope missing sender_id' });
+                    return;
+                }
+                if (this._leafBySenderId.has(senderId)) {
+                    this.onEvent({ kind: 'error',
+                        reason: `sender ${senderId} already has a leaf — duplicate KeyPackage rejected` });
+                    return;
+                }
+                await this._handleIncomingKeyPackage(payload, senderId);
                 return;
             }
 
@@ -238,20 +261,27 @@
             // is silently dropped — Welcome is the catch-up path.
         }
 
-        async _handleIncomingKeyPackage(kpBytes) {
+        async _handleIncomingKeyPackage(kpBytes, senderId) {
             // The envelope payload is the raw KeyPackage body — wire_format
             // rides as a separate envelope field, so the bytes are NOT wrapped
             // in MLSMessage framing. Pass them straight to commitAddMember
             // which calls KeyPackage.parseKeyPackage internally.
-            let commitMessage, welcomeMessage;
+            let commitMessage, welcomeMessage, addedLeafIndex;
             try {
                 ({ commitMessage, welcomeMessage } = await this.group.commitAddMember({
                     keyPackageBytes: kpBytes,
                 }));
+                // commitAddMember always inserts at `nLeaves` (pre-bump).
+                // After the call, this.group.nLeaves has been bumped, so
+                // the new leaf occupies index nLeaves - 1.
+                addedLeafIndex = this.group.nLeaves - 1;
             } catch (err) {
                 console.error('[MLS] commitAddMember failed:', err);
                 this.onEvent({ kind: 'error', reason: `commitAddMember failed: ${err.message}` });
                 return;
+            }
+            if (senderId !== undefined) {
+                this._leafBySenderId.set(senderId, addedLeafIndex);
             }
             const ratchetTreeBytes = MLS.Nodes.ratchetTreeBytes(this.group.ratchetTree);
 

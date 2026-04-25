@@ -121,6 +121,32 @@
     class Group {
         constructor(state) {
             Object.assign(this, state);
+            // Replay protection: per-epoch set of (leafIndex, generation)
+            // pairs we have already accepted. Reset on every epoch
+            // transition; cap per-leaf to bound memory growth.
+            this.consumedByLeaf = new Map();
+        }
+
+        _markGenerationConsumed(leafIndex, generation) {
+            let set = this.consumedByLeaf.get(leafIndex);
+            if (!set) {
+                set = new Set();
+                this.consumedByLeaf.set(leafIndex, set);
+            }
+            // Hard cap: if a sender exhausts more than 4096 distinct
+            // generations within one epoch, drop the oldest (smallest)
+            // entries. In practice we're nowhere near this — generations
+            // are reset on every commit.
+            if (set.size >= 4096) {
+                const sorted = [...set].sort((a, b) => a - b);
+                for (let i = 0; i < sorted.length / 2; i += 1) set.delete(sorted[i]);
+            }
+            set.add(generation);
+        }
+
+        _isGenerationConsumed(leafIndex, generation) {
+            const set = this.consumedByLeaf.get(leafIndex);
+            return set ? set.has(generation) : false;
         }
 
         // ------------------------------------------------------------------
@@ -302,6 +328,9 @@
             if (pm.contentType !== Framing.ContentType.APPLICATION) {
                 throw new Error(`group: expected application content, got ${pm.contentType}`);
             }
+            if (!equalBytes(pm.groupId, this.groupId)) {
+                throw new Error('group: group_id mismatch on incoming application message');
+            }
             if (pm.epoch !== this.epoch) {
                 throw new Error(`group: wrong epoch (got ${pm.epoch}, expected ${this.epoch})`);
             }
@@ -314,6 +343,20 @@
             });
 
             const senderLeafIndex = out.senderData.leafIndex;
+            const generation = out.senderData.generation;
+            // Replay protection: reject (leafIndex, generation) duplicates
+            // within the current epoch. Reset on every epoch transition.
+            // The legitimate sender increments senderRatchetGeneration once
+            // per send, so seeing the same (leaf, gen) twice means either
+            // a relay-level retransmission or an attacker replaying a
+            // captured ciphertext — both must be dropped to preserve
+            // AES-GCM nonce uniqueness guarantees.
+            if (this._isGenerationConsumed(senderLeafIndex, generation)) {
+                throw new Error(
+                    `group: replayed application message (leaf=${senderLeafIndex}, gen=${generation})`,
+                );
+            }
+
             const senderLeaf = RatchetTree.leafFor(this.ratchetTree, senderLeafIndex);
             if (!senderLeaf) {
                 throw new Error(`group: unknown sender leaf_index ${senderLeafIndex}`);
@@ -338,6 +381,8 @@
             if (!sigOk) {
                 throw new Error('group: application message signature invalid');
             }
+
+            this._markGenerationConsumed(senderLeafIndex, generation);
 
             return out.content.payloadBytes;
         }
@@ -640,6 +685,11 @@
         for (let i = 0; i < committerDirectPath.length; i += 1) {
             this.parentKeyPairs.set(committerDirectPath[i], chain[i].keyPair);
         }
+        // Replay protection state is per-epoch — every commit advances
+        // the epoch and re-keys the secret tree, so old generations no
+        // longer collide with anything new. Drop the consumed set so it
+        // doesn't grow unboundedly across long-lived groups.
+        this.consumedByLeaf = new Map();
 
         return { commitMessage, welcomeMessage };
     };
@@ -672,6 +722,9 @@
         const content = pm.content;
         if (content.contentType !== Framing.ContentType.COMMIT) {
             throw new Error(`processCommit: expected commit, got ${content.contentType}`);
+        }
+        if (!equalBytes(content.groupId, this.groupId)) {
+            throw new Error('processCommit: group_id mismatch');
         }
         if (content.epoch !== this.epoch) {
             throw new Error(`processCommit: wrong epoch (got ${content.epoch}, expected ${this.epoch})`);
@@ -940,6 +993,10 @@
             }
         }
         this.parentKeyPairs = survivors;
+        // Replay protection state is per-epoch — drop the consumed
+        // generations now that we've advanced past the epoch they
+        // applied to.
+        this.consumedByLeaf = new Map();
 
         return {
             addedLeafIndex: lastAddedLeafIndex,

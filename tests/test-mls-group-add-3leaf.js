@@ -252,6 +252,68 @@ async function main() {
         assert(threw2, 'tampered KeyPackage signature rejected');
     }
 
+    // ---- Replay rejection ------------------------------------------------
+    // After a (leafIndex, generation) tuple has been consumed, a second
+    // attempt to decrypt the same ciphertext within the same epoch must
+    // be rejected. This prevents AES-GCM nonce reuse attacks where an
+    // attacker captures and re-injects a ciphertext to provoke a second
+    // decryption with the same key/nonce.
+    console.log('# Replay + group_id rejection');
+    {
+        const wireReplay = await alice.encryptApplicationMessage('once');
+        const pt1 = await bobGroup.decryptApplicationMessage(wireReplay);
+        assert(new TextDecoder().decode(pt1) === 'once',
+            'first decrypt of replay candidate succeeds');
+        let threwReplay = false;
+        try {
+            await bobGroup.decryptApplicationMessage(wireReplay);
+        } catch (_) { threwReplay = true; }
+        assert(threwReplay, 'second decrypt of same ciphertext rejected as replay');
+
+        // ---- group_id mismatch rejection --------------------------------
+        // A ciphertext encrypted by a *different* group must be rejected
+        // before any AEAD work happens. Build a totally separate Alice/Bob
+        // pair and feed Alice's ciphertext into our Bob's decryptor.
+        const otherAliceId = await freshIdentity();
+        const otherAlice = await Group.Group.create({ identity: otherAliceId });
+        const otherBob = await buildKeyPackage();
+        const otherR1 = await otherAlice.commitAddMember({
+            keyPackageBytes: otherBob.keyPackageBytes,
+        });
+        const otherTreeBytes = Nodes.ratchetTreeBytes(otherAlice.ratchetTree);
+        await Group.Group.joinFromWelcomeWithTree({
+            welcomeMessage: otherR1.welcomeMessage,
+            keyPackageBytes: otherBob.keyPackageBytes,
+            initPrivateKey: otherBob.initKp.privateKey,
+            identity: otherBob.identity,
+            leafEncKeyPair: otherBob.initKp,
+            ratchetTreeBytes: otherTreeBytes,
+        });
+        const foreignWire = await otherAlice.encryptApplicationMessage('foreign');
+        let threwGid = false;
+        let gidErrMsg = '';
+        try {
+            await alice.decryptApplicationMessage(foreignWire);
+        } catch (err) { threwGid = true; gidErrMsg = err.message; }
+        assert(threwGid && gidErrMsg.includes('group_id'),
+            'foreign-group ciphertext rejected on group_id check',
+            gidErrMsg);
+
+        // ---- Replay state cleared on epoch transition --------------------
+        // After a new commit advances the epoch, a fresh (gen=0) message
+        // from a sender whose previous gen=0 was already consumed must be
+        // accepted again — the per-epoch consumed set has been dropped.
+        const eve = await buildKeyPackage();
+        const rEve = await alice.commitAddMember({ keyPackageBytes: eve.keyPackageBytes });
+        await bobGroup.processCommit(rEve.commitMessage);
+        await carolGroup.processCommit(rEve.commitMessage);
+        await daveGroup.processCommit(rEve.commitMessage);
+        const wireFresh = await alice.encryptApplicationMessage('after rekey');
+        const ptFresh = await bobGroup.decryptApplicationMessage(wireFresh);
+        assert(new TextDecoder().decode(ptFresh) === 'after rekey',
+            'gen=0 in new epoch accepted (replay state cleared on rekey)');
+    }
+
     console.log('');
     console.log(`group-add-3leaf: ${passed} passed, ${failed} failed`);
     process.exit(failed === 0 ? 0 : 1);
