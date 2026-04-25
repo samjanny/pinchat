@@ -45,7 +45,7 @@ See [`ciphersuite.js`](ciphersuite.js) for the full profile.
 | [`commit.js`](commit.js)                 |   ✅   | [`test-mls-proposal.js`](../../../tests/test-mls-proposal.js) (IETF vectors)                  |
 | [`public-message.js`](public-message.js) |   ✅   | [`test-mls-public-message.js`](../../../tests/test-mls-public-message.js) (IETF end-to-end)   |
 | [`private-message.js`](private-message.js) | ✅   | [`test-mls-private-message.js`](../../../tests/test-mls-private-message.js) (IETF end-to-end) |
-| [`group.js`](group.js)                   |   ✅   | [`test-mls-group.js`](../../../tests/test-mls-group.js) + [`test-mls-group-add.js`](../../../tests/test-mls-group-add.js) (2-leaf end-to-end) |
+| [`group.js`](group.js)                   |   ✅   | [`test-mls-group.js`](../../../tests/test-mls-group.js) + [`test-mls-group-add.js`](../../../tests/test-mls-group-add.js) + [`test-mls-group-add-3leaf.js`](../../../tests/test-mls-group-add-3leaf.js) (N-leaf end-to-end) |
 
 The codec matches RFC 9000 QUIC varint vectors; HKDF-SHA256 matches the
 RFC 5869 §A.1 vector; DHKEM is validated by Encap/Decap symmetry plus HPKE
@@ -54,43 +54,49 @@ confirmed/interim transcript-hash chain are all verified byte-for-byte
 against the IETF reference vectors in
 [`tests/vectors/mls/`](../../../tests/vectors/mls/) for ciphersuite 0x0002.
 
-## Roadmap
+## End-to-end status
 
-Ordered so that each step only depends on what precedes it.
+The browser-facing flow runs entirely over MLS for group rooms:
 
-1. **Credential + KeyPackage** (`key-package.js`) — RFC 9420 §5, §10.
-   A KeyPackage binds an HPKE init key, a signature key (ECDSA P-256), and
-   a credential. Signature-chained and serializable via the codec.
+- 1-to-N **Add / Commit / Welcome** with filtered direct-path encryption.
+  Creator commits each new member; existing members apply incoming Commits
+  via `Group.processCommit`, walking the UpdatePath from the LCA up to root
+  and storing parent keypairs for subsequent epochs.
+- The orchestrator (`mls-session.js`) tags every application payload with
+  one byte (`0x01` text / `0x02` image), so images travel the same MLS
+  path as text without falling back to the 1:1 Double Ratchet.
+- The Rust server stays a blind relay: it forwards a single `mls`
+  envelope kind with `wire_format` and an optional `ratchet_tree`
+  side-channel, never inspecting the body.
 
-2. **Ratchet tree** (`ratchet-tree.js`) — RFC 9420 §7.
-   Array-backed tree of LeafNode / ParentNode, with blanking, resolution,
-   parent-hash and tree-hash. Verified against the IETF
-   `tree-math.json` / `tree-validation.json` vectors.
+Verified by `tests/test-mls-group-add-3leaf.js`: a 4-member group is
+built one member at a time; every (sender → receiver) pair exchanges
+text application messages at every epoch.
 
-3. **TreeKEM UpdatePath** (`update-path.js`) — RFC 9420 §7.5–§7.6.
-   Path-secret chain + HPKE Seal along the copath resolution; verified
-   against `treekem.json`.
+## Known gaps (post-MVP)
 
-4. **Welcome / joining** (`welcome.js`) — RFC 9420 §12.4.
-   Group-info encryption to the new member's HPKE init key; verified
-   against `welcome.json`.
-
-5. **Proposals + Commit + framing** (`framing.js`, `proposal.js`) —
-   RFC 9420 §6, §12. PublicMessage / PrivateMessage framing with the
-   confirmation + membership tags.
-
-6. **Application messages / secret tree** (`secret-tree.js`) — RFC 9420 §9.
-   Per-leaf AEAD nonce/key derivation for encryption of application data;
-   verified against `secret-tree.json`.
-
-7. **Server relay**. The Rust server gains new broadcast envelope types
-   (`group_commit`, `group_welcome`, `group_proposal`, `group_app_message`)
-   but remains a blind relay: no key material, no decryption, no membership
-   tracking beyond the existing room participant set.
-
-8. **UI wiring**. `chat.html` + `app.js` + `mls-session.js` orchestrator.
-   Re-enable group rooms in [`src/models/room.rs`](../../../src/models/room.rs)
-   once the crypto + relay are both in place.
+- **Parent-hash chaining (§7.9).** Commit-source LeafNodes are signed
+  with `parent_hash = empty`, and we don't enforce parent_hash on the
+  receive side. Both ends are consistent (we sign and verify the same
+  field), so signatures still validate — but a malicious member could
+  in principle splice subtrees without being caught. In our scenario
+  (creator-only commits, ephemeral rooms, blind relay) this is a
+  defence-in-depth gap rather than a usable vulnerability, and no IETF
+  reference vectors for the parent-hash chain shipped with our local
+  vector cache. Fixing it requires implementing
+  `original_sibling_tree_hash` plus the top-down chain walk in both
+  `commitAddMember` and `processCommit`.
+- **Update / Remove proposals.** Only `Add` is wired through. PCS
+  currently happens at every join (the whole tree re-keys); periodic
+  `Update` commits and explicit `Remove` for departing members are not
+  implemented.
+- **Proposal-by-reference.** All proposals travel inline inside their
+  Commit; the proposal store + RefHash dispatch is not wired.
+- **`ratchet_tree` GroupInfo extension.** The new joiner currently
+  receives the serialised tree as a side-channel field on the Welcome
+  envelope; the standardised extension path is unimplemented.
+- **`hashes.json.signed`.** Regenerated unsigned (sequence ≥ 31). The
+  operator re-signs locally with their ECDSA key.
 
 ## Test vectors
 
