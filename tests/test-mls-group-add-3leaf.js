@@ -209,6 +209,49 @@ async function main() {
             `${name} app msg at epoch 3`);
     }
 
+    // ---- Tampered KeyPackage rejection -----------------------------------
+    // A relay that flips a single byte of any signed field — leafNode
+    // encryption_key, leafNode signature_key, or the outer KeyPackage
+    // signature itself — must be rejected by commitAddMember. Without
+    // these checks an attacker could splice attacker-controlled leaves
+    // into the tree.
+    console.log('# KeyPackage tamper rejection');
+    {
+        const kpVictim = await buildKeyPackage();
+        const aliceClean = await Group.Group.create({ identity: aliceId });
+        // Sanity: clean KP accepted by a fresh group.
+        await aliceClean.commitAddMember({ keyPackageBytes: kpVictim.keyPackageBytes });
+        assert(aliceClean.nLeaves === 2, 'sanity: clean KP accepted');
+
+        // Flip a bit in the LeafNode encryption_key (KeyPackage TBS bytes).
+        const tamperedEncKey = kpVictim.keyPackageBytes.slice();
+        // Find the encryption_key bytes (first 65-byte uncompressed point
+        // after the LeafNode prefix). Easier: just flip a byte well inside
+        // the structure. We pick a byte that's part of the signed body —
+        // bytes 100..200 are LeafNode territory in our typical encoding.
+        tamperedEncKey[120] ^= 0x01;
+        const aliceA = await Group.Group.create({ identity: await freshIdentity() });
+        let threw = false;
+        try {
+            await aliceA.commitAddMember({ keyPackageBytes: tamperedEncKey });
+        } catch (_) {
+            threw = true;
+        }
+        assert(threw, 'tampered KeyPackage TBS body rejected');
+
+        // Flip the trailing KeyPackage signature byte directly.
+        const tamperedSig = kpVictim.keyPackageBytes.slice();
+        tamperedSig[tamperedSig.length - 1] ^= 0x01;
+        const aliceB = await Group.Group.create({ identity: await freshIdentity() });
+        let threw2 = false;
+        try {
+            await aliceB.commitAddMember({ keyPackageBytes: tamperedSig });
+        } catch (_) {
+            threw2 = true;
+        }
+        assert(threw2, 'tampered KeyPackage signature rejected');
+    }
+
     console.log('');
     console.log(`group-add-3leaf: ${passed} passed, ${failed} failed`);
     process.exit(failed === 0 ? 0 : 1);

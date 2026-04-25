@@ -377,6 +377,14 @@
             throw new Error(`group: KeyPackage cipher_suite mismatch (got ${kp.cipherSuite})`);
         }
 
+        // ---- 0. Verify the joiner's KeyPackage and inner LeafNode ----
+        // Without this, a malicious relay could substitute leafNode fields
+        // (encryption_key, signature_key, credential) and have us insert
+        // an attacker-controlled leaf into the tree. The signing key is
+        // taken from kp.leafNode.signatureKey because our credential model
+        // ties identity to the signature key directly.
+        await verifyKeyPackageBindings(kp);
+
         // ---- 1. Compute new tree shape, insert new leaf ----
         const newLeafIndex = this.nLeaves;
         const newNLeaves = this.nLeaves + 1;
@@ -625,7 +633,10 @@
             publicKey: leafNodePair.keyPair.publicKey,
             publicKeyBytes: leafNodePair.keyPair.publicKeyBytes,
         };
-        if (!this.parentKeyPairs) this.parentKeyPairs = new Map();
+        // Replace parent keypairs wholesale with the freshly-derived
+        // entries — anything not on our new direct path is unreachable
+        // and only weakens forward secrecy by lingering in memory.
+        this.parentKeyPairs = new Map();
         for (let i = 0; i < committerDirectPath.length; i += 1) {
             this.parentKeyPairs.set(committerDirectPath[i], chain[i].keyPair);
         }
@@ -727,6 +738,29 @@
             throw new Error(
                 `processCommit: UpdatePath nodes ${updatePath.nodes.length} != direct path ${committerDirectPath.length}`,
             );
+        }
+
+        // Verify the committer's NEW LeafNode is properly signed by the
+        // same identity key that signed the FramedContent. Without this
+        // check, a malicious party who somehow holds the committer's
+        // signing key (or a relay that forged FramedContentTBS — already
+        // rejected above) could splice in a leaf with an attacker-
+        // controlled encryption_key.
+        await verifyCommitLeafBinding(
+            updatePath.leafNode,
+            senderLeaf.signatureKey,
+            this.groupId,
+            senderLeafIndex,
+        );
+
+        // Apply Add proposals' KeyPackages: each leafNode the committer
+        // is inserting must itself carry valid signatures (otherwise the
+        // committer could smuggle attacker-controlled leaves through Adds).
+        for (const por of commit.proposals) {
+            if (por.type === Proposal.ProposalOrRefType.PROPOSAL
+                && por.proposal.proposalType === Proposal.ProposalType.ADD) {
+                await verifyKeyPackageBindings(por.proposal.keyPackage);
+            }
         }
 
         // Replace committer's leaf and stamp parent encryption_keys.
@@ -887,10 +921,25 @@
         this.interimTranscriptHash = newInterimTranscriptHash;
         this.epochSecrets = newEpochSecrets;
         this.senderRatchetGeneration = 0;
-        if (!this.parentKeyPairs) this.parentKeyPairs = new Map();
-        for (const [nodeIdx, pk] of newParentKeyPairs) {
-            this.parentKeyPairs.set(nodeIdx, pk);
+        // Forward secrecy: keep only entries that are on our direct
+        // path in the new tree. Any prior entry not in this set was
+        // either a node-of-no-current-relevance (tree grew past it) or
+        // got re-keyed in this commit — either way, the old keypair
+        // shouldn't survive the epoch transition.
+        const myNewDirectPath = TreeMath.directPathWithRoot(
+            TreeMath.leafToNode(this.myLeafIndex), newNLeaves,
+        );
+        const survivors = new Map();
+        for (const nodeIdx of myNewDirectPath) {
+            if (newParentKeyPairs.has(nodeIdx)) {
+                survivors.set(nodeIdx, newParentKeyPairs.get(nodeIdx));
+            } else if (this.parentKeyPairs && this.parentKeyPairs.has(nodeIdx)) {
+                // Below LCA — committer didn't re-key this node, but it's
+                // still on our path so we need the previously-known key.
+                survivors.set(nodeIdx, this.parentKeyPairs.get(nodeIdx));
+            }
         }
+        this.parentKeyPairs = survivors;
 
         return {
             addedLeafIndex: lastAddedLeafIndex,
@@ -1113,6 +1162,69 @@
             extensions: [],
             signature: new Uint8Array(0),
         };
+    }
+
+    /**
+     * Verify a KeyPackage's two signatures: the inner LeafNode (signed
+     * with source = KEY_PACKAGE, so the TBS is just the LeafNode bytes)
+     * and the outer KeyPackageTBS. Both use the leaf's signature_key —
+     * our credential model identifies a member by their signature key,
+     * so a forgery would have to forge ECDSA-P-256.
+     *
+     * Throws on any mismatch; returns void on success.
+     */
+    async function verifyKeyPackageBindings(kp) {
+        if (kp.leafNode.leafNodeSource !== Nodes.LeafNodeSource.KEY_PACKAGE) {
+            throw new Error(
+                `verifyKeyPackage: expected source=KEY_PACKAGE, got ${kp.leafNode.leafNodeSource}`,
+            );
+        }
+        const sigPub = await Signature.importPublicKey(kp.leafNode.signatureKey);
+        const leafTbs = Nodes.leafNodeTbsBytes(kp.leafNode);
+        const leafOk = await Labeled.verifyWithLabel(
+            sigPub, 'LeafNodeTBS', leafTbs, kp.leafNode.signature,
+        );
+        if (!leafOk) {
+            throw new Error('verifyKeyPackage: inner LeafNode signature invalid');
+        }
+        const kpTbs = KeyPackage.keyPackageTbsBytes(kp);
+        const kpOk = await Labeled.verifyWithLabel(
+            sigPub, 'KeyPackageTBS', kpTbs, kp.signature,
+        );
+        if (!kpOk) {
+            throw new Error('verifyKeyPackage: outer KeyPackage signature invalid');
+        }
+    }
+
+    /**
+     * Verify a COMMIT-source LeafNode: the TBS includes group_id and
+     * leaf_index appended after the LeafNode body. The signing key in
+     * the new leaf must match the OLD leaf's signing key (we don't
+     * support identity rotation in this MVP) — that ties the commit's
+     * new leaf back to the same member who signed the FramedContent.
+     */
+    async function verifyCommitLeafBinding(leaf, expectedSignatureKey, groupId, leafIndex) {
+        if (leaf.leafNodeSource !== Nodes.LeafNodeSource.COMMIT) {
+            throw new Error(
+                `verifyCommitLeaf: expected source=COMMIT, got ${leaf.leafNodeSource}`,
+            );
+        }
+        if (!equalBytes(leaf.signatureKey, expectedSignatureKey)) {
+            throw new Error(
+                'verifyCommitLeaf: signature_key rotation in commit not supported',
+            );
+        }
+        const sigPub = await Signature.importPublicKey(leaf.signatureKey);
+        const encoder = new Codec.Encoder();
+        Nodes.writeLeafNodeTbs(encoder, leaf);
+        encoder.writeOpaque(groupId);
+        encoder.writeU32(leafIndex);
+        const ok = await Labeled.verifyWithLabel(
+            sigPub, 'LeafNodeTBS', encoder.bytes(), leaf.signature,
+        );
+        if (!ok) {
+            throw new Error('verifyCommitLeaf: LeafNode signature invalid');
+        }
     }
 
     async function signLeafNodeForKeyPackage(signaturePrivateKey, leaf) {
