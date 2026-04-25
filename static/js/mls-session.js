@@ -195,9 +195,6 @@
             const payload = base64UrlDecode(envelope.payload);
             const wireFormat = envelope.wire_format;
 
-            console.log('[MLS] envelope wire_format=', wireFormat,
-                'role=', this.role, 'state=', this._state);
-
             // Creator: accept KeyPackages from new joiners while we have
             // a valid group to commit into. The state machine moves
             // 'awaiting-keypackage' → 'joined' on the first commit and
@@ -246,7 +243,6 @@
             // rides as a separate envelope field, so the bytes are NOT wrapped
             // in MLSMessage framing. Pass them straight to commitAddMember
             // which calls KeyPackage.parseKeyPackage internally.
-            console.log('[MLS] creator: received KeyPackage (', kpBytes.length, 'bytes), committing Add…');
             let commitMessage, welcomeMessage;
             try {
                 ({ commitMessage, welcomeMessage } = await this.group.commitAddMember({
@@ -257,7 +253,6 @@
                 this.onEvent({ kind: 'error', reason: `commitAddMember failed: ${err.message}` });
                 return;
             }
-            console.log('[MLS] creator: Add committed, broadcasting Commit + Welcome');
             const ratchetTreeBytes = MLS.Nodes.ratchetTreeBytes(this.group.ratchetTree);
 
             // Broadcast commit + welcome. We ship the ratchet_tree as a
@@ -359,8 +354,6 @@
             );
             try {
                 const result = await this.group.processCommit(wrapped);
-                console.log('[MLS] processed commit, added leaf', result.addedLeafIndex,
-                    'committer leaf', result.committerLeafIndex);
                 this.onEvent({ kind: 'commit-applied', ...result });
             } catch (err) {
                 console.error('[MLS] processCommit failed:', err);

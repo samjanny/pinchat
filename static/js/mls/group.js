@@ -899,92 +899,20 @@
     };
 
     /**
-     * Process a Welcome and join the group as the new member. Inputs:
+     * Process a Welcome and join the group as the new member. The
+     * ratchet_tree travels as a side-channel on the welcome envelope
+     * (committer serialises via Nodes.ratchetTreeBytes) until the
+     * `ratchet_tree` GroupInfo extension path lands.
+     *
+     * Inputs:
      *   welcomeMessage    : MLSMessage bytes (wire_format = mls_welcome)
      *   keyPackageBytes   : our published KeyPackage's serialised bytes
      *   initPrivateKey    : ECDH CryptoKey matching keyPackage.init_key
      *   identity          : our signature identity (as in Group.create)
-     *   leafEncKeyPair    : the full HPKE keypair for the leaf (the
-     *                       init_key from the KeyPackage; we reuse it as
-     *                       the leaf's encryption_key until we rotate).
-     *
-     * Scope limit: assumes exactly one new member (ourselves) and a
-     * 2-leaf resulting tree. Leaf_index == 1.
-     */
-    Group.joinFromWelcome = async function joinFromWelcome({
-        welcomeMessage, keyPackageBytes, initPrivateKey, identity, leafEncKeyPair,
-    }) {
-        const frame = MLSMessage.parseMLSMessage(welcomeMessage);
-        if (frame.wireFormat !== MLSMessage.WireFormat.MLS_WELCOME) {
-            throw new Error(`group.join: expected mls_welcome, got ${frame.wireFormat}`);
-        }
-        const welcome = Welcome.parseWelcome(frame.body);
-        if (welcome.cipherSuite !== CIPHERSUITE) {
-            throw new Error(`group.join: cipher_suite mismatch (got ${welcome.cipherSuite})`);
-        }
-
-        const kp = KeyPackage.parseKeyPackage(keyPackageBytes);
-        const myRef = await KeyPackage.keyPackageRef(keyPackageBytes);
-        const entry = welcome.secrets.find((s) => {
-            if (s.newMember.length !== myRef.length) return false;
-            for (let i = 0; i < myRef.length; i += 1) {
-                if (s.newMember[i] !== myRef[i]) return false;
-            }
-            return true;
-        });
-        if (!entry) throw new Error('group.join: no EncryptedGroupSecrets for our KeyPackage');
-
-        // Decrypt GroupSecrets.
-        const gs = await Welcome.decryptGroupSecrets(
-            entry.encryptedGroupSecrets, initPrivateKey, kp.initKey, welcome.encryptedGroupInfo,
-        );
-        if (!gs.pathSecret) {
-            throw new Error('group.join: no path_secret in GroupSecrets (MVP assumes Add+path)');
-        }
-
-        // Derive welcome_secret → welcome_key/nonce → decrypt GroupInfo.
-        const welcomeSecret = await Welcome.deriveWelcomeSecret(
-            gs.joinerSecret, new Uint8Array(HPKE.Nh),
-        );
-        const { key: wKey, nonce: wNonce } = await Welcome.welcomeKeyNonce(welcomeSecret);
-        const giBytes = await Welcome.openEncryptedGroupInfo(wKey, wNonce, welcome.encryptedGroupInfo);
-        const groupInfo = GroupInfo.parseGroupInfo(giBytes);
-
-        // Verify GroupInfo signature with the signer's signature_key. The
-        // signer is a leaf index; we need their LeafNode. Since our MVP
-        // assumes a 2-leaf tree with the signer at leaf 0, we'll locate
-        // them after reconstructing the tree below.
-        //
-        // Reconstruct the ratchet tree. MVP: we synthesise the 2-leaf
-        // shape (signer at leaf 0, new member at leaf 1). A full
-        // implementation would load the ratchet_tree extension.
-        const signerLeafIndex = groupInfo.signer;
-        if (signerLeafIndex !== 0) {
-            throw new Error('group.join: MVP scope — signer must be leaf 0');
-        }
-
-        // The committer's LeafNode is not directly in GroupInfo; we
-        // recover it by decrypting the path_secret and walking from
-        // the LCA down. But for tree-hash + sig-verify we also need
-        // the signer's LeafNode up front.
-        //
-        // For a 2-leaf group, a dedicated ratchet_tree extension (or
-        // side-channel) carries the full tree. Our MVP wire contract:
-        // the caller can fetch it from the server relay. Here we
-        // require callers to supply it so the joiner can validate
-        // against groupInfo.group_context.tree_hash.
-
-        throw new Error(
-            'group.join: MVP requires out-of-band ratchet_tree bytes; '
-            + 'call Group.joinFromWelcomeWithTree(...) instead.'
-        );
-    };
-
-    /**
-     * Variant that takes the ratchet_tree explicitly (serialised via
-     * Nodes.ratchetTreeBytes). Committer should ship it alongside the
-     * Welcome for now, until the `ratchet_tree` GroupInfo extension
-     * path lands.
+     *   leafEncKeyPair    : the full HPKE keypair for the leaf — the
+     *                       init_key from the KeyPackage, reused as the
+     *                       leaf's encryption_key until we rotate
+     *   ratchetTreeBytes  : serialised tree (out-of-band from Welcome)
      */
     Group.joinFromWelcomeWithTree = async function joinFromWelcomeWithTree({
         welcomeMessage, keyPackageBytes, initPrivateKey, identity,
