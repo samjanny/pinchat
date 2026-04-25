@@ -123,6 +123,11 @@ const TEST_SUITES = {
         name: 'MLS Group Add/Commit/Welcome flow',
         file: 'test-mls-group-add.js',
         description: 'Alice adds Bob via Welcome; both exchange messages at epoch 1'
+    },
+    'mls-group-add-3leaf': {
+        name: 'MLS Group N-leaf flow (processCommit + multi-Add)',
+        file: 'test-mls-group-add-3leaf.js',
+        description: 'Sequential adds up to 4 members; existing members process Commit'
     }
 };
 

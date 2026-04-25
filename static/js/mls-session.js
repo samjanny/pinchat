@@ -166,8 +166,13 @@
             console.log('[MLS] envelope wire_format=', wireFormat,
                 'role=', this.role, 'state=', this._state);
 
+            // Creator: accept KeyPackages from new joiners while we have
+            // a valid group to commit into. The state machine moves
+            // 'awaiting-keypackage' → 'joined' on the first commit and
+            // stays 'joined' afterwards; both states accept new KPs.
             if (wireFormat === MLS.MLSMessage.WireFormat.MLS_KEY_PACKAGE
-                && this.role === 'creator' && this._state === 'awaiting-keypackage') {
+                && this.role === 'creator'
+                && (this._state === 'awaiting-keypackage' || this._state === 'joined')) {
                 await this._handleIncomingKeyPackage(payload);
                 return;
             }
@@ -183,19 +188,25 @@
                 return;
             }
 
+            // Existing members (creator or already-joined joiners) process
+            // incoming Commit broadcasts to advance their epoch state.
+            // The creator filters their own echoes upstream via sender_id;
+            // joiners-still-awaiting-welcome ignore commits because their
+            // group state isn't built yet (Welcome is the catch-up path).
+            if (wireFormat === MLS.MLSMessage.WireFormat.MLS_PUBLIC_MESSAGE
+                && this._state === 'joined') {
+                await this._handleIncomingCommit(payload);
+                return;
+            }
+
             if (wireFormat === MLS.MLSMessage.WireFormat.MLS_PRIVATE_MESSAGE
                 && this._state === 'joined') {
                 await this._handleApplication(payload);
                 return;
             }
 
-            // Commit / PublicMessage from the creator after we joined is
-            // expected but ignored in this MVP — we fast-forwarded via
-            // the Welcome. A production build would validate it against
-            // our local state.
-            if (wireFormat === MLS.MLSMessage.WireFormat.MLS_PUBLIC_MESSAGE) {
-                return;
-            }
+            // Anything else (commit while still awaiting-welcome, etc.)
+            // is silently dropped — Welcome is the catch-up path.
         }
 
         async _handleIncomingKeyPackage(kpBytes) {
@@ -262,6 +273,29 @@
             } catch (err) {
                 this.onEvent({ kind: 'error',
                     reason: `decrypt failed: ${err.message}` });
+            }
+        }
+
+        /**
+         * Apply an incoming Commit broadcast to the local group state.
+         * Re-wraps the body with MLSMessage framing so processCommit can
+         * dispatch off wire_format. Errors during processing are surfaced
+         * via onEvent — they should be rare in our scenario (creator-only
+         * adds), so we treat them as actionable rather than silent drops.
+         */
+        async _handleIncomingCommit(mlsMessageBytes) {
+            const wrapped = MLS.MLSMessage.serializeMLSMessage(
+                MLS.MLSMessage.WireFormat.MLS_PUBLIC_MESSAGE, mlsMessageBytes,
+            );
+            try {
+                const result = await this.group.processCommit(wrapped);
+                console.log('[MLS] processed commit, added leaf', result.addedLeafIndex,
+                    'committer leaf', result.committerLeafIndex);
+                this.onEvent({ kind: 'commit-applied', ...result });
+            } catch (err) {
+                console.error('[MLS] processCommit failed:', err);
+                this.onEvent({ kind: 'error',
+                    reason: `processCommit failed: ${err.message}` });
             }
         }
 

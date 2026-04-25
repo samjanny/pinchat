@@ -108,6 +108,14 @@
         return out;
     }
 
+    function equalBytes(a, b) {
+        if (!a || !b) return false;
+        if (a.length !== b.length) return false;
+        let diff = 0;
+        for (let i = 0; i < a.length; i += 1) diff |= a[i] ^ b[i];
+        return diff === 0;
+    }
+
     // --- Group class ------------------------------------------------------
 
     class Group {
@@ -336,89 +344,95 @@
     }
 
     // ------------------------------------------------------------------
-    // Add/Commit/Welcome flow — scoped to 2-leaf groups.
+    // Add/Commit/Welcome flow — generic for N-leaf groups.
     //
-    // The committer (existing member, leaf 0) invokes
+    // The committer invokes
     //   alice.commitAddMember({ keyPackageBytes }) → { commitMessage,
     //                                                 welcomeMessage }
     // New member invokes
-    //   Group.joinFromWelcome({ welcomeMessage, keyPackageBytes,
-    //                           initPrivateKey, identity })
-    // to enter epoch 1 with Alice.
+    //   Group.joinFromWelcomeWithTree({ welcomeMessage, ... })
+    // to enter the next epoch.
     //
-    // Scope limit: this implementation handles committer == leaf 0 and
-    // adds the new member at leaf 1 (tree width 1 → 3). For deeper
-    // trees the filtered direct path / copath resolution logic
-    // generalises cleanly — just not in this commit.
+    // Existing members process the broadcast Commit via
+    //   alice.processCommit(commitMessageBytes)
+    // which decrypts the appropriate path_secret out of the UpdatePath,
+    // walks it up to root, and advances the local epoch state.
+    //
+    // Tree growth: new members are always appended at the next free leaf
+    // (newLeafIndex = nLeaves). The ratchet tree is padded to the new
+    // node-width on each Add. Parent nodes that are NOT on the
+    // committer's direct path stay blank — TreeKEM resolution recurses
+    // through them automatically.
+    //
+    // Parent-hash chaining (§7.9) is intentionally skipped; commit-source
+    // leaves carry an empty parent_hash byte string. Signatures still
+    // verify because we encode and verify the same field consistently
+    // on both sides. Adding stricter parent-hash validation is a
+    // post-MVP hardening item.
     // ------------------------------------------------------------------
 
     Group.prototype.commitAddMember = async function commitAddMember({ keyPackageBytes }) {
-        if (this.myLeafIndex !== 0 || this.nLeaves !== 1) {
-            throw new Error('group: commitAddMember is 2-leaf-only (MVP scope)');
-        }
         const kp = KeyPackage.parseKeyPackage(keyPackageBytes);
         if (kp.cipherSuite !== CIPHERSUITE) {
             throw new Error(`group: KeyPackage cipher_suite mismatch (got ${kp.cipherSuite})`);
         }
-        const newLeafIndex = 1;
 
-        // ---- 1. Generate committer's new leaf_secret and path chain ----
-        //
-        // The path secrets chain walks from the committer's leaf up to
-        // the root. For a 2-leaf tree the committer's direct path (with
-        // root) is just [root=1], so there's exactly one chain entry.
+        // ---- 1. Compute new tree shape, insert new leaf ----
+        const newLeafIndex = this.nLeaves;
+        const newNLeaves = this.nLeaves + 1;
+        const newWidth = TreeMath.nodeWidth(newNLeaves);
+        const newTree = Nodes.padRatchetTree(this.ratchetTree, newWidth);
+        newTree[TreeMath.leafToNode(newLeafIndex)] = {
+            nodeType: Nodes.NodeType.LEAF, leaf: kp.leafNode,
+        };
+
+        // ---- 2. Generate fresh leaf_secret + path-secret chain ----
         const leafSecret = randomBytes(HPKE.Nh);
         const leafNodePair = await TreeKEM.leafKeyPairFromSecret(leafSecret, this.myLeafIndex);
-        const chain = await TreeKEM.pathSecretChain(leafSecret, this.myLeafIndex, 2);
-        // chain.length === 1 for 2-leaf tree; root entry.
-        if (chain.length !== 1) {
-            throw new Error(`group: expected chain.length === 1 for 2-leaf, got ${chain.length}`);
+        const chain = await TreeKEM.pathSecretChain(leafSecret, this.myLeafIndex, newNLeaves);
+        const committerDirectPath = TreeMath.directPathWithRoot(
+            TreeMath.leafToNode(this.myLeafIndex), newNLeaves,
+        );
+        if (chain.length !== committerDirectPath.length) {
+            throw new Error(
+                `commitAddMember: chain length ${chain.length} != direct path ${committerDirectPath.length}`,
+            );
         }
-        const rootEntry = chain[0];
 
-        // ---- 2. Build provisional ratchet tree + new GroupContext ----
-        //
-        // After applying: leaves 0 (Alice updated) and 1 (Bob new),
-        // parent node 1 (encryption_key derived from rootEntry).
-        const bobLeaf = kp.leafNode;
-        const aliceNewLeafPreSign = buildSelfLeaf({
+        // ---- 3. Build NEW committer leaf (commit-source) and place it ----
+        const committerNewLeafPreSign = buildSelfLeaf({
             encryptionKeyBytes: leafNodePair.keyPair.publicKeyBytes,
             signatureKeyBytes: this.identity.signaturePublicKeyBytes,
             credentialIdentity: this.identity.signaturePublicKeyBytes,
             leafNodeSource: Nodes.LeafNodeSource.COMMIT,
         });
-        // For commit-source leaves, parent_hash binds the new leaf to
-        // the freshly-computed root. We use an empty parent_hash for
-        // this MVP: full parent-hash chaining lands with §7.9 later.
-        aliceNewLeafPreSign.parentHash = new Uint8Array(0);
-
-        // Sign the committer's updated LeafNode. §7.4.2 mandates the
-        // LeafNodeTBS for commit-source leaves include the group_id and
-        // leaf_index after the LeafNode fields — we honour that.
-        aliceNewLeafPreSign.signature = await signLeafNodeInCommit(
+        committerNewLeafPreSign.parentHash = new Uint8Array(0);
+        committerNewLeafPreSign.signature = await signLeafNodeInCommit(
             this.identity.signaturePrivateKey,
-            aliceNewLeafPreSign,
+            committerNewLeafPreSign,
             this.groupId,
             this.myLeafIndex,
         );
+        newTree[TreeMath.leafToNode(this.myLeafIndex)] = {
+            nodeType: Nodes.NodeType.LEAF, leaf: committerNewLeafPreSign,
+        };
 
-        // Replace Alice's leaf, blank her direct-path parents, and add
-        // Bob at leaf 1. Build new parent node at index 1 (the root
-        // for 2-leaf trees).
-        const newTree = [
-            { nodeType: Nodes.NodeType.LEAF, leaf: aliceNewLeafPreSign },
-            {
+        // ---- 4. Set new parent encryption_keys on direct path ----
+        // §5.3.1: intermediate nodes intersected by an UpdatePath have
+        // empty unmerged_leaves.
+        for (let i = 0; i < committerDirectPath.length; i += 1) {
+            newTree[committerDirectPath[i]] = {
                 nodeType: Nodes.NodeType.PARENT,
                 parent: {
-                    encryptionKey: rootEntry.keyPair.publicKeyBytes,
+                    encryptionKey: chain[i].keyPair.publicKeyBytes,
                     parentHash: new Uint8Array(0),
                     unmergedLeaves: [],
                 },
-            },
-            { nodeType: Nodes.NodeType.LEAF, leaf: bobLeaf },
-        ];
-        const newTreeHash = await TreeHash.hashRoot(newTree);
+            };
+        }
 
+        // ---- 5. Compute new tree hash + provisional GroupContext ----
+        const newTreeHash = await TreeHash.hashRoot(newTree);
         const newEpoch = this.epoch + 1n;
         const provisionalGroupContext = {
             version: PROTOCOL_VERSION,
@@ -432,24 +446,47 @@
         const provisionalGroupContextBytes =
             GroupContext.groupContextBytes(provisionalGroupContext);
 
-        // ---- 3. Encrypt path_secret[root] to Bob via EncryptWithLabel ----
-        const { kemOutput, ciphertext } = await Labeled.encryptWithLabel(
-            bobLeaf.encryptionKey,
-            'UpdatePathNode',
-            provisionalGroupContextBytes,
-            rootEntry.pathSecret,
-        );
-
-        const updatePathNode = {
-            encryptionKey: rootEntry.keyPair.publicKeyBytes,
-            encryptedPathSecret: [{ kemOutput, ciphertext }],
-        };
+        // ---- 6. Encrypt each path_secret to resolution(copath_sibling) ----
+        // For each parent on the committer's direct path, encrypt that
+        // parent's path_secret to every node in the resolution of the
+        // copath sibling. The new member's leaf is excluded — they
+        // receive their copy via the Welcome's group_secrets.path_secret
+        // at the LCA between the committer and their leaf.
+        const newLeafNodeIdx = TreeMath.leafToNode(newLeafIndex);
+        const updatePathNodes = [];
+        for (let i = 0; i < committerDirectPath.length; i += 1) {
+            const childOnPath = i === 0
+                ? TreeMath.leafToNode(this.myLeafIndex)
+                : committerDirectPath[i - 1];
+            const copathSibling = TreeMath.sibling(childOnPath, newNLeaves);
+            const res = RatchetTree.resolution(newTree, copathSibling);
+            const filtered = res.filter((n) => n !== newLeafNodeIdx);
+            const ciphertexts = [];
+            for (const targetNode of filtered) {
+                const targetSlot = newTree[targetNode];
+                if (!targetSlot) {
+                    throw new Error(`commitAddMember: resolution target ${targetNode} unexpectedly blank`);
+                }
+                const encKey = targetSlot.nodeType === Nodes.NodeType.LEAF
+                    ? targetSlot.leaf.encryptionKey
+                    : targetSlot.parent.encryptionKey;
+                const { kemOutput, ciphertext } = await Labeled.encryptWithLabel(
+                    encKey, 'UpdatePathNode',
+                    provisionalGroupContextBytes, chain[i].pathSecret,
+                );
+                ciphertexts.push({ kemOutput, ciphertext });
+            }
+            updatePathNodes.push({
+                encryptionKey: chain[i].keyPair.publicKeyBytes,
+                encryptedPathSecret: ciphertexts,
+            });
+        }
         const updatePath = {
-            leafNode: aliceNewLeafPreSign,
-            nodes: [updatePathNode],
+            leafNode: committerNewLeafPreSign,
+            nodes: updatePathNodes,
         };
 
-        // ---- 4. Build Commit struct: Add proposal + UpdatePath ----
+        // ---- 7. Commit struct: Add proposal + UpdatePath ----
         const addProposal = { proposalType: Proposal.ProposalType.ADD, keyPackage: kp };
         const commitStruct = {
             proposals: [{
@@ -460,10 +497,10 @@
         };
         const commitBodyBytes = Commit.commitBytes(commitStruct);
 
-        // ---- 5. FramedContent(commit) + signature ----
+        // ---- 8. FramedContent(commit) + signature (under OLD context) ----
         const content = {
             groupId: this.groupId,
-            epoch: this.epoch,  // signed under OLD group_context
+            epoch: this.epoch,
             sender: { senderType: Framing.SenderType.MEMBER, leafIndex: this.myLeafIndex },
             authenticatedData: new Uint8Array(0),
             contentType: Framing.ContentType.COMMIT,
@@ -475,10 +512,7 @@
             wireFormat, content, this._buildGroupContextStruct(),
         );
 
-        // ---- 6. Advance transcripts + derive new epoch secrets ----
-        //
-        // ConfirmedTranscriptHashInput = serialize(wire_format ||
-        //                     FramedContent || opaque<V>(signature))
+        // ---- 9. Transcript hashes + new epoch secrets ----
         const cthInput = new Codec.Encoder();
         cthInput.writeU16(wireFormat);
         Framing.writeFramedContent(cthInput, content);
@@ -486,16 +520,16 @@
         const newConfirmedTranscriptHash = await TranscriptHashes.confirmedTranscriptHash(
             this.interimTranscriptHash, cthInput.bytes(),
         );
-
         const epochGroupContext = {
             ...provisionalGroupContext,
             confirmedTranscriptHash: newConfirmedTranscriptHash,
         };
         const epochGroupContextBytes = GroupContext.groupContextBytes(epochGroupContext);
 
+        const rootChainEntry = chain[chain.length - 1];
         const epochSecrets = await KeySchedule.deriveEpoch({
             initSecretPrev: this.epochSecrets.initSecret,
-            commitSecret: await TreeKEM.commitSecret(rootEntry.pathSecret),
+            commitSecret: await TreeKEM.commitSecret(rootChainEntry.pathSecret),
             pskSecret: new Uint8Array(HPKE.Nh),
             groupContext: epochGroupContextBytes,
         });
@@ -506,24 +540,18 @@
         const newInterimTranscriptHash = await TranscriptHashes.interimTranscriptHash(
             newConfirmedTranscriptHash, confirmationTag,
         );
-
         const auth = { signature, confirmationTag };
 
-        // ---- 7. PublicMessage with membership_tag ----
-        const pmGroupContext = {
-            ...epochGroupContext,
-            confirmedTranscriptHash: newConfirmedTranscriptHash,
-        };
+        // ---- 10. PublicMessage with membership_tag (under OLD context) ----
         const membershipTag = await PublicMessage.computeMembershipTag(
-            epochSecrets.membershipKey, wireFormat, content, auth, this._buildGroupContextStruct(),
+            this.epochSecrets.membershipKey, wireFormat, content, auth,
+            this._buildGroupContextStruct(),
         );
-        const pm = {
-            content, auth, membershipTag,
-        };
+        const pm = { content, auth, membershipTag };
         const pmBytes = PublicMessage.publicMessageBytes(pm);
         const commitMessage = MLSMessage.serializeMLSMessage(wireFormat, pmBytes);
 
-        // ---- 8. Build GroupInfo + AES-GCM encrypt for Welcome ----
+        // ---- 11. GroupInfo + Welcome for the new member ----
         const groupInfoPreSign = {
             groupContext: epochGroupContext,
             extensions: [],
@@ -544,13 +572,25 @@
         const { key: wKey, nonce: wNonce } = await Welcome.welcomeKeyNonce(welcomeSecret);
         const encryptedGroupInfo = await Welcome.sealEncryptedGroupInfo(wKey, wNonce, giBytes);
 
-        // ---- 9. Encrypt GroupSecrets for Bob ----
-        // path_secret for Bob is the path_secret at the LCA of Alice's
-        // leaf (0) and Bob's leaf (2). For a 2-leaf tree, LCA = root
-        // (node 1), so path_secret is rootEntry.pathSecret.
+        // The path_secret to ship in the Welcome is the chain entry at
+        // the LCA of the committer and the new leaf — i.e. the lowest
+        // direct-path entry whose subtree contains the new leaf.
+        let lcaIndexForNewMember = -1;
+        for (let i = 0; i < committerDirectPath.length; i += 1) {
+            const descendants = TreeMath.leafDescendants(
+                committerDirectPath[i], newNLeaves,
+            );
+            if (descendants.includes(newLeafIndex)) {
+                lcaIndexForNewMember = i;
+                break;
+            }
+        }
+        if (lcaIndexForNewMember === -1) {
+            throw new Error('commitAddMember: cannot locate new member ancestor');
+        }
         const groupSecrets = {
             joinerSecret: epochSecrets.joinerSecret,
-            pathSecret: rootEntry.pathSecret,
+            pathSecret: chain[lcaIndexForNewMember].pathSecret,
             psks: [],
         };
         const gsBytes = Welcome.groupSecretsBytes(groupSecrets);
@@ -571,9 +611,9 @@
             MLSMessage.WireFormat.MLS_WELCOME, welcomeBytes,
         );
 
-        // ---- 10. Apply commit to our own state ----
+        // ---- 12. Apply commit to local state ----
         this.ratchetTree = newTree;
-        this.nLeaves = 2;
+        this.nLeaves = newNLeaves;
         this.epoch = newEpoch;
         this.treeHash = newTreeHash;
         this.confirmedTranscriptHash = newConfirmedTranscriptHash;
@@ -585,8 +625,277 @@
             publicKey: leafNodePair.keyPair.publicKey,
             publicKeyBytes: leafNodePair.keyPair.publicKeyBytes,
         };
+        if (!this.parentKeyPairs) this.parentKeyPairs = new Map();
+        for (let i = 0; i < committerDirectPath.length; i += 1) {
+            this.parentKeyPairs.set(committerDirectPath[i], chain[i].keyPair);
+        }
 
         return { commitMessage, welcomeMessage };
+    };
+
+    /**
+     * Process a Commit broadcast by another member. Inputs:
+     *   commitMessageBytes : MLSMessage(mls_public_message) bytes
+     *
+     * Verifies the FramedContent signature + membership_tag, applies
+     * Add proposals, walks the UpdatePath to recover our share of the
+     * new path_secret chain, and advances the local epoch state.
+     *
+     * Scope:
+     *   - Inline proposals only (Add). Proposal-by-reference (which
+     *     would require a local proposal cache) is not implemented.
+     *   - Single Add per commit. Multi-Add commits are accepted by the
+     *     parser but only the last new leaf index is reported back —
+     *     more than one would still apply correctly in tree terms but
+     *     hasn't been verified end-to-end yet.
+     */
+    Group.prototype.processCommit = async function processCommit(commitMessageBytes) {
+        const frame = MLSMessage.parseMLSMessage(commitMessageBytes);
+        if (frame.wireFormat !== MLSMessage.WireFormat.MLS_PUBLIC_MESSAGE) {
+            throw new Error(`processCommit: expected mls_public_message, got ${frame.wireFormat}`);
+        }
+        const pm = PublicMessage.parsePublicMessage(frame.body, (decoder, ct) => {
+            if (ct === Framing.ContentType.COMMIT) return Commit.readCommit(decoder);
+            throw new Error(`processCommit: unexpected content_type ${ct}`);
+        });
+        const content = pm.content;
+        if (content.contentType !== Framing.ContentType.COMMIT) {
+            throw new Error(`processCommit: expected commit, got ${content.contentType}`);
+        }
+        if (content.epoch !== this.epoch) {
+            throw new Error(`processCommit: wrong epoch (got ${content.epoch}, expected ${this.epoch})`);
+        }
+        if (content.sender.senderType !== Framing.SenderType.MEMBER) {
+            throw new Error('processCommit: non-member sender not supported');
+        }
+        const senderLeafIndex = content.sender.leafIndex;
+        if (senderLeafIndex === this.myLeafIndex) {
+            throw new Error('processCommit: own commit echo (filter upstream)');
+        }
+        const senderLeaf = RatchetTree.leafFor(this.ratchetTree, senderLeafIndex);
+        if (!senderLeaf) {
+            throw new Error(`processCommit: unknown sender leaf ${senderLeafIndex}`);
+        }
+
+        const wireFormat = MLSMessage.WireFormat.MLS_PUBLIC_MESSAGE;
+        const senderSigPub = await Signature.importPublicKey(senderLeaf.signatureKey);
+        const sigOk = await PublicMessage.verifyFramedContent(
+            senderSigPub, wireFormat, content,
+            this._buildGroupContextStruct(), pm.auth.signature,
+        );
+        if (!sigOk) throw new Error('processCommit: FramedContent signature invalid');
+
+        const membOk = await PublicMessage.verifyMembershipTag(
+            this.epochSecrets.membershipKey, wireFormat, content, pm.auth,
+            this._buildGroupContextStruct(), pm.membershipTag,
+        );
+        if (!membOk) throw new Error('processCommit: membership_tag invalid');
+
+        const commit = content.parsed;
+
+        // ---- Apply Add proposals (insert new leaves) ----
+        let newTree = this.ratchetTree.slice();
+        let newNLeaves = this.nLeaves;
+        let lastAddedLeafIndex = null;
+        for (const por of commit.proposals) {
+            if (por.type !== Proposal.ProposalOrRefType.PROPOSAL) {
+                throw new Error('processCommit: proposal-by-reference not supported');
+            }
+            const proposal = por.proposal;
+            if (proposal.proposalType !== Proposal.ProposalType.ADD) {
+                throw new Error(`processCommit: unsupported proposal_type ${proposal.proposalType}`);
+            }
+            const addLeafIndex = newNLeaves;
+            newNLeaves += 1;
+            const newWidth = TreeMath.nodeWidth(newNLeaves);
+            newTree = Nodes.padRatchetTree(newTree, newWidth);
+            newTree[TreeMath.leafToNode(addLeafIndex)] = {
+                nodeType: Nodes.NodeType.LEAF, leaf: proposal.keyPackage.leafNode,
+            };
+            lastAddedLeafIndex = addLeafIndex;
+        }
+
+        // ---- Apply UpdatePath ----
+        const updatePath = commit.path;
+        if (!updatePath) {
+            throw new Error('processCommit: commit without path is not supported (Add+Path only)');
+        }
+        const committerDirectPath = TreeMath.directPathWithRoot(
+            TreeMath.leafToNode(senderLeafIndex), newNLeaves,
+        );
+        if (updatePath.nodes.length !== committerDirectPath.length) {
+            throw new Error(
+                `processCommit: UpdatePath nodes ${updatePath.nodes.length} != direct path ${committerDirectPath.length}`,
+            );
+        }
+
+        // Replace committer's leaf and stamp parent encryption_keys.
+        newTree[TreeMath.leafToNode(senderLeafIndex)] = {
+            nodeType: Nodes.NodeType.LEAF, leaf: updatePath.leafNode,
+        };
+        for (let i = 0; i < committerDirectPath.length; i += 1) {
+            newTree[committerDirectPath[i]] = {
+                nodeType: Nodes.NodeType.PARENT,
+                parent: {
+                    encryptionKey: updatePath.nodes[i].encryptionKey,
+                    parentHash: new Uint8Array(0),
+                    unmergedLeaves: [],
+                },
+            };
+        }
+
+        // Provisional group context for HPKE info string.
+        const newTreeHash = await TreeHash.hashRoot(newTree);
+        const newEpoch = this.epoch + 1n;
+        const provisionalGroupContext = {
+            version: PROTOCOL_VERSION,
+            cipherSuite: CIPHERSUITE,
+            groupId: this.groupId,
+            epoch: newEpoch,
+            treeHash: newTreeHash,
+            confirmedTranscriptHash: this.confirmedTranscriptHash,
+            extensions: [],
+        };
+        const provisionalGroupContextBytes =
+            GroupContext.groupContextBytes(provisionalGroupContext);
+
+        // ---- Find LCA and decrypt our share of path_secret ----
+        let lcaIdxInPath = -1;
+        for (let i = 0; i < committerDirectPath.length; i += 1) {
+            const descendants = TreeMath.leafDescendants(
+                committerDirectPath[i], newNLeaves,
+            );
+            if (descendants.includes(this.myLeafIndex)) {
+                lcaIdxInPath = i;
+                break;
+            }
+        }
+        if (lcaIdxInPath === -1) {
+            throw new Error(`processCommit: my leaf ${this.myLeafIndex} not under any committer ancestor`);
+        }
+
+        // Resolution of committer's copath sibling at the LCA level.
+        const childOnPathAtLca = lcaIdxInPath === 0
+            ? TreeMath.leafToNode(senderLeafIndex)
+            : committerDirectPath[lcaIdxInPath - 1];
+        const copathSibling = TreeMath.sibling(childOnPathAtLca, newNLeaves);
+        const resolution = RatchetTree.resolution(newTree, copathSibling);
+        const filtered = lastAddedLeafIndex !== null
+            ? resolution.filter((n) => n !== TreeMath.leafToNode(lastAddedLeafIndex))
+            : resolution;
+
+        const myLeafNodeIdx = TreeMath.leafToNode(this.myLeafIndex);
+        let myCtIndex = -1;
+        let myPrivateKey = null;
+        let myPublicKeyBytes = null;
+        for (let j = 0; j < filtered.length; j += 1) {
+            const n = filtered[j];
+            if (n === myLeafNodeIdx) {
+                myCtIndex = j;
+                myPrivateKey = this.leafKeyPair.privateKey;
+                myPublicKeyBytes = this.leafKeyPair.publicKeyBytes;
+                break;
+            }
+            if (this.parentKeyPairs && this.parentKeyPairs.has(n)) {
+                const pk = this.parentKeyPairs.get(n);
+                myCtIndex = j;
+                myPrivateKey = pk.privateKey;
+                myPublicKeyBytes = pk.publicKeyBytes;
+                break;
+            }
+        }
+        if (myCtIndex === -1) {
+            throw new Error(
+                `processCommit: cannot locate my key in resolution at LCA index ${lcaIdxInPath}`,
+            );
+        }
+
+        const ct = updatePath.nodes[lcaIdxInPath].encryptedPathSecret[myCtIndex];
+        if (!ct) {
+            throw new Error(
+                `processCommit: missing ciphertext at index ${myCtIndex} for LCA node`,
+            );
+        }
+        const lcaPathSecret = await Labeled.decryptWithLabel(
+            myPrivateKey, myPublicKeyBytes, 'UpdatePathNode',
+            provisionalGroupContextBytes, ct.kemOutput, ct.ciphertext,
+        );
+
+        // Walk path_secret from LCA up to root, deriving keypairs and
+        // checking each against the encryption_key the committer
+        // advertised. Track derived keypairs so we can decrypt later
+        // commits from any committer whose copath sibling resolution
+        // lands on one of these nodes.
+        const newParentKeyPairs = new Map();
+        let cur = lcaPathSecret;
+        for (let i = lcaIdxInPath; i < committerDirectPath.length; i += 1) {
+            if (i > lcaIdxInPath) {
+                cur = await KeySchedule.deriveSecret(cur, 'path');
+            }
+            const nodeIdx = committerDirectPath[i];
+            const nodeSecret = await KeySchedule.deriveSecret(cur, 'node');
+            const kpDerived = await HPKE.deriveKeyPair(nodeSecret);
+            const expectedPub = updatePath.nodes[i].encryptionKey;
+            if (!equalBytes(kpDerived.publicKeyBytes, expectedPub)) {
+                throw new Error(
+                    `processCommit: derived public key mismatch at node ${nodeIdx} (i=${i})`,
+                );
+            }
+            newParentKeyPairs.set(nodeIdx, kpDerived);
+        }
+
+        // commit_secret = DeriveSecret(path_secret_root, "path")
+        const commitSecretBytes = await TreeKEM.commitSecret(cur);
+
+        // ---- Transcript hashes + new epoch secrets ----
+        const cthInput = new Codec.Encoder();
+        cthInput.writeU16(wireFormat);
+        Framing.writeFramedContent(cthInput, content);
+        cthInput.writeOpaque(pm.auth.signature);
+        const newConfirmedTranscriptHash = await TranscriptHashes.confirmedTranscriptHash(
+            this.interimTranscriptHash, cthInput.bytes(),
+        );
+        const epochGroupContext = {
+            ...provisionalGroupContext,
+            confirmedTranscriptHash: newConfirmedTranscriptHash,
+        };
+        const epochGroupContextBytes = GroupContext.groupContextBytes(epochGroupContext);
+
+        const newEpochSecrets = await KeySchedule.deriveEpoch({
+            initSecretPrev: this.epochSecrets.initSecret,
+            commitSecret: commitSecretBytes,
+            pskSecret: new Uint8Array(HPKE.Nh),
+            groupContext: epochGroupContextBytes,
+        });
+
+        const expectedConfTag = await TranscriptHashes.confirmationTag(
+            newEpochSecrets.confirmationKey, newConfirmedTranscriptHash,
+        );
+        if (!equalBytes(expectedConfTag, pm.auth.confirmationTag)) {
+            throw new Error('processCommit: confirmation_tag mismatch');
+        }
+        const newInterimTranscriptHash = await TranscriptHashes.interimTranscriptHash(
+            newConfirmedTranscriptHash, expectedConfTag,
+        );
+
+        // ---- Commit the new state ----
+        this.ratchetTree = newTree;
+        this.nLeaves = newNLeaves;
+        this.epoch = newEpoch;
+        this.treeHash = newTreeHash;
+        this.confirmedTranscriptHash = newConfirmedTranscriptHash;
+        this.interimTranscriptHash = newInterimTranscriptHash;
+        this.epochSecrets = newEpochSecrets;
+        this.senderRatchetGeneration = 0;
+        if (!this.parentKeyPairs) this.parentKeyPairs = new Map();
+        for (const [nodeIdx, pk] of newParentKeyPairs) {
+            this.parentKeyPairs.set(nodeIdx, pk);
+        }
+
+        return {
+            addedLeafIndex: lastAddedLeafIndex,
+            committerLeafIndex: senderLeafIndex,
+        };
     };
 
     /**
@@ -702,12 +1011,32 @@
         const giBytes = await Welcome.openEncryptedGroupInfo(wKey, wNonce, welcome.encryptedGroupInfo);
         const groupInfo = GroupInfo.parseGroupInfo(giBytes);
 
+        // Parse the ratchet tree. The committer always serialises with
+        // node_width(nLeaves) entries (no trailing-blank truncation), so
+        // the wire length tells us nLeaves directly.
         const parsedTree = Nodes.parseRatchetTree(ratchetTreeBytes);
-        const tree = Nodes.padRatchetTree(parsedTree, 3); // 2-leaf width
-        const nLeaves = 2;
+        const nLeaves = TreeMath.numLeaves(parsedTree.length);
+        const tree = Nodes.padRatchetTree(parsedTree, TreeMath.nodeWidth(nLeaves));
+
+        // Locate our own leaf by matching the encryption_key against our
+        // KeyPackage's leaf-node encryption_key (the committer copies it
+        // into the tree verbatim on Add).
+        const myEncKey = kp.leafNode.encryptionKey;
+        let myLeafIndex = -1;
+        for (let li = 0; li < nLeaves; li += 1) {
+            const leaf = RatchetTree.leafFor(tree, li);
+            if (leaf && equalBytes(leaf.encryptionKey, myEncKey)) {
+                myLeafIndex = li;
+                break;
+            }
+        }
+        if (myLeafIndex === -1) {
+            throw new Error('group.join: cannot locate our leaf in the ratchet_tree');
+        }
 
         // Verify GroupInfo signature with the signer's signature_key.
-        const signerLeaf = RatchetTree.leafFor(tree, groupInfo.signer);
+        const signerLeafIndex = groupInfo.signer;
+        const signerLeaf = RatchetTree.leafFor(tree, signerLeafIndex);
         if (!signerLeaf) throw new Error('group.join: signer leaf not present');
         const signerSigPub = await Signature.importPublicKey(signerLeaf.signatureKey);
         const sigOk = await Labeled.verifyWithLabel(
@@ -719,15 +1048,52 @@
 
         // Verify tree_hash matches what the GroupInfo claims.
         const computedTreeHash = await TreeHash.hashRoot(tree);
-        if (computedTreeHash.length !== groupInfo.groupContext.treeHash.length
-            || !computedTreeHash.every((b, i) => b === groupInfo.groupContext.treeHash[i])) {
+        if (!equalBytes(computedTreeHash, groupInfo.groupContext.treeHash)) {
             throw new Error('group.join: tree_hash mismatch');
         }
 
+        // Walk our path_secret (gs.pathSecret = path_secret[LCA]) up the
+        // direct path to root, deriving keypairs and verifying each
+        // matches the encryption_key the committer placed in the tree.
+        // This both validates the GroupSecrets we received AND populates
+        // our parentKeyPairs map for future commits.
+        if (!gs.pathSecret) {
+            throw new Error('group.join: missing path_secret in GroupSecrets');
+        }
+        const myDirectPath = TreeMath.directPathWithRoot(
+            TreeMath.leafToNode(myLeafIndex), nLeaves,
+        );
+        let lcaIdx = -1;
+        for (let i = 0; i < myDirectPath.length; i += 1) {
+            const descendants = TreeMath.leafDescendants(myDirectPath[i], nLeaves);
+            if (descendants.includes(signerLeafIndex)) {
+                lcaIdx = i;
+                break;
+            }
+        }
+        if (lcaIdx === -1) {
+            throw new Error('group.join: signer leaf not under any of our ancestors');
+        }
+        const parentKeyPairs = new Map();
+        let cur = gs.pathSecret;
+        for (let i = lcaIdx; i < myDirectPath.length; i += 1) {
+            if (i > lcaIdx) {
+                cur = await KeySchedule.deriveSecret(cur, 'path');
+            }
+            const nodeIdx = myDirectPath[i];
+            const nodeSecret = await KeySchedule.deriveSecret(cur, 'node');
+            const kpDerived = await HPKE.deriveKeyPair(nodeSecret);
+            const slot = tree[nodeIdx];
+            if (!slot || slot.nodeType !== Nodes.NodeType.PARENT) {
+                throw new Error(`group.join: parent node ${nodeIdx} unexpectedly blank/non-parent`);
+            }
+            if (!equalBytes(kpDerived.publicKeyBytes, slot.parent.encryptionKey)) {
+                throw new Error(`group.join: derived public key mismatch at node ${nodeIdx}`);
+            }
+            parentKeyPairs.set(nodeIdx, kpDerived);
+        }
+
         // Derive epoch secrets using gs.joinerSecret as the joiner_secret.
-        // We bypass the full deriveEpoch path because GroupSecrets
-        // already carries joiner_secret; the derivation just splits it
-        // into welcome/epoch + downstream secrets.
         const memberSecret = await HPKE.hkdfExtract(
             gs.joinerSecret, new Uint8Array(HPKE.Nh),
         );
@@ -765,8 +1131,7 @@
         const expectedConfTag = await TranscriptHashes.confirmationTag(
             confirmationKey, groupInfo.groupContext.confirmedTranscriptHash,
         );
-        if (expectedConfTag.length !== groupInfo.confirmationTag.length
-            || !expectedConfTag.every((b, i) => b === groupInfo.confirmationTag[i])) {
+        if (!equalBytes(expectedConfTag, groupInfo.confirmationTag)) {
             throw new Error('group.join: confirmation_tag mismatch');
         }
 
@@ -776,9 +1141,10 @@
             epoch: groupInfo.groupContext.epoch,
             ratchetTree: tree,
             nLeaves,
-            myLeafIndex: 1, // MVP scope
+            myLeafIndex,
             identity,
             leafKeyPair: leafEncKeyPair,
+            parentKeyPairs,
             senderRatchetGeneration: 0,
             interimTranscriptHash: await TranscriptHashes.interimTranscriptHash(
                 groupInfo.groupContext.confirmedTranscriptHash, expectedConfTag,
