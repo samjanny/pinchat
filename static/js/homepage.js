@@ -1,6 +1,22 @@
 /**
  * Homepage - Room creation form (Alpine.js CSP-compatible Global Store)
  */
+
+/**
+ * Fetch a fresh CSRF token from /api/csrf and return it. The endpoint
+ * also sets the csrf_token cookie, so the X-CSRF-Token header we send
+ * back will match the cookie when the API verifies the double-submit.
+ */
+async function fetchCsrfToken() {
+    const r = await fetch('/api/csrf', { credentials: 'same-origin' });
+    if (!r.ok) throw new Error(`CSRF token fetch failed: ${r.status}`);
+    const data = await r.json();
+    if (!/^[a-f0-9]{32}\.[a-f0-9]{64}$/.test(data.csrf_token)) {
+        throw new Error('CSRF token format invalid');
+    }
+    return data.csrf_token;
+}
+
 document.addEventListener('alpine:init', () => {
     Alpine.store('homepage', {
         // State
@@ -89,11 +105,13 @@ document.addEventListener('alpine:init', () => {
          * Creates a room with automatic PoW challenge handling
          */
         async createRoomWithPoW(config, powHeaders = {}) {
+            const csrfToken = await fetchCsrfToken();
             const response = await fetch('/api/rooms', {
                 method: 'POST',
                 credentials: 'same-origin',
                 headers: {
                     'Content-Type': 'application/json',
+                    'X-CSRF-Token': csrfToken,
                     ...powHeaders
                 },
                 body: JSON.stringify(config)

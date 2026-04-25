@@ -390,9 +390,12 @@ async fn main() {
         .layer(rate_limiter.clone())
         .with_state(app_state.clone());
 
-    // Apply rate limiting to WebSocket token endpoint (with auth)
+    // Apply rate limiting to WebSocket token endpoint (with auth + CSRF).
+    // POST (not GET) so the request body cannot be forged as a top-level
+    // navigation; CSRF double-submit token gating applied inside the
+    // handler itself.
     let rate_limited_ws_token = Router::new()
-        .route("/api/ws-token/:room_id", get(generate_ws_token))
+        .route("/api/ws-token/:room_id", post(generate_ws_token))
         .layer(middleware::from_fn_with_state(
             app_state.clone(),
             require_auth_api,

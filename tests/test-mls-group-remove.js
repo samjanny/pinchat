@@ -50,8 +50,9 @@ async function freshIdentity() {
 async function buildKeyPackage() {
     const identity = await freshIdentity();
     const initKp = await HPKE.generateKeyPair();
+    const leafEncKp = await HPKE.generateKeyPair();
     const leaf = Group.buildSelfLeaf({
-        encryptionKeyBytes: initKp.publicKeyBytes,
+        encryptionKeyBytes: leafEncKp.publicKeyBytes,
         signatureKeyBytes: identity.signaturePublicKeyBytes,
         credentialIdentity: identity.signaturePublicKeyBytes,
         leafNodeSource: Nodes.LeafNodeSource.KEY_PACKAGE,
@@ -72,7 +73,7 @@ async function buildKeyPackage() {
         identity.signaturePrivateKey, 'KeyPackageTBS', tbs,
     );
     const bytes = KeyPackage.keyPackageBytes(kp);
-    return { identity, initKp, leaf, keyPackage: kp, keyPackageBytes: bytes };
+    return { identity, initKp, leafEncKp, leaf, keyPackage: kp, keyPackageBytes: bytes };
 }
 
 function hex(u8) { return Buffer.from(u8).toString('hex'); }
@@ -92,7 +93,7 @@ async function main() {
         keyPackageBytes: bob.keyPackageBytes,
         initPrivateKey: bob.initKp.privateKey,
         identity: bob.identity,
-        leafEncKeyPair: bob.initKp,
+        leafEncKeyPair: bob.leafEncKp,
         ratchetTreeBytes: tree1,
     });
 
@@ -106,7 +107,7 @@ async function main() {
         keyPackageBytes: carol.keyPackageBytes,
         initPrivateKey: carol.initKp.privateKey,
         identity: carol.identity,
-        leafEncKeyPair: carol.initKp,
+        leafEncKeyPair: carol.leafEncKp,
         ratchetTreeBytes: tree2,
     });
     assert(alice.epoch === 2n && bobGroup.epoch === 2n && carolGroup.epoch === 2n,
@@ -190,7 +191,7 @@ async function main() {
         keyPackageBytes: dave.keyPackageBytes,
         initPrivateKey: dave.initKp.privateKey,
         identity: dave.identity,
-        leafEncKeyPair: dave.initKp,
+        leafEncKeyPair: dave.leafEncKp,
         ratchetTreeBytes: tree4,
     });
     assert(daveGroup.myLeafIndex === 3, 'Dave joined at leaf 3 (after blank Bob slot)');

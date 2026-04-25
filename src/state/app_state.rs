@@ -43,6 +43,15 @@ pub struct AppState {
     /// Prevents bandwidth exhaustion and client-side decryption DoS
     pub connection_message_timestamps: Arc<DashMap<Uuid, VecDeque<DateTime<Utc>>>>,
 
+    /// Per-connection MLS Commit rate limiting (separate, much tighter).
+    /// Commits are 10²-10³× more expensive than application messages on
+    /// the receiver (TreeKEM path verification + signature + transcript
+    /// hash + key schedule), so the global msg_rate_limit is too generous
+    /// when applied to broadcast Commits. Capped at a few per minute
+    /// (see `commit_rate_limit` in the config) to bound the CPU cost a
+    /// single peer can inflict on every other room member.
+    pub connection_commit_timestamps: Arc<DashMap<Uuid, VecDeque<DateTime<Utc>>>>,
+
     /// Per-connection global frame timestamps.
     /// Applied to EVERY text frame (ECDH, message, image, unknown, malformed),
     /// so attackers cannot bypass the stricter message/image rate limiter by
@@ -120,6 +129,7 @@ impl AppState {
             broadcast_channels: Arc::new(DashMap::new()),
             seen_message_hashes: Arc::new(DashMap::new()),
             connection_message_timestamps: Arc::new(DashMap::new()),
+            connection_commit_timestamps: Arc::new(DashMap::new()),
             connection_frame_timestamps: Arc::new(DashMap::new()),
             connection_protocol_errors: Arc::new(DashMap::new()),
             challenge_cache: Arc::new(ChallengeCache::new(config.challenge_ttl_secs, 10_000)),
@@ -261,6 +271,7 @@ impl AppState {
 
             // Cleanup rate limiting timestamps for this connection
             self.connection_message_timestamps.remove(connection_id);
+            self.connection_commit_timestamps.remove(connection_id);
             self.connection_frame_timestamps.remove(connection_id);
             self.connection_protocol_errors.remove(connection_id);
 

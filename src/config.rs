@@ -52,6 +52,15 @@ pub struct Config {
     pub msg_rate_limit: usize,
     pub msg_rate_window_secs: i64,
 
+    // Per-connection MLS Commit rate limit. Commits are broadcast to every
+    // member and trigger TreeKEM verification + transcript hash + signature
+    // checks on each receiver, so they're far more expensive than regular
+    // application messages. Defaults: 12 commits / 60 seconds (one every
+    // 5 s on average) — a peer can still bring in members at a steady
+    // cadence but cannot CPU-pin the room.
+    pub commit_rate_limit: usize,
+    pub commit_rate_window_secs: i64,
+
     // Per-connection global frame rate limit (applies to EVERY text frame,
     // including handshakes, unknown types, and malformed JSON, not just
     // message/image). Acts as an anti-flood ceiling that sits above the
@@ -162,6 +171,16 @@ impl Config {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(1),
+
+            // MLS Commit rate limit (default: 12 commits per 60 seconds).
+            commit_rate_limit: env::var("COMMIT_RATE_LIMIT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(12),
+            commit_rate_window_secs: env::var("COMMIT_RATE_WINDOW_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(60),
 
             // Global frame rate limit (default: 4x msg_rate_limit, same window).
             // Applied to every text frame regardless of msg_type so ECDH,

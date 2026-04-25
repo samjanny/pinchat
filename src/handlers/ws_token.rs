@@ -21,6 +21,7 @@ use serde_json::json;
 use std::net::SocketAddr;
 use uuid::Uuid;
 
+use crate::handlers::auth::verify_csrf_for_api;
 use crate::ip_hash::{extract_client_ip_with_proxy, hash_ip};
 use crate::jwt::{sign_token, WsTokenClaims};
 use crate::pow::{calculate_difficulty, PowChallenge};
@@ -80,6 +81,13 @@ pub async fn generate_ws_token(
     headers: HeaderMap,
     Path(room_id): Path<Uuid>,
 ) -> Result<Json<WsTokenResponse>, Response> {
+    // CSRF: this endpoint hands out a JWT bound to the caller's
+    // connection_id; without CSRF it can be forged from any same-site
+    // injection context (XSS, sibling subdomain, …) and used to hijack
+    // the victim's relay slot. POST + double-submit token gating closes
+    // that gap on top of SameSite=Strict + session auth.
+    verify_csrf_for_api(&headers, &state.csrf_secret)?;
+
     // Extract and hash client IP for challenge cache lookup
     // Considers trusted proxies for X-Forwarded-For when configured
     let client_ip =

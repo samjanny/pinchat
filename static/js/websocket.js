@@ -2,6 +2,22 @@
  * Module for managing the WebSocket connection with reconnection logic
  */
 
+/**
+ * Fetch a fresh CSRF token from /api/csrf and return it. The endpoint
+ * also sets the csrf_token cookie, so the X-CSRF-Token header sent on
+ * the subsequent /api/ws-token POST will match the cookie when the
+ * server verifies the double-submit pair.
+ */
+async function _fetchCsrfTokenForWs() {
+    const r = await fetch('/api/csrf', { credentials: 'same-origin' });
+    if (!r.ok) throw new Error(`CSRF token fetch failed: ${r.status}`);
+    const data = await r.json();
+    if (!/^[a-f0-9]{32}\.[a-f0-9]{64}$/.test(data.csrf_token)) {
+        throw new Error('CSRF token format invalid');
+    }
+    return data.csrf_token;
+}
+
 class WebSocketManager {
     constructor(roomId) {
         this.roomId = roomId;
@@ -60,12 +76,19 @@ class WebSocketManager {
      */
     async requestWsToken() {
         try {
+            // CSRF: /api/ws-token is now POST with double-submit token
+            // gating. Fetch a fresh cookie/header pair every call — the
+            // /api/csrf endpoint sets a Set-Cookie alongside its JSON
+            // response so the cookie/header always agree.
+            const csrfToken = await _fetchCsrfTokenForWs();
+
             // First attempt: request token (may succeed if PoW already solved for room creation)
             let response = await fetch(`/api/ws-token/${this.roomId}`, {
-                method: 'GET',
+                method: 'POST',
                 credentials: 'same-origin',
                 headers: {
-                    'Content-Type': 'application/json'
+                    'Content-Type': 'application/json',
+                    'X-CSRF-Token': csrfToken
                 }
             });
 
@@ -121,13 +144,18 @@ class WebSocketManager {
                     this.onPowProgress(-1); // -1 indicates completion
                 }
 
-                // Retry token request with PoW solution
+                // Retry token request with PoW solution. The CSRF
+                // double-submit pair is single-use semantically (verified
+                // server-side) but cookie + header are still both valid
+                // until the cookie expires; reuse the same csrfToken
+                // captured at the top of this method.
                 response = await fetch(`/api/ws-token/${this.roomId}`, {
-                    method: 'GET',
+                    method: 'POST',
                     credentials: 'same-origin',
                     headers: {
                         'Content-Type': 'application/json',
                         'X-Pow-Nonce': nonce.toString(),
+                        'X-CSRF-Token': csrfToken,
                     }
                 });
 

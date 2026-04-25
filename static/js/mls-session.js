@@ -91,8 +91,16 @@
     }
 
     /**
-     * Build a fresh identity + HPKE init keypair + signed KeyPackage.
-     * Returns { identity, initKeyPair, leaf, keyPackage, keyPackageBytes }.
+     * Build a fresh identity + HPKE init keypair + HPKE leaf-encryption
+     * keypair + signed KeyPackage.
+     *
+     * RFC 9420 §7.2.1 mandates that LeafNode.encryption_key be DISTINCT
+     * from KeyPackage.init_key. The init_key is a one-shot HPKE recipient
+     * key used only to decrypt the Welcome's GroupSecrets; the leaf
+     * encryption_key is used for TreeKEM path encryption to that leaf
+     * across all subsequent epochs the member participates in. Reusing
+     * the same keypair would mean a captured Welcome ciphertext could
+     * compromise the joiner's first-epoch leaf decryption key.
      */
     async function buildKeyPackage() {
         const sigKp = await MLS.Signature.generateKeyPair();
@@ -101,9 +109,10 @@
             signaturePublicKeyBytes: sigKp.publicKeyBytes,
         };
         const initKp = await MLS.HPKE.generateKeyPair();
+        const leafEncKp = await MLS.HPKE.generateKeyPair();
 
         const leaf = MLS.Group.buildSelfLeaf({
-            encryptionKeyBytes: initKp.publicKeyBytes,
+            encryptionKeyBytes: leafEncKp.publicKeyBytes,
             signatureKeyBytes: identity.signaturePublicKeyBytes,
             credentialIdentity: identity.signaturePublicKeyBytes,
             leafNodeSource: MLS.Nodes.LeafNodeSource.KEY_PACKAGE,
@@ -127,7 +136,8 @@
         const wrapped = MLS.MLSMessage.serializeMLSMessage(
             MLS.MLSMessage.WireFormat.MLS_KEY_PACKAGE, keyPackageBytes,
         );
-        return { identity, initKeyPair: initKp, leaf, keyPackage: kp,
+        return { identity, initKeyPair: initKp, leafEncKeyPair: leafEncKp,
+            leaf, keyPackage: kp,
             keyPackageBytes, wrappedKeyPackageBytes: wrapped };
     }
 
@@ -322,7 +332,7 @@
                 keyPackageBytes: this.keyPackageBundle.keyPackageBytes,
                 initPrivateKey: this.keyPackageBundle.initKeyPair.privateKey,
                 identity: this.identity,
-                leafEncKeyPair: this.keyPackageBundle.initKeyPair,
+                leafEncKeyPair: this.keyPackageBundle.leafEncKeyPair,
                 ratchetTreeBytes,
                 pskSecret: this.pskSecret,
             });

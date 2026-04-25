@@ -356,6 +356,16 @@
 
             const senderLeafIndex = out.senderData.leafIndex;
             const generation = out.senderData.generation;
+            // Defense-in-depth bounds check before tree lookup. Even
+            // though leafFor returns falsy for OOB, an explicit guard
+            // makes a future port (e.g. typed-array-backed RatchetTree)
+            // memory-safe by construction.
+            if (!Number.isInteger(senderLeafIndex) || senderLeafIndex < 0
+                || senderLeafIndex >= this.nLeaves) {
+                throw new Error(
+                    `group: sender leaf_index ${senderLeafIndex} out of range [0,${this.nLeaves})`,
+                );
+            }
             // Replay protection: reject (leafIndex, generation) duplicates
             // within the current epoch. Reset on every epoch transition.
             // The legitimate sender increments senderRatchetGeneration once
@@ -962,6 +972,12 @@
             throw new Error('processCommit: non-member sender not supported');
         }
         const senderLeafIndex = content.sender.leafIndex;
+        if (!Number.isInteger(senderLeafIndex) || senderLeafIndex < 0
+            || senderLeafIndex >= this.nLeaves) {
+            throw new Error(
+                `processCommit: sender leaf_index ${senderLeafIndex} out of range [0,${this.nLeaves})`,
+            );
+        }
         if (senderLeafIndex === this.myLeafIndex) {
             throw new Error('processCommit: own commit echo (filter upstream)');
         }
@@ -1337,6 +1353,12 @@
 
         // Verify GroupInfo signature with the signer's signature_key.
         const signerLeafIndex = groupInfo.signer;
+        if (!Number.isInteger(signerLeafIndex) || signerLeafIndex < 0
+            || signerLeafIndex >= nLeaves) {
+            throw new Error(
+                `group.join: signer leaf_index ${signerLeafIndex} out of range [0,${nLeaves})`,
+            );
+        }
         const signerLeaf = RatchetTree.leafFor(tree, signerLeafIndex);
         if (!signerLeaf) throw new Error('group.join: signer leaf not present');
         const signerSigPub = await Signature.importPublicKey(signerLeaf.signatureKey);
@@ -1477,13 +1499,21 @@
                 credentials: [Nodes.CredentialType.BASIC],
             },
             leafNodeSource,
-            // KEY_PACKAGE variant needs a Lifetime; the in-tree group
-            // operations don't pin an absolute clock, so we advertise
-            // a window of ± ~34 years around epoch zero (i.e. "always
-            // valid"). Ephemeral rooms enforce lifetime via TTL at the
-            // relay, not via Lifetime.
+            // KEY_PACKAGE variant needs a Lifetime per RFC §7.2.3.
+            // We bind it to a 24-hour window around publication; the
+            // recipient validates `now ∈ [notBefore, notAfter)` so an
+            // old or replayed KeyPackage is rejected even if its
+            // signature is intact. Rooms have a hard TTL ≤ 24h so
+            // this matches the operational lifetime of any valid
+            // KeyPackage in flight.
             lifetime: leafNodeSource === Nodes.LeafNodeSource.KEY_PACKAGE
-                ? { notBefore: 0n, notAfter: 0xffffffffffffffffn }
+                ? (() => {
+                    const nowSecs = BigInt(Math.floor(Date.now() / 1000));
+                    return {
+                        notBefore: nowSecs - 60n,           // 1 min clock-skew
+                        notAfter: nowSecs + 24n * 60n * 60n, // 24h
+                    };
+                })()
                 : undefined,
             extensions: [],
             signature: new Uint8Array(0),
@@ -1503,6 +1533,24 @@
         if (kp.leafNode.leafNodeSource !== Nodes.LeafNodeSource.KEY_PACKAGE) {
             throw new Error(
                 `verifyKeyPackage: expected source=KEY_PACKAGE, got ${kp.leafNode.leafNodeSource}`,
+            );
+        }
+        // RFC §7.2.3: enforce now ∈ [notBefore, notAfter). Rejects
+        // replayed KeyPackages from a former member trying to rejoin
+        // off a captured invite.
+        const lt = kp.leafNode.lifetime;
+        if (!lt || typeof lt.notBefore !== 'bigint' || typeof lt.notAfter !== 'bigint') {
+            throw new Error('verifyKeyPackage: missing or malformed Lifetime');
+        }
+        const nowSecs = BigInt(Math.floor(Date.now() / 1000));
+        if (nowSecs < lt.notBefore) {
+            throw new Error(
+                `verifyKeyPackage: Lifetime not yet valid (now=${nowSecs} < notBefore=${lt.notBefore})`,
+            );
+        }
+        if (nowSecs >= lt.notAfter) {
+            throw new Error(
+                `verifyKeyPackage: Lifetime expired (now=${nowSecs} >= notAfter=${lt.notAfter})`,
             );
         }
         const sigPub = await Signature.importPublicKey(kp.leafNode.signatureKey);

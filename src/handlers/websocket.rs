@@ -453,29 +453,43 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: Uuid, connec
                                 }
                             };
 
-                            // Upper bound: Welcome + ratchet_tree can be large
-                            // for 20-member groups. Cap at the same image
-                            // ceiling so one mls envelope cannot exceed the
-                            // AEAD-framed image budget.
+                            // Upper bound on the MLS payload itself: Welcome
+                            // and Commit messages stay well under the image
+                            // ceiling, which is also the AEAD-framed budget.
                             let max_size =
                                 max_image_payload_size(state_clone.config.max_image_size);
-                            if payload.len() > max_size
-                                || incoming
-                                    .ratchet_tree
-                                    .as_ref()
-                                    .map(|s| s.len())
-                                    .unwrap_or(0)
-                                    > max_size
-                            {
+                            if payload.len() > max_size {
                                 tracing::warn!(
-                                    "mls envelope too large from connection_id={} (payload={}, rt={})",
+                                    "mls payload too large from connection_id={} ({} > {})",
                                     connection_id,
                                     payload.len(),
-                                    incoming
-                                        .ratchet_tree
-                                        .as_ref()
-                                        .map(|s| s.len())
-                                        .unwrap_or(0)
+                                    max_size
+                                );
+                                if bump_protocol_error(&state_clone, connection_id) {
+                                    break;
+                                }
+                                continue;
+                            }
+                            // Tighter cap on ratchet_tree side-channel: a
+                            // 64 KB tree comfortably fits ≥ 32-leaf groups
+                            // at ciphersuite 0x0002 (~2 KB/leaf in the
+                            // worst case), well above our ≤ 20-member
+                            // room cap. Larger blobs are bandwidth +
+                            // CPU amplification (every joiner has to
+                            // tree-hash whatever they receive) — drop
+                            // them rather than forward.
+                            const RATCHET_TREE_MAX_BYTES: usize = 64 * 1024;
+                            let rt_len = incoming
+                                .ratchet_tree
+                                .as_ref()
+                                .map(|s| s.len())
+                                .unwrap_or(0);
+                            if rt_len > RATCHET_TREE_MAX_BYTES {
+                                tracing::warn!(
+                                    "mls ratchet_tree too large from connection_id={} ({} > {})",
+                                    connection_id,
+                                    rt_len,
+                                    RATCHET_TREE_MAX_BYTES
                                 );
                                 if bump_protocol_error(&state_clone, connection_id) {
                                     break;
@@ -540,6 +554,44 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: Uuid, connec
                                 break;
                             }
                             timestamps.push_back(now);
+                            // Release the entry guard before grabbing the
+                            // commit-specific one to avoid holding two
+                            // DashMap shards across an await point.
+                            drop(timestamps);
+
+                            // Tighter per-connection commit rate limit.
+                            // wire_format = 1 (MLS_PUBLIC_MESSAGE) is the
+                            // Commit channel — every other room member has
+                            // to verify TreeKEM + signatures + transcripts
+                            // on receipt, so the cost scales with member
+                            // count. A handful of commits per minute is
+                            // far below any legitimate add/remove cadence.
+                            const WIRE_PUBLIC_MESSAGE: u16 = 1;
+                            if wire_format == WIRE_PUBLIC_MESSAGE {
+                                let max_commits = state_clone.config.commit_rate_limit;
+                                let commit_window =
+                                    state_clone.config.commit_rate_window_secs;
+                                let mut commit_ts = state_clone
+                                    .connection_commit_timestamps
+                                    .entry(connection_id)
+                                    .or_insert_with(VecDeque::new);
+                                let commit_cutoff =
+                                    now - chrono::Duration::seconds(commit_window);
+                                commit_ts.retain(|&ts| ts > commit_cutoff);
+                                if commit_ts.len() >= max_commits {
+                                    tracing::warn!(
+                                        "Connection {} exceeded MLS commit rate limit ({}/{}s), dropping",
+                                        connection_id,
+                                        max_commits,
+                                        commit_window
+                                    );
+                                    if bump_protocol_error(&state_clone, connection_id) {
+                                        break;
+                                    }
+                                    continue;
+                                }
+                                commit_ts.push_back(now);
+                            }
 
                             let broadcast_msg = Message::Mls {
                                 payload,
@@ -817,6 +869,8 @@ mod tests {
             room_token_period_secs: 600,
             msg_rate_limit: 30,
             msg_rate_window_secs: 1,
+            commit_rate_limit: 12,
+            commit_rate_window_secs: 60,
             frame_rate_limit: 120,
             protocol_error_limit: 10,
             pow_min_difficulty: 12,

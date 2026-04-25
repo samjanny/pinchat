@@ -16,6 +16,60 @@ use crate::state::AppState;
 pub const SESSION_COOKIE_NAME: &str = "pinchat_session";
 /// Cookie name for CSRF token
 pub const CSRF_COOKIE_NAME: &str = "csrf_token";
+/// Header name CSRF-protected JSON APIs read the token from.
+pub const CSRF_HEADER_NAME: &str = "x-csrf-token";
+
+/// Verify the double-submit CSRF token for a JSON API endpoint:
+///   1. Read the `csrf_token` cookie. Must be present and HMAC-valid.
+///   2. Read the `X-CSRF-Token` header. Must equal the cookie value.
+///
+/// Returns Ok(()) on success, an error Response (403 Forbidden) otherwise.
+/// Same gating as `login_submit` so any state-changing API picks up the
+/// same protection without re-implementing the cookie parser.
+pub fn verify_csrf_for_api(headers: &HeaderMap, csrf_secret: &[u8; 32]) -> Result<(), Response> {
+    let cookie_header = headers.get(header::COOKIE).and_then(|h| h.to_str().ok());
+    let cookie_token = cookie_header.and_then(|cookies| {
+        cookies.split(';').find_map(|c| {
+            let c = c.trim();
+            if c.starts_with(&format!("{}=", CSRF_COOKIE_NAME)) {
+                Some(
+                    c.trim_start_matches(&format!("{}=", CSRF_COOKIE_NAME))
+                        .to_string(),
+                )
+            } else {
+                None
+            }
+        })
+    });
+
+    let cookie_token = match cookie_token {
+        Some(t) => t,
+        None => {
+            tracing::warn!("CSRF: missing cookie on API request");
+            return Err((StatusCode::FORBIDDEN, "Missing CSRF cookie").into_response());
+        }
+    };
+    if !verify_csrf_token(&cookie_token, csrf_secret) {
+        tracing::warn!("CSRF: invalid cookie token on API request");
+        return Err((StatusCode::FORBIDDEN, "Invalid CSRF cookie").into_response());
+    }
+    let header_token = headers
+        .get(CSRF_HEADER_NAME)
+        .and_then(|h| h.to_str().ok())
+        .map(str::to_owned);
+    let header_token = match header_token {
+        Some(t) => t,
+        None => {
+            tracing::warn!("CSRF: missing X-CSRF-Token header");
+            return Err((StatusCode::FORBIDDEN, "Missing X-CSRF-Token header").into_response());
+        }
+    };
+    if header_token != cookie_token {
+        tracing::warn!("CSRF: cookie/header mismatch");
+        return Err((StatusCode::FORBIDDEN, "CSRF token mismatch").into_response());
+    }
+    Ok(())
+}
 
 /// Query parameters for login page
 #[derive(Deserialize, Default)]

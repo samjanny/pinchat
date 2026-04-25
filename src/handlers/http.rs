@@ -9,6 +9,7 @@ use serde_json::json;
 use std::net::SocketAddr;
 use uuid::Uuid;
 
+use crate::handlers::auth::verify_csrf_for_api;
 use crate::ip_hash::{extract_client_ip_with_proxy, hash_ip};
 use crate::jwt::{sign_token, WsTokenClaims};
 use crate::models::{CreateRoomResponse, Room, RoomConfig};
@@ -49,6 +50,11 @@ pub async fn create_room(
     headers: HeaderMap,
     Json(config): Json<RoomConfig>,
 ) -> Result<Json<CreateRoomResponse>, Response> {
+    // CSRF: defence-in-depth on top of SameSite=Strict + session auth.
+    // Required because /api/rooms is a state-creating endpoint reachable
+    // from any authenticated context (XSS, sibling-subdomain takeover, …).
+    verify_csrf_for_api(&headers, &state.csrf_secret)?;
+
     // Extract and hash client IP for challenge cache lookup
     // Considers trusted proxies for X-Forwarded-For when configured
     let client_ip =
