@@ -123,6 +123,11 @@ pub struct Config {
     // Explicitly allow anonymous access when no password hashes are configured
     // SECURITY: defaults to false to avoid accidental fail-open deployments
     pub allow_anonymous: bool,
+
+    // Comma-separated list of allowed CORS origins.
+    // Used both for the CorsLayer (HTTP responses) and the WebSocket Origin check.
+    // Default: "https://localhost:3000"
+    pub cors_allowed_origins: Vec<String>,
 }
 
 impl Config {
@@ -312,6 +317,14 @@ impl Config {
                 .ok()
                 .map(|v| matches!(v.to_lowercase().as_str(), "true" | "1" | "yes"))
                 .unwrap_or(false),
+
+            // Allowed CORS origins (comma-separated, default: https://localhost:3000)
+            cors_allowed_origins: env::var("CORS_ALLOWED_ORIGINS")
+                .unwrap_or_else(|_| "https://localhost:3000".to_string())
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect(),
         };
 
         // Validate configuration

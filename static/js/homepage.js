@@ -128,7 +128,9 @@ document.addEventListener('alpine:init', () => {
                 // SECURITY: never send window.location.hash to the server (could contain
                 // the E2E key on /c/* routes). Stash it in sessionStorage for restoration.
                 if (window.location.hash) {
-                    sessionStorage.setItem(`pinchat_hash:${window.location.pathname}`, window.location.hash);
+                    const _stashKey = `pinchat_hash:${window.location.pathname}`;
+                    sessionStorage.setItem(_stashKey, window.location.hash);
+                    setTimeout(() => sessionStorage.removeItem(_stashKey), 30000);
                 }
                 const returnUrl = encodeURIComponent(window.location.pathname + window.location.search);
                 window.location.href = `/login?redirect=${returnUrl}`;

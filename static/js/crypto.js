@@ -158,6 +158,20 @@ class ChainRatchet {
     }
 
     /**
+     * Return a deep copy of this chain's mutable state.
+     * Used by DoubleRatchet to snapshot state before tentative decrypt.
+     * CryptoKey references inside messageKeyWindow are opaque and safe to share.
+     */
+    clone() {
+        const c = new ChainRatchet();
+        c.chainKeyMaterial = this.chainKeyMaterial ? new Uint8Array(this.chainKeyMaterial) : null;
+        c.messageNumber = this.messageNumber;
+        c.messageKeyWindow = this.messageKeyWindow ? new Map(this.messageKeyWindow) : new Map();
+        c.WINDOW_SIZE = this.WINDOW_SIZE ?? 16;
+        return c;
+    }
+
+    /**
      * Derive ephemeral message key for encryption/decryption
      *
      * Uses HMAC-SHA256 as KDF:
@@ -507,17 +521,11 @@ class CryptoManager {
     async generateKey() {
         this.key = await crypto.subtle.generateKey(
             this.algorithm,
-            true,
+            false,  // non-extractable: XSS cannot export raw bytes after fragment is cleared
             ['encrypt', 'decrypt']
         );
         return this.key;
     }
-
-    /**
-     * REMOVED: exportKeyAsBase64() - Dead code, never called
-     * Bootstrap key is now non-extractable (extractable=false) for security.
-     * This function would fail anyway since the key cannot be exported.
-     */
 
     /**
      * Resync receiving chain to target counter (recovery from dropped messages)
@@ -968,7 +976,7 @@ class CryptoManager {
 
         // Use the existing Double Ratchet encryption
         const envelopeJson = JSON.stringify(envelope);
-        const result = await this.doubleRatchet.encryptMessage(envelopeJson, roomId, senderId);
+        const result = await this.doubleRatchet.encryptMessage(envelopeJson, roomId, senderId, 'image');
 
         debugLog('[CRYPTO] Image encrypted successfully');
 
@@ -995,7 +1003,7 @@ class CryptoManager {
         debugLog('[CRYPTO] Decrypting image with Double Ratchet...');
 
         // Use the existing Double Ratchet decryption
-        const envelope = await this.doubleRatchet.decryptMessage(payloadBase64, header, roomId, senderId);
+        const envelope = await this.doubleRatchet.decryptMessage(payloadBase64, header, roomId, senderId, 'image');
 
         // Parse the envelope (it's the inner JSON with image data)
         // The Double Ratchet returns {ts, text} but for images we encoded the full envelope as 'text'

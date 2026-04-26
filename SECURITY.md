@@ -305,6 +305,61 @@ AAD = TLV_encode([
 
 ---
 
+## Known Limitations and Design Trade-offs
+
+### JS Memory Zeroization is Best-Effort
+
+After a message key or chain key is used, PinChat calls `Uint8Array.fill(0)` on the raw key material. This is a best-effort mitigation: JavaScript engines (V8, SpiderMonkey) do not guarantee that the backing buffer is zeroed in native memory or that the GC reclaims it promptly. A memory dump of the browser process may still recover key material.
+
+**What does help:**
+- Identity private keys are imported with `extractable: false` — WebCrypto's opaque `CryptoKey` objects cannot be exported or read by JS, even with a memory dump via `exportKey`.
+- Double Ratchet chain keys are zeroized (`fill(0)`) after ratchet progression; the old material is no longer reachable from JS once the typed array reference is released.
+
+**Recommendation:** Use incognito/private mode for sensitive chats. Close the tab immediately after the conversation ends. Do not use PinChat on shared or potentially compromised devices.
+
+---
+
+### Server-Side Anti-Replay is Advisory, Not Authoritative
+
+The server maintains a per-room set of SHA-256 hashes of received encrypted payloads (bounded at `REPLAY_CACHE_MAX_PER_ROOM`, default 10 000 entries). If a ciphertext is resent verbatim, the server drops it.
+
+**Limitation:** AES-GCM with a random 96-bit IV produces a different ciphertext for every encryption of the same plaintext, so identical ciphertexts are already an extremely strong indicator of a replay attack. The *authoritative* replay protection is the Double Ratchet's monotone message counter `n` (checked client-side against the AAD). The server-side hash check is a defense-in-depth layer that complements, but does not replace, the cryptographic guarantees of the protocol.
+
+**Implication:** A server memory dump reveals whether a given ciphertext has been seen in a room, but not its plaintext. This is a metadata observation, not a confidentiality breach.
+
+---
+
+### SAS Verification is Optional — Skipping Enables Operator MITM
+
+Short Authentication String (SAS) verification is the mechanism by which users confirm that no man-in-the-middle has replaced their peer's ECDH identity key during the handshake. When both participants compare and confirm the emoji codes match, the session is authenticated end-to-end.
+
+**If SAS is skipped:** the chat is encrypted, but not authenticated against the server operator. The server (or anyone with full relay access) could have substituted both parties' identity public keys with its own at the ECDH exchange step, establishing a session it can decrypt. The ECDSA signatures on the DH ratchet keys only prove self-consistency of those keys — they do not prove ownership by the expected human peer. Only SAS ties the cryptographic identity to a real-world identity.
+
+**Current UX:** skipping SAS sets `sasVerificationStatus = 'skipped'` and displays a persistent "Key verification skipped — connection security not confirmed" indicator. Sending and receiving messages remains possible. This is a deliberate usability trade-off: requiring SAS for all chats would add significant friction, and users can make an informed choice.
+
+**Recommendation:** Always complete SAS verification for sensitive conversations, especially with new contacts. Never skip SAS if you received the room link from an untrusted channel.
+
+---
+
+### Bootstrap Key Temporarily Stored in `sessionStorage` During Login Redirects
+
+The bootstrap key is normally kept only in the URL fragment (`#key=<base64url>`), which browsers do not include in HTTP requests (RFC 3986 §3.5), keeping it server-blind. However, if an authenticated session expires mid-navigation (HTTP 401), PinChat stores the fragment in `sessionStorage` so it can be restored after login completes:
+
+```
+sessionStorage["pinchat_hash:/c/<room_id>"] = "#key=<base64url_key>"
+```
+
+**Exposure window:** the value is stored from the moment of the 401 redirect until either (a) the post-login page reads and removes it via `sessionStorage.removeItem`, or (b) a 30-second `setTimeout` safety net fires and removes it automatically.
+
+**Risk:** any same-origin JavaScript executing during this window (e.g., an XSS on `login.html` or another page opened in the same tab) can read the key. The bootstrap key is already visible in `window.location.hash` on the originating page, so this does not introduce a new attack surface — it extends the window by the login round-trip duration (typically 1–5 seconds, never more than 30 seconds before automatic cleanup).
+
+**Mitigations in place:**
+- `sessionStorage` is scoped to the tab (not shared across tabs or persisted after the tab closes)
+- `sessionStorage.removeItem` is called immediately on post-login key restoration
+- A 30-second `setTimeout` unconditionally removes the stash key as a safety net
+
+---
+
 ## Attack Surface Analysis
 
 ### Transport Layer

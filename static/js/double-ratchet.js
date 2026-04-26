@@ -208,7 +208,7 @@ class DoubleRatchet {
      * @param {string} senderId - Sender ID for AAD binding
      * @returns {Promise<Object>} Encrypted message envelope with header
      */
-    async encryptMessage(plaintext, roomId, senderId) {
+    async encryptMessage(plaintext, roomId, senderId, msgType = 'message') {
         if (!this.sendingChain) {
             throw new Error('Double Ratchet not initialized');
         }
@@ -247,7 +247,7 @@ class DoubleRatchet {
             {type: AAD_FIELD_TYPES.ROOM_ID, value: roomId},
             {type: AAD_FIELD_TYPES.SENDER_ID, value: senderId},
             {type: AAD_FIELD_TYPES.MESSAGE_NUMBER, value: messageNumber},
-            {type: AAD_FIELD_TYPES.MESSAGE_TYPE, value: 'message'},
+            {type: AAD_FIELD_TYPES.MESSAGE_TYPE, value: msgType},
             {type: AAD_FIELD_TYPES.RATCHET_COUNT, value: this.ratchetCount}
         ]);
 
@@ -313,7 +313,7 @@ class DoubleRatchet {
      * @param {string} senderId - Sender ID for AAD binding
      * @returns {Promise<Object>} Decrypted message envelope
      */
-    async decryptMessage(payloadBase64, header, roomId, senderId) {
+    async decryptMessage(payloadBase64, header, roomId, senderId, msgType = 'message') {
         if (!this.receivingChain) {
             throw new Error('Double Ratchet not initialized');
         }
@@ -354,126 +354,158 @@ class DoubleRatchet {
         const isFirstMessage = !this.DHrRaw;  // Responder's first received message
         const isNewKey = !isFirstMessage && !this.arraysEqual(dhPublicKeyRaw, new Uint8Array(this.DHrRaw));
 
-        if (isFirstMessage) {
-            // Responder receiving first message from initiator
-            // Don't do DH ratchet - just store their public key and use initial chains
-            // The initial receivingChain (from handshake) matches initiator's sendingChain
-            debugLog('[DoubleRatchet] First message received - storing DHr (no ratchet yet)');
+        // Snapshot ratchet state before any mutation (Signal Protocol "tentative decrypt").
+        // The DH header signature was already verified above, but the AEAD tag
+        // authenticates the payload only later. A replay of a valid header with a
+        // corrupt/injected payload would permanently desynchronise the ratchet without
+        // this rollback guard. State is committed only on successful AES-GCM decryption.
+        const _drSnapshot = {
+            Nr: this.Nr,
+            Ns: this.Ns,
+            PN: this.PN,
+            DHr: this.DHr,
+            DHrRaw: this.DHrRaw ? new Uint8Array(this.DHrRaw) : null,
+            sendingChain: this.sendingChain ? this.sendingChain.clone() : null,
+            receivingChain: this.receivingChain ? this.receivingChain.clone() : null,
+            skippedKeys: new Map(this.skippedKeys),
+            ratchetCount: this.ratchetCount,
+            hasRatchetedSinceReceive: this.hasRatchetedSinceReceive,
+            DHs: this.DHs,
+            DHsSignature: this.DHsSignature,
+            rootKey: this.rootKey ? new Uint8Array(this.rootKey) : null,
+        };
 
-            const newDHr = await crypto.subtle.importKey(
-                'raw',
-                dhPublicKeyRaw,
-                { name: 'ECDH', namedCurve: this.CURVE },
-                true,
-                []
-            );
-            this.DHr = newDHr;
-            this.DHrRaw = new Uint8Array(dhPublicKeyRaw);
-
-            // Mark that we need to do a send-side DH ratchet before our next send
-            this.hasRatchetedSinceReceive = false;
-        } else if (isNewKey) {
-            debugLog('[DoubleRatchet] 🔄 New DH public key detected - performing RECEIVE-SIDE DH ratchet...');
-            debugLog(`[DoubleRatchet] Old DHr: ${this.arrayBufferToBase64url(this.DHrRaw).substring(0, 20)}...`);
-            debugLog(`[DoubleRatchet] New DHr: ${dhPublicKeyBase64.substring(0, 20)}...`);
-
-            // Skip message keys for out-of-order messages from previous chain
-            if (this.receivingChain && prevChainLength > this.Nr) {
-                await this.skipMessageKeys(prevChainLength);
-            }
-
-            // Perform DH ratchet
-            await this.performDHRatchetOnReceive(dhPublicKeyRaw);
-
-            // After receive-side ratchet, we DON'T need another send-side ratchet
-            // because performDHRatchetOnReceive already generates new DHs and sendingChain
-            this.hasRatchetedSinceReceive = true;
-            debugLog('[DoubleRatchet] ✅ Receive-side ratchet complete - new sendingChain ready for reply');
-        } else {
-            debugLog('[DoubleRatchet] Same DH public key - no ratchet needed');
-        }
-
-        // Decide which path derives the message key, and whether the chain
-        // state should be advanced afterwards.
-        //   - skipped-key path: already past this counter, do NOT touch chain state
-        //   - forward-jump path: messageNumber > Nr, store intermediate keys first
-        //   - replay/too-old path: messageNumber < Nr with no stored key → reject
-        //   - in-order path: messageNumber === Nr (after skip), derive and advance once
-        const skippedKeyId = `${dhPublicKeyBase64}:${messageNumber}`;
-        const isSkippedKey = this.skippedKeys.has(skippedKeyId);
-
-        if (!isSkippedKey && messageNumber < this.Nr) {
-            // Already advanced past this counter and no skipped key stored.
-            // Treat as replay / out-of-window to preserve PFS.
-            debugError(`[DoubleRatchet] Message #${messageNumber} is behind Nr=${this.Nr} and not in skipped keys`);
-            throw new Error('Message decryption failed - authentication error');
-        }
-
-        if (!isSkippedKey && messageNumber > this.Nr) {
-            // Forward jump within the current chain: store keys for Nr..messageNumber-1
-            // so delayed messages can still be decrypted. After this call, Nr has
-            // advanced to messageNumber and the chain is positioned at messageNumber.
-            await this.skipMessageKeys(messageNumber);
-        }
-
-        // Try to decrypt with current receiving chain
-        let plaintextBytes;
+        let envelope;
         try {
-            let messageKey;
+            if (isFirstMessage) {
+                // Responder receiving first message from initiator
+                // Don't do DH ratchet - just store their public key and use initial chains
+                // The initial receivingChain (from handshake) matches initiator's sendingChain
+                debugLog('[DoubleRatchet] First message received - storing DHr (no ratchet yet)');
 
-            if (isSkippedKey) {
-                const entry = this.skippedKeys.get(skippedKeyId);
-                messageKey = entry.key;
-                this.skippedKeys.delete(skippedKeyId);
-                debugLog(`[DoubleRatchet] Using skipped key for message #${messageNumber}`);
+                const newDHr = await crypto.subtle.importKey(
+                    'raw',
+                    dhPublicKeyRaw,
+                    { name: 'ECDH', namedCurve: this.CURVE },
+                    true,
+                    []
+                );
+                this.DHr = newDHr;
+                this.DHrRaw = new Uint8Array(dhPublicKeyRaw);
+
+                // Mark that we need to do a send-side DH ratchet before our next send
+                this.hasRatchetedSinceReceive = false;
+            } else if (isNewKey) {
+                debugLog('[DoubleRatchet] 🔄 New DH public key detected - performing RECEIVE-SIDE DH ratchet...');
+                debugLog(`[DoubleRatchet] Old DHr: ${this.arrayBufferToBase64url(this.DHrRaw).substring(0, 20)}...`);
+                debugLog(`[DoubleRatchet] New DHr: ${dhPublicKeyBase64.substring(0, 20)}...`);
+
+                // Skip message keys for out-of-order messages from previous chain
+                if (this.receivingChain && prevChainLength > this.Nr) {
+                    await this.skipMessageKeys(prevChainLength);
+                }
+
+                // Perform DH ratchet
+                await this.performDHRatchetOnReceive(dhPublicKeyRaw);
+
+                // After receive-side ratchet, we DON'T need another send-side ratchet
+                // because performDHRatchetOnReceive already generates new DHs and sendingChain
+                this.hasRatchetedSinceReceive = true;
+                debugLog('[DoubleRatchet] ✅ Receive-side ratchet complete - new sendingChain ready for reply');
             } else {
-                messageKey = await this.receivingChain.deriveMessageKeyForCounter(messageNumber);
+                debugLog('[DoubleRatchet] Same DH public key - no ratchet needed');
             }
 
-            // Decode payload
-            const combined = this.base64urlToArrayBuffer(payloadBase64);
-            const iv = combined.slice(0, 12);
-            const ciphertext = combined.slice(12);
+            // Decide which path derives the message key, and whether the chain
+            // state should be advanced afterwards.
+            //   - skipped-key path: already past this counter, do NOT touch chain state
+            //   - forward-jump path: messageNumber > Nr, store intermediate keys first
+            //   - replay/too-old path: messageNumber < Nr with no stored key → reject
+            //   - in-order path: messageNumber === Nr (after skip), derive and advance once
+            const skippedKeyId = `${dhPublicKeyBase64}:${messageNumber}`;
+            const isSkippedKey = this.skippedKeys.has(skippedKeyId);
 
-            // Create AAD (must match encryption)
-            const aad = encodeAADWithLengthPrefix([
-                {type: AAD_FIELD_TYPES.ROOM_ID, value: roomId},
-                {type: AAD_FIELD_TYPES.SENDER_ID, value: senderId},
-                {type: AAD_FIELD_TYPES.MESSAGE_NUMBER, value: messageNumber},
-                {type: AAD_FIELD_TYPES.MESSAGE_TYPE, value: 'message'},
-                {type: AAD_FIELD_TYPES.RATCHET_COUNT, value: ratchetCount}
-            ]);
+            if (!isSkippedKey && messageNumber < this.Nr) {
+                // Already advanced past this counter and no skipped key stored.
+                // Treat as replay / out-of-window to preserve PFS.
+                debugError(`[DoubleRatchet] Message #${messageNumber} is behind Nr=${this.Nr} and not in skipped keys`);
+                throw new Error('Message decryption failed - authentication error');
+            }
 
-            // Decrypt with AES-GCM
-            plaintextBytes = await crypto.subtle.decrypt(
-                {
-                    name: 'AES-GCM',
-                    iv: iv,
-                    additionalData: aad
-                },
-                messageKey,
-                ciphertext
-            );
+            if (!isSkippedKey && messageNumber > this.Nr) {
+                // Forward jump within the current chain: store keys for Nr..messageNumber-1
+                // so delayed messages can still be decrypted. After this call, Nr has
+                // advanced to messageNumber and the chain is positioned at messageNumber.
+                await this.skipMessageKeys(messageNumber);
+            }
 
-        } catch (error) {
-            debugError('[DoubleRatchet] Decryption failed:', error);
-            throw new Error('Message decryption failed - authentication error');
+            // Try to decrypt with current receiving chain
+            let plaintextBytes;
+            try {
+                let messageKey;
+
+                if (isSkippedKey) {
+                    const entry = this.skippedKeys.get(skippedKeyId);
+                    messageKey = entry.key;
+                    this.skippedKeys.delete(skippedKeyId);
+                    debugLog(`[DoubleRatchet] Using skipped key for message #${messageNumber}`);
+                } else {
+                    messageKey = await this.receivingChain.deriveMessageKeyForCounter(messageNumber);
+                }
+
+                // Decode payload
+                const combined = this.base64urlToArrayBuffer(payloadBase64);
+                const iv = combined.slice(0, 12);
+                const ciphertext = combined.slice(12);
+
+                // Create AAD (must match encryption)
+                const aad = encodeAADWithLengthPrefix([
+                    {type: AAD_FIELD_TYPES.ROOM_ID, value: roomId},
+                    {type: AAD_FIELD_TYPES.SENDER_ID, value: senderId},
+                    {type: AAD_FIELD_TYPES.MESSAGE_NUMBER, value: messageNumber},
+                    {type: AAD_FIELD_TYPES.MESSAGE_TYPE, value: msgType},
+                    {type: AAD_FIELD_TYPES.RATCHET_COUNT, value: ratchetCount}
+                ]);
+
+                // Decrypt with AES-GCM — this is the AEAD authentication point.
+                // Only on success does the outer try block reach the commit phase.
+                plaintextBytes = await crypto.subtle.decrypt(
+                    {
+                        name: 'AES-GCM',
+                        iv: iv,
+                        additionalData: aad
+                    },
+                    messageKey,
+                    ciphertext
+                );
+
+            } catch (error) {
+                debugError('[DoubleRatchet] Decryption failed:', error);
+                throw new Error('Message decryption failed - authentication error');
+            }
+
+            if (!isSkippedKey) {
+                // In-order (or just caught up via skip): ratchet exactly once past
+                // messageNumber so the chain is ready for messageNumber+1.
+                await this.receivingChain.ratchet();
+                this.Nr = messageNumber + 1;
+                this.receivingChain.messageNumber = this.Nr;
+            }
+            // Skipped-key path: chain state is already well ahead of messageNumber,
+            // leave Nr and chain untouched.
+
+            // Parse envelope
+            const decoder = new TextDecoder();
+            const envelopeJson = decoder.decode(plaintextBytes);
+            envelope = JSON.parse(envelopeJson);
+
+        } catch (err) {
+            // AEAD failed or any other error: roll back all ratchet state mutations
+            // so the session remains synchronised and future valid messages can still
+            // be decrypted.
+            Object.assign(this, _drSnapshot);
+            throw err;
         }
-
-        if (!isSkippedKey) {
-            // In-order (or just caught up via skip): ratchet exactly once past
-            // messageNumber so the chain is ready for messageNumber+1.
-            await this.receivingChain.ratchet();
-            this.Nr = messageNumber + 1;
-            this.receivingChain.messageNumber = this.Nr;
-        }
-        // Skipped-key path: chain state is already well ahead of messageNumber,
-        // leave Nr and chain untouched.
-
-        // Parse envelope
-        const decoder = new TextDecoder();
-        const envelopeJson = decoder.decode(plaintextBytes);
-        const envelope = JSON.parse(envelopeJson);
 
         debugLog(`[DoubleRatchet] ✅ Message decrypted #${messageNumber} (ratchet: ${this.ratchetCount})`);
 

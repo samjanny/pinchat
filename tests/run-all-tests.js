@@ -29,6 +29,11 @@ const TEST_SUITES = {
         file: 'test-double-ratchet.js',
         description: 'DH + Symmetric ratchet for PFS + Post-Compromise Security (PCS)'
     },
+    security: {
+        name: 'Security Properties',
+        file: 'test-security.js',
+        description: 'Key extractability invariants (bootstrap key, identity key)'
+    },
     'mls-tree-math': {
         name: 'MLS tree math',
         file: 'test-mls-tree-math.js',

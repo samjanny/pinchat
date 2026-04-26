@@ -1,4 +1,5 @@
-use chrono::{DateTime, Utc};
+use chrono::DateTime;
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -40,7 +41,6 @@ pub enum Message {
         /// Signal Protocol header with DH public key and signature
         header: MessageHeader,
         sender_id: Uuid,
-        timestamp: DateTime<Utc>,
     },
 
     /// Encrypted image message to send to other participants
@@ -52,7 +52,6 @@ pub enum Message {
         /// Signal Protocol header with DH public key and signature
         header: MessageHeader,
         sender_id: Uuid,
-        timestamp: DateTime<Utc>,
     },
 
     /// Notification that a user joined the room
@@ -163,7 +162,7 @@ mod tests {
     #[test]
     fn message_without_header_fails_deserialize() {
         // In protocol v1 `header` is mandatory on message/image.
-        let raw = r#"{"type":"message","payload":"x","sender_id":"00000000-0000-0000-0000-000000000000","timestamp":"2026-01-01T00:00:00Z"}"#;
+        let raw = r#"{"type":"message","payload":"x","sender_id":"00000000-0000-0000-0000-000000000000"}"#;
         let res: Result<Message, _> = serde_json::from_str(raw);
         assert!(res.is_err(), "message without header must fail");
     }

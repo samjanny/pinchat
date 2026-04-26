@@ -153,6 +153,15 @@ class ChainRatchet {
         this.messageKeyWindow.clear();
     }
 
+    clone() {
+        const c = new ChainRatchet();
+        c.chainKeyMaterial = this.chainKeyMaterial ? new Uint8Array(this.chainKeyMaterial) : null;
+        c.messageNumber = this.messageNumber;
+        c.messageKeyWindow = this.messageKeyWindow ? new Map(this.messageKeyWindow) : new Map();
+        c.WINDOW_SIZE = this.WINDOW_SIZE ?? 16;
+        return c;
+    }
+
     reset() {
         if (this.chainKeyMaterial) {
             this.chainKeyMaterial.fill(0);
@@ -254,7 +263,7 @@ class DoubleRatchet {
         if (this.identityManager) await this.signCurrentDHs();
     }
 
-    async encryptMessage(plaintext, roomId, senderId) {
+    async encryptMessage(plaintext, roomId, senderId, msgType = 'message') {
         if (!this.sendingChain) throw new Error('Double Ratchet not initialized');
 
         if (this.DHr && !this.hasRatchetedSinceReceive) {
@@ -274,7 +283,7 @@ class DoubleRatchet {
             { type: AAD_FIELD_TYPES.ROOM_ID, value: roomId },
             { type: AAD_FIELD_TYPES.SENDER_ID, value: senderId },
             { type: AAD_FIELD_TYPES.MESSAGE_NUMBER, value: messageNumber },
-            { type: AAD_FIELD_TYPES.MESSAGE_TYPE, value: 'message' },
+            { type: AAD_FIELD_TYPES.MESSAGE_TYPE, value: msgType },
             { type: AAD_FIELD_TYPES.RATCHET_COUNT, value: this.ratchetCount }
         ]);
 
@@ -307,7 +316,7 @@ class DoubleRatchet {
         return { payload, header };
     }
 
-    async decryptMessage(payloadBase64, header, roomId, senderId) {
+    async decryptMessage(payloadBase64, header, roomId, senderId, msgType = 'message') {
         if (!this.receivingChain) throw new Error('Double Ratchet not initialized');
 
         const { dh: dhPublicKeyBase64, pn: prevChainLength, n: messageNumber, rc: ratchetCount } = header;
@@ -326,42 +335,51 @@ class DoubleRatchet {
             throw new Error('MISSING_SIGNATURE');
         }
 
-        const isFirstMessage = !this.DHrRaw;
-        const isNewKey = !isFirstMessage && !this.arraysEqual(dhPublicKeyRaw, new Uint8Array(this.DHrRaw));
+        // Snapshot state before any mutation so we can roll back on AEAD failure.
+        const _snap = {
+            Nr: this.Nr, Ns: this.Ns, PN: this.PN,
+            DHr: this.DHr,
+            DHrRaw: this.DHrRaw ? new Uint8Array(this.DHrRaw) : null,
+            sendingChain: this.sendingChain ? this.sendingChain.clone() : null,
+            receivingChain: this.receivingChain ? this.receivingChain.clone() : null,
+            skippedKeys: new Map(this.skippedKeys),
+            ratchetCount: this.ratchetCount,
+            hasRatchetedSinceReceive: this.hasRatchetedSinceReceive,
+            DHs: this.DHs, DHsSignature: this.DHsSignature,
+            rootKey: this.rootKey ? new Uint8Array(this.rootKey) : null,
+        };
 
-        if (isFirstMessage) {
-            const newDHr = await subtle.importKey('raw', dhPublicKeyRaw,
-                { name: 'ECDH', namedCurve: this.CURVE }, true, []);
-            this.DHr = newDHr;
-            this.DHrRaw = new Uint8Array(dhPublicKeyRaw);
-            this.hasRatchetedSinceReceive = false;
-        } else if (isNewKey) {
-            if (this.receivingChain && prevChainLength > this.Nr) {
-                await this.skipMessageKeys(prevChainLength);
-            }
-            await this.performDHRatchetOnReceive(dhPublicKeyRaw);
-            this.hasRatchetedSinceReceive = true;
-        }
-
-        const skippedKeyId = `${dhPublicKeyBase64}:${messageNumber}`;
-        const isSkippedKey = this.skippedKeys.has(skippedKeyId);
-
-        if (!isSkippedKey && messageNumber < this.Nr) {
-            // Replay / out-of-window: chain already advanced past this counter
-            // and no skipped key stored. Reject to preserve PFS.
-            throw new Error('Message decryption failed - authentication error');
-        }
-
-        if (!isSkippedKey && messageNumber > this.Nr) {
-            // Forward jump within the current chain: store keys for Nr..messageNumber-1
-            // so delayed messages can still be decrypted.
-            await this.skipMessageKeys(messageNumber);
-        }
-
-        let plaintextBytes;
+        let envelope;
         try {
-            let messageKey;
+            const isFirstMessage = !this.DHrRaw;
+            const isNewKey = !isFirstMessage && !this.arraysEqual(dhPublicKeyRaw, new Uint8Array(this.DHrRaw));
 
+            if (isFirstMessage) {
+                const newDHr = await subtle.importKey('raw', dhPublicKeyRaw,
+                    { name: 'ECDH', namedCurve: this.CURVE }, true, []);
+                this.DHr = newDHr;
+                this.DHrRaw = new Uint8Array(dhPublicKeyRaw);
+                this.hasRatchetedSinceReceive = false;
+            } else if (isNewKey) {
+                if (this.receivingChain && prevChainLength > this.Nr) {
+                    await this.skipMessageKeys(prevChainLength);
+                }
+                await this.performDHRatchetOnReceive(dhPublicKeyRaw);
+                this.hasRatchetedSinceReceive = true;
+            }
+
+            const skippedKeyId = `${dhPublicKeyBase64}:${messageNumber}`;
+            const isSkippedKey = this.skippedKeys.has(skippedKeyId);
+
+            if (!isSkippedKey && messageNumber < this.Nr) {
+                throw new Error('Message decryption failed - authentication error');
+            }
+
+            if (!isSkippedKey && messageNumber > this.Nr) {
+                await this.skipMessageKeys(messageNumber);
+            }
+
+            let messageKey;
             if (isSkippedKey) {
                 const entry = this.skippedKeys.get(skippedKeyId);
                 messageKey = entry.key;
@@ -378,29 +396,34 @@ class DoubleRatchet {
                 { type: AAD_FIELD_TYPES.ROOM_ID, value: roomId },
                 { type: AAD_FIELD_TYPES.SENDER_ID, value: senderId },
                 { type: AAD_FIELD_TYPES.MESSAGE_NUMBER, value: messageNumber },
-                { type: AAD_FIELD_TYPES.MESSAGE_TYPE, value: 'message' },
+                { type: AAD_FIELD_TYPES.MESSAGE_TYPE, value: msgType },
                 { type: AAD_FIELD_TYPES.RATCHET_COUNT, value: ratchetCount }
             ]);
 
-            plaintextBytes = await subtle.decrypt(
-                { name: 'AES-GCM', iv: iv, additionalData: aad },
-                messageKey,
-                ciphertext
-            );
-        } catch (error) {
-            throw new Error('Message decryption failed - authentication error');
+            let plaintextBytes;
+            try {
+                plaintextBytes = await subtle.decrypt(
+                    { name: 'AES-GCM', iv: iv, additionalData: aad },
+                    messageKey,
+                    ciphertext
+                );
+            } catch (error) {
+                throw new Error('Message decryption failed - authentication error');
+            }
+
+            if (!isSkippedKey) {
+                await this.receivingChain.ratchet();
+                this.Nr = messageNumber + 1;
+                this.receivingChain.messageNumber = this.Nr;
+            }
+
+            envelope = JSON.parse(new TextDecoder().decode(plaintextBytes));
+        } catch (err) {
+            Object.assign(this, _snap);
+            throw err;
         }
 
-        if (!isSkippedKey) {
-            // In-order (or just caught up via skip): ratchet once past messageNumber.
-            await this.receivingChain.ratchet();
-            this.Nr = messageNumber + 1;
-            this.receivingChain.messageNumber = this.Nr;
-        }
-        // Skipped-key path: chain state is already ahead, do not touch Nr or chain.
-
-        const decoder = new TextDecoder();
-        return JSON.parse(decoder.decode(plaintextBytes));
+        return envelope;
     }
 
     async performDHRatchetOnReceive(newDHrRaw) {
@@ -1507,6 +1530,161 @@ async function runTests() {
             passed++;
         } else {
             console.log('FAILED: decrypt did not throw SIGNATURE_INVALID');
+            failed++;
+        }
+    } catch (e) {
+        console.log('FAILED:', e.message);
+        failed++;
+    }
+    console.log('');
+
+    // =========================================================================
+    // Test 17: Corrupted payload does not mutate DR state (tentative-decrypt)
+    // =========================================================================
+    console.log('--- Test 17: Corrupted Payload Does Not Mutate DR State ---');
+    try {
+        const sharedSecret = hexToBytes('cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc');
+        const aliceKp = await subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveKey', 'deriveBits']);
+        const bobKp = await subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveKey', 'deriveBits']);
+
+        const alice = new DoubleRatchet();
+        await alice.initialize(sharedSecret, true, aliceKp, bobKp.publicKey);
+        const bob = new DoubleRatchet();
+        await bob.initialize(new Uint8Array(sharedSecret), false, bobKp, null);
+
+        // Establish a DH ratchet: Alice sends msg0, Bob receives; Bob sends reply, Alice receives
+        const enc0 = await alice.encryptMessage('msg0', ROOM_ID, ALICE_ID);
+        await bob.decryptMessage(enc0.payload, enc0.header, ROOM_ID, ALICE_ID);
+        const bobReply = await bob.encryptMessage('reply', ROOM_ID, BOB_ID);
+        await alice.decryptMessage(bobReply.payload, bobReply.header, ROOM_ID, BOB_ID);
+
+        // Alice sends a second message with her NEW DH key (after send-side ratchet)
+        const enc1 = await alice.encryptMessage('msg1', ROOM_ID, ALICE_ID);
+
+        // Record Bob's state before the attack
+        const nrBefore = bob.Nr;
+        const rcBefore = bob.ratchetCount;
+
+        // Corrupt enc1's payload (keep valid header with valid signature if any)
+        const payloadBytes = bob.base64urlToArrayBuffer(enc1.payload);
+        payloadBytes[12] ^= 0xFF; // flip a byte in the ciphertext (past the 12-byte IV)
+        const corruptPayload = bob.arrayBufferToBase64url(payloadBytes);
+
+        let threw = false;
+        try {
+            await bob.decryptMessage(corruptPayload, enc1.header, ROOM_ID, ALICE_ID);
+        } catch (e) {
+            threw = true;
+            console.log(`  Expected error: ${e.message}`);
+        }
+
+        const nrAfter = bob.Nr;
+        const rcAfter = bob.ratchetCount;
+
+        // State must be rolled back
+        let canStillDecrypt = false;
+        try {
+            const dec = await bob.decryptMessage(enc1.payload, enc1.header, ROOM_ID, ALICE_ID);
+            canStillDecrypt = dec.text === 'msg1';
+        } catch (e) {
+            console.log(`  Retry failed: ${e.message}`);
+        }
+
+        if (threw && nrBefore === nrAfter && rcBefore === rcAfter && canStillDecrypt) {
+            console.log(`PASSED: corrupted payload rejected, Nr ${nrBefore}→${nrAfter}, rc ${rcBefore}→${rcAfter}, retry succeeds`);
+            passed++;
+        } else {
+            console.log(`FAILED: threw=${threw}, Nr ${nrBefore}→${nrAfter}, rc ${rcBefore}→${rcAfter}, canStillDecrypt=${canStillDecrypt}`);
+            failed++;
+        }
+    } catch (e) {
+        console.log('FAILED:', e.message);
+        console.log(e.stack);
+        failed++;
+    }
+    console.log('');
+
+    // =========================================================================
+    // Test 18: msgType AAD binding — cross-type replay rejected
+    // =========================================================================
+    console.log('--- Test 18: msgType AAD Binding — Cross-Type Rejection ---');
+    try {
+        const sharedSecret = hexToBytes('dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd');
+        const aliceKp = await subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveKey', 'deriveBits']);
+        const bobKp = await subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveKey', 'deriveBits']);
+
+        const alice = new DoubleRatchet();
+        await alice.initialize(sharedSecret, true, aliceKp, bobKp.publicKey);
+
+        // Alice encrypts as 'image'
+        const enc = await alice.encryptMessage('image-envelope', ROOM_ID, ALICE_ID, 'image');
+
+        // Bob (instance 1) tries to decrypt as 'message' — AEAD must fail
+        const bob1 = new DoubleRatchet();
+        await bob1.initialize(new Uint8Array(sharedSecret), false, bobKp, null);
+        let crossTypeRejected = false;
+        try {
+            await bob1.decryptMessage(enc.payload, enc.header, ROOM_ID, ALICE_ID, 'message');
+        } catch (e) {
+            crossTypeRejected = true;
+            console.log(`  Cross-type rejected (expected): ${e.message}`);
+        }
+
+        // Bob (instance 2) decrypts as 'image' — must succeed
+        const bob2 = new DoubleRatchet();
+        await bob2.initialize(new Uint8Array(sharedSecret), false, bobKp, null);
+        let correctDecrypt = false;
+        try {
+            const dec = await bob2.decryptMessage(enc.payload, enc.header, ROOM_ID, ALICE_ID, 'image');
+            correctDecrypt = dec.text === 'image-envelope';
+        } catch (e) {
+            console.log(`  Correct-type failed (unexpected): ${e.message}`);
+        }
+
+        if (crossTypeRejected && correctDecrypt) {
+            console.log('PASSED: cross-type replay rejected; correct msgType succeeds');
+            passed++;
+        } else {
+            console.log(`FAILED: crossTypeRejected=${crossTypeRejected}, correctDecrypt=${correctDecrypt}`);
+            failed++;
+        }
+    } catch (e) {
+        console.log('FAILED:', e.message);
+        console.log(e.stack);
+        failed++;
+    }
+    console.log('');
+
+    // =========================================================================
+    // Test 19: AAD TLV wire-format freeze (little-endian numerics)
+    // =========================================================================
+    console.log('--- Test 19: AAD TLV Wire-Format Freeze ---');
+    try {
+        // Encode a fixed set of fields and compare against a hardcoded expected value.
+        // This freezes the current wire format so any inadvertent change is caught.
+        // WARNING: changing this format requires a coordinated deploy of all clients.
+        const aad = encodeAADWithLengthPrefix([
+            { type: AAD_FIELD_TYPES.ROOM_ID,         value: 'r1'      },
+            { type: AAD_FIELD_TYPES.SENDER_ID,        value: 's1'      },
+            { type: AAD_FIELD_TYPES.MESSAGE_NUMBER,   value: 1         },
+            { type: AAD_FIELD_TYPES.MESSAGE_TYPE,     value: 'message' },
+            { type: AAD_FIELD_TYPES.RATCHET_COUNT,    value: 0         },
+        ]);
+
+        const hex = Array.from(aad).map(b => b.toString(16).padStart(2, '0')).join('');
+        // ROOM_ID(01) len=2 "r1" | SENDER_ID(02) len=2 "s1" |
+        // MESSAGE_NUMBER(05) len=8 value=1 LE-u64 | MESSAGE_TYPE(06) len=7 "message" |
+        // RATCHET_COUNT(07) len=8 value=0 LE-u64
+        const EXPECTED = '0100027231020002733105000801000000000000000600076d6573736167650700080000000000000000';
+
+        console.log(`  Got:      ${hex}`);
+        console.log(`  Expected: ${EXPECTED}`);
+
+        if (hex === EXPECTED) {
+            console.log('PASSED: AAD wire format matches expected (little-endian numerics)');
+            passed++;
+        } else {
+            console.log('FAILED: AAD wire format changed — all clients must be updated atomically');
             failed++;
         }
     } catch (e) {
