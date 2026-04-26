@@ -208,7 +208,7 @@ class DoubleRatchet {
      * @param {string} senderId - Sender ID for AAD binding
      * @returns {Promise<Object>} Encrypted message envelope with header
      */
-    async encryptMessage(plaintext, roomId, senderId) {
+    async encryptMessage(plaintext, roomId, senderId, msgType = 'message') {
         if (!this.sendingChain) {
             throw new Error('Double Ratchet not initialized');
         }
@@ -247,7 +247,7 @@ class DoubleRatchet {
             {type: AAD_FIELD_TYPES.ROOM_ID, value: roomId},
             {type: AAD_FIELD_TYPES.SENDER_ID, value: senderId},
             {type: AAD_FIELD_TYPES.MESSAGE_NUMBER, value: messageNumber},
-            {type: AAD_FIELD_TYPES.MESSAGE_TYPE, value: 'message'},
+            {type: AAD_FIELD_TYPES.MESSAGE_TYPE, value: msgType},
             {type: AAD_FIELD_TYPES.RATCHET_COUNT, value: this.ratchetCount}
         ]);
 
@@ -313,7 +313,7 @@ class DoubleRatchet {
      * @param {string} senderId - Sender ID for AAD binding
      * @returns {Promise<Object>} Decrypted message envelope
      */
-    async decryptMessage(payloadBase64, header, roomId, senderId) {
+    async decryptMessage(payloadBase64, header, roomId, senderId, msgType = 'message') {
         if (!this.receivingChain) {
             throw new Error('Double Ratchet not initialized');
         }
@@ -463,7 +463,7 @@ class DoubleRatchet {
                     {type: AAD_FIELD_TYPES.ROOM_ID, value: roomId},
                     {type: AAD_FIELD_TYPES.SENDER_ID, value: senderId},
                     {type: AAD_FIELD_TYPES.MESSAGE_NUMBER, value: messageNumber},
-                    {type: AAD_FIELD_TYPES.MESSAGE_TYPE, value: 'message'},
+                    {type: AAD_FIELD_TYPES.MESSAGE_TYPE, value: msgType},
                     {type: AAD_FIELD_TYPES.RATCHET_COUNT, value: ratchetCount}
                 ]);
 

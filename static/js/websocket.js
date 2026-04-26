@@ -77,7 +77,9 @@ class WebSocketManager {
                 // leave the client. Stash it in sessionStorage (tab-scoped) so it can
                 // be restored after login; the server-facing redirect carries path+query only.
                 if (window.location.hash) {
-                    sessionStorage.setItem(`pinchat_hash:${window.location.pathname}`, window.location.hash);
+                    const _stashKey = `pinchat_hash:${window.location.pathname}`;
+                    sessionStorage.setItem(_stashKey, window.location.hash);
+                    setTimeout(() => sessionStorage.removeItem(_stashKey), 30000);
                 }
                 const returnUrl = encodeURIComponent(window.location.pathname + window.location.search);
                 window.location.href = `/login?redirect=${returnUrl}`;
@@ -136,7 +138,9 @@ class WebSocketManager {
                     if (response.status === 401) {
                         console.log('Authentication required, redirecting to login...');
                         if (window.location.hash) {
-                            sessionStorage.setItem(`pinchat_hash:${window.location.pathname}`, window.location.hash);
+                            const _stashKey = `pinchat_hash:${window.location.pathname}`;
+                            sessionStorage.setItem(_stashKey, window.location.hash);
+                            setTimeout(() => sessionStorage.removeItem(_stashKey), 30000);
                         }
                         const returnUrl = encodeURIComponent(window.location.pathname + window.location.search);
                         window.location.href = `/login?redirect=${returnUrl}`;
@@ -153,7 +157,9 @@ class WebSocketManager {
                 if (response.status === 401) {
                     console.log('Authentication required, redirecting to login...');
                     if (window.location.hash) {
-                        sessionStorage.setItem(`pinchat_hash:${window.location.pathname}`, window.location.hash);
+                        const _stashKey = `pinchat_hash:${window.location.pathname}`;
+                        sessionStorage.setItem(_stashKey, window.location.hash);
+                        setTimeout(() => sessionStorage.removeItem(_stashKey), 30000);
                     }
                     const returnUrl = encodeURIComponent(window.location.pathname + window.location.search);
                     window.location.href = `/login?redirect=${returnUrl}`;
@@ -309,6 +315,12 @@ class WebSocketManager {
         // rather than the URL (so it never lands in proxy/referrer/middlebox logs).
         const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
         const wsUrl = `${protocol}//${window.location.host}/ws/${this.roomId}`;
+
+        // Consume the cached token now: jti is single-use on the server, so once
+        // the upgrade is attempted the token is gone regardless of success/failure.
+        // Clearing here ensures a reconnect always requests a fresh token via PoW.
+        this.cachedToken = null;
+        this.tokenExpiresAt = 0;
 
         console.log('Connecting to WebSocket (pinchat.v1 subprotocol auth)');
 
