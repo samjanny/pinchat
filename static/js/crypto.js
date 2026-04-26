@@ -158,6 +158,20 @@ class ChainRatchet {
     }
 
     /**
+     * Return a deep copy of this chain's mutable state.
+     * Used by DoubleRatchet to snapshot state before tentative decrypt.
+     * CryptoKey references inside messageKeyWindow are opaque and safe to share.
+     */
+    clone() {
+        const c = new ChainRatchet();
+        c.chainKeyMaterial = this.chainKeyMaterial ? new Uint8Array(this.chainKeyMaterial) : null;
+        c.messageNumber = this.messageNumber;
+        c.messageKeyWindow = this.messageKeyWindow ? new Map(this.messageKeyWindow) : new Map();
+        c.WINDOW_SIZE = this.WINDOW_SIZE ?? 16;
+        return c;
+    }
+
+    /**
      * Derive ephemeral message key for encryption/decryption
      *
      * Uses HMAC-SHA256 as KDF:

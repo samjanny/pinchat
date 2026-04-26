@@ -72,6 +72,7 @@ document.addEventListener('alpine:init', () => {
         sas: null,
         sasBackup: null,            // Backup of SAS for reopening verification
         sasVerificationStatus: 'none', // 'none' | 'pending' | 'verified' | 'mismatch' | 'skipped'
+        sasMismatchFatal: false,    // Permanently locks composer after SAS mismatch (possible MITM)
         sasCopied: false,           // For copy button feedback
         pendingECDHKey: null,
 
@@ -1159,14 +1160,27 @@ document.addEventListener('alpine:init', () => {
          * shows a security warning to the user.
          */
         handleSasMismatch() {
-            console.warn('[SECURITY] SAS code mismatch reported by user - potential MITM attack');
+            console.warn('[SECURITY] SAS mismatch — treating as active MITM, aborting session');
 
-            // Close SAS verification dialog
+            // Destroy ratchet and identity state so the compromised chain cannot be reused
+            if (this.cryptoManager) {
+                this.cryptoManager.resetToBootstrapKey().catch(() => {});
+            }
+            if (this.identityManager && typeof this.identityManager.reset === 'function') {
+                this.identityManager.reset();
+            }
+
+            // Permanently lock the composer for this session
+            this.sasMismatchFatal = true;
             this.sas = null;
             this.sasVerificationStatus = 'mismatch';
 
-            // Show system message warning
-            this.addSystemMessage('⚠️ WARNING: Possible MITM attack detected! It is recommended to start a new chat.');
+            // Close WebSocket with 1008 Policy Violation; suppress auto-reconnect
+            if (this.wsManager) {
+                this.wsManager.disconnectWithError(1008, 'SAS mismatch — session aborted');
+            }
+
+            this.addSystemMessage('🚫 Security alert: codes did not match. The session has been destroyed to prevent eavesdropping. Please open a new chat.');
         },
 
         /**
@@ -1272,6 +1286,7 @@ document.addEventListener('alpine:init', () => {
          * calls in directive values, not arbitrary expressions.
          */
         isComposerLocked() {
+            if (this.sasMismatchFatal) return true;
             if (!this.connected) return true;
             if (this.participantCount < 2) return true;
             if (this.roomType === 'onetoone' && !this.pfsActive) return true;
@@ -1280,6 +1295,7 @@ document.addEventListener('alpine:init', () => {
 
         /** Placeholder copy that mirrors the current lock reason. */
         composerPlaceholder() {
+            if (this.sasMismatchFatal) return 'Session destroyed — open a new chat.';
             if (!this.connected) return 'Connecting…';
             if (this.participantCount < 2) return 'Waiting for someone to join this room…';
             if (this.roomType === 'onetoone' && !this.pfsActive) return 'Establishing secure connection…';
