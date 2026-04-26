@@ -28,6 +28,11 @@ const TEST_SUITES = {
         name: 'Double Ratchet',
         file: 'test-double-ratchet.js',
         description: 'DH + Symmetric ratchet for PFS + Post-Compromise Security (PCS)'
+    },
+    security: {
+        name: 'Security Properties',
+        file: 'test-security.js',
+        description: 'Key extractability invariants (bootstrap key, identity key)'
     }
 };
 
