@@ -28,7 +28,7 @@ use std::time::Duration;
 use tower::ServiceBuilder;
 use tower_governor::{governor::GovernorConfigBuilder, GovernorLayer};
 use tower_http::{
-    cors::CorsLayer,
+    cors::{AllowOrigin, CorsLayer},
     services::ServeDir,
     trace::{DefaultMakeSpan, TraceLayer},
 };
@@ -266,9 +266,15 @@ async fn main() {
         config: governor_config,
     });
 
-    // Configure CORS
+    // Configure CORS using CORS_ALLOWED_ORIGINS env var (comma-separated).
+    // Defaults to "https://localhost:3000" when the variable is absent.
+    let allowed_origin_values: Vec<HeaderValue> = config
+        .cors_allowed_origins
+        .iter()
+        .filter_map(|s| s.parse::<HeaderValue>().ok())
+        .collect();
     let cors = CorsLayer::new()
-        .allow_origin("https://localhost:3000".parse::<HeaderValue>().unwrap())
+        .allow_origin(AllowOrigin::list(allowed_origin_values))
         .allow_methods([Method::GET, Method::POST])
         .allow_headers([
             header::CONTENT_TYPE,

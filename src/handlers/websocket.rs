@@ -3,7 +3,7 @@ use axum::{
         ws::{Message as WsMessage, WebSocket},
         Path, State, WebSocketUpgrade,
     },
-    http::{header::SEC_WEBSOCKET_PROTOCOL, HeaderMap, StatusCode},
+    http::{header, header::SEC_WEBSOCKET_PROTOCOL, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
 use chrono::Utc;
@@ -124,6 +124,22 @@ pub async fn ws_handler(
             room_id
         );
         return (StatusCode::FORBIDDEN, "Token already used").into_response();
+    }
+
+    // Origin check — defense-in-depth (RFC 6455 §4.1).
+    // The primary guard is the SameSite=Strict session cookie preventing
+    // cross-origin token acquisition; this check makes the guarantee
+    // explicit and holds even if that assumption ever changes.
+    // Non-browser clients (curl, test harnesses) omit Origin → allowed.
+    if let Some(origin_val) = headers.get(header::ORIGIN) {
+        let origin_str = origin_val.to_str().unwrap_or("");
+        if !state.config.cors_allowed_origins.iter().any(|o| o == origin_str) {
+            tracing::warn!(
+                "WebSocket upgrade rejected: Origin '{}' not in allowlist",
+                origin_str
+            );
+            return (StatusCode::FORBIDDEN, "Origin not allowed").into_response();
+        }
     }
 
     tracing::info!(
@@ -305,10 +321,14 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: Uuid, connec
         }
     });
 
-    // Task that receives messages from the client and broadcasts them
+    // Task that receives messages from the client and broadcasts them.
+    // The 90-second idle timeout closes zombie connections that stop sending
+    // frames (including pong responses) within that window, protecting
+    // against file-descriptor exhaustion from stale TCP sessions.
+    const IDLE_TIMEOUT: Duration = Duration::from_secs(90);
     let state_clone = state.clone();
     let mut recv_task = tokio::spawn(async move {
-        while let Some(Ok(msg)) = receiver.next().await {
+        while let Ok(Some(Ok(msg))) = tokio::time::timeout(IDLE_TIMEOUT, receiver.next()).await {
             if let WsMessage::Text(text) = msg {
                 // Early size check before JSON parsing
                 // This acts as an extra safeguard in addition to WebSocket frame limits
@@ -553,16 +573,14 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: Uuid, connec
                                 let broadcast_msg = if incoming.msg_type == "image" {
                                     Message::Image {
                                         payload,
-                                        header: hdr, // Validated v1 header (no Option)
+                                        header: hdr,
                                         sender_id: connection_id,
-                                        timestamp: now,
                                     }
                                 } else {
                                     Message::Message {
                                         payload,
-                                        header: hdr, // Validated v1 header (no Option)
+                                        header: hdr,
                                         sender_id: connection_id,
-                                        timestamp: now,
                                     }
                                 };
 
@@ -699,6 +717,7 @@ mod tests {
             force_http: false,
             website_dir: None,
             allow_anonymous: true,
+            cors_allowed_origins: vec!["https://localhost:3000".to_string()],
         }
     }
 
