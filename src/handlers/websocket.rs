@@ -465,8 +465,8 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: Uuid, connec
                                 // Validate header: must be present, v1, and within size bounds.
                                 // The cryptographic signature verification happens client-side
                                 // (server is blind relay), but we enforce shape + DoS caps here.
-                                const MAX_SIG_LEN: usize = 512;
-                                const MAX_DH_LEN: usize = 256;
+                                const MAX_SIG_LEN: usize = 100; // ECDSA P-256 base64url ≤ 88 chars
+                                const MAX_DH_LEN: usize = 100; // P-256 uncompressed raw 65 B → ~88 chars base64url
                                 let hdr = match incoming.header {
                                     Some(h)
                                         if h.v == crate::models::PINCHAT_PROTOCOL_VERSION
