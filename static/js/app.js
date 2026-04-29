@@ -95,6 +95,13 @@ document.addEventListener('alpine:init', () => {
 
             debugLog('Initializing chat room:', this.roomId);
 
+            // Best-effort cleanup of decrypted image blob URLs when the tab
+            // is closed. Browser GC frees them eventually, but explicit revoke
+            // shortens the window in which the references stay enumerable.
+            window.addEventListener('beforeunload', () => {
+                this.cleanupImageBlobs();
+            });
+
             // Initialize emoji picker categories
             if (window.emojiManager) {
                 this.emojiCategories = window.emojiManager.getCategoryNames();
@@ -357,7 +364,7 @@ document.addEventListener('alpine:init', () => {
         async handleIncomingMessage(message) {
             try {
                 // Pass header to decryption (contains DH public key for ratchet)
-                const plaintext = await window.cryptoManager.decryptMessage(
+                const { text: plaintext, outOfOrder } = await window.cryptoManager.decryptMessage(
                     message.payload,
                     message.header,  // Signal Protocol header with DH public key
                     this.roomId,
@@ -376,7 +383,8 @@ document.addEventListener('alpine:init', () => {
                     timestamp: new Date(message.timestamp),
                     isOwn: isOwn,
                     nickname: nicknameData.display,        // "Cosmic Fox"
-                    senderId: message.sender_id            // Full UUID (for tooltip)
+                    senderId: message.sender_id,           // Full UUID (for tooltip)
+                    outOfOrder: outOfOrder === true        // True if a later counter was already seen
                 });
 
                 // Scroll to bottom after DOM update
@@ -586,7 +594,8 @@ document.addEventListener('alpine:init', () => {
                     timestamp: new Date(message.timestamp),
                     isOwn: false,
                     nickname: nicknameData.display,
-                    senderId: message.sender_id
+                    senderId: message.sender_id,
+                    outOfOrder: imageData.outOfOrder === true
                 });
 
                 // Scroll to bottom
@@ -649,6 +658,7 @@ document.addEventListener('alpine:init', () => {
                 try {
                     await this.handleECDHAborted(true);
                 } catch (_) { /* already surfaced to user */ }
+                this.cleanupImageBlobs();
                 if (this.wsManager && typeof this.wsManager.disconnectWithError === 'function') {
                     this.wsManager.disconnectWithError(1008, 'SIGNATURE_INVALID');
                 }
@@ -783,15 +793,31 @@ document.addEventListener('alpine:init', () => {
         },
 
         /**
-         * Formats emoji string as HTML grid elements
-         * Wraps each emoji character in a <span> for CSS Grid layout
+         * Splits the SAS emoji string into an array of grapheme-aware glyphs.
+         * Used by the SAS modal to render each emoji into its own <span> via
+         * x-for + x-text — keeping all rendering on the safe DOM-text path
+         * and never going through x-html.
          */
-        formatEmojiGrid(emojiString) {
-            if (!emojiString) return '';
-            // Split the emoji string and wrap each emoji in a span
-            return Array.from(emojiString)
-                .map(emoji => `<span>${emoji}</span>`)
-                .join('');
+        sasEmojiArray(emojiString) {
+            if (!emojiString) return [];
+            return Array.from(emojiString);
+        },
+
+        /**
+         * Revokes every blob: ObjectURL we created for received images.
+         * Called on hard session abort and on page unload so that decrypted
+         * image bytes do not linger as enumerable references after the chat
+         * is gone.
+         */
+        cleanupImageBlobs() {
+            for (const msg of this.messages) {
+                if (msg && msg.type === 'image' && typeof msg.imageUrl === 'string' && msg.imageUrl.startsWith('blob:')) {
+                    try {
+                        URL.revokeObjectURL(msg.imageUrl);
+                    } catch (_) { /* best-effort */ }
+                    msg.imageUrl = null;
+                }
+            }
         },
 
         /**
@@ -882,9 +908,14 @@ document.addEventListener('alpine:init', () => {
         async restartECDHHandshake() {
             debugLog('[RECONNECT] Restarting ECDH handshake to resynchronize Chain Ratchet...');
 
-            // Check if we had a verified identity before reconnect
+            // Check if we had a verified identity before reconnect.
+            // Capture the raw bytes (not the CryptoKey) so identity-change
+            // detection after reconnect can compare bytes without needing
+            // exportKey on a non-extractable key.
             const hadVerifiedIdentity = this.identityManager && this.identityManager.isSASVerified();
-            const previousPeerIdentity = this.identityManager ? this.identityManager.peerIdentityPublicKey : null;
+            const previousPeerIdentityRaw = this.identityManager && this.identityManager.peerIdentityPublicKeyRaw
+                ? new Uint8Array(this.identityManager.peerIdentityPublicKeyRaw)
+                : null;
 
             // Reset crypto state (but NOT identity manager - keep for SAS persistence)
             this.pfsActive = false;
@@ -901,8 +932,8 @@ document.addEventListener('alpine:init', () => {
             // Identity keys persist for the entire session while ephemeral keys are regenerated
             // The peer's identity will be re-verified during handshake
             if (this.identityManager) {
-                // Store previous peer identity to detect MITM on reconnect
-                this.identityManager.previousPeerIdentity = previousPeerIdentity;
+                // Store previous peer identity (raw bytes) to detect MITM on reconnect
+                this.identityManager.previousPeerIdentityRaw = previousPeerIdentityRaw;
                 debugLog('[RECONNECT] Keeping identity manager alive (SAS verified:', hadVerifiedIdentity, ')');
             }
 
@@ -1011,8 +1042,8 @@ document.addEventListener('alpine:init', () => {
                 );
 
                 // Check if the peer's identity key changed (possible MITM on reconnect)
-                if (this.identityManager && this.identityManager.previousPeerIdentity) {
-                    if (await this.identityManager.hasPeerIdentityChanged(this.identityManager.peerIdentityPublicKey)) {
+                if (this.identityManager && this.identityManager.previousPeerIdentityRaw) {
+                    if (this.identityManager.hasPeerIdentityChanged()) {
                         console.warn('[SECURITY] ⚠️ Peer identity key changed after reconnect - possible MITM!');
                         this.sasVerificationStatus = 'none';  // Force re-verification
                         this.identityManager.sasVerified = false;
@@ -1021,7 +1052,7 @@ document.addEventListener('alpine:init', () => {
                         debugLog('[SECURITY] ✅ Peer identity key unchanged - SAS verification persists');
                     }
                     // Clear previous peer identity after comparison
-                    this.identityManager.previousPeerIdentity = null;
+                    this.identityManager.previousPeerIdentityRaw = null;
                 }
 
                 // Deriva raw key material (Uint8Array, non CryptoKey)
@@ -1179,6 +1210,9 @@ document.addEventListener('alpine:init', () => {
             if (this.wsManager) {
                 this.wsManager.disconnectWithError(1008, 'SAS mismatch — session aborted');
             }
+
+            // Free decrypted image blobs eagerly: this session is dead.
+            this.cleanupImageBlobs();
 
             this.addSystemMessage('🚫 Security alert: codes did not match. The session has been destroyed to prevent eavesdropping. Please open a new chat.');
         },

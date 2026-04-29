@@ -72,9 +72,9 @@
                     </div>
                 </div>
                 <div class="sidebar-legal">
-                    <a href="/static/terms.html" target="_blank" rel="noopener">Terms</a>
+                    <a href="/static/terms.html" target="_blank" rel="noopener noreferrer">Terms</a>
                     <span class="footer-sep" aria-hidden="true">·</span>
-                    <a href="/static/privacy.html" target="_blank" rel="noopener">Privacy</a>
+                    <a href="/static/privacy.html" target="_blank" rel="noopener noreferrer">Privacy</a>
                     <span class="footer-sep" aria-hidden="true">·</span>
                     <a href="https://github.com/samjanny/pinchat" target="_blank" rel="noopener noreferrer">GitHub&nbsp;↗</a>
                 </div>
@@ -173,7 +173,7 @@
                                 <div x-show="msg.nickname" class="message-sender" :title="msg.senderId">
                                     <strong x-text="msg.nickname"></strong>
                                 </div>
-                                <p><span x-html="renderMessage(msg.text)"></span><span class="message-time" x-text="formatTimestamp(msg.timestamp)"></span></p>
+                                <p><span x-html="renderMessage(msg.text)"></span><span class="message-time" x-text="formatTimestamp(msg.timestamp)"></span><span x-show="msg.outOfOrder" class="message-late" title="Delivered out of order">late</span></p>
                             </div>
                         </div>
 
@@ -188,6 +188,7 @@
                                     <img :src="msg.imageUrl" class="message-image" alt="Shared image" @click="openImageFullscreen(msg.imageUrl)">
                                 </div>
                                 <p class="message-time-standalone" x-text="formatTimestamp(msg.timestamp)"></p>
+                                <p x-show="msg.outOfOrder" class="message-late" title="Delivered out of order">late</p>
                             </div>
                         </div>
 
@@ -380,8 +381,12 @@
                         </div>
                     </div>
 
-                    <!-- Emoji SAS (Primary) -->
-                    <div class="sas-code-emoji" x-html="formatEmojiGrid(sas ? (sas.emoji || '') : '')" aria-label="Short Authentication String"></div>
+                    <!-- Emoji SAS (Primary) — rendered via x-for + x-text so the SAS string never touches innerHTML. -->
+                    <div class="sas-code-emoji" aria-label="Short Authentication String">
+                        <template x-for="(emoji, index) in sasEmojiArray(sas ? (sas.emoji || '') : '')" :key="'sas-' + index">
+                            <span x-text="emoji"></span>
+                        </template>
+                    </div>
 
                     <!-- Hex + copy inline -->
                     <div class="sas-hex-row">
@@ -436,13 +441,13 @@
 
     <!-- Include JS modules -->
     <script src="/static/js/debug.js" integrity="sha256-nY3zkFVKF7x6KVbWq1mwcHq4Y/g8O10iOmLAFfiDsJ8=" crossorigin="anonymous" ></script>
-    <script src="/static/js/crypto.js" integrity="sha256-t3iV+/xrvEjL3D6GbI0QRp9wtCISJt1Qz2NNwc+KJqk=" crossorigin="anonymous" ></script>
-    <script src="/static/js/identity.js" integrity="sha256-VeiPWNZTvV4zKphiwPBCoP92H/6lV+Db0swimDx8avA=" crossorigin="anonymous" ></script>
-    <script src="/static/js/double-ratchet.js" integrity="sha256-AWOKSY8Z0iYUXWJ5DEu5ydcXn/Mvb+G3Qu8gcvjDNEM=" crossorigin="anonymous" ></script>
-    <script src="/static/js/ecdh.js" integrity="sha256-wx5quW6kBmpKtVGOffD3J1UszHYV4y7TpaPYQ6mXxtY=" crossorigin="anonymous" ></script>
+    <script src="/static/js/crypto.js" integrity="sha256-LJKCLjwUjlksRVBtP9XC32k2hvFM5tF+oHBe5sMTTpw=" crossorigin="anonymous" ></script>
+    <script src="/static/js/identity.js" integrity="sha256-UhpfUcahF1Fgy0TNKAK6go7ItwAaVJPcG/rlWOSWg8Q=" crossorigin="anonymous" ></script>
+    <script src="/static/js/double-ratchet.js" integrity="sha256-SK/5eznNxO3+n+seoUD3kOGxNLRPE2Zm+CpL76bWQ98=" crossorigin="anonymous" ></script>
+    <script src="/static/js/ecdh.js" integrity="sha256-MoFGYUO8bcHjxpm127Af74fTfJG6VD4A7J1ENwNdYus=" crossorigin="anonymous" ></script>
     <script src="/static/js/websocket.js" integrity="sha256-UcUdIdoze6mxLgXbxg0pAR6xVTqn6U1TbEkAyWBXbNw=" crossorigin="anonymous" ></script>
-    <script src="/static/js/emoji.js" integrity="sha256-50Jl89UVAxsebd+pNB1khjany8UVe0zq3ZoOZcGi6CY=" crossorigin="anonymous" ></script>
-    <script src="/static/js/app.js" integrity="sha256-Pt8VRzurFu0gGh+mle6JA2EQikIDRg4TmI2kHWGLBAE=" crossorigin="anonymous" ></script>
+    <script src="/static/js/emoji.js" integrity="sha256-WpxZR4Pkn/LcG/x682Rif5tCQQsHkgs+aV8NmR0YINc=" crossorigin="anonymous" ></script>
+    <script src="/static/js/app.js" integrity="sha256-v8+Ohrz5blhkNvDRfA38YG0i6b0ISyOm+AcHlJ+vTI4=" crossorigin="anonymous" ></script>
     <script src="/static/js/alpine-csp.min.js" integrity="sha256-58hj2liWaS9dR44Q2uCJ5hZP7RxcG2offLv3qbCT8FU=" crossorigin="anonymous" defer></script>
 
     <!-- Lucide icon sprite (ISC license, https://lucide.dev) -->

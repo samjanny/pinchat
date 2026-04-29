@@ -71,6 +71,12 @@ pub struct Config {
     pub challenge_ttl_secs: u64,
     pub jwt_token_ttl_secs: u64,
 
+    // Absolute hard cap on a single WebSocket connection's lifetime, in seconds.
+    // Independent of the idle timeout: even an active client is forced to
+    // reconnect (and thus restart the handshake) after this duration. Bounds
+    // resource usage from clients that keep heartbeating indefinitely.
+    pub max_ws_connection_age_secs: u64,
+
     // Cleanup intervals
     pub room_cleanup_interval_secs: u64,
     pub challenge_cleanup_interval_secs: u64,
@@ -204,6 +210,13 @@ impl Config {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(30),
+
+            // Hard cap on WebSocket connection lifetime (default: 30 minutes).
+            // Forces a reconnect that re-runs PoW/JWT and the handshake.
+            max_ws_connection_age_secs: env::var("MAX_WS_CONNECTION_AGE_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(30 * 60),
 
             // Cleanup intervals (default: 60 seconds)
             room_cleanup_interval_secs: env::var("ROOM_CLEANUP_INTERVAL_SECS")
@@ -386,6 +399,9 @@ impl Config {
         }
         if self.jwt_token_ttl_secs == 0 {
             panic!("JWT_TOKEN_TTL_SECS must be greater than 0");
+        }
+        if self.max_ws_connection_age_secs == 0 {
+            panic!("MAX_WS_CONNECTION_AGE_SECS must be greater than 0");
         }
 
         // Validate cleanup intervals are non-zero

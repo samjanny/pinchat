@@ -67,6 +67,13 @@ class DoubleRatchet {
         // Initiator starts as true (no need to ratchet before first send)
         // Responder will set to false when they receive first message
 
+        // Highest (ratchetCount, messageNumber) tuple successfully decrypted.
+        // Used to flag late/reordered arrivals to the UI without weakening the
+        // cryptographic acceptance rules — out-of-order messages are still
+        // valid, but the application can mark them visually.
+        this.maxRatchetSeen = -1;
+        this.maxCounterSeen = -1;
+
         // Configuration
         this.CURVE = 'P-256';
     }
@@ -373,6 +380,8 @@ class DoubleRatchet {
             DHs: this.DHs,
             DHsSignature: this.DHsSignature,
             rootKey: this.rootKey ? new Uint8Array(this.rootKey) : null,
+            maxRatchetSeen: this.maxRatchetSeen,
+            maxCounterSeen: this.maxCounterSeen,
         };
 
         let envelope;
@@ -498,6 +507,24 @@ class DoubleRatchet {
             const decoder = new TextDecoder();
             const envelopeJson = decoder.decode(plaintextBytes);
             envelope = JSON.parse(envelopeJson);
+
+            // Tag the envelope as out-of-order if this (ratchetCount, messageNumber)
+            // tuple is strictly less than the highest tuple we have ever decrypted.
+            // The AEAD already authenticated the counter; this is purely a UI hint.
+            const isLate =
+                ratchetCount < this.maxRatchetSeen ||
+                (ratchetCount === this.maxRatchetSeen && messageNumber < this.maxCounterSeen);
+            if (isLate) {
+                envelope._outOfOrder = true;
+            }
+
+            if (
+                ratchetCount > this.maxRatchetSeen ||
+                (ratchetCount === this.maxRatchetSeen && messageNumber > this.maxCounterSeen)
+            ) {
+                this.maxRatchetSeen = ratchetCount;
+                this.maxCounterSeen = messageNumber;
+            }
 
         } catch (err) {
             // AEAD failed or any other error: roll back all ratchet state mutations

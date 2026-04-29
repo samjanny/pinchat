@@ -152,9 +152,14 @@ class EmojiManager {
     substituteEmoticons(text) {
         if (!text) return text;
 
-        // Extract and preserve code blocks
+        // Strip NUL bytes from the input. The code-block extraction below uses
+        // \x00CODE_BLOCK_N\x00 sentinels; if a peer-controlled plaintext
+        // contains literal NUL bytes that match such a sentinel, the literal
+        // String.prototype.replace below would substitute it with a code block,
+        // or leave a stray sentinel in the output. Removing NUL bytes up-front
+        // makes the sentinel namespace exclusive to this function.
         const codeBlocks = [];
-        let processedText = text;
+        let processedText = text.replace(/\u0000/g, '');
 
         // Preserve multi-line code blocks (```)
         processedText = processedText.replace(/```[\s\S]*?```/g, (match) => {
@@ -196,8 +201,13 @@ class EmojiManager {
     renderWithCodeBlocks(text) {
         if (!text) return '';
 
+        // Strip NUL bytes for the same reason as in substituteEmoticons:
+        // the regex below uses \x00CODE_BLOCK_N\x00 as placeholder sentinels
+        // that must be unique to this function's substitution pass.
+        const sanitized = text.replace(/\u0000/g, '');
+
         // First apply emoticon substitution (preserves code blocks)
-        let processedText = this.substituteEmoticons(text);
+        let processedText = this.substituteEmoticons(sanitized);
 
         // Escape HTML entities (except in code blocks which we handle separately)
         const escapeHtml = (str) => {
