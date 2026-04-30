@@ -264,7 +264,6 @@ If you are running your own PinChat instance (not using the official pinchat.io)
 
    - `chrome/background.js`
    - `firefox/background.js`
-   - `shared/verify.js`
 
    Replace:
    ```javascript
@@ -303,8 +302,6 @@ extensions/
 ├── generate-hashes.js     # Hash generation and signing script
 ├── generate-icons.sh      # Icon generation script
 ├── hashes.json.example    # Example hash file format
-├── shared/
-│   └── verify.js          # Shared verification logic (reference)
 ├── chrome/
 │   ├── manifest.json      # Chrome extension manifest (MV3)
 │   ├── background.js      # Service worker

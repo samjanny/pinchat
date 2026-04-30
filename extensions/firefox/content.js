@@ -18,6 +18,16 @@ let fileHashVerificationDone = false;  // Track if we've verified file hashes
 let manifestSRIMap = {};  // Map of path -> expected SRI for O(1) lookups
 let reVerifyTimeout = null;  // Debounce timer for re-verification
 
+// Overlay persistence — a compromised page could try to remove or hide our
+// warning host element. We retain the args used to render the overlay so a
+// watchdog (and the main MutationObserver) can re-mount/restore on tamper.
+let overlayPersistentState = {
+    active: false,           // True between showWarningOverlay() and an explicit dismiss
+    mismatches: [],
+    isUnauthorized: false
+};
+let overlayWatchdogTimer = null;
+
 /**
  * Escape HTML special characters to prevent XSS
  * @param {string} text - Text to escape
@@ -715,6 +725,11 @@ function setupDOMObserver() {
         if (needsReVerification) {
             scheduleReVerification();
         }
+
+        // Fast path: if the overlay should be visible but isn't, re-mount NOW
+        // rather than waiting for the next watchdog tick. childList mutations
+        // include removals of the overlay host element.
+        restoreOverlayIfTampered();
     });
 
     domObserver.observe(document.documentElement, {
@@ -837,6 +852,15 @@ async function performDOMSecurityCheck() {
  * The adoptedStyleSheets API doesn't work in Firefox content scripts due to Xray wrappers.
  */
 async function showWarningOverlay(mismatches = [], isUnauthorized = false) {
+    // Persist args so the watchdog can re-mount if the page tries to remove the
+    // overlay. We take a defensive copy of `mismatches` so a later mutation of
+    // the source array doesn't change what we render on re-mount.
+    overlayPersistentState = {
+        active: true,
+        mismatches: Array.isArray(mismatches) ? [...mismatches] : [],
+        isUnauthorized
+    };
+
     if (overlayElement) {
         overlayElement.remove();
     }
@@ -909,15 +933,70 @@ async function showWarningOverlay(mismatches = [], isUnauthorized = false) {
 
     // Append to DOM
     (document.body || document.documentElement).appendChild(overlayElement);
+
+    // Start the watchdog now that an overlay is live. Idempotent.
+    ensureOverlayWatchdog();
 }
 
 /**
- * Hide the warning overlay
+ * Hide the warning overlay. Called from explicit user "Dismiss" action and
+ * from the verification path when issues are resolved. Marks the persistent
+ * state inactive so the watchdog stops re-mounting.
  */
 function hideWarningOverlay() {
+    overlayPersistentState.active = false;
     if (overlayElement) {
         overlayElement.remove();
         overlayElement = null;
+    }
+    if (overlayWatchdogTimer !== null) {
+        clearInterval(overlayWatchdogTimer);
+        overlayWatchdogTimer = null;
+    }
+}
+
+/**
+ * Ensure the overlay watchdog is running. The watchdog catches tampering that
+ * the main MutationObserver may miss or that arrives via property/style
+ * setters: removal of the host element, style attributes that hide it, and
+ * the `hidden` attribute. Cheap (a periodic poll) and idempotent.
+ */
+function ensureOverlayWatchdog() {
+    if (overlayWatchdogTimer !== null) return;
+    overlayWatchdogTimer = setInterval(restoreOverlayIfTampered, 500);
+}
+
+/**
+ * If the overlay should be visible but the page has tampered with it, restore
+ * the original state. Called both periodically (watchdog) and synchronously
+ * from the main MutationObserver for fast reaction to childList removals.
+ */
+function restoreOverlayIfTampered() {
+    if (!overlayPersistentState.active) return;
+
+    // Removed entirely (or never reattached after a page-driven detach).
+    if (!overlayElement || !document.contains(overlayElement)) {
+        console.warn('[PinChat Verify] Overlay missing — re-mounting');
+        overlayElement = null;
+        // showWarningOverlay re-creates and re-appends. It will also reset
+        // overlayPersistentState.active = true (idempotent).
+        showWarningOverlay(overlayPersistentState.mismatches, overlayPersistentState.isUnauthorized);
+        return;
+    }
+
+    // Style attribute tampering — strip it. The Shadow DOM stylesheet sets
+    // :host with !important properties, so removing the host's inline style
+    // restores correct positioning and visibility.
+    if (overlayElement.hasAttribute('style')) {
+        console.warn('[PinChat Verify] Overlay style attribute tampered — clearing');
+        overlayElement.removeAttribute('style');
+    }
+    if (overlayElement.hidden) {
+        console.warn('[PinChat Verify] Overlay `hidden` attribute set — clearing');
+        overlayElement.hidden = false;
+    }
+    if (overlayElement.getAttribute('class')) {
+        overlayElement.removeAttribute('class');
     }
 }
 
