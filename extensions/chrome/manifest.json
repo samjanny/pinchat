@@ -9,6 +9,7 @@
     ],
     "host_permissions": [
         "https://pinchat.io/*",
+        "https://www.pinchat.io/*",
         "https://raw.githubusercontent.com/samjanny/pinchat/*"
     ],
     "background": {
@@ -17,9 +18,10 @@
     },
     "content_scripts": [
         {
-            "matches": ["https://pinchat.io/*"],
+            "matches": ["https://pinchat.io/*", "https://www.pinchat.io/*"],
             "js": ["content.js"],
-            "run_at": "document_start"
+            "run_at": "document_start",
+            "all_frames": true
         }
     ],
     "action": {
@@ -40,7 +42,7 @@
     "web_accessible_resources": [
         {
             "resources": ["warning.css"],
-            "matches": ["https://pinchat.io/*"]
+            "matches": ["https://pinchat.io/*", "https://www.pinchat.io/*"]
         }
     ]
 }
