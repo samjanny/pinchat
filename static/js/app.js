@@ -1193,13 +1193,22 @@ document.addEventListener('alpine:init', () => {
         handleSasMismatch() {
             console.warn('[SECURITY] SAS mismatch — treating as active MITM, aborting session');
 
-            // Destroy ratchet and identity state so the compromised chain cannot be reused
-            if (this.cryptoManager) {
-                this.cryptoManager.resetToBootstrapKey().catch(() => {});
+            // Destroy ratchet and identity state so the compromised chain cannot be reused.
+            // Note: cryptoManager is a module-level singleton on `window`, NOT a property
+            // of this Alpine store. The previous `this.cryptoManager` reference was a
+            // silent no-op — keys would persist in memory until tab close.
+            if (window.cryptoManager) {
+                window.cryptoManager.resetToBootstrapKey().catch(() => {});
             }
-            if (this.identityManager && typeof this.identityManager.reset === 'function') {
-                this.identityManager.reset();
+            // IdentityKeyManager exposes destroy(), not reset() — calling the wrong
+            // name guarded by typeof was a silent no-op. We want the keys gone now.
+            if (this.identityManager && typeof this.identityManager.destroy === 'function') {
+                this.identityManager.destroy();
             }
+            if (this.ecdhManager && typeof this.ecdhManager.destroyEphemeralKeys === 'function') {
+                this.ecdhManager.destroyEphemeralKeys();
+            }
+            this.pfsActive = false;
 
             // Permanently lock the composer for this session
             this.sasMismatchFatal = true;

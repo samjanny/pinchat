@@ -411,6 +411,36 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: Uuid, connec
                     Ok(incoming) => {
                         // Handle ECDH public key exchange (blind relay, no crypto server-side)
                         if incoming.msg_type == "ecdh_public_key" {
+                            // Per-connection ECDH burst limiter. The looser
+                            // frame_rate_limit (default 120/s) was the only gate
+                            // here; an authenticated peer could flood handshake
+                            // frames and force the receiver client into repeated
+                            // signature verification + key import + Double
+                            // Ratchet reinit. Real handshakes need 1–2 frames
+                            // per session, so a small burst over a long window
+                            // is more than enough for legitimate reconnects.
+                            {
+                                let limit = state_clone.config.ecdh_burst_limit;
+                                let window = state_clone.config.ecdh_burst_window_secs;
+                                let now = Utc::now();
+                                let cutoff = now - chrono::Duration::seconds(window);
+                                let mut ts = state_clone
+                                    .connection_ecdh_timestamps
+                                    .entry(connection_id)
+                                    .or_default();
+                                ts.retain(|&t| t > cutoff);
+                                if ts.len() >= limit {
+                                    tracing::warn!(
+                                        "Connection {} exceeded ECDH burst limit ({}/{}s), disconnecting",
+                                        connection_id,
+                                        ts.len(),
+                                        window
+                                    );
+                                    break;
+                                }
+                                ts.push_back(now);
+                            }
+
                             tracing::info!(
                                 "ECDH public key received from connection_id={} in room={}",
                                 connection_id,
@@ -743,6 +773,8 @@ mod tests {
             challenge_ttl_secs: 300,
             jwt_token_ttl_secs: 30,
             max_ws_connection_age_secs: 30 * 60,
+            ecdh_burst_limit: 8,
+            ecdh_burst_window_secs: 60,
             room_cleanup_interval_secs: 60,
             challenge_cleanup_interval_secs: 60,
             password_hashes: vec![],

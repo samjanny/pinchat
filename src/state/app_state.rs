@@ -54,6 +54,13 @@ pub struct AppState {
     /// payloads. Connection is closed past `config.protocol_error_limit`.
     pub connection_protocol_errors: Arc<DashMap<Uuid, u32>>,
 
+    /// Per-connection ECDH-frame timestamps.
+    /// Each `ecdh_public_key` frame the server relays triggers signature
+    /// verification + key import + Double Ratchet reinit on the peer client.
+    /// Without a stricter cap than `frame_rate_limit`, an authenticated peer
+    /// could exhaust the receiver's CPU under cover of normal frame budget.
+    pub connection_ecdh_timestamps: Arc<DashMap<Uuid, VecDeque<DateTime<Utc>>>>,
+
     /// PoW challenge cache indexed by HMAC(IP)
     /// Prevents offline challenge fabrication attacks
     pub challenge_cache: Arc<ChallengeCache>,
@@ -122,6 +129,7 @@ impl AppState {
             connection_message_timestamps: Arc::new(DashMap::new()),
             connection_frame_timestamps: Arc::new(DashMap::new()),
             connection_protocol_errors: Arc::new(DashMap::new()),
+            connection_ecdh_timestamps: Arc::new(DashMap::new()),
             challenge_cache: Arc::new(ChallengeCache::new(config.challenge_ttl_secs, 10_000)),
             ip_hash_secret,
             jwt_secret,
@@ -263,6 +271,7 @@ impl AppState {
             self.connection_message_timestamps.remove(connection_id);
             self.connection_frame_timestamps.remove(connection_id);
             self.connection_protocol_errors.remove(connection_id);
+            self.connection_ecdh_timestamps.remove(connection_id);
 
             Some(room_id)
         } else {
