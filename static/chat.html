@@ -250,7 +250,7 @@
             <!-- Image Preview (shown when image is selected or being sent) -->
             <div x-show="pendingImage || sendingImage" class="image-preview-container">
                 <div class="image-preview-wrapper" x-show="pendingImage">
-                    <img :src="pendingImage ? pendingImage.dataUrl : ''" class="image-preview" alt="Preview">
+                    <img :src="pendingImage ? pendingImage.previewUrl : ''" class="image-preview" alt="Preview">
                     <button @click="cancelImage()" class="image-preview-cancel" title="Cancel" x-show="!sendingImage">×</button>
                 </div>
                 <div class="image-preview-info" x-show="pendingImage">
@@ -447,7 +447,7 @@
     <script src="/static/js/ecdh.js" integrity="sha256-CVN4eN0i8sQBgVu52unHdpXxUJ9pjq82mYZn3yoYCgo=" crossorigin="anonymous" ></script>
     <script src="/static/js/websocket.js" integrity="sha256-Xr4tEvRw9pB/3SXWMEZxUXHXA5ZpYhYDWT16gvP3Fbc=" crossorigin="anonymous" ></script>
     <script src="/static/js/emoji.js" integrity="sha256-w67zAeAVHFA9AB+RnbDbadBSg6LDd5RS+4mvZksLUv8=" crossorigin="anonymous" ></script>
-    <script src="/static/js/app.js" integrity="sha256-4GaUlPjF4rpBzJWnDu54x9nwYSfe+uyCaHbjGpjmfsQ=" crossorigin="anonymous" ></script>
+    <script src="/static/js/app.js" integrity="sha256-qzE0CkEnzzUjt5wc8pjcYhPPgl/tJKUa27lCg9zurDo=" crossorigin="anonymous" ></script>
     <script src="/static/js/alpine-csp.min.js" integrity="sha256-58hj2liWaS9dR44Q2uCJ5hZP7RxcG2offLv3qbCT8FU=" crossorigin="anonymous" defer></script>
 
     <!-- Lucide icon sprite (ISC license, https://lucide.dev) -->

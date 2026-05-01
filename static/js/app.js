@@ -475,16 +475,14 @@ document.addEventListener('alpine:init', () => {
                 // Read file as ArrayBuffer for encryption
                 const arrayBuffer = await file.arrayBuffer();
 
-                // Read file as DataURL for preview
-                const dataUrl = await new Promise((resolve, reject) => {
-                    const reader = new FileReader();
-                    reader.onload = () => resolve(reader.result);
-                    reader.onerror = reject;
-                    reader.readAsDataURL(file);
-                });
+                // Build a blob URL for the preview. This replaces the previous
+                // FileReader/data URL approach: data: URIs are blocked by our
+                // strict CSP (img-src 'self' blob:), while blob: URLs are
+                // allowed and avoid the base64 round-trip in memory.
+                const previewUrl = URL.createObjectURL(file);
 
                 this.pendingImage = {
-                    dataUrl: dataUrl,
+                    previewUrl,           // blob: URL (CSP-compatible)
                     name: file.name,
                     size: file.size,
                     mimeType: file.type,
@@ -505,6 +503,12 @@ document.addEventListener('alpine:init', () => {
          * Cancels pending image
          */
         cancelImage() {
+            // Free the blob URL — the user discarded the preview, no message
+            // will reference it. Without this, the underlying File data stays
+            // alive until the page unloads.
+            if (this.pendingImage && this.pendingImage.previewUrl) {
+                try { URL.revokeObjectURL(this.pendingImage.previewUrl); } catch {}
+            }
             this.pendingImage = null;
         },
 
@@ -519,8 +523,13 @@ document.addEventListener('alpine:init', () => {
             this.sendingImage = true;
 
             try {
-                // Add image message to local list immediately
-                const localImageUrl = this.pendingImage.dataUrl;
+                // Add image message to local list immediately. We hand over the
+                // existing preview blob URL — both the preview and the local
+                // history entry can share the same object URL (the underlying
+                // Blob is not freed until every reference goes away). This
+                // means we DO NOT revoke it here; it will be released when the
+                // tab closes or when handleImageUpload creates a new one.
+                const localImageUrl = this.pendingImage.previewUrl;
                 this.messages.push({
                     id: this.nextMessageId++,
                     type: 'image',
@@ -550,17 +559,22 @@ document.addEventListener('alpine:init', () => {
                 });
 
                 if (!sent) {
-                    // Remove local message on failure
+                    // Remove local message on failure — the only reference to
+                    // the blob URL goes with it, so revoke to free the blob.
                     this.messages.pop();
+                    try { URL.revokeObjectURL(localImageUrl); } catch {}
                     this.error = '⚠️ Unable to send image. Please try again.';
                 }
 
-                // Clear pending image
+                // Clear pending image (do NOT revoke previewUrl here on the
+                // happy path — it is now owned by the local message entry).
                 this.pendingImage = null;
 
             } catch (error) {
                 console.error('Failed to send image:', error);
                 this.messages.pop();
+                // Encrypt/send threw — local message gone, revoke its blob URL.
+                try { URL.revokeObjectURL(localImageUrl); } catch {}
                 this.error = '⚠️ Error encrypting image.';
             } finally {
                 this.sendingImage = false;
