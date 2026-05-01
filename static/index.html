@@ -218,5 +218,12 @@
             <path d="M12 17h.01"/>
         </symbol>
     </svg>
+
+    <!-- Cookie notice (informational, dismissible — see static/js/cookie-notice.js) -->
+    <div id="cookie-notice" class="cookie-notice hidden" role="region" aria-label="Cookie notice">
+        <span class="cookie-notice-text">This site uses only strictly necessary cookies (session, CSRF). No tracking, no analytics. <a href="/static/privacy.html">Privacy</a></span>
+        <button type="button" class="cookie-notice-ok">OK</button>
+    </div>
+    <script src="/static/js/cookie-notice.js" crossorigin="anonymous"></script>
 </body>
 </html>

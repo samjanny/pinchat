@@ -29,6 +29,7 @@ const JS_CSS_FILES = [
   // JavaScript
   '/static/js/alpine-csp.min.js',
   '/static/js/app.js',
+  '/static/js/cookie-notice.js',
   '/static/js/crypto.js',
   '/static/js/double-ratchet.js',
   '/static/js/ecdh.js',

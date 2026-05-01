@@ -3997,3 +3997,60 @@ input[type="password"]:focus {
 }
 .page-legal .card::before { display: none; }
 
+/* Cookie notice — informational, not a consent banner.
+ * Floating bottom card, dismissible. Hidden by default; cookie-notice.js
+ * removes the .hidden class only if the user has not dismissed it before. */
+.cookie-notice {
+    position: fixed;
+    bottom: 1rem;
+    left: 50%;
+    transform: translateX(-50%);
+    max-width: min(680px, calc(100vw - 2rem));
+    background: var(--bg-card);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    padding: 0.875rem 1rem;
+    box-shadow: var(--shadow-lg);
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+    z-index: 10000;
+    font-size: 0.875rem;
+    line-height: 1.45;
+    -webkit-font-smoothing: antialiased;
+}
+.cookie-notice-text { flex: 1; min-width: 0; }
+.cookie-notice-text a {
+    color: var(--primary);
+    text-decoration: underline;
+    text-underline-offset: 2px;
+}
+.cookie-notice-text a:hover { color: var(--primary-dark); }
+.cookie-notice-ok {
+    background: var(--primary);
+    color: #ffffff;
+    border: 1px solid var(--primary-dark);
+    border-bottom-width: 2px;
+    padding: 0.5rem 1.1rem;
+    border-radius: var(--radius-sm);
+    font-family: inherit;
+    font-weight: 700;
+    font-size: 0.875rem;
+    letter-spacing: 0.02em;
+    cursor: pointer;
+    flex-shrink: 0;
+    transition: background 0.15s ease, transform 0.1s ease;
+}
+.cookie-notice-ok:hover { background: var(--primary-dark); }
+.cookie-notice-ok:active { transform: translateY(1px); }
+@media (max-width: 600px) {
+    .cookie-notice {
+        flex-direction: column;
+        gap: 0.65rem;
+        align-items: stretch;
+        bottom: 0.5rem;
+    }
+    .cookie-notice-ok { width: 100%; }
+}
+
