@@ -1,8 +1,8 @@
 {
   "data": {
     "version": "1.2.0",
-    "sequence": 20,
-    "generated": "2026-04-24T15:03:37.173Z",
+    "sequence": 21,
+    "generated": "2026-05-01T08:10:42.305Z",
     "site": "https://pinchat.io",
     "files": [
       {
@@ -15,31 +15,31 @@
       },
       {
         "path": "/static/js/app.js",
-        "hash": "3edf15473bab16ed201a1fa695ee890361108a4203460e13988da41d618b0401"
+        "hash": "e0669494f8c5e2ba41cc95a70eee78c7d9f06127defaec826876e31a98e67ec4"
       },
       {
         "path": "/static/js/crypto.js",
-        "hash": "b77895fbfc6bbc48cbdc3e866c8d10469f70b4221226dd50cf634dc1cf8a26a9"
+        "hash": "9e77126d27def7e18389a95b7102c58b4f9357c77c37ba6984ba3bb851b9c843"
       },
       {
         "path": "/static/js/double-ratchet.js",
-        "hash": "01638a498f19d226145d62790c4bb9c9d7179ff32f6fe1b742ef2072f8c33443"
+        "hash": "e9ad8a3b738f31a12c22559530b0af118f5049313d3402c08ceb1969057f1024"
       },
       {
         "path": "/static/js/ecdh.js",
-        "hash": "c31e6ab96ea4066a4ab5518e7df0f727552ccc7615e32ed3a5a3d843a997c6d6"
+        "hash": "09537878dd22f2c401815bb9dae9c77695f1509f698eaf36998667df2a180a0a"
       },
       {
         "path": "/static/js/emoji.js",
-        "hash": "e74265f3d515031b1e6ddfa9341d648636a7cbc5157b4ceadd9a0e65c1a2e826"
+        "hash": "c3aef301e0151c503d001f919db0db69d05283a2c3779452fb89af664b0b52ff"
       },
       {
         "path": "/static/js/homepage.js",
-        "hash": "bb95b341e8d30fd59dfa0c32877fa60ddea873f723999b4d446a2291f24b2e78"
+        "hash": "17962227fd97c388763cda77d6faf4454c118f5729c740bf1c3ab96529680623"
       },
       {
         "path": "/static/js/identity.js",
-        "hash": "55e88f58d653bd5e332a9862c0f042a0ff761ffea557e0dbd2cc22983c7c6af0"
+        "hash": "b25ea0d3e663234e54b6fc2a38b71d1a3f231ac9c2f28dcd0b6b8675c90a3159"
       },
       {
         "path": "/static/js/legal.js",
@@ -47,7 +47,7 @@
       },
       {
         "path": "/static/js/login.js",
-        "hash": "f7467d251f7d88d99c2fc733c3a13bc95f78f06d5934a2a2f67cb1aecdf2e1f8"
+        "hash": "399d629fe63f2791d2645c367d351504db53e5f906b4e44d333f3fd72a74d10c"
       },
       {
         "path": "/static/js/nicknames.js",
@@ -63,7 +63,7 @@
       },
       {
         "path": "/static/js/websocket.js",
-        "hash": "51c51d21da337ba9b12e05dbc60d29011eb1553aa7e94d536c4900c960576cdc"
+        "hash": "5ebe2d12f470f6907fdd25d63046715171d7039669621603593d7a82f3f715b7"
       },
       {
         "path": "/static/js/debug.js",
@@ -71,15 +71,15 @@
       },
       {
         "path": "/static/index.html",
-        "hash": "0c48f12a16ce521d2313e00f692fab7102d1d6d0277e64a4fe1c1a190c5080d1"
+        "hash": "e2fb0e580222302a9e27a6c96bea79bdfa8d26f88345b3e66239bba3e52177c0"
       },
       {
         "path": "/static/login.html",
-        "hash": "c69eaaebc0759035fcb4d2d294d2fa7c549ff25744af3bd5cac4018ef9de720f"
+        "hash": "fc80311dd6e27f0cfbdd29cb1d33f32c22bb06fbd198ff67d1239243c06b0bb2"
       },
       {
         "path": "/static/chat.html",
-        "hash": "a580275c24b4005896fca1781beefa8c88828351ae408d6e2bc1258f9c2ce985"
+        "hash": "a94dfea5ff9c93b010ab33be6f86ca32c2c9223e4ddb7b5415d0132b9944e333"
       },
       {
         "path": "/static/terms.html",
@@ -95,5 +95,5 @@
       }
     ]
   },
-  "signature": "MEQCIDsXwKjxSP2tvSxhCP4X++Dr70XNSBjw8SHuw98lDpd7AiAdpgQLtvDbpdSX+yYcfEPRciuTV5c4GYmgRyY3460gZQ=="
+  "signature": "MEUCIQD3hMODNMshuxBr6SkY8yBh7N5vThEiZ+s02J7tqyipbAIgaTfj89oJ9y4r3I53Oomhf8X7zcsldZh7A0bWY8KMtO4="
 }
