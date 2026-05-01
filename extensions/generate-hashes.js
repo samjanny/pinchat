@@ -71,10 +71,37 @@ function urlPathToFilePath(urlPath) {
 }
 
 /**
+ * Read a file's bytes for hashing.
+ *
+ * For text-typed files (.js .css .html .json) we normalize CRLF -> LF so the
+ * resulting hash matches what the production server will serve (a Linux
+ * filesystem with LF line endings) regardless of the platform this script
+ * runs on. Without this, generating hashes on Windows with autocrlf=true
+ * produces SRI/manifest values that mismatch the bytes the browser sees in
+ * production, blocking every script via SRI failure.
+ *
+ * Binary files (none currently in the manifest, but defensively) bypass
+ * normalization to avoid corrupting their content.
+ */
+function readForHashing(filePath) {
+    const buf = fs.readFileSync(filePath);
+    const ext = path.extname(filePath).toLowerCase();
+    const TEXT_EXTS = new Set(['.js', '.css', '.html', '.htm', '.json', '.svg', '.txt', '.md']);
+    if (!TEXT_EXTS.has(ext)) return buf;
+    // CRLF -> LF using a byte-safe transform that doesn't touch UTF-8 multibyte sequences.
+    const out = [];
+    for (let i = 0; i < buf.length; i++) {
+        if (buf[i] === 0x0d && buf[i + 1] === 0x0a) continue; // skip CR before LF
+        out.push(buf[i]);
+    }
+    return Buffer.from(out);
+}
+
+/**
  * Calculate SHA-256 hash of a file (hex format for manifest)
  */
 function hashFileHex(filePath) {
-    const content = fs.readFileSync(filePath, 'utf8');
+    const content = readForHashing(filePath);
     return crypto.createHash('sha256').update(content).digest('hex');
 }
 
@@ -82,16 +109,21 @@ function hashFileHex(filePath) {
  * Calculate SHA-256 hash of a file (base64 format for SRI)
  */
 function hashFileSRI(filePath) {
-    const content = fs.readFileSync(filePath, 'utf8');
+    const content = readForHashing(filePath);
     const hash = crypto.createHash('sha256').update(content).digest('base64');
     return `sha256-${hash}`;
 }
 
 /**
- * Calculate SHA-256 hash of content (base64 format for SRI)
+ * Calculate SHA-256 hash of content (base64 format for SRI).
+ * Normalizes CRLF -> LF for consistency with on-disk file hashing
+ * (see readForHashing for rationale).
  */
 function hashContentSRI(content) {
-    const hash = crypto.createHash('sha256').update(content).digest('base64');
+    const normalized = typeof content === 'string'
+        ? content.replace(/\r\n/g, '\n')
+        : content;
+    const hash = crypto.createHash('sha256').update(normalized).digest('base64');
     return `sha256-${hash}`;
 }
 
@@ -453,8 +485,13 @@ async function main() {
             // Hash the updated content (already written to disk)
             hexHash = hashFileHex(fullPath);
         } else if (update) {
-            // Dry run: hash the content that would be written
-            hexHash = crypto.createHash('sha256').update(update.content).digest('hex');
+            // Dry run: hash the content that would be written.
+            // Normalize CRLF -> LF so dry-run matches the on-disk hash that
+            // would be produced once the file is actually written.
+            const normalized = typeof update.content === 'string'
+                ? update.content.replace(/\r\n/g, '\n')
+                : update.content;
+            hexHash = crypto.createHash('sha256').update(normalized).digest('hex');
         } else {
             hexHash = hashFileHex(fullPath);
         }
