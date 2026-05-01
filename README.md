@@ -273,6 +273,7 @@ Environment variables for customization:
 | `PRIVACY_MODE` | `strict` | Logging level: `strict`, `minimal`, `development` |
 | `FORCE_HTTP` | `false` | Allow HTTP (for reverse proxy setups) |
 | `FORCE_SECURE_COOKIES` | `false` | Force Secure cookie flag |
+| `CORS_ALLOWED_ORIGINS` | `https://localhost:3000` | Comma-separated origins for CORS + WebSocket Origin check. **Required in production** — must include your public origin(s) or browsers will fail the WS upgrade with 403. Example: `https://your-domain.com,https://www.your-domain.com` |
 | `MAX_TOTAL_ROOMS` | `1000` | Maximum concurrent rooms |
 | `CSP_WS_HOST` | `'self'` | WebSocket CSP origins |
 | `WS_CONN_BURST_SIZE` | `30` | WebSocket connections allowed per period |
