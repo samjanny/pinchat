@@ -1,13 +1,13 @@
 {
   "data": {
     "version": "1.2.0",
-    "sequence": 23,
-    "generated": "2026-05-01T09:51:02.670Z",
+    "sequence": 24,
+    "generated": "2026-05-01T10:19:02.021Z",
     "site": "https://pinchat.io",
     "files": [
       {
         "path": "/static/css/style.css",
-        "hash": "5116d38f7ab78876349ca475976f8f5256543235102558496c2af65484e8e632"
+        "hash": "23b8e9a701fed3fa910d93d97ed32399bdd34ba3aedf096df9a671f6a17aa19d"
       },
       {
         "path": "/static/js/alpine-csp.min.js",
@@ -16,6 +16,10 @@
       {
         "path": "/static/js/app.js",
         "hash": "ab31340a4127cf3523b79c1cf298dc6213cf825fed24a51adbb94283dceeac3a"
+      },
+      {
+        "path": "/static/js/cookie-notice.js",
+        "hash": "aef6ff6c74365b68eeae660829a394868083e26837c3de3e51bba58c2ab00dd2"
       },
       {
         "path": "/static/js/crypto.js",
@@ -71,23 +75,23 @@
       },
       {
         "path": "/static/index.html",
-        "hash": "6798dcefcd87db64d806cde81dda533bdd03c7a867a34353d6eabae34040bc8b"
+        "hash": "9ea725249cc0bb92821cf3df4d225c50e1f3b5893b350a88e2ab546b4753efbe"
       },
       {
         "path": "/static/login.html",
-        "hash": "fc80311dd6e27f0cfbdd29cb1d33f32c22bb06fbd198ff67d1239243c06b0bb2"
+        "hash": "90248c185c6fd92f4874d4f14ae663b4eeefb507cfd6c3c6ea4bc93ce4a63bf5"
       },
       {
         "path": "/static/chat.html",
-        "hash": "92096b76858004479c4d6479587654596d5e32ac4f380c2e17dc9205d16b5de4"
+        "hash": "eeba642a902c323ae04832d7ffff178d69dd7d2d47cc9691d09054c6ba53a528"
       },
       {
         "path": "/static/terms.html",
-        "hash": "a7e4851357f41b50e96e10fb3f19959e65319c31f119524869f8563e52e87ab0"
+        "hash": "8457709f2db604845542591b17719a3d68d1d76102a7c8b8c4ad371602160a8f"
       },
       {
         "path": "/static/privacy.html",
-        "hash": "5093b9871254262d66d2561196812baa3003f9e0f5ae148ca68b8ad33eef8d0d"
+        "hash": "8717626fa0791a784456e058cffdc6a1d92d16dc2003a4bde77c207ea1157dcb"
       },
       {
         "path": "/static/operator.json",
@@ -95,5 +99,5 @@
       }
     ]
   },
-  "signature": "MEUCICXvNAoKzvfwL3PprGC6Dk1Yo1OTzsG1ebMuiJ7qNhOFAiEA87KcOQoSclmDEaWk/4wbeg+VFuN1IYHlCNQKWskcjTE="
+  "signature": "MEQCIDm4IcZQkvGQ5WVfWmZ9mmIeTky5Y9Ciax9RCBjG2vt3AiB8cG3GnaCdatJmXpdiPaAS3zc0mSSqFPPku/dfdEmVxQ=="
 }
