@@ -18,9 +18,14 @@ RUN cargo build --release --locked
 # Runtime stage
 FROM debian:bookworm-slim
 
-# Install CA certificates for HTTPS
+# Pull every security update available for the base image, then install
+# CA certificates for outbound HTTPS. The upgrade keeps libsystemd0/libudev1,
+# zlib1g, and friends current with Debian security patches even though the
+# affected APIs are not reachable from the pinchat binary at runtime.
 RUN apt-get update && \
-    apt-get install -y ca-certificates && \
+    DEBIAN_FRONTEND=noninteractive apt-get upgrade -y && \
+    apt-get install -y --no-install-recommends ca-certificates && \
+    apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
