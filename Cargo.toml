@@ -20,7 +20,7 @@ sha2 = "0.10"
 hex = "0.4"
 rand = "0.8"
 hmac = "0.12"
-jsonwebtoken = "9"
+jsonwebtoken = { version = "10.3", default-features = false, features = ["aws_lc_rs"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 futures = "0.3"
