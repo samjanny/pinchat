@@ -197,15 +197,19 @@ PinChat implements the Signal Protocol Double Ratchet for combined PFS and PCS:
 
 ### Frontend Stack
 
-- **JavaScript**: Vanilla JS with Alpine.js for reactivity
+- **JavaScript**: Vanilla JS with Alpine.js (CSP build) for reactivity
 - **Cryptography**: WebCrypto API (native browser crypto)
+- **Icons**: Lucide (vendored, no CDN)
+- **Cookie notice**: First-party banner (no third-party SDK) — see [static/js/cookie-notice.js](static/js/cookie-notice.js)
 - **Styling**: Responsive CSS (no frameworks)
+
+Vendored third-party assets are attributed in [NOTICE](NOTICE).
 
 ## Quick Start
 
 ### Prerequisites
 
-- Rust 1.75 or later
+- Rust 1.85 or later (edition 2024)
 - OpenSSL (for certificate generation)
 
 ### Installation
@@ -282,6 +286,11 @@ Environment variables for customization:
 | `ROOM_TOKEN_PERIOD_SECS` | `600` | Window for room/token rate limiting (10 min) |
 | `MSG_RATE_LIMIT` | `30` | Messages per connection per window |
 | `MSG_RATE_WINDOW_SECS` | `1` | Window length for per-connection message rate limiting |
+| `FRAME_RATE_LIMIT` | `120` | Global ceiling for *every* text frame on a connection (must be ≥ `MSG_RATE_LIMIT`) — covers handshakes, unknown types, malformed JSON |
+| `PROTOCOL_ERROR_LIMIT` | `10` | Per-connection cap on parse failures, unknown `msg_type` values, and oversized ECDH payloads before the connection is closed |
+| `ECDH_BURST_LIMIT` | `8` | Per-connection ECDH-frame burst cap (signature verify + Double Ratchet re-init is expensive) |
+| `ECDH_BURST_WINDOW_SECS` | `60` | Window for ECDH burst limiting |
+| `MAX_WS_CONNECTION_AGE_SECS` | `1800` | Hard cap on a single WebSocket connection's lifetime; forces a reconnect that re-runs PoW/JWT and the handshake |
 | `POW_MIN_DIFFICULTY` | `12` | Minimum PoW difficulty (bits) |
 | `POW_MAX_DIFFICULTY` | `18` | Maximum PoW difficulty (bits) |
 | `CHALLENGE_TTL_SECS` | `300` | Proof-of-work challenge TTL |
@@ -289,6 +298,7 @@ Environment variables for customization:
 | `ROOM_CLEANUP_INTERVAL_SECS` | `60` | Room cleanup interval |
 | `CHALLENGE_CLEANUP_INTERVAL_SECS` | `60` | PoW cache cleanup interval |
 | `PINCHAT_PASSWORD_HASHES` | _empty_ | Semicolon-separated Argon2id hashes; if empty, auth is disabled |
+| `ALLOW_ANONYMOUS` | `false` | Explicitly allow anonymous access when no password hashes are configured. Defaults to `false` to avoid accidental fail-open deployments |
 | `SESSION_TTL_SECS` | `86400` | Session lifetime |
 | `LOGIN_BURST_SIZE` | `5` | Login attempts allowed per period |
 | `LOGIN_PERIOD_SECS` | `900` | Window for login rate limiting |
