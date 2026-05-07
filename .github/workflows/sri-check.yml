@@ -1,0 +1,27 @@
+name: SRI consistency
+
+on:
+  push:
+    branches: [main, experimental-groups-custom]
+    paths:
+      - 'static/**'
+      - '.github/scripts/verify-sri.js'
+      - '.github/workflows/sri-check.yml'
+  pull_request:
+    paths:
+      - 'static/**'
+      - '.github/scripts/verify-sri.js'
+
+jobs:
+  verify-sri:
+    name: Verify inline SRI matches asset hashes
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Verify SRI
+        run: node .github/scripts/verify-sri.js
