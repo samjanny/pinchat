@@ -126,20 +126,35 @@ pub async fn ws_handler(
     // The primary guard is the SameSite=Strict session cookie preventing
     // cross-origin token acquisition; this check makes the guarantee
     // explicit and holds even if that assumption ever changes.
-    // Non-browser clients (curl, test harnesses) omit Origin → allowed.
-    if let Some(origin_val) = headers.get(header::ORIGIN) {
-        let origin_str = origin_val.to_str().unwrap_or("");
-        if !state
-            .config
-            .cors_allowed_origins
-            .iter()
-            .any(|o| o == origin_str)
-        {
-            tracing::warn!(
-                "WebSocket upgrade rejected: Origin '{}' not in allowlist",
-                origin_str
-            );
-            return (StatusCode::FORBIDDEN, "Origin not allowed").into_response();
+    //
+    // Production policy (PRIVACY_MODE != "development"): Origin is REQUIRED
+    // and must be in the allowlist. A missing Origin would let a non-browser
+    // client (curl/script) with a stolen session cookie bypass the allowlist.
+    // Development policy: a missing Origin is allowed so test harnesses and
+    // raw-socket integration tests still work.
+    let dev_mode = std::env::var("PRIVACY_MODE").unwrap_or_default() == "development";
+    match headers.get(header::ORIGIN) {
+        Some(origin_val) => {
+            let origin_str = origin_val.to_str().unwrap_or("");
+            if !state
+                .config
+                .cors_allowed_origins
+                .iter()
+                .any(|o| o == origin_str)
+            {
+                tracing::warn!(
+                    "WebSocket upgrade rejected: Origin '{}' not in allowlist",
+                    origin_str
+                );
+                return (StatusCode::FORBIDDEN, "Origin not allowed").into_response();
+            }
+        }
+        None if !dev_mode => {
+            tracing::warn!("WebSocket upgrade rejected: Origin header missing (production)");
+            return (StatusCode::FORBIDDEN, "Origin header required").into_response();
+        }
+        None => {
+            // dev mode: tolerate missing Origin for raw-socket test clients
         }
     }
 
@@ -832,11 +847,24 @@ mod tests {
     /// Issue a raw HTTP/1.1 WebSocket upgrade request and return the status line.
     /// Using raw TCP + manual request so we can avoid pulling a full reqwest
     /// feature set just for these tests.
-    async fn raw_upgrade(addr: SocketAddr, path: &str, subprotocol: Option<&str>) -> u16 {
+    ///
+    /// `origin`: pass `Some(o)` to set Origin (default for tests is the allowed
+    /// origin from `test_config`); pass `None` to omit the header explicitly
+    /// (used by the test that verifies production rejection of missing Origin).
+    async fn raw_upgrade_with_origin(
+        addr: SocketAddr,
+        path: &str,
+        subprotocol: Option<&str>,
+        origin: Option<&str>,
+    ) -> u16 {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         let sp_header = match subprotocol {
             Some(sp) => format!("Sec-WebSocket-Protocol: {}\r\n", sp),
+            None => String::new(),
+        };
+        let origin_header = match origin {
+            Some(o) => format!("Origin: {}\r\n", o),
             None => String::new(),
         };
         let req = format!(
@@ -846,7 +874,7 @@ mod tests {
              Upgrade: websocket\r\n\
              Sec-WebSocket-Version: 13\r\n\
              Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
-             {sp_header}\r\n"
+             {origin_header}{sp_header}\r\n"
         );
         stream.write_all(req.as_bytes()).await.unwrap();
         let mut buf = [0u8; 256];
@@ -859,12 +887,39 @@ mod tests {
             .unwrap_or(0)
     }
 
+    /// Convenience wrapper: send a request with the test's allowed Origin so
+    /// existing tests keep validating only their specific failure mode.
+    async fn raw_upgrade(addr: SocketAddr, path: &str, subprotocol: Option<&str>) -> u16 {
+        raw_upgrade_with_origin(addr, path, subprotocol, Some("https://localhost:3000")).await
+    }
+
     #[tokio::test]
     async fn rejects_without_subprotocol_header() {
         let (addr, _state, room_id) = spawn_test_server().await;
         let path = format!("/ws/{}", room_id);
         let status = raw_upgrade(addr, &path, None).await;
         assert_eq!(status, 401);
+    }
+
+    #[tokio::test]
+    async fn rejects_missing_origin_in_production() {
+        // PRIVACY_MODE not set → production policy applies: missing Origin → 403.
+        // Defense-in-depth against non-browser clients (curl/script) that could
+        // otherwise bypass the cors_allowed_origins allowlist with a stolen
+        // session cookie.
+        //
+        // We must pass a fully-valid JWT in the subprotocol so the request
+        // reaches the Origin gate (which sits after JWT verification + jti
+        // consumption). Without a valid JWT the handler returns 401 earlier
+        // and we'd test the wrong path.
+        let (addr, state, room_id) = spawn_test_server().await;
+        let claims = WsTokenClaims::new(room_id, 30);
+        let token = sign_token(&claims, &state.jwt_secret).unwrap();
+        let sp = format!("pinchat.v1, pinchat.v1.jwt.{}", token);
+        let path = format!("/ws/{}", room_id);
+        let status =
+            raw_upgrade_with_origin(addr, &path, Some(&sp), None).await;
+        assert_eq!(status, 403);
     }
 
     #[tokio::test]
@@ -933,6 +988,7 @@ mod tests {
              Upgrade: websocket\r\n\
              Sec-WebSocket-Version: 13\r\n\
              Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+             Origin: https://localhost:3000\r\n\
              Sec-WebSocket-Protocol: {sp}\r\n\r\n"
         );
         stream.write_all(req.as_bytes()).await.unwrap();
