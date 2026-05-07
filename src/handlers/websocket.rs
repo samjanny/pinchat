@@ -917,8 +917,7 @@ mod tests {
         let token = sign_token(&claims, &state.jwt_secret).unwrap();
         let sp = format!("pinchat.v1, pinchat.v1.jwt.{}", token);
         let path = format!("/ws/{}", room_id);
-        let status =
-            raw_upgrade_with_origin(addr, &path, Some(&sp), None).await;
+        let status = raw_upgrade_with_origin(addr, &path, Some(&sp), None).await;
         assert_eq!(status, 403);
     }
 
