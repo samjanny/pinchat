@@ -750,6 +750,28 @@ function setupDOMObserver() {
         attributes: true,
         attributeFilter: ['src', 'href', 'integrity', 'type']
     });
+
+    // Safe-fail deadline: validateResourceAgainstManifest defers verdicts
+    // when manifestData is still null (race with the async manifest delivery
+    // from the background script). If the manifest never lands — network
+    // blocked, hashes.json.signed deleted, background script crashed/disabled,
+    // service worker not yet woken — we MUST surface that as an overlay
+    // rather than silently treat the page as trusted.
+    //
+    // 10s is generous enough to absorb cold-start service worker spin-up
+    // and slow links (cargo audit / hashes.json.signed fetch + signature
+    // verification on a contested CPU), and short enough that real users
+    // notice before they trust the page.
+    setTimeout(() => {
+        if (!manifestData || !manifestData.files) {
+            console.error('[PinChat Verify] Manifest not delivered within 10s — treating page as unverified');
+            showWarningOverlay([{
+                path: 'Manifest',
+                error: 'Manifest unavailable — cannot verify page integrity. The background script may be blocked, the network may be filtering hashes.json.signed, or the service worker is not running.',
+                type: 'manifest-unavailable'
+            }], true);
+        }
+    }, 10000);
 }
 
 /**
