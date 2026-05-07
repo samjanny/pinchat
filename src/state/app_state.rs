@@ -173,7 +173,8 @@ impl AppState {
         let now = Instant::now();
         let before = self.consumed_tokens.len();
 
-        self.consumed_tokens.retain(|_, expiration| *expiration > now);
+        self.consumed_tokens
+            .retain(|_, expiration| *expiration > now);
 
         before - self.consumed_tokens.len()
     }

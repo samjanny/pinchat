@@ -11,10 +11,10 @@
 //! 5. Client uses JWT in WebSocket upgrade request
 
 use axum::{
-    extract::{ConnectInfo, Path, State},
-    http::{header, HeaderMap, StatusCode},
-    response::{IntoResponse, Response},
     Json,
+    extract::{ConnectInfo, Path, State},
+    http::{HeaderMap, StatusCode, header},
+    response::{IntoResponse, Response},
 };
 use axum_extra::extract::cookie::Cookie;
 use serde_json::json;
@@ -22,8 +22,8 @@ use std::net::SocketAddr;
 use uuid::Uuid;
 
 use crate::ip_hash::{extract_client_ip_with_proxy, hash_ip};
-use crate::jwt::{sign_token, WsTokenClaims};
-use crate::pow::{calculate_difficulty, PowChallenge};
+use crate::jwt::{WsTokenClaims, sign_token};
+use crate::pow::{PowChallenge, calculate_difficulty};
 use crate::pow_session::{pow_cache_key, resolve_pow_session, should_use_secure_pow_cookies};
 use crate::state::AppState;
 

@@ -14,7 +14,7 @@
 //! - Slot saturation attacks (token rate-limited)
 //! - Ciphertext spam (only authenticated clients)
 
-use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
+use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;

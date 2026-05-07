@@ -1,16 +1,16 @@
 use axum::{
     extract::{
-        ws::{Message as WsMessage, WebSocket},
         Path, State, WebSocketUpgrade,
+        ws::{Message as WsMessage, WebSocket},
     },
-    http::{header, header::SEC_WEBSOCKET_PROTOCOL, HeaderMap, StatusCode},
+    http::{HeaderMap, StatusCode, header, header::SEC_WEBSOCKET_PROTOCOL},
     response::{IntoResponse, Response},
 };
 use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
 use sha2::{Digest, Sha256};
 use std::collections::{HashSet, VecDeque};
-use tokio::time::{interval, Duration, Instant};
+use tokio::time::{Duration, Instant, interval};
 use uuid::Uuid;
 
 use crate::jwt::verify_token;
@@ -78,11 +78,7 @@ pub async fn ws_handler(
     // Gate: client MUST offer the base `pinchat.v1` subprotocol.
     if !offered.contains(&"pinchat.v1") {
         tracing::warn!("WebSocket upgrade rejected: base pinchat.v1 subprotocol missing");
-        return (
-            StatusCode::UPGRADE_REQUIRED,
-            "Protocol pinchat.v1 required",
-        )
-            .into_response();
+        return (StatusCode::UPGRADE_REQUIRED, "Protocol pinchat.v1 required").into_response();
     }
 
     // Extract JWT from the `pinchat.v1.jwt.<token>` companion subprotocol.
@@ -133,7 +129,12 @@ pub async fn ws_handler(
     // Non-browser clients (curl, test harnesses) omit Origin → allowed.
     if let Some(origin_val) = headers.get(header::ORIGIN) {
         let origin_str = origin_val.to_str().unwrap_or("");
-        if !state.config.cors_allowed_origins.iter().any(|o| o == origin_str) {
+        if !state
+            .config
+            .cors_allowed_origins
+            .iter()
+            .any(|o| o == origin_str)
+        {
             tracing::warn!(
                 "WebSocket upgrade rejected: Origin '{}' not in allowlist",
                 origin_str
@@ -235,7 +236,12 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: Uuid, connec
     // Get validated room configuration from server (prevents URL spoofing)
     let (room_type, ttl_minutes, max_participants, created_at) = {
         let room = state.rooms.get(&room_id).expect("Room must exist");
-        (room.room_type, room.ttl_minutes, room.max_participants, room.created_at)
+        (
+            room.room_type,
+            room.ttl_minutes,
+            room.max_participants,
+            room.created_at,
+        )
     };
 
     // Send connection confirmation message with validated room config
@@ -283,8 +289,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: Uuid, connec
     // connections opened just before the TTL boundary.
     let send_state = state.clone();
     let connected_at = Instant::now();
-    let max_connection_age =
-        Duration::from_secs(send_state.config.max_ws_connection_age_secs);
+    let max_connection_age = Duration::from_secs(send_state.config.max_ws_connection_age_secs);
     let mut send_task = tokio::spawn(async move {
         let mut ping_interval = interval(Duration::from_secs(30));
 
@@ -483,7 +488,11 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: Uuid, connec
                                         {
                                             match tx.send(json) {
                                                 Ok(receiver_count) => {
-                                                    tracing::info!("✅ ECDH public key broadcasted to {} receivers in room={}", receiver_count, room_id);
+                                                    tracing::info!(
+                                                        "✅ ECDH public key broadcasted to {} receivers in room={}",
+                                                        receiver_count,
+                                                        room_id
+                                                    );
                                                 }
                                                 Err(e) => {
                                                     tracing::error!(
@@ -507,7 +516,10 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: Uuid, connec
                                     }
                                 }
                             } else {
-                                tracing::warn!("⚠️ ECDH message received but payload is missing (connection_id={})", connection_id);
+                                tracing::warn!(
+                                    "⚠️ ECDH message received but payload is missing (connection_id={})",
+                                    connection_id
+                                );
                             }
                         }
                         // Handle regular encrypted message (text or image)
@@ -750,9 +762,9 @@ mod tests {
     //! spin up a bound listener and issue raw upgrade requests via reqwest.
     use super::*;
     use crate::config::Config;
-    use crate::jwt::{sign_token, WsTokenClaims};
+    use crate::jwt::{WsTokenClaims, sign_token};
     use crate::models::{Room, RoomConfig, RoomType};
-    use axum::{routing::get, Router};
+    use axum::{Router, routing::get};
     use std::net::SocketAddr;
     use uuid::Uuid;
 
@@ -841,7 +853,10 @@ mod tests {
         let n = stream.read(&mut buf).await.unwrap();
         let head = std::str::from_utf8(&buf[..n]).unwrap_or("");
         // First line: "HTTP/1.1 <status> <reason>"
-        head.split_whitespace().nth(1).and_then(|s| s.parse().ok()).unwrap_or(0)
+        head.split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0)
     }
 
     #[tokio::test]
@@ -940,7 +955,11 @@ mod tests {
             }
         }
         let head = String::from_utf8_lossy(&buf).to_string();
-        assert!(head.starts_with("HTTP/1.1 101"), "expected 101, got: {}", head);
+        assert!(
+            head.starts_with("HTTP/1.1 101"),
+            "expected 101, got: {}",
+            head
+        );
         // Server must echo only the base subprotocol (NOT the jwt.* companion).
         let low = head.to_ascii_lowercase();
         assert!(
