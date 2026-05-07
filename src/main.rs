@@ -14,11 +14,11 @@ mod session;
 mod state;
 
 use axum::{
-    http::{header, HeaderValue, Method},
+    Router,
+    http::{HeaderValue, Method, header},
     middleware::{self, Next},
     response::Response,
     routing::{get, post},
-    Router,
 };
 use axum_server::tls_rustls::RustlsConfig;
 use std::net::SocketAddr;
@@ -26,7 +26,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tower::ServiceBuilder;
-use tower_governor::{governor::GovernorConfigBuilder, GovernorLayer};
+use tower_governor::{GovernorLayer, governor::GovernorConfigBuilder};
 use tower_http::{
     cors::{AllowOrigin, CorsLayer},
     services::ServeDir,
@@ -339,7 +339,10 @@ async fn main() {
     // Note: When no custom dir is set, we use fallback to itself for type consistency
     // (the overhead is negligible - fallback only triggers on 404)
     let static_service = if let Some(ref website_dir) = config.website_dir {
-        tracing::info!("Custom website directory: {} (fallback: static/)", website_dir);
+        tracing::info!(
+            "Custom website directory: {} (fallback: static/)",
+            website_dir
+        );
         ServeDir::new(website_dir).fallback(ServeDir::new("static"))
     } else {
         ServeDir::new("static").fallback(ServeDir::new("static"))
@@ -480,19 +483,28 @@ async fn main() {
             eprintln!("   PinChat requires HTTPS in production to protect passwords and sessions.");
             eprintln!("   ");
             eprintln!("   To fix this:");
-            eprintln!("   1. Generate certificates: mkdir -p certs && openssl req -x509 -newkey rsa:4096 -keyout certs/key.pem -out certs/cert.pem -days 365 -nodes");
+            eprintln!(
+                "   1. Generate certificates: mkdir -p certs && openssl req -x509 -newkey rsa:4096 -keyout certs/key.pem -out certs/cert.pem -days 365 -nodes"
+            );
             eprintln!("   2. Or set PRIVACY_MODE=development for local testing (insecure!)");
-            eprintln!("   3. Or set FORCE_HTTP=true if running behind a TLS-terminating reverse proxy");
+            eprintln!(
+                "   3. Or set FORCE_HTTP=true if running behind a TLS-terminating reverse proxy"
+            );
             std::process::exit(1);
         }
 
         if config.force_http {
             // FORCE_HTTP mode - for reverse proxy setups
-            tracing::info!("Starting HTTP server on http://{} (FORCE_HTTP=true, TLS handled by reverse proxy)", addr);
+            tracing::info!(
+                "Starting HTTP server on http://{} (FORCE_HTTP=true, TLS handled by reverse proxy)",
+                addr
+            );
             eprintln!("ℹ️  Starting HTTP server (FORCE_HTTP=true)");
             eprintln!("   TLS termination expected to be handled by reverse proxy.");
             if !config.force_secure_cookies && privacy_mode == "development" {
-                eprintln!("   ⚠️  FORCE_SECURE_COOKIES not set - cookies may not have Secure flag!");
+                eprintln!(
+                    "   ⚠️  FORCE_SECURE_COOKIES not set - cookies may not have Secure flag!"
+                );
             }
         } else {
             // Development mode only - HTTP without TLS
