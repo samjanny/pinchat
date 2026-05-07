@@ -14,7 +14,7 @@
 //! challenge on every request, which is functionally equivalent to the
 //! pre-cookie behaviour for a solitary client.
 
-use axum::http::{header, HeaderMap};
+use axum::http::{HeaderMap, header};
 use axum_extra::extract::cookie::{Cookie, SameSite};
 use uuid::Uuid;
 

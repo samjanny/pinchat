@@ -86,6 +86,12 @@ document.addEventListener('alpine:init', () => {
         sasBackup: null,            // Backup of SAS for reopening verification
         sasVerificationStatus: 'none', // 'none' | 'pending' | 'verified' | 'mismatch' | 'skipped'
         sasMismatchFatal: false,    // Permanently locks composer after SAS mismatch (possible MITM)
+        // Set true when the peer's identity key changed AFTER the user had
+        // explicitly verified SAS in this session. The user has already
+        // committed to verifying, so they can't downgrade to 'skipped' from
+        // this state — they must either confirm the new code matches
+        // (handleSasVerified) or declare mismatch (handleSasMismatch).
+        sasReverifyRequired: false,
         sasCopied: false,           // For copy button feedback
         pendingECDHKey: null,
 
@@ -1285,15 +1291,44 @@ document.addEventListener('alpine:init', () => {
                 // Check if the peer's identity key changed (possible MITM on reconnect)
                 if (this.identityManager && this.identityManager.previousPeerIdentityRaw) {
                     if (this.identityManager.hasPeerIdentityChanged()) {
-                        console.warn('[SECURITY] ⚠️ Peer identity key changed after reconnect - possible MITM!');
-                        this.sasVerificationStatus = 'none';  // Force re-verification
-                        this.identityManager.sasVerified = false;
-                        this.addSystemMessage('⚠️ WARNING: Contact\'s identity key changed! Please re-verify the security code.');
+                        // Policy: if the user had explicitly verified SAS before
+                        // this reconnect, the change of peer identity is suspicious
+                        // (could be MITM, could be a legitimate peer page-refresh
+                        // since identity is in-memory only). We can't distinguish
+                        // the two automatically, so we:
+                        //   - keep the WebSocket open (a peer refresh is benign)
+                        //   - invalidate the SAS-verified flag and require fresh
+                        //     re-verification of the new SAS code
+                        //   - lock the composer until the user explicitly confirms
+                        //     the new code matches out-of-band (sasReverifyRequired)
+                        // Skipping is disabled in this state: the user already
+                        // committed to verifying, they can't silently downgrade.
+                        const wasVerified = this.identityManager.sasVerified === true;
+                        // Clear previous peer identity now (single-shot comparison)
+                        this.identityManager.previousPeerIdentityRaw = null;
+
+                        if (wasVerified) {
+                            console.warn('[SECURITY] ⚠️ Peer identity key changed after SAS verification — forcing re-verify');
+                            this.identityManager.sasVerified = false;
+                            // Force the SAS modal to reopen (set BEFORE the later
+                            // pending/verified branch so it isn't overridden).
+                            this.sasReverifyRequired = true;
+                            this.addSystemMessage('⚠️ Contact\'s identity key changed since verification — please confirm the new security code before continuing');
+                        } else {
+                            // Identity wasn't verified before: warn + force first-time
+                            // verification. No prior commitment to break, so the user
+                            // can still skip if they accept the trust trade-off.
+                            console.warn('[SECURITY] ⚠️ Peer identity key changed (pre-verification) — re-verify required');
+                            this.identityManager.sasVerified = false;
+                            this.addSystemMessage('⚠️ WARNING: Contact\'s identity key changed! Please re-verify the security code.');
+                        }
+                        // Both branches: status will be set to 'pending' below
+                        // because isSASVerified() is now false.
                     } else {
                         debugLog('[SECURITY] ✅ Peer identity key unchanged - SAS verification persists');
+                        // Clear previous peer identity after successful comparison
+                        this.identityManager.previousPeerIdentityRaw = null;
                     }
-                    // Clear previous peer identity after comparison
-                    this.identityManager.previousPeerIdentityRaw = null;
                 }
 
                 // Deriva raw key material (Uint8Array, non CryptoKey)
@@ -1396,6 +1431,11 @@ document.addEventListener('alpine:init', () => {
                 this.identityManager.destroy();
                 this.identityManager = null;
                 this.sasVerificationStatus = 'none';
+                // The re-verify lock is tied to a specific peer identity; once
+                // identity state is destroyed there is nothing left to re-verify
+                // against, so clear the flag (otherwise the composer would stay
+                // locked through subsequent fresh handshakes).
+                this.sasReverifyRequired = false;
             }
 
             // Full tear-down of ratchet state + re-extract bootstrap key from URL.
@@ -1453,6 +1493,10 @@ document.addEventListener('alpine:init', () => {
 
             // Permanently lock the composer for this session
             this.sasMismatchFatal = true;
+            // sasMismatchFatal subsumes the re-verify lock; clear the latter
+            // so we don't carry inconsistent flags across the rest of the
+            // session (sasMismatchFatal already covers the lock).
+            this.sasReverifyRequired = false;
             this.sas = null;
             this.sasVerificationStatus = 'mismatch';
 
@@ -1490,19 +1534,64 @@ document.addEventListener('alpine:init', () => {
                 this.identityManager.markSASVerified();
             }
 
+            // Clear the re-verify lock (if this verification was triggered by
+            // a peer-identity-changed event after a prior verified handshake).
+            const wasReverify = this.sasReverifyRequired === true;
+            this.sasReverifyRequired = false;
+
             // Close SAS verification dialog
             this.sas = null;
             this.sasVerificationStatus = 'verified';
 
             // Show confirmation message
-            this.addSystemMessage('✅ Key verified - secure connection confirmed');
+            this.addSystemMessage(
+                wasReverify
+                    ? '✅ New key verified - secure connection re-confirmed'
+                    : '✅ Key verified - secure connection confirmed'
+            );
         },
 
         /**
-         * Handles user skipping SAS verification (user clicked "I don't want to verify")
+         * Handles user skipping SAS verification (user clicked "I don't want to verify").
+         *
+         * SECURITY: Skipping SAS leaves the chat encrypted but unauthenticated
+         * against the server operator (operator could substitute identity keys
+         * during the handshake — see SECURITY.md F-1 / "SAS Verification is
+         * Optional"). We require an explicit second confirmation so a stray
+         * tap on the skip button doesn't silently downgrade the security model.
          */
         handleSasSkipped() {
-            debugLog('[SECURITY] SAS verification skipped by user');
+            // If this SAS prompt was triggered by a *change* of peer identity
+            // after a previous verified handshake, skipping is disabled: the
+            // user already committed to verification, allowing a silent
+            // downgrade now would defeat the whole point of the lock.
+            if (this.sasReverifyRequired) {
+                debugLog('[SECURITY] SAS skip rejected: re-verification required after identity change');
+                window.alert(
+                    'Cannot skip — your contact\'s identity key changed since you ' +
+                    'last verified it. Please confirm whether the new security code ' +
+                    'matches (out-of-band) or declare a mismatch.'
+                );
+                return;
+            }
+
+            // Browser-native confirm: works under our strict CSP (no eval/inline)
+            // and is keyboard-accessible. The text states the consequence in
+            // plain language — short enough to read, specific enough to deter.
+            const ok = window.confirm(
+                'Skip identity verification?\n\n' +
+                'Your messages will still be encrypted, but you will NOT detect ' +
+                'a man-in-the-middle attack. The server operator (or anyone ' +
+                'intercepting the connection) could read your conversation.\n\n' +
+                'Only skip if you are willing to accept that risk.\n\n' +
+                'Press OK to skip, or Cancel to go back and verify.'
+            );
+            if (!ok) {
+                debugLog('[SECURITY] SAS skip cancelled by user');
+                return;
+            }
+
+            debugLog('[SECURITY] SAS verification skipped by user (confirmed)');
 
             // Close SAS verification dialog
             this.sas = null;
@@ -1574,6 +1663,10 @@ document.addEventListener('alpine:init', () => {
             if (!this.connected) return true;
             if (this.participantCount < 2) return true;
             if (this.roomType === 'onetoone' && !this.pfsActive) return true;
+            // Peer identity changed since the user explicitly verified SAS:
+            // block sends until the new code is re-confirmed (or declared
+            // mismatch, which transitions to sasMismatchFatal above).
+            if (this.sasReverifyRequired) return true;
             return false;
         },
 
@@ -1583,6 +1676,7 @@ document.addEventListener('alpine:init', () => {
             if (!this.connected) return 'Connecting…';
             if (this.participantCount < 2) return 'Waiting for someone to join this room…';
             if (this.roomType === 'onetoone' && !this.pfsActive) return 'Establishing secure connection…';
+            if (this.sasReverifyRequired) return 'Re-verify the new security code to continue…';
             return 'Write an encrypted message…';
         },
 
@@ -1591,6 +1685,7 @@ document.addEventListener('alpine:init', () => {
             if (!this.connected) return 'Not connected';
             if (this.participantCount < 2) return 'Waiting for peer to join';
             if (this.roomType === 'onetoone' && !this.pfsActive) return 'Waiting for secure connection…';
+            if (this.sasReverifyRequired) return 'Re-verify identity to send';
             return 'Send message';
         },
 

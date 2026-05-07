@@ -1,10 +1,10 @@
 use axum::{
+    Json,
     body::Body,
     extract::State,
     http::{Request, StatusCode},
     middleware::Next,
     response::{IntoResponse, Redirect, Response},
-    Json,
 };
 use serde_json::json;
 

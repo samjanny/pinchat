@@ -1,0 +1,21 @@
+# Default: let Git decide line endings on text files (autocrlf-friendly).
+* text=auto
+
+# Shell scripts must always be LF — they're consumed by bash/sh on Linux
+# (server, CI, Docker build, WSL) where CRLF is a hard parse error.
+*.sh text eol=lf
+
+# Same constraint for any file with a shebang we ship (no extension).
+generate-certs.sh text eol=lf
+extensions/generate-icons.sh text eol=lf
+
+# Lockfiles, signed manifests, and JSON fixtures: LF for reproducible
+# hashing across platforms. The signed-hash generator already normalises
+# CRLF→LF before hashing, but committing LF avoids a needless round-trip
+# through that normaliser.
+Cargo.lock text eol=lf
+hashes.json.signed text eol=lf
+
+# CI helpers stay LF (run on ubuntu-latest in GitHub Actions).
+.github/scripts/*.js text eol=lf
+.github/workflows/*.yml text eol=lf

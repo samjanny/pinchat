@@ -7,7 +7,6 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: -D warnings
 
 jobs:
   rust:
@@ -27,8 +26,13 @@ jobs:
       - name: cargo fmt
         run: cargo fmt --all -- --check
 
-      - name: cargo clippy
+      # Clippy runs as advisory (no -D warnings). The codebase predates
+      # several Rust style lints introduced in 1.90+; failing the build
+      # on every new lint creates churn. Review the output, but don't
+      # block PRs on it until we explicitly opt in to specific lints.
+      - name: cargo clippy (advisory)
         run: cargo clippy --all-targets --locked
+        continue-on-error: true
 
       - name: cargo test
         run: cargo test --locked

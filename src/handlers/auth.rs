@@ -1,8 +1,8 @@
 use axum::{
-    extract::{Query, State},
-    http::{header, HeaderMap, StatusCode},
-    response::{IntoResponse, Response},
     Form,
+    extract::{Query, State},
+    http::{HeaderMap, StatusCode, header},
+    response::{IntoResponse, Response},
 };
 use axum_extra::extract::cookie::{Cookie, SameSite};
 use serde::Deserialize;
@@ -142,7 +142,10 @@ pub async fn login_page(
     let location = if redirect_url.is_empty() {
         "/static/login.html".to_string()
     } else {
-        format!("/static/login.html?redirect={}", urlencoding::encode(&redirect_url))
+        format!(
+            "/static/login.html?redirect={}",
+            urlencoding::encode(&redirect_url)
+        )
     };
     headers.insert(header::LOCATION, location.parse().unwrap());
 
@@ -166,10 +169,7 @@ pub async fn get_csrf_token(State(state): State<AppState>) -> impl IntoResponse 
 
     let mut headers = HeaderMap::new();
     headers.append(header::SET_COOKIE, csrf_cookie.to_string().parse().unwrap());
-    headers.insert(
-        header::CONTENT_TYPE,
-        "application/json".parse().unwrap(),
-    );
+    headers.insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
 
     // Return token in JSON response
     (
@@ -364,14 +364,7 @@ fn login_error_response(
     _force_secure_cookies: bool,
 ) -> Response {
     // Redirect back to static login page with error message
-    let location = format!(
-        "/static/login.html?error={}",
-        urlencoding::encode(message)
-    );
+    let location = format!("/static/login.html?error={}", urlencoding::encode(message));
 
-    (
-        StatusCode::SEE_OTHER,
-        [(header::LOCATION, location)],
-    )
-        .into_response()
+    (StatusCode::SEE_OTHER, [(header::LOCATION, location)]).into_response()
 }

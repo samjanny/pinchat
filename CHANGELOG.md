@@ -4,6 +4,46 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Dates are the repository-local commit dates; entries are curated for user-visible impact
 rather than being a 1:1 mirror of `git log`.
 
+## [2026-05-07] — v0.2.2
+
+Security patch release. Wire protocol unchanged (still v1); no client-side
+changes, no deploy-ordering constraints vs. v0.2.1.
+
+### Security (high)
+
+- **`rustls-webpki` 0.103.8 → 0.103.13.** Pulled in transitively via
+  `axum-server` → `tokio-rustls` → `rustls`; closes four advisories that
+  reach the TLS-terminating server path:
+  - **RUSTSEC-2026-0049** — CRLs were not considered authoritative by their
+    Distribution Point because of faulty matching logic.
+  - **RUSTSEC-2026-0098** — name constraints for URI names were incorrectly
+    accepted, so a constrained CA could issue certificates outside its
+    permitted scope.
+  - **RUSTSEC-2026-0099** — name constraints were accepted for certificates
+    asserting a wildcard name, with the same scope-bypass effect.
+  - **RUSTSEC-2026-0104** — reachable panic when parsing a malformed
+    Certificate Revocation List (DoS surface on TLS handshake paths that
+    consume CRLs).
+
+### CI / tooling
+
+- Added GitHub Actions workflows: Rust CI (fmt + clippy advisory + test),
+  cargo-audit (push, PR, weekly cron), SRI consistency gate (recomputes
+  asset hashes with CRLF-normalisation matching `extensions/generate-hashes.js`),
+  and a Docker build verification.
+- One-time `cargo fmt --all` pass across the server crate; recorded in
+  `.git-blame-ignore-revs` so `git blame` skips it.
+
+### Known informational warnings (non-blocking)
+
+`cargo audit` still emits two warnings that do not fail the run and are
+not exploitable in this codebase:
+
+- **RUSTSEC-2026-0097** — `rand 0.8.5` unsoundness when used with a
+  custom logger via `rand::rng()`. We do not register such a logger.
+- **RUSTSEC-2025-0134** — `rustls-pemfile 2.2.0` is unmaintained,
+  pinned transitively by `axum-server`. Tracked upstream.
+
 ## [2026-04-24] — v0.2.1
 
 Security patch release. Wire protocol unchanged (still v1); no deploy-ordering

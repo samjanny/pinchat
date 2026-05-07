@@ -1,8 +1,8 @@
 use axum::{
-    extract::{ConnectInfo, Path, State},
-    http::{header, HeaderMap, StatusCode},
-    response::{IntoResponse, Redirect, Response},
     Json,
+    extract::{ConnectInfo, Path, State},
+    http::{HeaderMap, StatusCode, header},
+    response::{IntoResponse, Redirect, Response},
 };
 use axum_extra::extract::cookie::Cookie;
 use serde_json::json;
@@ -11,9 +11,9 @@ use uuid::Uuid;
 
 use crate::handlers::auth::verify_csrf_for_api;
 use crate::ip_hash::{extract_client_ip_with_proxy, hash_ip};
-use crate::jwt::{sign_token, WsTokenClaims};
+use crate::jwt::{WsTokenClaims, sign_token};
 use crate::models::{CreateRoomResponse, Room, RoomConfig};
-use crate::pow::{calculate_difficulty, PowChallenge};
+use crate::pow::{PowChallenge, calculate_difficulty};
 use crate::pow_session::{pow_cache_key, resolve_pow_session, should_use_secure_pow_cookies};
 use crate::state::AppState;
 
@@ -268,7 +268,10 @@ pub async fn room_page(
     let room = match state.rooms.get(&room_id) {
         Some(room) => room,
         None => {
-            tracing::warn!("Room page access failed - Room {}… not found", short_room_id(&room_id));
+            tracing::warn!(
+                "Room page access failed - Room {}… not found",
+                short_room_id(&room_id)
+            );
             return Err((StatusCode::NOT_FOUND, "Room not found").into_response());
         }
     };
@@ -303,7 +306,10 @@ pub async fn room_page(
     // existence to callers probing random UUIDs. UUIDv4 (122 bits) makes blind
     // enumeration infeasible, but unified responses remove a metadata side-channel.
     if room.is_full() {
-        tracing::warn!("Room page access failed - Room {}… is full", short_room_id(&room_id));
+        tracing::warn!(
+            "Room page access failed - Room {}… is full",
+            short_room_id(&room_id)
+        );
         return Err((StatusCode::NOT_FOUND, "Room not found").into_response());
     }
 

@@ -83,6 +83,20 @@ document.addEventListener('alpine:init', () => {
                             JSON.stringify(roomData.supported_subprotocols)
                         );
                     }
+                    // Safety-net cleanup: the JWT TTL is 30s server-side and the
+                    // happy-path consumer (websocket.js connect()) already calls
+                    // clearCreatorMetadata() on success/failure. If the user
+                    // never navigates (or stays on the homepage), the token
+                    // would otherwise sit in sessionStorage until the tab
+                    // closes, exposing it to any same-origin script that runs
+                    // in the meantime. Clear it after the JWT has unconditionally
+                    // expired (60s ≫ 30s TTL, with margin).
+                    setTimeout(() => {
+                        sessionStorage.removeItem(`ws_token_${roomData.room_id}`);
+                        sessionStorage.removeItem(`ws_connection_${roomData.room_id}`);
+                        sessionStorage.removeItem(`ws_protocol_version_${roomData.room_id}`);
+                        sessionStorage.removeItem(`ws_subprotocols_${roomData.room_id}`);
+                    }, 60000);
                     console.log('✅ WebSocket token saved for room creator (no second PoW needed)');
                 }
 
