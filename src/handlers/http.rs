@@ -17,6 +17,14 @@ use crate::pow::{calculate_difficulty, PowChallenge};
 use crate::pow_session::{pow_cache_key, resolve_pow_session, should_use_secure_pow_cookies};
 use crate::state::AppState;
 
+/// Truncate a Uuid to the first 8 hex chars for non-strict logging. Enough
+/// for debug correlation across log lines, not enough for an external
+/// observer to recover the full room id from leaked logs.
+fn short_room_id(id: &Uuid) -> String {
+    let s = id.simple().to_string();
+    s[..8.min(s.len())].to_string()
+}
+
 /// Build a 4xx/5xx response, attaching the given Set-Cookie header when
 /// present. Centralised so every 428 path in the PoW handlers stays consistent.
 fn pow_error_response(
@@ -197,7 +205,7 @@ pub async fn create_room(
     // Atomic check+insert (prevents concurrent requests from exceeding capacity)
     match state.try_create_room(room) {
         Ok(created_room_id) => {
-            tracing::info!("Created room: {}", created_room_id);
+            tracing::info!("Created room id={}…", short_room_id(&created_room_id));
 
             // Generate WebSocket token for room creator to avoid second PoW
             // This improves UX by eliminating the second challenge
@@ -260,7 +268,7 @@ pub async fn room_page(
     let room = match state.rooms.get(&room_id) {
         Some(room) => room,
         None => {
-            tracing::warn!("Room page access failed - Room {} not found", room_id);
+            tracing::warn!("Room page access failed - Room {}… not found", short_room_id(&room_id));
             return Err((StatusCode::NOT_FOUND, "Room not found").into_response());
         }
     };
@@ -281,19 +289,22 @@ pub async fn room_page(
     // Verify that the room has not expired
     if room.is_expired() {
         tracing::warn!(
-            "Room page access failed - Room {} has expired (created_at: {:?}, ttl_minutes: {})",
-            room_id,
-            room.created_at,
+            "Room page access failed - Room {}… has expired (ttl_minutes: {})",
+            short_room_id(&room_id),
             room.ttl_minutes
         );
         state.remove_room(&room_id);
         return Err((StatusCode::GONE, "Room has expired").into_response());
     }
 
-    // Verify that the room is not full
+    // Verify that the room is not full.
+    //
+    // Returns 404 (same as "not found") rather than 403 to avoid leaking room
+    // existence to callers probing random UUIDs. UUIDv4 (122 bits) makes blind
+    // enumeration infeasible, but unified responses remove a metadata side-channel.
     if room.is_full() {
-        tracing::warn!("Room page access failed - Room {} is full", room_id);
-        return Err((StatusCode::FORBIDDEN, "Room is full").into_response());
+        tracing::warn!("Room page access failed - Room {}… is full", short_room_id(&room_id));
+        return Err((StatusCode::NOT_FOUND, "Room not found").into_response());
     }
 
     tracing::info!(

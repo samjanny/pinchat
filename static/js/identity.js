@@ -17,10 +17,11 @@
 
 class IdentityKeyManager {
     constructor() {
-        this.identityKeyPair = null;           // ECDSA keypair (long-term)
-        this.peerIdentityPublicKey = null;     // Peer's identity public key (SAS-verified)
-        this.sasVerified = false;              // Whether SAS has been verified by user
-        this.previousPeerIdentity = null;      // Last known peer identity (for reconnect diff)
+        this.identityKeyPair = null;             // ECDSA keypair (long-term)
+        this.peerIdentityPublicKey = null;       // Peer's identity public key (CryptoKey, non-extractable)
+        this.peerIdentityPublicKeyRaw = null;    // Peer's identity public key (Uint8Array, cached at import)
+        this.sasVerified = false;                // Whether SAS has been verified by user
+        this.previousPeerIdentityRaw = null;     // Last known peer identity raw bytes (for reconnect diff)
 
         // Configuration
         this.CURVE = 'P-256';  // Same curve for both ECDSA (signing) and ECDH (key agreement)
@@ -114,18 +115,28 @@ class IdentityKeyManager {
     async importPeerIdentityPublicKey(publicKeyRaw) {
         debugLog('[Identity] Importing peer identity public key...');
 
+        // Cache the raw bytes once at import-time so SAS generation and
+        // identity-change detection do not need to call exportKey() later.
+        // The CryptoKey itself is then imported as non-extractable: even
+        // with a hostile script in the page, the key cannot be re-exported
+        // from the WebCrypto opaque handle.
+        const rawBytes = (publicKeyRaw instanceof Uint8Array)
+            ? new Uint8Array(publicKeyRaw)
+            : new Uint8Array(publicKeyRaw);
+        this.peerIdentityPublicKeyRaw = rawBytes;
+
         this.peerIdentityPublicKey = await crypto.subtle.importKey(
             'raw',
-            publicKeyRaw,
+            rawBytes,
             {
                 name: 'ECDSA',
                 namedCurve: this.CURVE
             },
-            true,  // Extractable (needed for SAS generation)
+            false,  // Non-extractable: SAS uses peerIdentityPublicKeyRaw, not exportKey
             ['verify']
         );
 
-        debugLog('[Identity] ✅ Peer identity public key imported');
+        debugLog('[Identity] ✅ Peer identity public key imported (non-extractable)');
         return this.peerIdentityPublicKey;
     }
 
@@ -195,22 +206,20 @@ class IdentityKeyManager {
     }
 
     /**
-     * Check if peer identity key changed (used after reconnect)
-     * @param {CryptoKey|null} currentKey - Current peer identity key
-     * @returns {Promise<boolean>} True if different from previousPeerIdentity
+     * Check if peer identity key changed (used after reconnect).
+     *
+     * Compares cached raw bytes — both the previous identity (captured
+     * before reconnect) and the current identity must have been imported
+     * via importPeerIdentityPublicKey, which populates the *Raw caches.
+     *
+     * @returns {boolean} True if different from previousPeerIdentityRaw
      */
-    async hasPeerIdentityChanged(currentKey) {
-        if (!this.previousPeerIdentity || !currentKey) {
+    hasPeerIdentityChanged() {
+        const prev = this.previousPeerIdentityRaw;
+        const curr = this.peerIdentityPublicKeyRaw;
+        if (!prev || !curr) {
             return false;
         }
-
-        const exportKey = async (key) => {
-            const raw = await crypto.subtle.exportKey('raw', key);
-            return new Uint8Array(raw);
-        };
-
-        const prev = await exportKey(this.previousPeerIdentity);
-        const curr = await exportKey(currentKey);
 
         if (prev.length !== curr.length) {
             return true;
@@ -255,8 +264,9 @@ class IdentityKeyManager {
 
         this.identityKeyPair = null;
         this.peerIdentityPublicKey = null;
+        this.peerIdentityPublicKeyRaw = null;
         this.sasVerified = false;
-        this.previousPeerIdentity = null;
+        this.previousPeerIdentityRaw = null;
 
         debugLog('[Identity] ✅ Identity keys destroyed');
     }

@@ -18,6 +18,16 @@ let fileHashVerificationDone = false;  // Track if we've verified file hashes
 let manifestSRIMap = {};  // Map of path -> expected SRI for O(1) lookups
 let reVerifyTimeout = null;  // Debounce timer for re-verification
 
+// Overlay persistence — a compromised page could try to remove or hide our
+// warning host element. We retain the args used to render the overlay so a
+// watchdog (and the main MutationObserver) can re-mount/restore on tamper.
+let overlayPersistentState = {
+    active: false,           // True between showWarningOverlay() and an explicit dismiss
+    mismatches: [],
+    isUnauthorized: false
+};
+let overlayWatchdogTimer = null;
+
 /**
  * Escape HTML special characters to prevent XSS
  * @param {string} text - Text to escape
@@ -29,26 +39,6 @@ function escapeHtml(text) {
     div.textContent = String(text);
     return div.innerHTML;
 }
-
-// Allowed resource paths (JS/CSS that should have SRI)
-const ALLOWED_PATHS = [
-    '/static/css/style.css',
-    '/static/js/alpine-csp.min.js',
-    '/static/js/app.js',
-    '/static/js/crypto.js',
-    '/static/js/double-ratchet.js',
-    '/static/js/ecdh.js',
-    '/static/js/emoji.js',
-    '/static/js/homepage.js',
-    '/static/js/identity.js',
-    '/static/js/legal.js',
-    '/static/js/login.js',
-    '/static/js/nicknames.js',
-    '/static/js/pow.js',
-    '/static/js/theme.js',
-    '/static/js/websocket.js',
-    '/static/js/debug.js'
-];
 
 /**
  * Extract pathname from a URL
@@ -173,6 +163,26 @@ function validateResourceAgainstManifest(element) {
 
     // Validate internal resources against manifest
     if (isInternalResource(path)) {
+        // Defense-in-depth: enforce that <script> points to .js and
+        // <link rel=stylesheet> to .css. Without this, a compromised server
+        // could inject <script src="/static/operator.json" integrity="..."> with
+        // a valid manifest hash, bypassing the manifest check via type confusion.
+        const pathLower = path.toLowerCase();
+        if (isScript && !pathLower.endsWith('.js')) {
+            return {
+                path: path,
+                error: 'Script src must reference a .js file',
+                type: 'type-confusion-script'
+            };
+        }
+        if (isStylesheet && !pathLower.endsWith('.css')) {
+            return {
+                path: path,
+                error: 'Stylesheet href must reference a .css file',
+                type: 'type-confusion-stylesheet'
+            };
+        }
+
         const expectedSRI = manifestSRIMap[path];
 
         if (!expectedSRI) {
@@ -373,6 +383,16 @@ function verifySRIInDOM(manifest) {
         }
 
         if (isInternalResource(path)) {
+            // Defense-in-depth: <script> must reference a .js file
+            if (!path.toLowerCase().endsWith('.js')) {
+                issues.push({
+                    path: path,
+                    error: 'Script src must reference a .js file',
+                    type: 'type-confusion-script'
+                });
+                return;
+            }
+
             const expected = expectedSRI[path];
 
             if (!expected) {
@@ -451,6 +471,16 @@ function verifySRIInDOM(manifest) {
         }
 
         if (isInternalResource(path)) {
+            // Defense-in-depth: stylesheet must reference a .css file
+            if (!path.toLowerCase().endsWith('.css')) {
+                issues.push({
+                    path: path,
+                    error: 'Stylesheet href must reference a .css file',
+                    type: 'type-confusion-stylesheet'
+                });
+                return;
+            }
+
             const expected = expectedSRI[path];
 
             if (!expected) {
@@ -549,7 +579,53 @@ function verifySRIInDOM(manifest) {
         }
     });
 
+    // Check for <base> elements. The site does not legitimately use one, so any
+    // <base> at all is suspicious. A <base href="https://attacker.com/"> rewrites
+    // the resolution of every relative URL in the page (form actions, link hrefs,
+    // images, fetch()) — an injection point for phishing/exfiltration.
+    const bases = document.querySelectorAll('base[href]');
+    bases.forEach(base => {
+        const issue = validateBaseElement(base);
+        if (issue) issues.push(issue);
+    });
+
     return issues;
+}
+
+/**
+ * Validate a <base> element. Returns an issue object or null.
+ * Any <base> on a pinchat.io page is unexpected and gets flagged.
+ */
+function validateBaseElement(element) {
+    if (element.tagName !== 'BASE') return null;
+    const href = element.getAttribute('href');
+    if (!href) return null;
+
+    let parsedOrigin = null;
+    try {
+        parsedOrigin = new URL(href, window.location.origin).origin;
+    } catch (e) {
+        return {
+            path: href,
+            error: 'Invalid <base href>',
+            type: 'base-invalid'
+        };
+    }
+
+    if (parsedOrigin !== window.location.origin) {
+        return {
+            path: href,
+            error: 'Cross-origin <base href> hijacks relative URLs',
+            type: 'base-cross-origin'
+        };
+    }
+
+    // Even same-origin <base> is unexpected on this site — flag it.
+    return {
+        path: href,
+        error: 'Unexpected <base> element',
+        type: 'base-unexpected'
+    };
 }
 
 /**
@@ -575,11 +651,10 @@ function setupDOMObserver() {
                 const target = mutation.target;
                 const attrName = mutation.attributeName;
 
-                // Only process script and stylesheet elements
+                // Process script, stylesheet, and base elements
                 if (target.tagName === 'SCRIPT' || (target.tagName === 'LINK' && target.rel === 'stylesheet')) {
                     console.log(`[PinChat Verify] Attribute '${attrName}' modified on ${target.tagName}`);
 
-                    // Critical attribute changed - validate against manifest
                     const issue = validateResourceAgainstManifest(target);
                     if (issue) {
                         console.warn(`[PinChat Verify] Resource validation failed after attribute change:`, issue);
@@ -587,8 +662,14 @@ function setupDOMObserver() {
                         foundUnauthorized = true;
                     }
 
-                    // Schedule full re-verification for thorough check
                     needsReVerification = true;
+                } else if (target.tagName === 'BASE') {
+                    const issue = validateBaseElement(target);
+                    if (issue) {
+                        console.warn(`[PinChat Verify] <base href> modification detected:`, issue);
+                        unauthorizedResources.push(issue);
+                        foundUnauthorized = true;
+                    }
                 }
             }
 
@@ -597,7 +678,7 @@ function setupDOMObserver() {
                 mutation.addedNodes.forEach(node => {
                     if (node.nodeType !== Node.ELEMENT_NODE) return;
 
-                    // Validate the node itself if it's a resource element
+                    // Validate the node itself if it's a resource or <base> element
                     if (node.tagName === 'SCRIPT' || (node.tagName === 'LINK' && node.rel === 'stylesheet')) {
                         const issue = validateResourceAgainstManifest(node);
                         if (issue) {
@@ -605,14 +686,29 @@ function setupDOMObserver() {
                             unauthorizedResources.push(issue);
                             foundUnauthorized = true;
                         }
+                    } else if (node.tagName === 'BASE') {
+                        const issue = validateBaseElement(node);
+                        if (issue) {
+                            console.warn(`[PinChat Verify] <base> injection detected:`, issue);
+                            unauthorizedResources.push(issue);
+                            foundUnauthorized = true;
+                        }
                     }
 
-                    // Check children recursively for nested resource elements
+                    // Check children recursively for nested resource/base elements
                     if (node.querySelectorAll) {
                         node.querySelectorAll('script, link[rel="stylesheet"]').forEach(el => {
                             const issue = validateResourceAgainstManifest(el);
                             if (issue) {
                                 console.warn(`[PinChat Verify] Nested resource injection detected:`, issue);
+                                unauthorizedResources.push(issue);
+                                foundUnauthorized = true;
+                            }
+                        });
+                        node.querySelectorAll('base[href]').forEach(el => {
+                            const issue = validateBaseElement(el);
+                            if (issue) {
+                                console.warn(`[PinChat Verify] Nested <base> injection detected:`, issue);
                                 unauthorizedResources.push(issue);
                                 foundUnauthorized = true;
                             }
@@ -629,6 +725,11 @@ function setupDOMObserver() {
         if (needsReVerification) {
             scheduleReVerification();
         }
+
+        // Fast path: if the overlay should be visible but isn't, re-mount NOW
+        // rather than waiting for the next watchdog tick. childList mutations
+        // include removals of the overlay host element.
+        restoreOverlayIfTampered();
     });
 
     domObserver.observe(document.documentElement, {
@@ -751,6 +852,15 @@ async function performDOMSecurityCheck() {
  * The adoptedStyleSheets API doesn't work in Firefox content scripts due to Xray wrappers.
  */
 async function showWarningOverlay(mismatches = [], isUnauthorized = false) {
+    // Persist args so the watchdog can re-mount if the page tries to remove the
+    // overlay. We take a defensive copy of `mismatches` so a later mutation of
+    // the source array doesn't change what we render on re-mount.
+    overlayPersistentState = {
+        active: true,
+        mismatches: Array.isArray(mismatches) ? [...mismatches] : [],
+        isUnauthorized
+    };
+
     if (overlayElement) {
         overlayElement.remove();
     }
@@ -823,15 +933,70 @@ async function showWarningOverlay(mismatches = [], isUnauthorized = false) {
 
     // Append to DOM
     (document.body || document.documentElement).appendChild(overlayElement);
+
+    // Start the watchdog now that an overlay is live. Idempotent.
+    ensureOverlayWatchdog();
 }
 
 /**
- * Hide the warning overlay
+ * Hide the warning overlay. Called from explicit user "Dismiss" action and
+ * from the verification path when issues are resolved. Marks the persistent
+ * state inactive so the watchdog stops re-mounting.
  */
 function hideWarningOverlay() {
+    overlayPersistentState.active = false;
     if (overlayElement) {
         overlayElement.remove();
         overlayElement = null;
+    }
+    if (overlayWatchdogTimer !== null) {
+        clearInterval(overlayWatchdogTimer);
+        overlayWatchdogTimer = null;
+    }
+}
+
+/**
+ * Ensure the overlay watchdog is running. The watchdog catches tampering that
+ * the main MutationObserver may miss or that arrives via property/style
+ * setters: removal of the host element, style attributes that hide it, and
+ * the `hidden` attribute. Cheap (a periodic poll) and idempotent.
+ */
+function ensureOverlayWatchdog() {
+    if (overlayWatchdogTimer !== null) return;
+    overlayWatchdogTimer = setInterval(restoreOverlayIfTampered, 500);
+}
+
+/**
+ * If the overlay should be visible but the page has tampered with it, restore
+ * the original state. Called both periodically (watchdog) and synchronously
+ * from the main MutationObserver for fast reaction to childList removals.
+ */
+function restoreOverlayIfTampered() {
+    if (!overlayPersistentState.active) return;
+
+    // Removed entirely (or never reattached after a page-driven detach).
+    if (!overlayElement || !document.contains(overlayElement)) {
+        console.warn('[PinChat Verify] Overlay missing — re-mounting');
+        overlayElement = null;
+        // showWarningOverlay re-creates and re-appends. It will also reset
+        // overlayPersistentState.active = true (idempotent).
+        showWarningOverlay(overlayPersistentState.mismatches, overlayPersistentState.isUnauthorized);
+        return;
+    }
+
+    // Style attribute tampering — strip it. The Shadow DOM stylesheet sets
+    // :host with !important properties, so removing the host's inline style
+    // restores correct positioning and visibility.
+    if (overlayElement.hasAttribute('style')) {
+        console.warn('[PinChat Verify] Overlay style attribute tampered — clearing');
+        overlayElement.removeAttribute('style');
+    }
+    if (overlayElement.hidden) {
+        console.warn('[PinChat Verify] Overlay `hidden` attribute set — clearing');
+        overlayElement.hidden = false;
+    }
+    if (overlayElement.getAttribute('class')) {
+        overlayElement.removeAttribute('class');
     }
 }
 
@@ -904,20 +1069,20 @@ browser.runtime.sendMessage({ type: 'GET_STATUS' }, (response) => {
     }
 });
 
-// Initialize DOM security monitoring
+// Setup MutationObserver IMMEDIATELY at document_start, before any page script
+// can execute. Initial DOM check is deferred to DOMContentLoaded (it depends on
+// the manifest arriving from background and on a fully-parsed DOM), but the
+// observer must be live as soon as possible so injections during parse are
+// caught — even if the script tag has already started fetching, we'll flag it
+// and trigger the warning overlay before the user trusts the page.
+setupDOMObserver();
+
 if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', () => {
         performDOMSecurityCheck();
-        setupDOMObserver();
     });
 } else {
     performDOMSecurityCheck();
-    setupDOMObserver();
 }
-
-// Delayed check for late-loaded resources
-setTimeout(() => {
-    performDOMSecurityCheck();
-}, 2000);
 
 console.log('[PinChat Verify] Content script loaded with SRI verification');

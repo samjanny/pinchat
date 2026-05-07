@@ -45,6 +45,13 @@ const OFFICIAL_DOMAIN = 'pinchat.io';
 const GITHUB_REPO = 'samjanny/pinchat';
 const GITHUB_BRANCH = 'main';
 
+// Minimum acceptable manifest sequence — hardcoded floor to defeat replay
+// attacks against fresh installs (where lastKnownSequence in storage is 0).
+// Bump this on every extension release to match (or stay below) the latest
+// signed manifest sequence at the time of release. A manifest with a lower
+// sequence than this constant is rejected even on first install.
+const MIN_KNOWN_SEQUENCE = 20;
+
 // Configuration
 const CONFIG = {
     HASH_LIST_URL: `https://raw.githubusercontent.com/${GITHUB_REPO}/${GITHUB_BRANCH}/hashes.json.signed`,
@@ -305,15 +312,19 @@ async function verifyIntegrity() {
         // Signature valid - now check sequence number for anti-downgrade
         const manifestSequence = signedData.data.sequence || 0;
         const { lastKnownSequence = 0 } = await chrome.storage.local.get('lastKnownSequence');
+        const minAcceptable = Math.max(lastKnownSequence, MIN_KNOWN_SEQUENCE);
 
-        console.log(`[PinChat Verify] Manifest sequence: ${manifestSequence}, Last known: ${lastKnownSequence}`);
+        console.log(`[PinChat Verify] Manifest sequence: ${manifestSequence}, Last known: ${lastKnownSequence}, Floor: ${MIN_KNOWN_SEQUENCE}`);
 
-        if (manifestSequence < lastKnownSequence) {
-            // Possible downgrade attack!
+        if (manifestSequence < minAcceptable) {
+            // Possible downgrade / replay attack
             verificationState.signatureStatus = 'invalid';
-            verificationState.errors.push(`DOWNGRADE ATTACK DETECTED - Manifest sequence (${manifestSequence}) < stored sequence (${lastKnownSequence})`);
+            const reason = manifestSequence < lastKnownSequence
+                ? `manifest sequence (${manifestSequence}) < stored sequence (${lastKnownSequence})`
+                : `manifest sequence (${manifestSequence}) < hardcoded floor (${MIN_KNOWN_SEQUENCE})`;
+            verificationState.errors.push(`DOWNGRADE ATTACK DETECTED - ${reason}`);
             verificationState.debug.lastError = 'Manifest downgrade detected';
-            console.error(`[PinChat Verify] ✗ DOWNGRADE ATTACK: manifest sequence ${manifestSequence} < stored ${lastKnownSequence}`);
+            console.error(`[PinChat Verify] ✗ DOWNGRADE ATTACK: ${reason}`);
             await updateOverallStatus();
             return verificationState;
         }
@@ -449,21 +460,69 @@ async function notifyContentScripts() {
     }
 }
 
+/**
+ * Validate that a runtime message originates from a trusted sender.
+ *
+ * Two profiles:
+ *  - 'popup': sender is the popup or another extension page (no sender.tab,
+ *    no sender.url pointing to a web page). Only GET_STATUS / VERIFY_NOW.
+ *  - 'content': sender is a content script running on a pinchat.io tab
+ *    (sender.tab.url points to OFFICIAL_DOMAIN). Used for FILE_HASH_*.
+ *
+ * Without externally_connectable, web pages cannot reach onMessage at all —
+ * but we still validate sender to harden against future regressions and to
+ * reject content scripts that somehow run on the wrong origin.
+ */
+function isSenderTrusted(sender, profile) {
+    if (sender.id && sender.id !== chrome.runtime.id) return false;
+
+    if (profile === 'content') {
+        if (!sender.tab || !sender.tab.url) return false;
+        try {
+            const u = new URL(sender.tab.url);
+            return u.hostname === OFFICIAL_DOMAIN || u.hostname === `www.${OFFICIAL_DOMAIN}`;
+        } catch {
+            return false;
+        }
+    }
+
+    if (profile === 'popup') {
+        if (sender.tab) return false;
+        if (sender.url && !sender.url.startsWith('moz-extension://') && !sender.url.startsWith('chrome-extension://')) {
+            return false;
+        }
+        return true;
+    }
+
+    return false;
+}
+
 // Message handler
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message.type === 'GET_STATUS') {
-        // Return full state including manifest
+        if (!isSenderTrusted(sender, 'popup')) {
+            console.warn('[PinChat Verify] Rejected GET_STATUS from untrusted sender');
+            return false;
+        }
         sendResponse(verificationState);
         return true;
     }
 
     if (message.type === 'VERIFY_NOW') {
+        if (!isSenderTrusted(sender, 'popup')) {
+            console.warn('[PinChat Verify] Rejected VERIFY_NOW from untrusted sender');
+            return false;
+        }
         verifyIntegrity().then(sendResponse);
         return true;
     }
 
     // Handle complete file hash verification results from content script
     if (message.type === 'FILE_HASH_VERIFICATION_COMPLETE') {
+        if (!isSenderTrusted(sender, 'content')) {
+            console.warn('[PinChat Verify] Rejected FILE_HASH_VERIFICATION_COMPLETE from untrusted sender:', sender);
+            return false;
+        }
         console.log('[PinChat Verify] Content script reported file verification complete:', message.summary);
 
         // Clear timeout since we got a response
@@ -508,6 +567,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
     // Handle file hash verification failure from content script (legacy support)
     if (message.type === 'FILE_HASH_VERIFICATION_FAILED') {
+        if (!isSenderTrusted(sender, 'content')) {
+            console.warn('[PinChat Verify] Rejected FILE_HASH_VERIFICATION_FAILED from untrusted sender:', sender);
+            return false;
+        }
         console.error('[PinChat Verify] Content script reported hash verification failure:', message.issues);
 
         // Clear timeout since we got a response

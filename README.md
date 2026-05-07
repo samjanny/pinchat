@@ -1,224 +1,403 @@
 # PinChat
 
-End-to-end encrypted ephemeral messaging with zero persistence and zero knowledge architecture.
+Experimental end-to-end encrypted, ephemeral, browser-based chat.
+
+PinChat is a small self-hostable web application for short-lived private conversations. Messages are encrypted in the browser before being relayed by the server. Room state is designed to live in application memory and expire after a configurable TTL.
+
+> **Security status:** PinChat has not received an independent cryptographic audit. Treat it as experimental software. Do not rely on it for high-risk use cases without review by qualified cryptographers and application-security engineers.
 
 ## Overview
 
-PinChat is a secure messaging application designed for privacy-first communication. All messages are encrypted client-side before transmission, ensuring the server operates as a blind relay with no ability to decrypt message content.
+PinChat is designed around a narrow goal: make the application server act primarily as an encrypted relay for short-lived chat rooms, without maintaining a persistent message database.
 
-### Key Features
+It is **not** an anonymity system, not a formally verified cryptographic protocol, and not a replacement for mature messaging applications such as Signal, WhatsApp, Matrix, Session, SimpleX, or similar systems.
 
-- **End-to-End Encryption**: All messages encrypted using AES-GCM 256-bit with keys that never leave the client
-- **Perfect Forward Secrecy**: Compromised keys cannot decrypt past messages (Double Ratchet protocol)
-- **Post-Compromise Security**: Session automatically recovers security after key compromise
-- **Authenticated DH Ratchet**: Every DH public key rotation is signed with the peer's identity key (ECDSA P-256). A live MITM swap triggers a hard session abort (WebSocket close 1008, no auto-reconnect).
-- **Zero Persistence**: All data exists only in memory; nothing is written to disk
-- **Zero Knowledge**: Server cannot decrypt messages, identify users, or correlate sessions
-- **Ephemeral Rooms**: Chat rooms automatically self-destruct after configurable TTL (1-1440 minutes)
-- **Anonymous Access**: No registration, no accounts, no tracking
-- **Encrypted Media**: Image sharing with the same E2E encryption as text messages
-- **MITM Detection**: Short Authentication String (SAS) verification for identity confirmation
-- **Subprotocol-based WebSocket auth**: JWT is carried in `Sec-WebSocket-Protocol`, never in the URL — so it never lands in proxy access logs, referrer headers, or middlebox caches.
+PinChat may be useful for:
 
-### Communication Modes
+- self-hosted temporary chats;
+- low-risk private conversations;
+- experiments with browser-based E2E encryption;
+- learning about encrypted WebSocket relay design;
+- situations where avoiding a server-side message database is useful.
 
-- **1:1 Chat**: Private conversations between two participants
-- **Group Chat**: Secure group messaging for up to 20 participants
-  - ⚠️ **Currently disabled**: Group chat functionality is temporarily disabled until a robust cryptographic solution is implemented (the current Bootstrap Key approach is insufficient for secure group key management)
+PinChat is not recommended for:
+
+- whistleblowing;
+- activist safety;
+- source protection;
+- life-or-death communications;
+- evading a state-level adversary;
+- situations where metadata exposure is unacceptable;
+- situations where participants cannot verify each other.
+
+## Key Features
+
+- **End-to-end encryption:** Messages are encrypted client-side using browser WebCrypto before being relayed by the server.
+- **Ephemeral rooms:** Chat rooms expire after a configurable TTL, from 1 to 1440 minutes.
+- **In-memory application state:** Room membership and relay state are kept in RAM by the application. Operators must still review reverse proxy logs, crash dumps, swap, container logs, hosting snapshots, and system journals.
+- **No accounts by default:** Anonymous rooms do not require user registration.
+- **Encrypted media:** Image sharing uses the same client-side encryption path as text messages.
+- **MITM detection:** Short Authentication String, or SAS, verification lets participants authenticate the session out of band.
+- **Double-Ratchet-inspired key progression:** Message keys advance over time and old message keys are deleted where possible. This is not a claim of full Signal Protocol equivalence.
+- **Authenticated DH ratchet:** DH public key rotations are signed with the peer's identity key using ECDSA P-256. A live MITM key swap should trigger a hard session abort.
+- **Subprotocol-based WebSocket auth:** JWTs are carried in `Sec-WebSocket-Protocol`, not in the URL, reducing accidental leakage through proxy access logs, referrer headers, or middlebox caches.
+- **Rate limiting and anti-spam controls:** Configurable WebSocket, login, room-token, message-rate, and proof-of-work controls.
+- **Optional static-asset integrity extension:** Browser extensions can verify signed file hashes for some static asset tampering scenarios.
+
+## Current Communication Modes
+
+### 1:1 Chat
+
+PinChat currently supports private one-to-one conversations between two participants.
+
+### Group Chat
+
+Group chat is intentionally disabled.
+
+The previous Bootstrap Key approach is not considered sufficient for robust group key management. Group messaging should not be enabled until the protocol has a proper design for:
+
+- membership changes;
+- sender authentication;
+- transcript consistency;
+- forward secrecy;
+- post-compromise recovery;
+- removed-member exclusion;
+- multi-device behavior, if supported.
 
 ## Security Model
 
-### Bootstrap Key
+### Security Goals
 
-When a room is created, the client generates a 256-bit AES key called the **Bootstrap Key**. This key is appended to the room URL as a fragment:
+PinChat is designed to help with:
 
-```
+1. **Message confidentiality from the relay server**  
+   Message contents are encrypted in the browser before being sent over the WebSocket relay.
+
+2. **No server-side message database**  
+   The application does not intentionally persist chat messages to a database.
+
+3. **Ephemeral room lifecycle**  
+   Rooms expire after a configured TTL. Expiry removes application-side room state, but cannot delete copies already seen by participants.
+
+4. **Authenticated encryption**  
+   Messages use AEAD encryption so tampering should be detected by clients.
+
+5. **Forward-secrecy-oriented key progression**  
+   Message keys are advanced and old message keys are deleted on the client side where possible.
+
+6. **Optional human-verifiable authentication**  
+   Participants can compare a SAS code over a secondary channel to reduce the risk of active man-in-the-middle attacks.
+
+### Non-Goals
+
+PinChat does not attempt to provide:
+
+- strong anonymity;
+- metadata privacy;
+- deniability;
+- protection from malicious participants;
+- protection from compromised clients;
+- protection from malicious browser extensions;
+- protection from a server that serves malicious JavaScript;
+- formal Signal Protocol compatibility;
+- a formally proven cryptographic protocol;
+- protection from screenshots, copy/paste, or screen recording;
+- protection from coercion;
+- protection from traffic analysis.
+
+## Threat Model
+
+### Trusted Components
+
+PinChat assumes the following components behave correctly:
+
+- the user's device;
+- the user's browser;
+- the browser's WebCrypto implementation;
+- the JavaScript code actually executed by the browser;
+- the participant after they receive plaintext.
+
+If any of these are compromised, PinChat cannot protect the conversation.
+
+### Not Trusted
+
+PinChat attempts to reduce trust in:
+
+- the PinChat application server;
+- the network;
+- passive packet capture;
+- ordinary server-side storage;
+- reverse proxies that might otherwise log sensitive URL query parameters.
+
+The server is expected to relay encrypted messages without knowing their plaintext.
+
+### Partially Trusted
+
+Other participants are only partially trusted.
+
+They necessarily receive plaintext. They can copy, screenshot, record, forward, or disclose the conversation.
+
+## Browser JavaScript Caveat
+
+PinChat is a browser-based E2E application. This has an important limitation: the same server that relays encrypted messages also serves the JavaScript that performs encryption.
+
+A malicious or compromised server could serve modified JavaScript that:
+
+- reads plaintext before encryption;
+- exfiltrates keys;
+- bypasses or fakes SAS verification;
+- changes security indicators in the UI;
+- weakens protocol behavior;
+- changes the code that verifies integrity.
+
+PinChat includes optional browser-extension integrity checks for static assets, but this does not completely remove the web-delivery trust problem.
+
+Users who need stronger assurance should prefer audited native clients with reproducible builds and stable release artifacts.
+
+## Bootstrap Key
+
+When a room is created, the browser generates a 256-bit Bootstrap Key. This key is appended to the room URL as a fragment:
+
+```text
 https://host/c/{room_id}#key={base64url_encoded_key}
 ```
 
-The URL fragment (everything after `#`) is never sent to the server per RFC 3986. This ensures:
+The fragment is the part after `#`. Browsers do not send URL fragments in normal HTTP requests, so the Bootstrap Key is not normally sent to the server during navigation.
 
-1. The server never has access to the Bootstrap Key
-2. Only users who receive the complete URL can decrypt messages
-3. The key is shared out-of-band (copy/paste, QR code, etc.)
+This is useful, but it is not magic.
 
-The Bootstrap Key encrypts the initial ECDH key exchange. After the handshake completes, the Double Ratchet takes over for message encryption with Perfect Forward Secrecy.
+The Bootstrap Key can still leak through:
 
-**Protocol v1 hardening (v0.2.0):** once the Double Ratchet is running the in-memory Bootstrap Key is dropped. On reconnect the key is re-extracted from the URL fragment (which survives transparent WebSocket reconnects). If the fragment is missing — e.g., a browser extension cleared `window.location.hash` — the client surfaces a clear "please re-open the original room link" message instead of attempting a handshake without a bootstrap key.
+- the user copying the full URL into an unsafe channel;
+- screenshots;
+- browser history on the local device;
+- malicious browser extensions;
+- same-origin JavaScript if the web app is compromised;
+- chat apps, note apps, or QR tools used to share the link;
+- someone who receives the link and forwards it.
 
-### Encryption Architecture
+Anyone who gets the full room link can join the room unless participants perform additional verification.
 
+The Bootstrap Key encrypts the initial ECDH key exchange. After the handshake completes, the ratchet-based session encryption takes over for message encryption.
+
+Protocol v1 hardening: once the ratchet is running, the in-memory Bootstrap Key is dropped. On reconnect, the key is re-extracted from the URL fragment. If the fragment is missing, for example because a browser extension cleared `window.location.hash`, the client surfaces a clear “please re-open the original room link” message instead of attempting a handshake without a Bootstrap Key.
+
+## Encryption Architecture
+
+```text
+                                      ENCRYPTION FLOW
+
+      Client A                         Server                          Client B
+      --------                         ------                          --------
+
+         |                                |                                |
+         |  [Bootstrap Key in URL fragment - not sent in HTTP request]     |
+         |                                |                                |
+         |  1. Generate Identity Key      |                                |
+         |     (ECDSA P-256)              |                                |
+         |                                |                                |
+         |  2. Generate Ephemeral Key     |                                |
+         |     (ECDH P-256)               |                                |
+         |                                |                                |
+         |  3. Encrypt ECDH Public Key    |                                |
+         |     with Bootstrap Key         |                                |
+         |     (AES-GCM)                  |                                |
+         |                                |                                |
+         |  4. Sign Ephemeral Key         |                                |
+         |     with Identity Key          |                                |
+         |                                |                                |
+         |======= Handshake Message =====>|======= Handshake Message =====>|
+         |                                |                                |
+         |                                |  5. Decrypt with Bootstrap Key |
+         |                                |                                |
+         |                                |  6. Verify Signature           |
+         |                                |     (MITM Detection)           |
+         |                                |                                |
+         |                                |  7. Derive Shared Secret       |
+         |                                |     (ECDH)                     |
+         |                                |                                |
+         |<====== Handshake Message ======|<====== Handshake Message ======|
+         |                                |                                |
+         |  8. Initialize Ratchet State   |                                |
+         |     - Root Key                 |                                |
+         |     - Sending Chain            |                                |
+         |     - Receiving Chain          |                                |
+         |                                |                                |
+         |  9. Encrypt Message            |                                |
+         |     (AES-GCM + AAD)            |                                |
+         |                                |                                |
+         |======= Encrypted Payload =====>|======= Encrypted Payload =====>|
+         |        (Encrypted Relay)       |                                |
+         |                                |                                |
 ```
-                                    ENCRYPTION FLOW
 
-    Client A                         Server                          Client B
-    --------                         ------                          --------
-       |                                |                                |
-       |  [Bootstrap Key in URL fragment - never sent to server]        |
-       |                                |                                |
-       |  1. Generate Identity Key      |                                |
-       |     (ECDSA P-256)              |                                |
-       |                                |                                |
-       |  2. Generate Ephemeral Key     |                                |
-       |     (ECDH P-256)               |                                |
-       |                                |                                |
-       |  3. Encrypt ECDH Public Key    |                                |
-       |     with Bootstrap Key         |                                |
-       |     (AES-GCM)                  |                                |
-       |                                |                                |
-       |  4. Sign Ephemeral Key         |                                |
-       |     with Identity Key          |                                |
-       |                                |                                |
-       |======= Handshake Message =====>|======= Handshake Message =====>|
-       |                                |                                |
-       |                                |  5. Decrypt with Bootstrap Key |
-       |                                |                                |
-       |                                |  6. Verify Signature           |
-       |                                |     (MITM Detection)           |
-       |                                |                                |
-       |                                |  7. Derive Shared Secret       |
-       |                                |     (ECDH)                     |
-       |                                |                                |
-       |<====== Handshake Message ======|<====== Handshake Message ======|
-       |                                |                                |
-       |  8. Initialize Double Ratchet  |                                |
-       |     - Root Key                 |                                |
-       |     - Sending Chain            |                                |
-       |     - Receiving Chain          |                                |
-       |                                |                                |
-       |  9. Encrypt Message            |                                |
-       |     (AES-GCM + AAD)            |                                |
-       |                                |                                |
-       |======= Encrypted Payload =====>|======= Encrypted Payload =====>|
-       |        (Blind Relay)           |                                |
-       |                                |                                |
-```
+## Server-Visible and Server-Hidden Data
 
-### Zero Knowledge Guarantees
+PinChat is designed so the application server does not receive the plaintext of chat messages during normal operation.
 
-The server architecture ensures:
+The server should not receive:
 
-1. **No Message Content Access**: All encryption/decryption occurs client-side
-2. **No Key Access**: Encryption keys exist only in browser memory and URL fragments (never transmitted to server)
-3. **No User Identification**: Each connection receives a random UUID; no cross-room correlation
-4. **No Persistent Logs**: In strict privacy mode, zero operational logs are generated
-5. **No Metadata Storage**: Room membership and timing data exist only in RAM
+1. message plaintext;
+2. derived message encryption keys;
+3. the Bootstrap Key through normal HTTP navigation, because it is placed in the URL fragment.
 
-### Cryptographic Primitives
+However, this is not a “zero knowledge” system in the formal cryptographic sense.
+
+The server, reverse proxy, hosting provider, CDN, or network observer may still observe metadata, including:
+
+1. source IP addresses, unless hidden by Tor, VPN, or another network layer;
+2. connection timing;
+3. room IDs in request paths;
+4. WebSocket connection events;
+5. approximate message sizes;
+6. rate-limiting state;
+7. proof-of-work challenge state;
+8. room membership while a room exists;
+9. browser and TLS metadata;
+10. deployment logs outside the PinChat application.
+
+PinChat should therefore be described as a browser-based encrypted relay with minimized server-side persistence, not as an anonymous or metadata-private messaging system.
+
+## Cryptographic Primitives
 
 | Component | Algorithm | Purpose |
-|-----------|-----------|---------|
-| Message Encryption | AES-GCM 256-bit | Authenticated encryption with associated data |
-| Key Exchange | ECDH P-256 | Derive shared secrets for Perfect Forward Secrecy |
-| Digital Signatures | ECDSA P-256 | Authenticate identity keys (MITM protection) |
-| Key Derivation | HKDF-SHA256 | Derive chain keys and message keys |
-| Chain Ratchet | HMAC-SHA256 | One-way key progression for PFS |
-| SAS Generation | PBKDF2 (100K iterations) | Brute-force resistant verification codes |
+|---|---|---|
+| Message encryption | AES-GCM 256-bit | Authenticated encryption with associated data |
+| Key exchange | ECDH P-256 | Derive shared secrets |
+| Digital signatures | ECDSA P-256 | Authenticate identity keys and ratchet keys |
+| Key derivation | HKDF-SHA256 | Derive root keys, chain keys, and message keys |
+| Chain ratchet | HMAC-SHA256 | One-way message-key progression |
+| SAS generation | PBKDF2, 100K iterations | Human-comparable verification codes |
 
-### Double Ratchet Protocol
+These primitives are used through browser WebCrypto on the client side.
 
-PinChat implements the Signal Protocol Double Ratchet for combined PFS and PCS:
+The use of modern primitives does not by itself make the protocol secure. Protocol composition, state handling, authentication, message ordering, error handling, implementation bugs, and deployment behavior all matter.
 
+## Ratchet Design
+
+PinChat uses a Double-Ratchet-inspired construction for message-key progression.
+
+```text
+                           ROOT KEY
+                              |
+              +---------------+---------------+
+              |                               |
+        SENDING CHAIN                   RECEIVING CHAIN
+              |                               |
+      +-------+-------+               +-------+-------+
+      |       |       |               |       |       |
+     MK_0    MK_1    MK_2            MK_0    MK_1    MK_2
+  (deleted) (deleted) (current)    (deleted) (deleted) (current)
+
+      DH RATCHET:
+      - new ECDH keypair generated on ratchet step
+      - new root key derived
+      - sending and receiving chains updated
 ```
-                         ROOT KEY (from ECDH)
-                               |
-              +----------------+----------------+
-              |                                 |
-        SENDING CHAIN                    RECEIVING CHAIN
-              |                                 |
-    +---------+---------+             +---------+---------+
-    |         |         |             |         |         |
-   MK_0      MK_1      MK_2          MK_0      MK_1      MK_2
- (deleted) (deleted) (current)     (deleted) (deleted) (current)
 
+This design is intended to provide forward-secrecy-oriented behavior under documented assumptions.
 
-    DH RATCHET: Triggered on direction change
-    - New ECDH keypair generated
-    - New root key derived
-    - Both chains re-initialized
-    - Post-Compromise Security achieved
-```
+It should not be read as a claim of full Signal Protocol equivalence, formal post-compromise security, or audited cryptographic correctness.
+
+## Authentication and SAS Verification
+
+Encryption without authentication is not enough.
+
+PinChat includes a Short Authentication String, or SAS, so participants can compare a small verification code through a separate trusted channel, such as:
+
+- voice call;
+- in-person comparison;
+- an already-authenticated messenger;
+- another channel whose authenticity the users already trust.
+
+If users skip SAS verification, the chat may still be encrypted against passive observers, but it is not strongly authenticated against an active relay/server man-in-the-middle during the initial exchange.
+
+For sensitive conversations, do not skip SAS verification.
 
 ## System Architecture
 
-```
+```text
 +------------------------------------------------------------------+
-|                           CLIENT                                  |
-|                                                                   |
+|                            CLIENT                                |
+|                                                                  |
 |  +------------------+  +------------------+  +------------------+ |
-|  |  Identity Keys   |  |  Ephemeral Keys  |  |  Double Ratchet  | |
-|  |  (ECDSA P-256)   |  |  (ECDH P-256)    |  |  (Signal Proto)  | |
+|  |  Identity Keys   |  | Ephemeral Keys   |  | Ratchet State    | |
+|  |  (ECDSA P-256)   |  | (ECDH P-256)     |  |                  | |
 |  +------------------+  +------------------+  +------------------+ |
 |           |                    |                     |            |
 |           +--------------------+---------------------+            |
-|                               |                                   |
+|                                |                                  |
 |                    +-------------------+                          |
 |                    |   CryptoManager   |                          |
-|                    | (WebCrypto API)   |                          |
+|                    |   WebCrypto API   |                          |
 |                    +-------------------+                          |
-|                               |                                   |
+|                                |                                  |
 |                    +-------------------+                          |
-|                    |  WebSocket Client |                          |
+|                    | WebSocket Client  |                          |
 |                    +-------------------+                          |
 +------------------------------------------------------------------+
-                               |
-                               | TLS 1.3 (Encrypted Transport)
-                               |
+                                 |
+                                 | TLS
+                                 |
 +------------------------------------------------------------------+
-|                           SERVER                                  |
-|                                                                   |
+|                            SERVER                                |
+|                                                                  |
 |  +------------------+  +------------------+  +------------------+ |
-|  |  Axum Framework  |  |  WebSocket Relay |  |  Rate Limiting   | |
-|  |  (Rust/Tokio)    |  |  (Blind Relay)   |  |  (tower-governor)| |
+|  |  Axum Framework  |  | WebSocket Relay  |  | Rate Limiting    | |
+|  |  Rust / Tokio    |  |                  |  | tower-governor   | |
 |  +------------------+  +------------------+  +------------------+ |
 |           |                    |                     |            |
 |           +--------------------+---------------------+            |
-|                               |                                   |
+|                                |                                  |
 |                    +-------------------+                          |
 |                    |     AppState      |                          |
-|                    |  (DashMap - RAM)  |                          |
+|                    |  DashMap / RAM    |                          |
 |                    +-------------------+                          |
-|                               |                                   |
+|                                |                                  |
 |                    +-------------------+                          |
 |                    |   Cleanup Task    |                          |
-|                    | (Expired Rooms)   |                          |
+|                    | Expired Rooms     |                          |
 |                    +-------------------+                          |
 +------------------------------------------------------------------+
 ```
 
 ### Backend Stack
 
-- **Runtime**: Rust with Tokio async runtime
-- **Framework**: Axum web framework
-- **Transport**: WebSocket over TLS (rustls)
-- **Storage**: In-memory only (DashMap)
-- **Rate Limiting**: tower-governor with HMAC-hashed IPs
-- **Anti-Spam**: Proof-of-Work challenge system
+- Runtime: Rust with Tokio async runtime
+- Framework: Axum web framework
+- Transport: WebSocket over TLS, or HTTP behind a properly configured TLS reverse proxy
+- Storage: application state in memory
+- Rate limiting: tower-governor with HMAC-hashed IPs
+- Anti-spam: proof-of-work challenge system
 
 ### Frontend Stack
 
-- **JavaScript**: Vanilla JS with Alpine.js for reactivity
-- **Cryptography**: WebCrypto API (native browser crypto)
-- **Styling**: Responsive CSS (no frameworks)
+- JavaScript: Vanilla JS with Alpine.js for reactivity
+- Cryptography: WebCrypto API
+- Styling: responsive CSS, no frontend framework build step required
 
 ## Quick Start
 
 ### Prerequisites
 
 - Rust 1.75 or later
-- OpenSSL (for certificate generation)
+- OpenSSL, for local certificate generation
+- A modern browser with WebCrypto support
 
 ### Installation
 
-1. Clone the repository:
+Clone the repository:
+
 ```bash
 git clone https://github.com/samjanny/pinchat.git
 cd pinchat
 ```
 
-2. Generate TLS certificates (required for HTTPS):
+Generate local TLS certificates:
+
 ```bash
 mkdir -p certs
+
 openssl req -x509 -newkey rsa:4096 \
     -keyout certs/key.pem \
     -out certs/cert.pem \
@@ -226,162 +405,281 @@ openssl req -x509 -newkey rsa:4096 \
     -subj "/CN=localhost"
 ```
 
-3. Provide operator data for the legal pages (Terms / Privacy):
+Provide operator data for the legal pages:
+
 ```bash
 cp static/operator.example.json static/operator.json
 # edit static/operator.json with your real contact, hosting provider, etc.
 ```
 
-The legal pages (`/static/terms.html`, `/static/privacy.html`) fetch
-`/static/operator.json` at runtime to fill in operator-specific values
-(support email, DPA, hosting note, last-updated date). The file is
-**gitignored** and deployment-specific — in production it is typically
-served from `WEBSITE_DIR` (see [Configuration](#configuration)) so the
-public repo never contains the operator's contact details. If the file
-is missing, the legal pages still render but show fallback placeholders.
+The legal pages, such as `/static/terms.html` and `/static/privacy.html`, fetch `/static/operator.json` at runtime to fill in operator-specific values such as support email, DPA information, hosting note, and last-updated date.
 
-4. Build and run:
+The file is gitignored and deployment-specific. In production it is typically served from `WEBSITE_DIR`, so the public repository does not need to contain the operator's contact details.
+
+If the file is missing, the legal pages still render but show fallback placeholders.
+
+Build and run:
+
 ```bash
 cargo run --release
 ```
 
-5. Access the application:
-```
+Open:
+
+```text
 https://localhost:3000
 ```
 
-Note: Browser will warn about the self-signed certificate. Accept the warning to proceed.
+Your browser will warn about the self-signed certificate in local development.
 
-### Docker Deployment
+## Docker Deployment
+
+Generate certificates first:
 
 ```bash
-# Generate certificates first
 ./generate-certs.sh
+```
 
-# Build and run with Docker Compose
+Build and run with Docker Compose:
+
+```bash
 docker-compose up --build
 ```
 
-### Configuration
+## Configuration
 
-Environment variables for customization:
+PinChat is configured through environment variables.
+
+These settings control application behavior only. They do not automatically configure your reverse proxy, CDN, container runtime, system journal, crash dumps, swap, VM snapshots, browser history, or hosting-provider logs.
 
 | Variable | Default | Description |
-|----------|---------|-------------|
+|---|---:|---|
 | `HOST` | `127.0.0.1` | Server bind address |
 | `PORT` | `3000` | Server port |
-| `PRIVACY_MODE` | `strict` | Logging level: `strict`, `minimal`, `development` |
-| `FORCE_HTTP` | `false` | Allow HTTP (for reverse proxy setups) |
-| `FORCE_SECURE_COOKIES` | `false` | Force Secure cookie flag |
+| `PRIVACY_MODE` | `strict` | Application logging profile: `strict`, `minimal`, `development` |
+| `FORCE_HTTP` | `false` | Allow HTTP for reverse-proxy deployments |
+| `FORCE_SECURE_COOKIES` | `false` | Force the Secure cookie flag |
+| `CORS_ALLOWED_ORIGINS` | `https://localhost:3000` | Comma-separated origins for CORS and WebSocket Origin checks. Required in production. Must include your public origin or browsers will fail the WebSocket upgrade with 403. Example: `https://your-domain.com,https://www.your-domain.com` |
 | `MAX_TOTAL_ROOMS` | `1000` | Maximum concurrent rooms |
 | `CSP_WS_HOST` | `'self'` | WebSocket CSP origins |
 | `WS_CONN_BURST_SIZE` | `30` | WebSocket connections allowed per period |
 | `WS_CONN_PERIOD_SECS` | `60` | Window for WebSocket connection rate limiting |
 | `ROOM_TOKEN_BURST_SIZE` | `100` | Room/token creations allowed per period |
-| `ROOM_TOKEN_PERIOD_SECS` | `600` | Window for room/token rate limiting (10 min) |
+| `ROOM_TOKEN_PERIOD_SECS` | `600` | Window for room/token rate limiting |
 | `MSG_RATE_LIMIT` | `30` | Messages per connection per window |
 | `MSG_RATE_WINDOW_SECS` | `1` | Window length for per-connection message rate limiting |
-| `POW_MIN_DIFFICULTY` | `12` | Minimum PoW difficulty (bits) |
-| `POW_MAX_DIFFICULTY` | `18` | Maximum PoW difficulty (bits) |
+| `POW_MIN_DIFFICULTY` | `12` | Minimum proof-of-work difficulty, in bits |
+| `POW_MAX_DIFFICULTY` | `18` | Maximum proof-of-work difficulty, in bits |
 | `CHALLENGE_TTL_SECS` | `300` | Proof-of-work challenge TTL |
-| `JWT_TOKEN_TTL_SECS` | `30` | WebSocket JWT TTL (seconds) |
+| `JWT_TOKEN_TTL_SECS` | `30` | WebSocket JWT TTL, in seconds |
 | `ROOM_CLEANUP_INTERVAL_SECS` | `60` | Room cleanup interval |
-| `CHALLENGE_CLEANUP_INTERVAL_SECS` | `60` | PoW cache cleanup interval |
-| `PINCHAT_PASSWORD_HASHES` | _empty_ | Semicolon-separated Argon2id hashes; if empty, auth is disabled |
+| `CHALLENGE_CLEANUP_INTERVAL_SECS` | `60` | Proof-of-work cache cleanup interval |
+| `PINCHAT_PASSWORD_HASHES` | empty | Semicolon-separated Argon2id hashes. If empty, password auth is disabled |
 | `SESSION_TTL_SECS` | `86400` | Session lifetime |
 | `LOGIN_BURST_SIZE` | `5` | Login attempts allowed per period |
 | `LOGIN_PERIOD_SECS` | `900` | Window for login rate limiting |
-| `TRUSTED_PROXIES` | _empty_ | Comma-separated proxy IPs/CIDRs for X-Forwarded-For |
-| `REPLAY_CACHE_MAX_PER_ROOM` | `10000` | Max anti-replay entries per room |
-| `MAX_IMAGE_SIZE` | `300KB` | Max image size (bytes or with KB/MB suffix) |
-| `WEBSITE_DIR` | _empty_ | Custom static files directory (fallback: `/static`) |
+| `TRUSTED_PROXIES` | empty | Comma-separated proxy IPs/CIDRs trusted for `X-Forwarded-For` |
+| `REPLAY_CACHE_MAX_PER_ROOM` | `10000` | Maximum anti-replay entries per room |
+| `MAX_IMAGE_SIZE` | `300KB` | Maximum image size, as bytes or with `KB`/`MB` suffix |
+| `WEBSITE_DIR` | empty | Custom static files directory. Falls back to `/static` |
 
-### Privacy Modes
+## Privacy Modes
 
-- **strict**: Zero operational logs, maximum privacy (production default)
-- **minimal**: Warnings and errors only
-- **development**: Full debug logging (local testing only)
+PinChat supports three application logging profiles:
+
+- `strict`: suppresses ordinary application logs as much as possible;
+- `minimal`: logs warnings and errors only;
+- `development`: enables verbose debug logging for local testing.
+
+`strict` mode only affects PinChat application logs.
+
+It does not disable logs from:
+
+- reverse proxies;
+- CDNs;
+- load balancers;
+- container runtimes;
+- systemd journals;
+- kernel/network logs;
+- hosting providers;
+- crash dumps;
+- browser history;
+- participant devices.
+
+Operators are responsible for validating the full deployment stack.
 
 ## Security Considerations
 
-### What PinChat Protects Against
+### What PinChat Is Designed to Help With
 
-- Server-side message interception
-- Retrospective decryption of captured traffic
-- User identification and correlation
-- Metadata analysis from server logs
-- Session hijacking (HTTPS + secure cookies)
-- Cross-Site Scripting (CSP headers)
-- Clickjacking (X-Frame-Options: DENY)
+PinChat is designed to help reduce:
 
-### What PinChat Does NOT Protect Against
+- server-side access to message plaintext;
+- accidental persistence of chat messages in an application database;
+- retrospective plaintext recovery from encrypted WebSocket payloads, assuming endpoint keys were not compromised;
+- accidental JWT leakage through URLs by using `Sec-WebSocket-Protocol`;
+- simple spam and abuse through rate limiting and proof-of-work;
+- some active MITM scenarios when users verify the SAS out of band.
 
-- Compromised client devices (malware, keyloggers)
-- Screenshots or deliberate recording by participants
-- Traffic analysis (IP addresses, timing)
-- Social engineering attacks
-- Attacks by participants within the same room
+### What PinChat Does Not Protect Against
 
-### Recommended Practices
+PinChat does not protect against:
 
-- Use a VPN or Tor for IP-level anonymity
-- Verify SAS codes via a secondary channel (voice call, Signal)
-- Use ephemeral/private browsing mode
-- Clear browser data after sensitive conversations
+- compromised client devices;
+- malicious browser extensions;
+- a malicious or compromised server serving modified JavaScript;
+- screenshots, copy/paste, or deliberate recording by participants;
+- traffic analysis;
+- IP-address visibility;
+- unsafe room-link sharing;
+- social engineering;
+- malicious participants in the room;
+- metadata visible to the server or deployment infrastructure;
+- coercion;
+- state-level adversaries.
+
+### Metadata
+
+Even when message contents are encrypted, metadata can still be sensitive.
+
+Depending on deployment and configuration, PinChat or surrounding infrastructure may process or expose:
+
+- source IP addresses;
+- User-Agent strings;
+- room URLs without fragments;
+- room IDs;
+- connection timing;
+- disconnection timing;
+- approximate message sizes;
+- rate-limit counters;
+- proof-of-work challenge state;
+- TLS and TCP metadata;
+- reverse proxy request logs;
+- hosting-provider telemetry.
+
+PinChat does not claim to hide this metadata.
+
+### RAM-Only Does Not Mean Unrecoverable
+
+PinChat avoids intentional server-side message persistence, but “in memory” does not mean “impossible to recover.”
+
+A live server compromise, memory dump, swap misconfiguration, crash dump, debug logging mistake, container snapshot, VM snapshot, or hosting-provider inspection may expose runtime data.
+
+Operators should disable swap or encrypt it, review crash dump settings, review journald/container logs, and understand their hosting provider’s snapshot/backup behavior.
+
+## Recommended Practices
+
+For more sensitive use:
+
+- use HTTPS;
+- verify the SAS out of band;
+- share room links only through a trusted channel;
+- avoid browser extensions you do not trust;
+- use a private browsing session;
+- close the tab after the conversation;
+- avoid screenshots and copy/paste into untrusted apps;
+- consider Tor or a VPN if IP metadata matters;
+- do not use a public or shared device;
+- keep the browser and operating system updated;
+- do not rely on PinChat for high-risk communications.
+
+## Abuse Prevention
+
+PinChat includes rate limiting and proof-of-work mechanisms to make abuse more expensive.
+
+These mechanisms are operational controls, not cryptographic privacy guarantees. Depending on deployment settings, abuse-prevention systems may require processing client IPs or derived identifiers.
 
 ## Browser Extensions
 
-PinChat includes browser extensions for Chrome and Firefox that verify the integrity of files served by the web application against cryptographically signed hashes.
+PinChat includes browser extensions for Chrome and Firefox that verify files served by the web application against cryptographically signed hashes.
 
 ### How It Works
 
-1. The extension fetches a signed hash list from GitHub (out-of-band source)
-2. Verifies the ECDSA P-256 signature using an embedded public key
-3. **DOM SRI Check**: Verifies `<script>` and `<link>` tags have correct `integrity` attributes
-4. **File Hash Verification**: Fetches ALL files from manifest and verifies SHA-256 hashes
-5. Displays a warning overlay if any integrity check fails
+1. The extension fetches a signed hash list from GitHub as an out-of-band source.
+2. It verifies the ECDSA P-256 signature using an embedded public key.
+3. It checks that `<script>` and `<link>` tags have expected `integrity` attributes.
+4. It fetches files listed in the manifest and verifies their SHA-256 hashes.
+5. It displays a warning overlay if an integrity check fails.
 
-This dual verification approach catches both HTML tampering (modified SRI attributes) and file tampering (modified JS/CSS), providing protection against server compromise scenarios.
+This can help detect some static-file tampering and some compromised-server scenarios.
 
-See [extensions/README.md](extensions/README.md) for setup and installation instructions.
+It is not a complete replacement for:
+
+- native application distribution;
+- reproducible builds;
+- independent audits;
+- careful operational security;
+- endpoint security;
+- browser security.
+
+See `extensions/README.md` for setup and installation instructions.
 
 ## Documentation
 
-- [SECURITY.md](SECURITY.md) - Detailed threat model and cryptographic specifications
-- [PROTOCOL.md](PROTOCOL.md) - Protocol specification and message formats
+- `SECURITY.md` — detailed threat model and cryptographic specifications.
+- `PROTOCOL.md` — protocol specification and message formats.
+- `CHANGELOG.md` — version history.
+- `NOTICE` — third-party asset attribution.
 
 ## Changelog
 
-See [CHANGELOG.md](CHANGELOG.md) for the full version history. The format is
-based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
+See `CHANGELOG.md` for the full version history.
+
+The changelog format is based on Keep a Changelog.
+
+## Reporting Security Issues
+
+Please do not report security issues through public GitHub issues if the issue could put users at risk.
+
+Use the contact process described in `SECURITY.md`.
+
+When reporting, include:
+
+- affected version or commit;
+- deployment mode;
+- browser and OS;
+- reproduction steps;
+- expected impact;
+- whether the issue is already public.
+
+## Audit Status
+
+PinChat has not been independently audited.
+
+The code and protocol should be reviewed before serious use. Contributions that reduce custom cryptography, improve documentation, remove ambiguous claims, or clarify the threat model are welcome.
 
 ## License
 
-Copyright 2025 Raffaele Mangiacasale <support@pinchat.io>
+Copyright 2025 Raffaele Mangiacasale  
+support@pinchat.io
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
+Licensed under the Apache License, Version 2.0.
 
-    http://www.apache.org/licenses/LICENSE-2.0
+You may not use this file except in compliance with the License. You may obtain a copy of the License at:
 
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
+```text
+http://www.apache.org/licenses/LICENSE-2.0
+```
 
-See the [LICENSE](LICENSE) file for details.
+Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on an “AS IS” BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+
+See the `LICENSE` file for details.
 
 ## Disclaimer
 
-This software is an experimental prototype provided strictly for educational and research purposes.
+This software is an experimental prototype provided for educational, research, and self-hosting experimentation purposes.
 
-It is NOT designed, intended, or warranted for:
-- production use,
-- the protection of real-world sensitive, personal, financial, or confidential data,
-- safety-critical, life-critical, or mission-critical communications.
+It is not designed, intended, or warranted for:
 
-Although it uses modern cryptographic techniques, it has not undergone a formal security review or audit, and MAY CONTAIN SERIOUS VULNERABILITIES.
+- high-risk production use;
+- protection of real-world sensitive, personal, financial, or confidential data;
+- safety-critical, life-critical, or mission-critical communications;
+- adversarial environments where metadata exposure creates serious risk.
 
-You use this software entirely at your own risk. The authors and contributors provide it “as is”, without any express or implied warranty, including but not limited to any warranty of security, fitness for a particular purpose, or non-infringement. Under no circumstances shall the authors or contributors be liable for any claim, damages, or other liability arising from, out of, or in connection with the software or its use.
+Although PinChat uses modern cryptographic primitives, it has not undergone a formal independent security review or audit and may contain serious vulnerabilities.
+
+You use this software entirely at your own risk.
+
+The authors and contributors provide it “as is”, without any express or implied warranty, including but not limited to any warranty of security, fitness for a particular purpose, or non-infringement.
+
+Under no circumstances shall the authors or contributors be liable for any claim, damages, or other liability arising from, out of, or in connection with the software or its use.

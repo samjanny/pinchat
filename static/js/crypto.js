@@ -639,9 +639,29 @@ class CryptoManager {
 
         debugLog('[CRYPTO] Using Double Ratchet for decryption (PFS + PCS)');
         const envelope = await this.doubleRatchet.decryptMessage(ciphertextBase64, header, roomId, expectedSenderId);
-        // DoubleRatchet returns {ts, text}
-        // We need to return just the text for compatibility
-        return envelope.text;
+
+        // Defence-in-depth timestamp window. The Double Ratchet's counter
+        // already rejects in-session replays, but a captured ciphertext that
+        // somehow lands inside a current skipped-key window still must respect
+        // the wall-clock guardrail: a message older than MAX_MESSAGE_AGE or
+        // farther in the future than FUTURE_TOLERANCE indicates either a
+        // stale replay across reconnects or clock manipulation.
+        if (typeof envelope.ts === 'number') {
+            const now = Date.now();
+            const age = now - envelope.ts;
+            if (age > this.MAX_MESSAGE_AGE) {
+                throw new Error('REPLAY_TOO_OLD');
+            }
+            if (age < -this.FUTURE_TOLERANCE) {
+                throw new Error('REPLAY_FUTURE');
+            }
+        }
+
+        // DoubleRatchet returns {ts, text} plus the receiver-only `_outOfOrder`
+        // flag set when (ratchetCount, messageNumber) was below the highest
+        // tuple already decrypted. We surface that flag to the app layer so
+        // late arrivals can be visually marked.
+        return { text: envelope.text, outOfOrder: envelope._outOfOrder === true };
     }
 
     /**
@@ -1005,6 +1025,20 @@ class CryptoManager {
         // Use the existing Double Ratchet decryption
         const envelope = await this.doubleRatchet.decryptMessage(payloadBase64, header, roomId, senderId, 'image');
 
+        // Apply the same timestamp window as text messages: late replays
+        // captured across reconnects must still be rejected even if the
+        // Double Ratchet counter slot happens to be available.
+        if (typeof envelope.ts === 'number') {
+            const now = Date.now();
+            const age = now - envelope.ts;
+            if (age > this.MAX_MESSAGE_AGE) {
+                throw new Error('REPLAY_TOO_OLD');
+            }
+            if (age < -this.FUTURE_TOLERANCE) {
+                throw new Error('REPLAY_FUTURE');
+            }
+        }
+
         // Parse the envelope (it's the inner JSON with image data)
         // The Double Ratchet returns {ts, text} but for images we encoded the full envelope as 'text'
         const imageEnvelope = JSON.parse(envelope.text);
@@ -1020,7 +1054,8 @@ class CryptoManager {
 
         return {
             data: imageData,
-            mimeType: imageEnvelope.mimeType
+            mimeType: imageEnvelope.mimeType,
+            outOfOrder: envelope._outOfOrder === true
         };
     }
 

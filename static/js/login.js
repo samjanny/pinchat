@@ -10,8 +10,7 @@
     // Show error message if present in URL
     const errorMsg = urlParams.get('error');
     if (errorMsg) {
-        document.getElementById('error-container').innerHTML =
-            '<div class="login-error-message">' + escapeHtml(errorMsg) + '</div>';
+        renderError(errorMsg);
         // Clean URL (remove error param) without reloading
         const cleanUrl = window.location.pathname +
             (urlParams.get('redirect') ? '?redirect=' + encodeURIComponent(urlParams.get('redirect')) : '');
@@ -40,15 +39,19 @@
             document.getElementById('submit-btn').textContent = 'Enter';
         })
         .catch(error => {
-            document.getElementById('error-container').innerHTML =
-                '<div class="login-error-message">Failed to initialize. Please refresh the page.</div>';
+            renderError('Failed to initialize. Please refresh the page.');
             console.error('CSRF fetch error:', error);
         });
 
-    // Helper to escape HTML to prevent XSS
-    function escapeHtml(text) {
+    // Render an error string into #error-container without ever using innerHTML.
+    // Building the DOM via createElement + textContent removes the need for a
+    // manual escape pass and prevents future regressions if the message source
+    // changes.
+    function renderError(text) {
         const div = document.createElement('div');
+        div.className = 'login-error-message';
         div.textContent = text;
-        return div.innerHTML;
+        const container = document.getElementById('error-container');
+        container.replaceChildren(div);
     }
 })();

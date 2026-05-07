@@ -10,7 +10,7 @@ use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
 use sha2::{Digest, Sha256};
 use std::collections::{HashSet, VecDeque};
-use tokio::time::{interval, Duration};
+use tokio::time::{interval, Duration, Instant};
 use uuid::Uuid;
 
 use crate::jwt::verify_token;
@@ -282,6 +282,9 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: Uuid, connec
     // and re-validates room TTL to enforce the hard expiry deadline even on
     // connections opened just before the TTL boundary.
     let send_state = state.clone();
+    let connected_at = Instant::now();
+    let max_connection_age =
+        Duration::from_secs(send_state.config.max_ws_connection_age_secs);
     let mut send_task = tokio::spawn(async move {
         let mut ping_interval = interval(Duration::from_secs(30));
 
@@ -313,6 +316,16 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: Uuid, connec
                         let _ = sender.send(WsMessage::Close(None)).await;
                         break;
                     }
+                    // Hard cap on connection lifetime: even an active client is
+                    // forced to reconnect, which re-runs PoW + JWT issuance and
+                    // restarts the Double Ratchet handshake. Bounds resource
+                    // usage from clients that heartbeat indefinitely.
+                    if connected_at.elapsed() > max_connection_age {
+                        #[cfg(debug_assertions)]
+                        tracing::debug!("Connection exceeded max age, closing");
+                        let _ = sender.send(WsMessage::Close(None)).await;
+                        break;
+                    }
                     if sender.send(WsMessage::Ping(vec![])).await.is_err() {
                         break;
                     }
@@ -330,6 +343,31 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: Uuid, connec
     let mut recv_task = tokio::spawn(async move {
         while let Ok(Some(Ok(msg))) = tokio::time::timeout(IDLE_TIMEOUT, receiver.next()).await {
             if let WsMessage::Text(text) = msg {
+                // Enforce room TTL on the receive path as well as on the ping
+                // tick. Without this, an expired room can still process and
+                // broadcast frames for up to one ping interval (~30s) after
+                // hard expiry. Closing here ensures expired rooms reject
+                // messages immediately.
+                let room_alive = state_clone
+                    .rooms
+                    .get(&room_id)
+                    .map(|r| !r.is_expired())
+                    .unwrap_or(false);
+                if !room_alive {
+                    #[cfg(debug_assertions)]
+                    tracing::debug!("Recv on expired room, closing");
+                    break;
+                }
+                // Hard cap on connection lifetime. The send-side ping check
+                // already enforces this, but applying it here closes the
+                // connection on the next inbound frame instead of waiting
+                // for the next ping tick.
+                if connected_at.elapsed() > max_connection_age {
+                    #[cfg(debug_assertions)]
+                    tracing::debug!("Recv past max connection age, closing");
+                    break;
+                }
+
                 // Early size check before JSON parsing
                 // This acts as an extra safeguard in addition to WebSocket frame limits
                 let ws_limit = max_ws_size(state_clone.config.max_image_size);
@@ -373,6 +411,36 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: Uuid, connec
                     Ok(incoming) => {
                         // Handle ECDH public key exchange (blind relay, no crypto server-side)
                         if incoming.msg_type == "ecdh_public_key" {
+                            // Per-connection ECDH burst limiter. The looser
+                            // frame_rate_limit (default 120/s) was the only gate
+                            // here; an authenticated peer could flood handshake
+                            // frames and force the receiver client into repeated
+                            // signature verification + key import + Double
+                            // Ratchet reinit. Real handshakes need 1–2 frames
+                            // per session, so a small burst over a long window
+                            // is more than enough for legitimate reconnects.
+                            {
+                                let limit = state_clone.config.ecdh_burst_limit;
+                                let window = state_clone.config.ecdh_burst_window_secs;
+                                let now = Utc::now();
+                                let cutoff = now - chrono::Duration::seconds(window);
+                                let mut ts = state_clone
+                                    .connection_ecdh_timestamps
+                                    .entry(connection_id)
+                                    .or_default();
+                                ts.retain(|&t| t > cutoff);
+                                if ts.len() >= limit {
+                                    tracing::warn!(
+                                        "Connection {} exceeded ECDH burst limit ({}/{}s), disconnecting",
+                                        connection_id,
+                                        ts.len(),
+                                        window
+                                    );
+                                    break;
+                                }
+                                ts.push_back(now);
+                            }
+
                             tracing::info!(
                                 "ECDH public key received from connection_id={} in room={}",
                                 connection_id,
@@ -895,6 +963,9 @@ mod tests {
             pow_max_difficulty: 18,
             challenge_ttl_secs: 300,
             jwt_token_ttl_secs: 30,
+            max_ws_connection_age_secs: 30 * 60,
+            ecdh_burst_limit: 8,
+            ecdh_burst_window_secs: 60,
             room_cleanup_interval_secs: 60,
             challenge_cleanup_interval_secs: 60,
             password_hashes: vec![],

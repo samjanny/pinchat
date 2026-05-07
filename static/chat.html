@@ -4,10 +4,10 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>PinChat - Secure Chat</title>
-    <link rel="stylesheet" href="/static/css/style.css" integrity="sha256-caH6wyoVV2hNx2Sn74/oVIDpEeyU5g038lzT/C2pnQk=" crossorigin="anonymous" >
-    <script src="/static/js/theme.js" integrity="sha256-vguZcvUBFZL2wz1CcdaSVsPfryWwZGvpw9DYzS7e6h0=" crossorigin="anonymous" ></script>
-    <script src="/static/js/pow.js" integrity="sha256-3k3xXgpNEs+yxB+EkOl0mP/rXAx/mgxrgxxVQC3kFsk=" crossorigin="anonymous" ></script>
-    <script src="/static/js/nicknames.js" integrity="sha256-kWwSJJkZrZc/EWnNPhvFuvpOjLE2tgUtTvXqwjz+nXA=" crossorigin="anonymous" ></script>
+    <link rel="stylesheet" href="/static/css/style.css" integrity="sha256-I7jppwH+0/qRDZPZftMjmb3TS6Ou3wlt+aZx9qF6oZ0=" crossorigin="anonymous" >
+    <script src="/static/js/theme.js" integrity="sha256-vc83MC35lVoXBnYkFcbi+cE5EgJ+drCEfcjEryWT40A=" crossorigin="anonymous" ></script>
+    <script src="/static/js/pow.js" integrity="sha256-4jyDkg400LlXkyi0zC+QbIJhh6pEYjneo43JWuFVRZc=" crossorigin="anonymous" ></script>
+    <script src="/static/js/nicknames.js" integrity="sha256-FFlmH12HLY/cK10Uu5ALIabktzw+KiCJdF2p60qlSuc=" crossorigin="anonymous" ></script>
 </head>
 <body class="chat-page">
     <div class="chat-container" x-data="$store.chatRoom"
@@ -91,9 +91,9 @@
                     </div>
                 </div>
                 <div class="sidebar-legal">
-                    <a href="/static/terms.html" target="_blank" rel="noopener">Terms</a>
+                    <a href="/static/terms.html" target="_blank" rel="noopener noreferrer">Terms</a>
                     <span class="footer-sep" aria-hidden="true">·</span>
-                    <a href="/static/privacy.html" target="_blank" rel="noopener">Privacy</a>
+                    <a href="/static/privacy.html" target="_blank" rel="noopener noreferrer">Privacy</a>
                     <span class="footer-sep" aria-hidden="true">·</span>
                     <a href="https://github.com/samjanny/pinchat" target="_blank" rel="noopener noreferrer">GitHub&nbsp;↗</a>
                 </div>
@@ -192,7 +192,7 @@
                                 <div x-show="msg.nickname" class="message-sender" :title="msg.senderId">
                                     <strong x-text="msg.nickname"></strong>
                                 </div>
-                                <p><span x-html="renderMessage(msg.text)"></span><span class="message-time" x-text="formatTimestamp(msg.timestamp)"></span></p>
+                                <p><span x-html="renderMessage(msg.text)"></span><span class="message-time" x-text="formatTimestamp(msg.timestamp)"></span><span x-show="msg.outOfOrder" class="message-late" title="Delivered out of order">late</span></p>
                             </div>
                         </div>
 
@@ -207,6 +207,7 @@
                                     <img :src="msg.imageUrl" class="message-image" alt="Shared image" @click="openImageFullscreen(msg.imageUrl)">
                                 </div>
                                 <p class="message-time-standalone" x-text="formatTimestamp(msg.timestamp)"></p>
+                                <p x-show="msg.outOfOrder" class="message-late" title="Delivered out of order">late</p>
                             </div>
                         </div>
 
@@ -264,7 +265,7 @@
             <!-- Image Preview (shown when image is selected or being sent) -->
             <div x-show="pendingImage || sendingImage" class="image-preview-container">
                 <div class="image-preview-wrapper" x-show="pendingImage">
-                    <img :src="pendingImage ? pendingImage.dataUrl : ''" class="image-preview" alt="Preview">
+                    <img :src="pendingImage ? pendingImage.previewUrl : ''" class="image-preview" alt="Preview">
                     <button @click="cancelImage()" class="image-preview-cancel" title="Cancel" x-show="!sendingImage">×</button>
                 </div>
                 <div class="image-preview-info" x-show="pendingImage">
@@ -395,8 +396,12 @@
                         </div>
                     </div>
 
-                    <!-- Emoji SAS (Primary) -->
-                    <div class="sas-code-emoji" x-html="formatEmojiGrid(sas ? (sas.emoji || '') : '')" aria-label="Short Authentication String"></div>
+                    <!-- Emoji SAS (Primary) — rendered via x-for + x-text so the SAS string never touches innerHTML. -->
+                    <div class="sas-code-emoji" aria-label="Short Authentication String">
+                        <template x-for="(emoji, index) in sasEmojiArray(sas ? (sas.emoji || '') : '')" :key="'sas-' + index">
+                            <span x-text="emoji"></span>
+                        </template>
+                    </div>
 
                     <!-- Hex + copy inline -->
                     <div class="sas-hex-row">
@@ -450,11 +455,11 @@
     </div><!-- /.chat-container -->
 
     <!-- Include JS modules -->
-    <script src="/static/js/debug.js" integrity="sha256-dpEwkN/rOziVnn/b1fxRTfhWXyLlsZMmIMENrOpgbTU=" crossorigin="anonymous" ></script>
-    <script src="/static/js/crypto.js" integrity="sha256-IWoJHF8bnGrUo8Y1Y/BZXGBKvQ/Q8thP+xu2A5QEK6M=" crossorigin="anonymous" ></script>
-    <script src="/static/js/identity.js" integrity="sha256-tUsx+TRqwYP2RRDJPg14UVZCLeaVn/n7wKzgkjNvkvw=" crossorigin="anonymous" ></script>
-    <script src="/static/js/double-ratchet.js" integrity="sha256-KkJ/dIYjQAydZUBJFWd4kj7A9OehQMFzJfq0NYCZ62o=" crossorigin="anonymous" ></script>
-    <script src="/static/js/ecdh.js" integrity="sha256-CJflAPUU9elsPuHzVCW3hz0TfJIrxbLC+r7lpDHJH7g=" crossorigin="anonymous" ></script>
+    <script src="/static/js/debug.js" integrity="sha256-nY3zkFVKF7x6KVbWq1mwcHq4Y/g8O10iOmLAFfiDsJ8=" crossorigin="anonymous" ></script>
+    <script src="/static/js/crypto.js" integrity="sha256-nqjsL3brCZtOO4fKuIo+kEsMswNKPv8Q1VWS9OES8VE=" crossorigin="anonymous" ></script>
+    <script src="/static/js/identity.js" integrity="sha256-sl6g0+ZjI05UtvwqOLcdGj8jGsnC8o3NC2uGdckKMVk=" crossorigin="anonymous" ></script>
+    <script src="/static/js/double-ratchet.js" integrity="sha256-6a2KO3OPMaEsIlWVMLCvEY9QSTE9NALAjOsZaQV/ECQ=" crossorigin="anonymous" ></script>
+    <script src="/static/js/ecdh.js" integrity="sha256-CVN4eN0i8sQBgVu52unHdpXxUJ9pjq82mYZn3yoYCgo=" crossorigin="anonymous" ></script>
     <!--
       MLS (RFC 9420) custom implementation — loaded in topological dependency
       order. Each module attaches its exports to window.MLS. The signed
@@ -488,13 +493,13 @@
     <script src="/static/js/mls/group.js" integrity="sha256-sPqcIUf4zf8fy81dDB/poy+obuVINaOuLobtn50mJK8=" crossorigin="anonymous" ></script>
     <script src="/static/js/mls-session.js" integrity="sha256-+vOpggnNKJ1WHVx1hpfHDQ11zjk9vlasuHlQ5zWQaEs=" crossorigin="anonymous" ></script>
     <!-- end MLS -->
-    <script src="/static/js/websocket.js" integrity="sha256-NwZ03AjgsumZhM5kVUkfrV52vteEDCSzR19pcHZ5Fp4=" crossorigin="anonymous" ></script>
-    <script src="/static/js/emoji.js" integrity="sha256-ftNQCPs0bSt0ceGeqFQxlPD2E0UjPEsy/jbuypugXrk=" crossorigin="anonymous" ></script>
-    <script src="/static/js/app.js" integrity="sha256-Z5N43VR9qND+/siGLkGOw10UOw4/dJyfruUNi2nlf7Y=" crossorigin="anonymous" ></script>
-    <script src="/static/js/alpine-csp.min.js" integrity="sha256-YC/00uVR+V8NMWaoYUbkNEnzQz0fSWF6WR3/qREP2hw=" crossorigin="anonymous" defer></script>
+    <script src="/static/js/websocket.js" integrity="sha256-LfJjh7GbF7UfEnlPXLYfLsoTdLRlnldSMilPNQqJtSY=" crossorigin="anonymous" ></script>
+    <script src="/static/js/emoji.js" integrity="sha256-w67zAeAVHFA9AB+RnbDbadBSg6LDd5RS+4mvZksLUv8=" crossorigin="anonymous" ></script>
+    <script src="/static/js/app.js" integrity="sha256-kaCwFL4SaSiqGG0Z3F1gbCJJPM7lY/lglh7HVvA9O8k=" crossorigin="anonymous" ></script>
+    <script src="/static/js/alpine-csp.min.js" integrity="sha256-58hj2liWaS9dR44Q2uCJ5hZP7RxcG2offLv3qbCT8FU=" crossorigin="anonymous" defer></script>
 
     <!-- Lucide icon sprite (ISC license, https://lucide.dev) -->
-    <svg xmlns="http://www.w3.org/2000/svg" style="display:none" aria-hidden="true">
+    <svg xmlns="http://www.w3.org/2000/svg" class="hidden" aria-hidden="true">
         <symbol id="i-lock" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
             <rect width="18" height="11" x="3" y="11" rx="2" ry="2"/>
             <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
@@ -556,5 +561,12 @@
             <path d="M20 6 9 17l-5-5"/>
         </symbol>
     </svg>
+
+    <!-- Cookie notice (informational, dismissible — see static/js/cookie-notice.js) -->
+    <div id="cookie-notice" class="cookie-notice hidden" role="region" aria-label="Cookie notice">
+        <span class="cookie-notice-text">This site uses only strictly necessary cookies (session, CSRF). No tracking, no analytics. <a href="/static/privacy.html">Privacy</a></span>
+        <button type="button" class="cookie-notice-ok">OK</button>
+    </div>
+    <script src="/static/js/cookie-notice.js" integrity="sha256-rvb/bHQ2W2jurmYIKaOUhoCD4mg3w94+UbuljCqwDdI=" crossorigin="anonymous" ></script>
 </body>
 </html>

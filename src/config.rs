@@ -72,6 +72,16 @@ pub struct Config {
     // is closed once this many protocol errors accumulate.
     pub protocol_error_limit: u32,
 
+    // Per-connection ECDH-frame burst limit and window. ECDH frames trigger
+    // signature verification + key import + Double Ratchet re-init on the
+    // peer client; without a dedicated cap, an authenticated peer could
+    // exhaust the receiver's CPU under cover of the (much looser)
+    // frame_rate_limit. Real handshakes need 1–2 frames per session and a
+    // few more across reconnects, so a small burst over a long window is
+    // ample.
+    pub ecdh_burst_limit: usize,
+    pub ecdh_burst_window_secs: i64,
+
     // Proof-of-Work configuration
     pub pow_min_difficulty: u8,
     pub pow_max_difficulty: u8,
@@ -79,6 +89,12 @@ pub struct Config {
     // Challenge and token TTLs
     pub challenge_ttl_secs: u64,
     pub jwt_token_ttl_secs: u64,
+
+    // Absolute hard cap on a single WebSocket connection's lifetime, in seconds.
+    // Independent of the idle timeout: even an active client is forced to
+    // reconnect (and thus restart the handshake) after this duration. Bounds
+    // resource usage from clients that keep heartbeating indefinitely.
+    pub max_ws_connection_age_secs: u64,
 
     // Cleanup intervals
     pub room_cleanup_interval_secs: u64,
@@ -223,6 +239,23 @@ impl Config {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(30),
+
+            // Hard cap on WebSocket connection lifetime (default: 30 minutes).
+            // Forces a reconnect that re-runs PoW/JWT and the handshake.
+            max_ws_connection_age_secs: env::var("MAX_WS_CONNECTION_AGE_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(30 * 60),
+
+            // ECDH burst (default: 8 frames per 60 seconds).
+            ecdh_burst_limit: env::var("ECDH_BURST_LIMIT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(8),
+            ecdh_burst_window_secs: env::var("ECDH_BURST_WINDOW_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(60),
 
             // Cleanup intervals (default: 60 seconds)
             room_cleanup_interval_secs: env::var("ROOM_CLEANUP_INTERVAL_SECS")
@@ -405,6 +438,15 @@ impl Config {
         }
         if self.jwt_token_ttl_secs == 0 {
             panic!("JWT_TOKEN_TTL_SECS must be greater than 0");
+        }
+        if self.max_ws_connection_age_secs == 0 {
+            panic!("MAX_WS_CONNECTION_AGE_SECS must be greater than 0");
+        }
+        if self.ecdh_burst_limit == 0 {
+            panic!("ECDH_BURST_LIMIT must be greater than 0");
+        }
+        if self.ecdh_burst_window_secs <= 0 {
+            panic!("ECDH_BURST_WINDOW_SECS must be greater than 0");
         }
 
         // Validate cleanup intervals are non-zero

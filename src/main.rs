@@ -62,7 +62,7 @@ fn build_csp_header() -> String {
         "default-src 'self'; \
          script-src 'self'; \
          style-src 'self'; \
-         img-src 'self' data: blob:; \
+         img-src 'self' blob:; \
          connect-src {}; \
          frame-ancestors 'none'; \
          base-uri 'self'; \

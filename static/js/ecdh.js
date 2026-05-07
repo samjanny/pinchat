@@ -494,13 +494,15 @@ class ECDHKeyExchange {
         debugLog('[ECDH] Generating SAS with PBKDF2 (48-bit, 100K iterations)...');
         debugLog('[ECDH] Using IDENTITY KEYS (not ephemeral keys) for SAS');
 
-        // Export identity public keys (non-ephemeral)
+        // Export own identity public key (CryptoKey is intentionally extractable
+        // for transmission to the peer). Peer's key was imported as
+        // non-extractable, but the raw bytes were cached at import time, so we
+        // read them directly from the identity manager — never via exportKey.
         const myPublicKeyRaw = await crypto.subtle.exportKey('raw', this.identityManager.identityKeyPair.publicKey);
-        const otherPublicKeyRaw = await crypto.subtle.exportKey('raw', this.identityManager.peerIdentityPublicKey);
 
         // Convert to Uint8Array for sorting
         const myKeyBytes = new Uint8Array(myPublicKeyRaw);
-        const otherKeyBytes = new Uint8Array(otherPublicKeyRaw);
+        const otherKeyBytes = new Uint8Array(this.identityManager.peerIdentityPublicKeyRaw);
 
         // Sort public keys to ensure both parties get same result (deterministic)
         const keys = [myKeyBytes, otherKeyBytes].sort((a, b) => {

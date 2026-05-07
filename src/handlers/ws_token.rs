@@ -220,9 +220,11 @@ pub async fn generate_ws_token(
     }
 
     if room_is_full {
+        // Return 404 (same as "not found") to avoid leaking room existence to
+        // callers probing UUIDs. See http.rs::room_page for rationale.
         return Err((
-            StatusCode::FORBIDDEN,
-            Json(json!({ "error": "Room is full" })),
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "Room not found" })),
         )
             .into_response());
     }
