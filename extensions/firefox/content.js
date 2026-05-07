@@ -186,6 +186,18 @@ function validateResourceAgainstManifest(element) {
         const expectedSRI = manifestSRIMap[path];
 
         if (!expectedSRI) {
+            // Race-condition guard: the MutationObserver runs at document_start
+            // and fires for every <script>/<link> the page parser inserts, but
+            // the manifest arrives asynchronously from the background script
+            // (browser.runtime.sendMessage callback). Until the manifest lands,
+            // manifestSRIMap is empty and every legitimate resource would be
+            // wrongly flagged "not in manifest". Defer to performDOMSecurityCheck,
+            // which already waits for the manifest and re-scans the full DOM
+            // once it arrives — so any genuinely unknown resource is still
+            // caught, just slightly later.
+            if (!manifestData || !manifestData.files) {
+                return null;
+            }
             return {
                 path: path,
                 error: `${isScript ? 'Script' : 'Stylesheet'} not in manifest`,
