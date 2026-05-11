@@ -305,5 +305,9 @@ class IdentityKeyManager {
     }
 }
 
-// Expose globally
-window.IdentityKeyManager = IdentityKeyManager;
+// Expose globally (browser) or via CommonJS (Node test harness).
+if (typeof module !== 'undefined' && module.exports) {
+    module.exports = { IdentityKeyManager };
+} else {
+    window.IdentityKeyManager = IdentityKeyManager;
+}

@@ -33,6 +33,11 @@ const TEST_SUITES = {
         name: 'Security Properties',
         file: 'test-security.js',
         description: 'Key extractability invariants (bootstrap key, identity key)'
+    },
+    correctness: {
+        name: 'Ratchet Correctness',
+        file: 'test-ratchet-correctness.js',
+        description: 'C-01 concurrency, C-02 cross-DH late delivery, C-05 non-extractable DH'
     }
 };
 

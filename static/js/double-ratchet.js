@@ -76,6 +76,31 @@ class DoubleRatchet {
 
         // Configuration
         this.CURVE = 'P-256';
+
+        // C-01: serialize all ratchet state mutations through an internal
+        // promise mutex. encryptMessage and decryptMessage mutate
+        // this.{Ns, Nr, chains, DHs, DHr, rootKey, ratchetCount} across
+        // multiple `await` points. An intermediate await would otherwise let
+        // another invocation observe an in-progress state (e.g. messageNumber
+        // already incremented but chainKeyMaterial not yet ratcheted),
+        // producing message keys the peer cannot derive. The mutex serializes
+        // BOTH directions: the receive-side DH ratchet touches sendingChain
+        // too, so per-direction locks are not sufficient.
+        this._mutex = Promise.resolve();
+    }
+
+    /**
+     * Run fn() after every previously-queued task has settled. Returns the
+     * result of fn() to the caller; rejections are NOT propagated into the
+     * mutex chain (the `.catch(() => undefined)` resets it so a single
+     * decrypt failure does not poison subsequent operations).
+     *
+     * @private
+     */
+    _serialize(fn) {
+        const task = this._mutex.then(() => fn());
+        this._mutex = task.catch(() => undefined);
+        return task;
     }
 
     /**
@@ -149,10 +174,13 @@ class DoubleRatchet {
             this.DHs = myKeypair;
             debugLog('[DoubleRatchet] Using provided ECDH keypair');
         } else {
-            // Generate new keypair if not provided (backward compatibility)
+            // Generate new keypair if not provided (backward compatibility).
+            // C-05: extractable=false on the private side; the public side of
+            // an asymmetric CryptoKey is always extractable per W3C WebCrypto,
+            // so exportKey('raw', publicKey) still works for header construction.
             this.DHs = await crypto.subtle.generateKey(
                 { name: 'ECDH', namedCurve: this.CURVE },
-                true,
+                false,
                 ['deriveKey', 'deriveBits']
             );
             debugLog('[DoubleRatchet] Generated new ECDH keypair');
@@ -216,6 +244,13 @@ class DoubleRatchet {
      * @returns {Promise<Object>} Encrypted message envelope with header
      */
     async encryptMessage(plaintext, roomId, senderId, msgType = 'message') {
+        // C-01: serialize through the ratchet mutex so concurrent calls
+        // cannot read a stale chain state between deriveMessageKey() and
+        // ratchet(). See _serialize() and the constructor.
+        return this._serialize(() => this._encryptMessageImpl(plaintext, roomId, senderId, msgType));
+    }
+
+    async _encryptMessageImpl(plaintext, roomId, senderId, msgType = 'message') {
         if (!this.sendingChain) {
             throw new Error('Double Ratchet not initialized');
         }
@@ -321,6 +356,13 @@ class DoubleRatchet {
      * @returns {Promise<Object>} Decrypted message envelope
      */
     async decryptMessage(payloadBase64, header, roomId, senderId, msgType = 'message') {
+        // C-01: serialize through the ratchet mutex (same rationale as
+        // encryptMessage). The receive-side DH ratchet also resets the
+        // sending chain, so this MUST share the mutex with encrypt.
+        return this._serialize(() => this._decryptMessageImpl(payloadBase64, header, roomId, senderId, msgType));
+    }
+
+    async _decryptMessageImpl(payloadBase64, header, roomId, senderId, msgType = 'message') {
         if (!this.receivingChain) {
             throw new Error('Double Ratchet not initialized');
         }
@@ -358,6 +400,58 @@ class DoubleRatchet {
             throw new Error('SIGNATURE_INVALID');
         }
 
+        // C-02: Skipped-key short-circuit.
+        // If we have already derived this (dh, n) message key — either via a
+        // forward-jump pre-derive (skipMessageKeys with messageNumber > Nr) or
+        // via a pre-ratchet skip on receive (prevChainLength > Nr) — use it
+        // directly WITHOUT touching chain state.
+        //
+        // Without this, a late message from a previous DH chain would hit the
+        // `isNewKey` branch below (because header.dh != this.DHrRaw after the
+        // chain has rotated), trigger a SPURIOUS performDHRatchetOnReceive on
+        // an OLD key, and the subsequent AEAD would fail. State would roll
+        // back, but the legitimate message — whose key is sitting in
+        // this.skippedKeys — would be lost.
+        const skippedKeyId = `${dhPublicKeyBase64}:${messageNumber}`;
+        if (this.skippedKeys.has(skippedKeyId)) {
+            debugLog(`[DoubleRatchet] Skipped-key hit for #${messageNumber} (dh=${dhPublicKeyBase64.substring(0, 12)}...)`);
+            const entry = this.skippedKeys.get(skippedKeyId);
+
+            try {
+                const combined = this.base64urlToArrayBuffer(payloadBase64);
+                const iv = combined.slice(0, 12);
+                const ciphertext = combined.slice(12);
+                const aad = encodeAADWithLengthPrefix([
+                    {type: AAD_FIELD_TYPES.ROOM_ID, value: roomId},
+                    {type: AAD_FIELD_TYPES.SENDER_ID, value: senderId},
+                    {type: AAD_FIELD_TYPES.MESSAGE_NUMBER, value: messageNumber},
+                    {type: AAD_FIELD_TYPES.MESSAGE_TYPE, value: msgType},
+                    {type: AAD_FIELD_TYPES.RATCHET_COUNT, value: ratchetCount}
+                ]);
+                const plaintextBytes = await crypto.subtle.decrypt(
+                    { name: 'AES-GCM', iv: iv, additionalData: aad },
+                    entry.key,
+                    ciphertext
+                );
+
+                // Single-use: remove from the map AFTER successful AEAD.
+                // If the AEAD fails the entry remains and will be GC'd by
+                // MAX_SKIPPED_KEYS_TOTAL eviction or by a future DH ratchet.
+                this.skippedKeys.delete(skippedKeyId);
+
+                const envelope = JSON.parse(new TextDecoder().decode(plaintextBytes));
+                // Late deliveries are by definition out-of-order. We do NOT
+                // update maxRatchetSeen / maxCounterSeen — those track the
+                // forward edge of the conversation, not late arrivals.
+                envelope._outOfOrder = true;
+                debugLog(`[DoubleRatchet] Skipped-key decrypt success #${messageNumber}`);
+                return envelope;
+            } catch (err) {
+                debugError('[DoubleRatchet] Skipped-key AEAD failed:', err);
+                throw new Error('Message decryption failed - authentication error');
+            }
+        }
+
         const isFirstMessage = !this.DHrRaw;  // Responder's first received message
         const isNewKey = !isFirstMessage && !this.arraysEqual(dhPublicKeyRaw, new Uint8Array(this.DHrRaw));
 
@@ -392,11 +486,14 @@ class DoubleRatchet {
                 // The initial receivingChain (from handshake) matches initiator's sendingChain
                 debugLog('[DoubleRatchet] First message received - storing DHr (no ratchet yet)');
 
+                // C-05: extractable=false. We never exportKey on DHr; we
+                // keep raw bytes in this.DHrRaw for keyId construction and
+                // identity-change detection (cf. skipMessageKeys).
                 const newDHr = await crypto.subtle.importKey(
                     'raw',
                     dhPublicKeyRaw,
                     { name: 'ECDH', namedCurve: this.CURVE },
-                    true,
+                    false,
                     []
                 );
                 this.DHr = newDHr;
@@ -555,12 +652,14 @@ class DoubleRatchet {
      * @param {Uint8Array} newDHrRaw - New DH public key from peer (raw bytes)
      */
     async performDHRatchetOnReceive(newDHrRaw) {
-        // Import peer's new public key
+        // Import peer's new public key.
+        // C-05: extractable=false. We use this.DHrRaw cache for any byte-level
+        // access (cf. skipMessageKeys).
         const newDHr = await crypto.subtle.importKey(
             'raw',
             newDHrRaw,
             { name: 'ECDH', namedCurve: this.CURVE },
-            true,
+            false,
             []
         );
 
@@ -591,11 +690,12 @@ class DoubleRatchet {
         this.receivingChain = new ChainRatchet();
         await this.receivingChain.initialize(newReceivingChainKey);
 
-        // Step 2: Generate new keypair for ourselves
+        // Step 2: Generate new keypair for ourselves.
+        // C-05: private side non-extractable.
         const oldDHs = this.DHs;
         this.DHs = await crypto.subtle.generateKey(
             { name: 'ECDH', namedCurve: this.CURVE },
-            true,
+            false,
             ['deriveKey', 'deriveBits']
         );
 
@@ -665,11 +765,12 @@ class DoubleRatchet {
         this.PN = this.Ns;
         this.Ns = 0;
 
-        // Generate new keypair
+        // Generate new keypair.
+        // C-05: private side non-extractable (see initialize() rationale).
         const oldDHs = this.DHs;
         this.DHs = await crypto.subtle.generateKey(
             { name: 'ECDH', namedCurve: this.CURVE },
-            true,
+            false,
             ['deriveKey', 'deriveBits']
         );
 
@@ -722,8 +823,15 @@ class DoubleRatchet {
             throw new Error(`Too many skipped messages: ${until - this.Nr} (max: ${this.MAX_SKIP})`);
         }
 
-        const dhPublicKeyRaw = await crypto.subtle.exportKey('raw', this.DHr);
-        const dhPublicKeyBase64 = this.arrayBufferToBase64url(dhPublicKeyRaw);
+        // C-05: this.DHr is now imported non-extractable; read raw bytes from
+        // the cache populated alongside every DHr assignment (initialize,
+        // first-message branch, performDHRatchetOnReceive). Defence-in-depth
+        // guard against developer error: if DHrRaw was somehow not populated,
+        // fail loudly instead of producing keyIds based on undefined.
+        if (!this.DHrRaw) {
+            throw new Error('skipMessageKeys called before DHrRaw is set');
+        }
+        const dhPublicKeyBase64 = this.arrayBufferToBase64url(this.DHrRaw);
 
         while (this.Nr < until) {
             const messageKey = await this.receivingChain.deriveMessageKeyForCounter(this.Nr);
@@ -869,5 +977,10 @@ class DoubleRatchet {
     }
 }
 
-// Expose globally
-window.DoubleRatchet = DoubleRatchet;
+// Expose globally (browser) or via CommonJS (Node test harness). The check
+// keeps the browser path identical and only activates exports under Node.
+if (typeof module !== 'undefined' && module.exports) {
+    module.exports = { DoubleRatchet };
+} else {
+    window.DoubleRatchet = DoubleRatchet;
+}

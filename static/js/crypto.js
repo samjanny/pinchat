@@ -7,7 +7,12 @@
  * Clients before this release are "v0 implicit" and will be rejected.
  */
 const PINCHAT_PROTOCOL_VERSION = 1;
-window.PINCHAT_PROTOCOL_VERSION = PINCHAT_PROTOCOL_VERSION;
+// Browser path: expose to window. Node test harness has no window — the
+// Node export block at the bottom of this file mirrors the value onto
+// globalThis there. The `typeof` guard keeps both runtimes happy.
+if (typeof window !== 'undefined') {
+    window.PINCHAT_PROTOCOL_VERSION = PINCHAT_PROTOCOL_VERSION;
+}
 
 /**
  * Converts standard Base64 to URL-safe Base64url (RFC 4648)
@@ -1048,5 +1053,24 @@ class CryptoManager {
     }
 }
 
-// Export a singleton instance
-window.cryptoManager = new CryptoManager();
+// Expose globally (browser) or via CommonJS (Node test harness).
+// Under Node we ALSO promote AAD_FIELD_TYPES, encodeAADWithLengthPrefix and
+// ChainRatchet to globalThis because the browser path relies on top-level
+// `const` declarations being visible across <script> files. Without this,
+// requiring double-ratchet.js after crypto.js would fail at runtime with
+// `AAD_FIELD_TYPES is not defined`.
+if (typeof module !== 'undefined' && module.exports) {
+    globalThis.AAD_FIELD_TYPES = AAD_FIELD_TYPES;
+    globalThis.encodeAADWithLengthPrefix = encodeAADWithLengthPrefix;
+    globalThis.ChainRatchet = ChainRatchet;
+    module.exports = {
+        CryptoManager,
+        ChainRatchet,
+        AAD_FIELD_TYPES,
+        encodeAADWithLengthPrefix,
+        base64ToBase64url,
+        base64urlToBase64,
+    };
+} else {
+    window.cryptoManager = new CryptoManager();
+}
