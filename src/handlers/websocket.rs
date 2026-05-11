@@ -93,34 +93,10 @@ pub async fn ws_handler(
         }
     };
 
-    // Validate JWT token before accepting the WebSocket upgrade
-    let claims = match verify_token(token, &state.jwt_secret) {
-        Ok(claims) => claims,
-        Err(e) => {
-            tracing::warn!("Invalid JWT token for WebSocket: {}", e);
-            return (StatusCode::UNAUTHORIZED, "Invalid or expired token").into_response();
-        }
-    };
-
-    // Verify room_id matches token claim (prevent token reuse for different rooms)
-    if claims.room_id != room_id {
-        tracing::warn!(
-            "JWT room_id mismatch: token={}, path={}",
-            claims.room_id,
-            room_id
-        );
-        return (StatusCode::FORBIDDEN, "Token not valid for this room").into_response();
-    }
-
-    // SECURITY: Single-use token enforcement (prevents replay attacks)
-    if !state.consume_token(claims.jti, state.config.jwt_token_ttl_secs) {
-        tracing::warn!(
-            "JWT token replay attempt detected: jti={}, room={}",
-            claims.jti,
-            room_id
-        );
-        return (StatusCode::FORBIDDEN, "Token already used").into_response();
-    }
+    // C-07: Order matters. All stateless rejections (Origin, signature, room
+    // claim) MUST run BEFORE the single-use JTI consumption. Otherwise a
+    // bounce of a legitimate token through an Origin/room-mismatch path
+    // would burn its jti and lock the real client out of its own session.
 
     // Origin check — defense-in-depth (RFC 6455 §4.1).
     // The primary guard is the SameSite=Strict session cookie preventing
@@ -156,6 +132,39 @@ pub async fn ws_handler(
         None => {
             // dev mode: tolerate missing Origin for raw-socket test clients
         }
+    }
+
+    // Validate JWT token before accepting the WebSocket upgrade
+    let claims = match verify_token(token, &state.jwt_secret) {
+        Ok(claims) => claims,
+        Err(e) => {
+            tracing::warn!("Invalid JWT token for WebSocket: {}", e);
+            return (StatusCode::UNAUTHORIZED, "Invalid or expired token").into_response();
+        }
+    };
+
+    // Verify room_id matches token claim (prevent token reuse for different rooms)
+    if claims.room_id != room_id {
+        tracing::warn!(
+            "JWT room_id mismatch: token={}, path={}",
+            claims.room_id,
+            room_id
+        );
+        return (StatusCode::FORBIDDEN, "Token not valid for this room").into_response();
+    }
+
+    // SECURITY: Single-use token enforcement (prevents replay attacks).
+    // C-07: this is the LAST gate before upgrade — every stateless check
+    // above has already passed by the time we mutate state. A failed
+    // upgrade attempt past this point cannot have "wasted" the JTI of a
+    // legitimate client whose Origin / room / signature didn't match.
+    if !state.consume_token(claims.jti, state.config.jwt_token_ttl_secs) {
+        tracing::warn!(
+            "JWT token replay attempt detected: jti={}, room={}",
+            claims.jti,
+            room_id
+        );
+        return (StatusCode::FORBIDDEN, "Token already used").into_response();
     }
 
     tracing::info!(
@@ -362,70 +371,93 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: Uuid, connec
     let state_clone = state.clone();
     let mut recv_task = tokio::spawn(async move {
         while let Ok(Some(Ok(msg))) = tokio::time::timeout(IDLE_TIMEOUT, receiver.next()).await {
-            if let WsMessage::Text(text) = msg {
-                // Enforce room TTL on the receive path as well as on the ping
-                // tick. Without this, an expired room can still process and
-                // broadcast frames for up to one ping interval (~30s) after
-                // hard expiry. Closing here ensures expired rooms reject
-                // messages immediately.
-                let room_alive = state_clone
-                    .rooms
-                    .get(&room_id)
-                    .map(|r| !r.is_expired())
-                    .unwrap_or(false);
-                if !room_alive {
-                    #[cfg(debug_assertions)]
-                    tracing::debug!("Recv on expired room, closing");
-                    break;
-                }
-                // Hard cap on connection lifetime. The send-side ping check
-                // already enforces this, but applying it here closes the
-                // connection on the next inbound frame instead of waiting
-                // for the next ping tick.
-                if connected_at.elapsed() > max_connection_age {
-                    #[cfg(debug_assertions)]
-                    tracing::debug!("Recv past max connection age, closing");
-                    break;
-                }
+            // C-14: classify the frame up front. Close terminates the loop
+            // and is not counted against the rate limit. All other frame
+            // types (Text, Binary, Ping, Pong) pass through the lifecycle
+            // gates and the global rate limiter, but only Text is
+            // application-relevant — Binary/Ping/Pong are accounted for
+            // and dropped.
+            let text = match msg {
+                WsMessage::Close(_) => break,
+                WsMessage::Text(t) => Some(t),
+                _ => None,
+            };
 
-                // Early size check before JSON parsing
-                // This acts as an extra safeguard in addition to WebSocket frame limits
-                let ws_limit = max_ws_size(state_clone.config.max_image_size);
-                if text.len() > ws_limit {
+            // Enforce room TTL on the receive path. Hoisted above the
+            // type-specific branch so a hostile peer flooding Ping/Binary
+            // on an already-expired room is severed immediately.
+            let room_alive = state_clone
+                .rooms
+                .get(&room_id)
+                .map(|r| !r.is_expired())
+                .unwrap_or(false);
+            if !room_alive {
+                #[cfg(debug_assertions)]
+                tracing::debug!("Recv on expired room, closing");
+                break;
+            }
+            // Hard cap on connection lifetime. The send-side ping check
+            // already enforces this, but applying it here closes the
+            // connection on the next inbound frame instead of waiting
+            // for the next ping tick.
+            if connected_at.elapsed() > max_connection_age {
+                #[cfg(debug_assertions)]
+                tracing::debug!("Recv past max connection age, closing");
+                break;
+            }
+
+            // GLOBAL FRAME RATE LIMIT (C-14): counts EVERY non-Close frame,
+            // not just Text. Previously the limiter sat inside the Text
+            // branch; a hostile peer could flood Ping/Pong/Binary frames
+            // to keep the recv loop busy without consuming the budget.
+            // axum/tungstenite auto-answers Ping with Pong, but the recv
+            // task still wakes up for each frame and burns CPU; this
+            // closes the gap. Lifecycle-bound (Close + max age + room
+            // expiry) frames still bypass the counter because they break
+            // the loop above.
+            {
+                let frame_limit = state_clone.config.frame_rate_limit;
+                let window = state_clone.config.msg_rate_window_secs;
+                let now = Utc::now();
+                let cutoff = now - chrono::Duration::seconds(window);
+                let mut ts = state_clone
+                    .connection_frame_timestamps
+                    .entry(connection_id)
+                    .or_default();
+                ts.retain(|&t| t > cutoff);
+                if ts.len() >= frame_limit {
                     tracing::warn!(
-                        "⚠️ Message exceeds size limit: {} bytes (max {}) from connection_id={} - closing connection",
-                        text.len(),
-                        ws_limit,
-                        connection_id
+                        "Connection {} exceeded frame rate limit ({}/{}s), disconnecting",
+                        connection_id,
+                        ts.len(),
+                        window
                     );
-                    break; // Close connection
+                    break;
                 }
+                ts.push_back(now);
+            }
 
-                // GLOBAL FRAME RATE LIMIT: counts every text frame regardless of
-                // msg_type. Prevents attackers from flooding ECDH/unknown/malformed
-                // frames to bypass the stricter message/image limiter below.
-                {
-                    let frame_limit = state_clone.config.frame_rate_limit;
-                    let window = state_clone.config.msg_rate_window_secs;
-                    let now = Utc::now();
-                    let cutoff = now - chrono::Duration::seconds(window);
-                    let mut ts = state_clone
-                        .connection_frame_timestamps
-                        .entry(connection_id)
-                        .or_default();
-                    ts.retain(|&t| t > cutoff);
-                    if ts.len() >= frame_limit {
-                        tracing::warn!(
-                            "Connection {} exceeded frame rate limit ({}/{}s), disconnecting",
-                            connection_id,
-                            ts.len(),
-                            window
-                        );
-                        break;
-                    }
-                    ts.push_back(now);
-                }
+            // Per-type handling: only Text frames carry application data.
+            // Binary/Ping/Pong have been counted above and are dropped
+            // silently here.
+            let Some(text) = text else {
+                continue;
+            };
 
+            // Early size check before JSON parsing
+            // This acts as an extra safeguard in addition to WebSocket frame limits
+            let ws_limit = max_ws_size(state_clone.config.max_image_size);
+            if text.len() > ws_limit {
+                tracing::warn!(
+                    "⚠️ Message exceeds size limit: {} bytes (max {}) from connection_id={} - closing connection",
+                    text.len(),
+                    ws_limit,
+                    connection_id
+                );
+                break; // Close connection
+            }
+
+            {
                 // Parse the incoming message
                 match serde_json::from_str::<IncomingMessage>(&text) {
                     Ok(incoming) => {
@@ -714,8 +746,6 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: Uuid, connec
                         }
                     }
                 }
-            } else if let WsMessage::Close(_) = msg {
-                break;
             }
         }
     });
@@ -809,7 +839,7 @@ mod tests {
             login_burst_size: 5,
             login_period_secs: 900,
             trusted_proxies: vec![],
-            replay_cache_max_per_room: 10000,
+            replay_cache_max_per_room: 1000,
             force_secure_cookies: false,
             max_image_size: 300 * 1024,
             force_http: false,
@@ -908,10 +938,10 @@ mod tests {
         // otherwise bypass the cors_allowed_origins allowlist with a stolen
         // session cookie.
         //
-        // We must pass a fully-valid JWT in the subprotocol so the request
-        // reaches the Origin gate (which sits after JWT verification + jti
-        // consumption). Without a valid JWT the handler returns 401 earlier
-        // and we'd test the wrong path.
+        // C-07: the Origin gate now runs BEFORE consume_token, so an
+        // Origin-rejected request must NOT have burned its jti. This test
+        // only checks the status code; rejects_bad_origin_preserves_jti
+        // below verifies the conservation property directly.
         let (addr, state, room_id) = spawn_test_server().await;
         let claims = WsTokenClaims::new(room_id, 30);
         let token = sign_token(&claims, &state.jwt_secret).unwrap();
@@ -919,6 +949,38 @@ mod tests {
         let path = format!("/ws/{}", room_id);
         let status = raw_upgrade_with_origin(addr, &path, Some(&sp), None).await;
         assert_eq!(status, 403);
+    }
+
+    #[tokio::test]
+    async fn rejects_bad_origin_preserves_jti() {
+        // C-07: a bounce on the Origin gate (bad Origin or missing-in-prod)
+        // MUST NOT consume the JTI. Otherwise a hostile cross-origin script
+        // armed with a stolen WS token could lock the legitimate client out
+        // of its own session by triggering one mistargeted upgrade attempt.
+        //
+        // We assert the conservation property directly: send the upgrade
+        // request with a non-allowlisted Origin (403), then verify the JTI
+        // is still absent from state.consumed_tokens.
+        let (addr, state, room_id) = spawn_test_server().await;
+        let claims = WsTokenClaims::new(room_id, 30);
+        let jti = claims.jti;
+        let token = sign_token(&claims, &state.jwt_secret).unwrap();
+        let sp = format!("pinchat.v1, pinchat.v1.jwt.{}", token);
+        let path = format!("/ws/{}", room_id);
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let status = raw_upgrade_with_origin(
+            addr,
+            &path,
+            Some(&sp),
+            Some("https://evil.example.com"),
+        )
+        .await;
+        assert_eq!(status, 403);
+        assert!(
+            !state.consumed_tokens.contains_key(&jti),
+            "JTI must NOT be consumed on Origin rejection (C-07)"
+        );
     }
 
     #[tokio::test]
