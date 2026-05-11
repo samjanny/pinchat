@@ -38,6 +38,7 @@ const JS_CSS_FILES = [
   '/static/js/identity.js',
   '/static/js/legal.js',
   '/static/js/login.js',
+  '/static/js/login-stash.js',
   '/static/js/nicknames.js',
   '/static/js/pow.js',
   '/static/js/theme.js',
