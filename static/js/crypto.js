@@ -378,39 +378,27 @@ class ChainRatchet {
 class CryptoManager {
     constructor() {
         this.key = null;                  // Bootstrap key (from URL)
-        this.sessionKey = null;           // ECDH-derived session key (DEPRECATED - use chain ratchet)
         this.algorithm = {
             name: 'AES-GCM',
             length: 256
         };
 
-        // Chain Ratchet for Perfect Forward Secrecy
-        this.sendingChain = new ChainRatchet();     // For messages we send
-        this.receivingChain = new ChainRatchet();   // For messages we receive
-        this.ratchetActive = false;                 // Flag: is chain ratchet initialized?
+        // Signal-inspired Double Ratchet for Post-Compromise Security.
+        // The legacy "Chain Ratchet" fields (sendingChain / receivingChain /
+        // ratchetActive / sessionKey / seenMessageHashes etc.) that lived
+        // on this class predate the Double Ratchet rewrite and are no
+        // longer reachable from any caller. They were removed in the
+        // hygiene pass; see C-13 in the audit report. The DoubleRatchet
+        // is the single source of truth for chain state.
+        this.doubleRatchet = null;
+        this.doubleRatchetActive = false;
 
-        // Signal-inspired Double Ratchet for Post-Compromise Security
-        this.doubleRatchet = null;                  // DoubleRatchet instance (DH + symmetric)
-        this.doubleRatchetActive = false;           // Flag: is double ratchet initialized?
-
-        // Enhanced Chain Ratchet: Bidirectional ratcheting (break-in recovery)
-        this.lastSenderId = null;                   // Track last message sender for direction-change detection
-
-        // Desync protection: Maximum allowed message gap
-        // Aligned with DoubleRatchet.MAX_SKIP and PROTOCOL.md.
-        this.MAX_SKIP = 100;                        // Anti-DoS: prevent memory exhaustion from excessive skips
-
-        // Anti-replay: Track seen message hashes
-        this.seenMessageHashes = new Set();
-        this.hashTimestamps = new Map(); // hash -> timestamp
-
-        // Security constants
+        // Wall-clock guardrails for defence-in-depth against captured
+        // ciphertexts that somehow land inside an active skipped-key
+        // window. The Double Ratchet's monotone counter is the primary
+        // anti-replay; these are belt-and-braces.
         this.MAX_MESSAGE_AGE = 5 * 60 * 1000;      // 5 minutes
         this.FUTURE_TOLERANCE = 30 * 1000;          // 30 seconds (clock skew)
-        this.HASH_CLEANUP_INTERVAL = 60 * 1000;     // 1 minute
-
-        // Start periodic cleanup
-        this.startHashCleanup();
     }
 
     /**
@@ -533,63 +521,6 @@ class CryptoManager {
     }
 
     /**
-     * Resync receiving chain to target counter (recovery from dropped messages)
-     *
-     * When a message is dropped (network loss, malicious server), the sender's
-     * counter advances but receiver's doesn't. This method fast-forwards the
-     * receiving chain to match the sender's counter.
-     *
-     * Security:
-     * - Anti-DoS: Limits maximum skip to prevent memory exhaustion
-     * - Logs warning for audit trail
-     * - Maintains PFS: skipped keys are not stored (irrecoverable)
-     *
-     * @param {number} targetCounter - Target message counter to reach
-     * @throws {Error} If gap exceeds MAX_SKIP (DoS protection)
-     */
-    async resyncReceivingChain(targetCounter) {
-        // Adjust for the already-incremented messageNumber to locate the last processed counter
-        const lastProcessedCounter = this.receivingChain.messageNumber - 1;
-        const gap = targetCounter - lastProcessedCounter;
-
-        if (gap <= 0) {
-            // No resync needed (already at or past target)
-            return;
-        }
-
-        if (gap > this.MAX_SKIP) {
-            throw new Error(
-                `[ChainRatchet] Desync gap too large: ${gap} messages (max ${this.MAX_SKIP}). ` +
-                `Possible DoS attack or severe network issues. Counter reset required.`
-            );
-        }
-
-        debugWarn(`[ChainRatchet] Desync detected: ${gap} message(s) dropped`);
-        debugWarn(`[ChainRatchet] Fast-forwarding from #${lastProcessedCounter} to #${targetCounter}`);
-
-        // Fast-forward: advance chain without deriving message keys
-        // (Skipped messages are permanently lost - cannot be decrypted)
-        for (let i = lastProcessedCounter; i < targetCounter; i++) {
-            await this.receivingChain.ratchet();
-            // Manually increment messageNumber to keep it in sync
-            this.receivingChain.messageNumber++;
-
-            // Remove consumed keys from window (maintain PFS)
-            this.receivingChain.messageKeyWindow.delete(i);
-        }
-
-        // Pre-derive next WINDOW_SIZE keys so the sliding window is ready for upcoming messages
-        for (let offset = 1; offset <= this.receivingChain.WINDOW_SIZE; offset++) {
-            const futureCounter = targetCounter + offset;
-            const futureKey = await this.receivingChain._deriveKeyForCounter(futureCounter, targetCounter);
-            this.receivingChain.messageKeyWindow.set(futureCounter, futureKey);
-        }
-
-        debugLog(`[ChainRatchet] Resync complete - now at counter #${this.receivingChain.messageNumber}`);
-        debugLog(`[ChainRatchet] Sliding window repopulated: [${targetCounter + 1}..${targetCounter + this.receivingChain.WINDOW_SIZE}]`);
-    }
-
-    /**
      * Encrypts a message with room and sender context binding (anti-replay protection)
      *
      * With Double Ratchet enabled:
@@ -667,124 +598,6 @@ class CryptoManager {
         // tuple already decrypted. We surface that flag to the app layer so
         // late arrivals can be visually marked.
         return { text: envelope.text, outOfOrder: envelope._outOfOrder === true };
-    }
-
-    /**
-     * Calculates SHA-256 hash of encrypted payload (for deduplication)
-     * @param {string} ciphertextBase64 - Base64 encoded ciphertext
-     * @returns {Promise<string>} Base64 encoded hash
-     */
-    async hashPayload(ciphertextBase64) {
-        const encoder = new TextEncoder();
-        const data = encoder.encode(ciphertextBase64);
-        const hashBuffer = await crypto.subtle.digest('SHA-256', data);
-        const hashArray = new Uint8Array(hashBuffer);
-        return btoa(String.fromCharCode(...hashArray));
-    }
-
-    /**
-     * Starts periodic cleanup of old message hashes
-     */
-    startHashCleanup() {
-        setInterval(() => {
-            this.cleanupOldHashes();
-        }, this.HASH_CLEANUP_INTERVAL);
-    }
-
-    /**
-     * Removes message hashes older than MAX_MESSAGE_AGE
-     */
-    cleanupOldHashes() {
-        const now = Date.now();
-        let cleanedCount = 0;
-
-        for (const [hash, ts] of this.hashTimestamps.entries()) {
-            if (now - ts > this.MAX_MESSAGE_AGE) {
-                this.seenMessageHashes.delete(hash);
-                this.hashTimestamps.delete(hash);
-                cleanedCount++;
-            }
-        }
-
-        if (cleanedCount > 0) {
-            debugLog(`[SECURITY] Cleaned up ${cleanedCount} old message hashes`);
-        }
-    }
-
-    /**
-     * Checks whether the key has been loaded
-     * @returns {boolean}
-     */
-    hasKey() {
-        return this.key !== null || this.sessionKey !== null || this.ratchetActive;
-    }
-
-    /**
-     * Initialize Chain Ratchet with ECDH-derived key material
-     *
-     * Derives separate sending/receiving chains from session key to prevent
-     * KDF collisions between Alice→Bob and Bob→Alice messages.
-     *
-     * Uses RFC 5869 HKDF with context-bound salt for defense-in-depth against
-     * theoretical preimage attacks.
-     *
-     * @param {Uint8Array} sessionKeyMaterial - 32-byte raw key from ECDH shared secret
-     * @param {boolean} isInitiator - Whether this party initiated the handshake
-     * @param {string|null} roomId - Room identifier for salt binding (optional but recommended)
-     * @param {string|null} userId - User identifier for salt binding (optional but recommended)
-     * @param {string|null} otherUserId - Other party's user identifier (optional but recommended)
-     */
-    async initializeChainRatchet(sessionKeyMaterial, isInitiator, roomId = null, userId = null, otherUserId = null) {
-        debugLog('[CRYPTO] Initializing Chain Ratchet for Perfect Forward Secrecy...');
-        debugLog(`[CRYPTO] Role: ${isInitiator ? 'Initiator' : 'Responder'}`);
-
-        if (!(sessionKeyMaterial instanceof Uint8Array) || sessionKeyMaterial.length !== 32) {
-            throw new Error('Session key material must be 32 bytes');
-        }
-
-        // Generate context-bound salt for HKDF (defense-in-depth)
-        // Binds chain keys to specific room and participant pair
-        let salt = null;
-        if (roomId && userId && otherUserId) {
-            // Sort user IDs to ensure both parties compute identical salt
-            const sortedUserIds = [userId, otherUserId].sort();
-            const saltContext = `PinChat-ChainRatchet-v1-${roomId}-${sortedUserIds[0]}-${sortedUserIds[1]}`;
-            const saltInput = new TextEncoder().encode(saltContext);
-            const saltBuffer = await crypto.subtle.digest('SHA-256', saltInput);
-            salt = new Uint8Array(saltBuffer);
-            debugLog('[CRYPTO] Using context-bound salt for HKDF (roomId + participant IDs)');
-        } else {
-            debugLog('[CRYPTO] Using default all-zero salt for HKDF (RFC 5869 compliant)');
-        }
-
-        // Role-based chain derivation for perfect symmetry:
-        // - Initiator sends with "InitiatorToResponder" and receives with "ResponderToInitiator"
-        // - Responder sends with "ResponderToInitiator" and receives with "InitiatorToResponder"
-        // This ensures: Alice's sendingChain === Bob's receivingChain (and vice versa)
-
-        const sendingLabel = isInitiator ? 'InitiatorToResponder' : 'ResponderToInitiator';
-        const receivingLabel = isInitiator ? 'ResponderToInitiator' : 'InitiatorToResponder';
-
-        const sendingKeyMaterial = await this.hkdf(
-            sessionKeyMaterial,
-            sendingLabel,
-            32,
-            salt  // Context-bound salt
-        );
-
-        const receivingKeyMaterial = await this.hkdf(
-            sessionKeyMaterial,
-            receivingLabel,
-            32,
-            salt  // Same salt for both chains
-        );
-
-        await this.sendingChain.initialize(sendingKeyMaterial);
-        await this.receivingChain.initialize(receivingKeyMaterial);
-
-        this.ratchetActive = true;
-
-        debugLog('[CRYPTO] ✅ Chain Ratchet active (Perfect Forward Secrecy enabled)');
     }
 
     /**
@@ -871,29 +684,6 @@ class CryptoManager {
     }
 
     /**
-     * Sets session key (ECDH-derived key for PFS)
-     * @param {CryptoKey} sessionKey - AES-256 key derived from ECDH
-     * @deprecated Use initializeChainRatchet() instead for true PFS
-     */
-    setSessionKey(sessionKey) {
-        debugLog('[CRYPTO] Switching to session key (ECDH-derived)');
-        this.sessionKey = sessionKey;
-    }
-
-    /**
-     * Marks bootstrap key as no longer in use (after ECDH handshake)
-     *
-     * NOTE: We keep the bootstrap key in memory to allow multiple handshakes
-     * (e.g., when a user leaves and rejoins, or during reconnection).
-     * The bootstrap key is only used to encrypt/decrypt ECDH public keys,
-     * not actual messages (which use the Chain Ratchet).
-     *
-     * This is a deliberate trade-off:
-     * - Messages still have Perfect Forward Secrecy via Chain Ratchet
-     * - Handshake can be repeated without re-extracting key from URL
-     * - Bootstrap key only protects ECDH public keys (already ephemeral)
-     */
-    /**
      * Drop the bootstrap key reference after handshake completion (protocol v1).
      *
      * PFS hardening: previously this method was a no-op to support re-handshaking
@@ -908,63 +698,33 @@ class CryptoManager {
     }
 
     /**
-     * Resets to bootstrap key (fallback when PFS ends)
-     *
-     * Called when participant count drops below 2 in a 1:1 room.
-     * Clears the ECDH session key and chain ratchet, falls back to bootstrap key
-     * so new handshakes can start from a clean state.
-     *
-     * IMPORTANT: This prevents DoS where:
-     * - User A keeps old sessionKey after User B leaves
-     * - User C enters and uses bootstrapKey
-     * - Messages become incompatible → permanent DoS
-     */
-    /**
      * Full reset of ratchet state and re-extraction of the bootstrap key.
      *
-     * Tear-down covers BOTH the legacy Chain Ratchet path AND the Double Ratchet
-     * instance that is actually in use at runtime. After this call, no key
-     * material from the previous session remains live in memory.
+     * Tears down the live Double Ratchet instance (the only ratchet at
+     * runtime — the legacy single-chain path was removed in the C-13
+     * hygiene pass) and re-reads the bootstrap key from the URL fragment
+     * or sessionStorage. Throws BOOTSTRAP_KEY_LOST when neither source
+     * has it any more so the caller can surface "re-open the room link"
+     * instead of starting a handshake without a bootstrap key.
      *
-     * The bootstrap key is re-extracted from the URL fragment (which survives
-     * WebSocket reconnects because we never navigate). If the fragment is gone
-     * (e.g., a hostile extension cleared window.location.hash), throws
-     * BOOTSTRAP_KEY_LOST so the caller can surface a "please re-open the
-     * original room link" message instead of attempting a handshake without a
-     * bootstrap key.
-     *
-     * @throws {Error} 'BOOTSTRAP_KEY_LOST' if the URL fragment is missing.
+     * @throws {Error} 'BOOTSTRAP_KEY_LOST' if the URL fragment / sessionStorage stash is missing.
      */
     async resetToBootstrapKey() {
-        debugLog('[CRYPTO] Full reset → re-extract bootstrap key from URL fragment');
+        debugLog('[CRYPTO] Full reset → re-extract bootstrap key');
 
-        // Legacy Chain Ratchet path
-        this.sendingChain.reset();
-        this.receivingChain.reset();
-        this.ratchetActive = false;
-        this.sessionKey = null;
-
-        // Double Ratchet (the one actually in use at runtime)
         if (this.doubleRatchet) {
             this.doubleRatchet.destroy();
             this.doubleRatchet = null;
         }
         this.doubleRatchetActive = false;
 
-        // Re-extract bootstrap key from URL fragment (survives WS reconnect;
-        // also has a sessionStorage recovery path for the login redirect case).
+        // Re-extract bootstrap key. extractKeyFromURL handles both the URL
+        // fragment and the sessionStorage stash (post-login restore + C-06
+        // in-tab persistence after the URL bar has been scrubbed).
         const reExtracted = await this.extractKeyFromURL();
         if (!reExtracted) {
             throw new Error('BOOTSTRAP_KEY_LOST');
         }
-    }
-
-    /**
-     * Gets the active encryption key (session key if available, otherwise bootstrap key)
-     * @returns {CryptoKey}
-     */
-    getActiveKey() {
-        return this.sessionKey || this.key;
     }
 
     /**

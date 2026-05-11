@@ -105,6 +105,21 @@ Per RFC 3986, the URL fragment (everything after `#`) is processed client-side o
 2. Server logs do not contain key material
 3. Key distribution is inherently out-of-band
 
+**Post-load lifecycle.** After the first successful import, the client
+(`crypto.js#extractKeyFromURL`) moves the fragment bytes into tab-scoped
+`sessionStorage` under the key `pinchat_hash:${pathname}` and clears
+`window.location.hash` via `history.replaceState`. The key remains
+recoverable for reload and reconnect within the tab; it is no longer
+visible in the URL bar, browser history, or to any other same-origin
+code reading `window.location.hash`. The CryptoKey reference itself is
+dropped via `deleteBootstrapKey()` once the Double Ratchet takes over.
+
+If the user is unauthenticated and bounces through `/login`, a small
+head-loaded script (`login-stash.js`) detects the fragment, stashes it
+in `sessionStorage` keyed for the eventual `/static/chat.html` landing
+page, and scrubs the URL bar before the login form renders. This means
+the bootstrap secret never lingers on `/login` either.
+
 **Security Note**: The Bootstrap Key must be shared through a secure channel (encrypted messaging, voice call, in-person). If an attacker obtains both the room URL and the Bootstrap Key, they can join the room and participate in the encrypted conversation.
 
 ### WebSocket Connection (v1)
@@ -338,8 +353,14 @@ chainKey = chainKey'
 - Window size: 16 messages
 - Pre-derived keys stored for future messages
 - Keys outside window are deleted (PFS)
-
-> **TODO**: Improve support for out-of-order messages older than the current receive counter (n < Nr) within the same chain. A `skipMessageKeys(messageNumber)` function should be implemented when `messageNumber > this.Nr`, storing skipped keys in a `skippedKeys` map for later decryption of delayed messages.
+- `skipMessageKeys(until)` is invoked when `messageNumber > Nr` (forward
+  jump within the current chain) and on receive-side DH ratchet when
+  `prevChainLength > Nr` (carry across chain rotation). Skipped keys
+  are indexed by `${dh_public_key_base64}:${n}` and bounded globally by
+  `MAX_SKIPPED_KEYS_TOTAL = 1000` with FIFO eviction. The receive path
+  short-circuits on a `skippedKeys` hit before any ratchet branch fires,
+  so a late message from a previous DH chain decrypts via its stored
+  key without triggering a spurious DH ratchet.
 
 ---
 
@@ -591,11 +612,23 @@ Alice                                    Bob
 |------|-------|------|
 | ROOM_ID | 0x01 | Variable (UTF-8) |
 | SENDER_ID | 0x02 | Variable (UTF-8) |
-| TIMESTAMP | 0x03 | 8 bytes (BigUint64) |
+| TIMESTAMP | 0x03 | 8 bytes (BigUint64, **little-endian**) |
 | NONCE | 0x04 | 16 bytes |
-| MESSAGE_NUMBER | 0x05 | 8 bytes (BigUint64) |
+| MESSAGE_NUMBER | 0x05 | 8 bytes (BigUint64, **little-endian**) |
 | MESSAGE_TYPE | 0x06 | Variable (UTF-8) |
-| RATCHET_COUNT | 0x07 | 8 bytes (BigUint64) |
+| RATCHET_COUNT | 0x07 | 8 bytes (BigUint64, **little-endian**) |
+
+**Endianness note.** The current reference implementation produces the
+BigUint64 fields by writing them through `BigUint64Array(...).buffer`,
+which yields the native byte order. On every browser platform PinChat
+runs on today this is little-endian; the wire format is therefore
+little-endian for these three fields. The DH-header signature
+(`pinchat-drheader-v1 || len:u16_be || dh || rc:u32_be`) uses an
+explicit big-endian convention for its `len` and `rc` fields — that is
+a separate canonicalisation and the asymmetry is intentional. A future
+non-JavaScript client MUST emit AAD numeric fields in little-endian to
+remain interoperable. Migrating both structures to a uniform endianness
+is a candidate for the next protocol version bump.
 
 ---
 

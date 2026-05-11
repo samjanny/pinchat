@@ -896,19 +896,22 @@ class DoubleRatchet {
     }
 
     /**
-     * Compare two Uint8Arrays for equality (constant-time)
+     * Compare two Uint8Arrays for equality.
      *
-     * SECURITY: This implementation is resistant to timing attacks.
-     * It always compares all bytes regardless of where differences occur,
-     * preventing attackers from inferring partial key matches.
+     * NOTE: The XOR-accumulator pattern below is structurally constant-time
+     * at the algorithmic level (every byte is compared, no early return).
+     * It is NOT a true wall-clock constant-time primitive — JS engines
+     * (V8/SpiderMonkey) make no guarantees about branch prediction or
+     * cache effects on `|=`. That is acceptable here because this helper
+     * only compares PUBLIC DH key bytes (this.DHrRaw vs incoming header.dh)
+     * for ratchet-direction detection. Public material; no secret is leaked
+     * by a timing side channel on a public comparison.
      *
      * @private
      */
     arraysEqual(a, b) {
         if (a.length !== b.length) return false;
 
-        // XOR accumulator - constant-time comparison
-        // All bytes are always compared, result is 0 only if all match
         let result = 0;
         for (let i = 0; i < a.length; i++) {
             result |= a[i] ^ b[i];

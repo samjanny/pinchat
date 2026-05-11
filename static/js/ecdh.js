@@ -309,7 +309,12 @@ class ECDHKeyExchange {
             throw new Error('🚨 MITM ATTACK DETECTED - Ephemeral key signature is invalid');
         }
 
-        // Import the public key (extractable: true needed for SAS generation)
+        // Import the peer's ephemeral ECDH public key.
+        // INFO-2: extractable=false. The SAS is now derived from the long-term
+        // IDENTITY keys (see ecdh.js#generateSAS), not from these ephemerals
+        // — so the original "Must be extractable for SAS generation" comment
+        // was stale. The ephemeral is only consumed by deriveBits as the
+        // `public` parameter, which does not require export.
         this.otherPublicKey = await crypto.subtle.importKey(
             'raw',
             publicKeyRaw,
@@ -317,7 +322,7 @@ class ECDHKeyExchange {
                 name: 'ECDH',
                 namedCurve: this.CURVE
             },
-            true,  // Must be extractable for SAS generation
+            false,
             []
         );
 

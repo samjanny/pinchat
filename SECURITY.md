@@ -105,7 +105,10 @@ URL format: https://host/c/{room_id}#key={base64url_encoded_key}
 - Never transmitted to server (URL fragment per RFC 3986)
 - Shared out-of-band (copy/paste, messaging app, QR code)
 - Used only for initial handshake encryption
-- Retained in memory for re-handshaking (reconnection scenarios)
+- Moved out of the URL bar and into tab-scoped `sessionStorage`
+  immediately after the first import (see Lifecycle step 6 below), so
+  the secret stops appearing in browser history, screen-shares, or any
+  same-origin code reading `window.location.hash`.
 
 **Usage**:
 - Encrypts ECDH public keys during handshake (AES-GCM with AAD)
@@ -119,9 +122,44 @@ URL format: https://host/c/{room_id}#key={base64url_encoded_key}
 3. URL shared with participants (out-of-band)
 4. Each participant extracts key from fragment
 5. Key used to encrypt/decrypt ECDH handshake
-6. Double Ratchet takes over for message encryption
-7. Bootstrap Key retained for potential re-handshake
+6. After successful import, the fragment bytes are stashed in
+   sessionStorage (key: `pinchat_hash:/static/chat.html`) and removed
+   from window.location.hash via history.replaceState. Reload survives.
+7. Double Ratchet takes over for message encryption
+8. cryptoManager.deleteBootstrapKey() nulls the in-memory CryptoKey
+   reference after handshake completion. resetToBootstrapKey() re-reads
+   the stash on reconnect / handshake retry.
 ```
+
+### Identity Key Storage
+
+ECDSA P-256 keypairs that authenticate each Double Ratchet DH header
+are persisted client-side in IndexedDB under the database name
+`pinchat_identity_v1` (object store `keys`, single entry under key
+`identity`). Entries carry a `version` field and an absolute `expiresAt`
+timestamp (24 h from creation, aligned with the default `session_ttl_secs`).
+
+**Properties:**
+- The private side is created `extractable: true` for a single re-import
+  round-trip, then re-imported as `extractable: false` and the
+  intermediate PKCS#8 buffer is zeroed (best-effort). All subsequent
+  observations of the private key — including the round-trip through
+  IndexedDB structured-clone (W3C IndexedDB §6 + WebCrypto §13) — yield
+  a non-extractable CryptoKey handle.
+- The public side stays extractable so it can be serialised to raw
+  bytes for transmission to the peer.
+- Scope: per-origin, never synced, never sent to the server.
+- Expiry: 24 h, after which `generateIdentityKeypair()` discards the
+  stale entry and mints a fresh keypair.
+- Forget gesture: `IdentityKeyManager.clearStoredIdentity()` for an
+  explicit "forget me on this device" reset.
+
+The reason this entry is persisted at all is SAS continuity: pre-C-04
+the identity keypair was regenerated on every page load, which meant
+the SAS code that a user had verified out-of-band stopped matching the
+next time they reopened the chat. The pressure to skip verification
+followed mechanically. Persistence keeps the SAS stable so verification
+becomes a one-time gesture per device-day.
 
 ### Symmetric Encryption
 
@@ -232,7 +270,8 @@ CK_{n+1} = HMAC-SHA256(CK_n, "ChainRatchet")
 
 **Algorithm**: PBKDF2-SHA256
 - Iterations: 100,000
-- Output: 36 bits (6 emoji from 64-character alphabet)
+- Output: 48 bits (8 emoji from 64-character alphabet — 6 bits per emoji)
+- Also displayed as 12 hex characters
 
 **Input Binding**:
 ```
@@ -241,9 +280,16 @@ Salt = roomId || sorted_nonces || sorted_timestamps
 ```
 
 **Security Properties**:
-- Brute-force resistant: 100K iterations adds computational cost
-- Context-bound: SAS changes per room and session
-- Deterministic: Both parties compute identical output
+- Brute-force resistant: 100K iterations adds computational cost (≈10s on
+  consumer hardware for a single SAS derivation)
+- Context-bound: SAS changes per room and per handshake (nonces and
+  timestamps are session-fresh)
+- Deterministic: Both parties compute identical output from the same
+  inputs
+- Identity persistence (IndexedDB, 24 h TTL — see §"Identity Key
+  Storage") keeps the SAS stable across reconnects with the same human
+  peer, so a user who verified once does not face a different code on
+  every page reload.
 
 ---
 
