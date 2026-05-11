@@ -414,28 +414,40 @@ class CryptoManager {
     }
 
     /**
-     * Extracts the key from the URL fragment
+     * Extracts the key from the URL fragment, then promotes the fragment
+     * to sessionStorage and scrubs the URL bar (C-06).
+     *
+     * Sources, in priority order:
+     *   1. window.location.hash — initial page load via the invite link.
+     *   2. sessionStorage[`pinchat_hash:${pathname}`] — post-login restore
+     *      (login-stash.js / websocket.js / homepage.js) AND in-tab re-reads
+     *      after C-06 has already scrubbed the URL on a previous call.
+     *
+     * After a successful import the raw fragment bytes are written back to
+     * sessionStorage and the URL is rewritten via history.replaceState() to
+     * remove `#key=...`. Rationale: keeping the bootstrap secret in
+     * window.location.hash for the entire chat session means any same-origin
+     * script (extension, popup, devtools observer) can read it directly, and
+     * the URL bar becomes a leak vector during screen-sharing. sessionStorage
+     * is tab-scoped, auto-cleared on tab close, and not visible in the URL.
+     *
      * @returns {Promise<CryptoKey|null>}
      */
     async extractKeyFromURL() {
+        const stashKey = `pinchat_hash:${window.location.pathname}`;
+
+        // Priority 1: the URL fragment.
         let fragment = window.location.hash.substring(1);
 
-        // Recovery path: websocket.js/homepage.js stash window.location.hash in
-        // sessionStorage before redirecting to /login so the fragment (which carries
-        // the E2E key) never reaches the server. When we return here without a hash,
-        // restore it from sessionStorage and put it back into the URL for any
-        // downstream reader.
+        // Priority 2: sessionStorage stash (login-stash.js, in-tab re-read,
+        // or websocket.js's 401-bounce path). We intentionally do NOT
+        // remove the stash here — the post-import block below rewrites it
+        // anyway, and leaving it in place during the import phase means a
+        // crash before the rewrite still keeps the secret recoverable.
         if (!fragment) {
-            const stashKey = `pinchat_hash:${window.location.pathname}`;
             const saved = sessionStorage.getItem(stashKey);
             if (saved) {
-                sessionStorage.removeItem(stashKey);
                 fragment = saved.startsWith('#') ? saved.substring(1) : saved;
-                history.replaceState(
-                    null,
-                    '',
-                    window.location.pathname + window.location.search + '#' + fragment
-                );
             }
         }
 
@@ -443,7 +455,7 @@ class CryptoManager {
         let keyBase64 = params.get('key');
 
         if (!keyBase64) {
-            debugError('No encryption key found in URL');
+            debugError('No encryption key found in URL or sessionStorage');
             return null;
         }
 
@@ -473,6 +485,30 @@ class CryptoManager {
                 false,  // Non-extractable: prevents key theft even if XSS occurs
                 ['encrypt', 'decrypt']
             );
+
+            // C-06: Move the bootstrap secret out of window.location.hash
+            // and into sessionStorage. The key remains recoverable across
+            // reloads (sessionStorage persists for the tab) and across
+            // resetToBootstrapKey() calls, but it is no longer visible in
+            // the URL bar, browser history, or to any code reading
+            // window.location.hash.
+            try {
+                sessionStorage.setItem(stashKey, '#' + fragment);
+            } catch (_) {
+                // Storage full / disabled: keep the fragment in URL as a
+                // fallback. Functional, just less private.
+            }
+            if (window.location.hash) {
+                try {
+                    history.replaceState(
+                        null,
+                        '',
+                        window.location.pathname + window.location.search
+                    );
+                } catch (_) {
+                    /* replaceState unavailable: best-effort */
+                }
+            }
 
             debugLog('✅ Encryption key loaded successfully');
             return this.key;

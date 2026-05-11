@@ -5,6 +5,12 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Login</title>
     <link rel="stylesheet" href="/static/css/style.css" integrity="sha256-I7jppwH+0/qRDZPZftMjmb3TS6Ou3wlt+aZx9qF6oZ0=" crossorigin="anonymous" >
+    <!--
+        Head-loaded synchronously so the bootstrap key fragment is scrubbed
+        from the URL bar before any other script (or the user) can observe
+        it. See static/js/login-stash.js and finding C-03 in the audit log.
+    -->
+    <script src="/static/js/login-stash.js" integrity="sha256-DD4V2qth6q+/FQP66jysQ1s7TA4xfiAo5t6etfb6xog=" crossorigin="anonymous" ></script>
     <script src="/static/js/theme.js" integrity="sha256-vc83MC35lVoXBnYkFcbi+cE5EgJ+drCEfcjEryWT40A=" crossorigin="anonymous" ></script>
 </head>
 <body>
