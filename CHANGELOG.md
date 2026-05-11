@@ -4,6 +4,189 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Dates are the repository-local commit dates; entries are curated for user-visible impact
 rather than being a 1:1 mirror of `git log`.
 
+## [2026-05-11] — v0.2.3
+
+Security and UX patch release driven by a full audit pass on the 1:1
+chat path. Wire protocol unchanged (still v1); existing v1 clients
+remain interoperable with the patched server, and vice-versa. The
+`hashes.json.signed` manifest needs to be regenerated and re-signed
+out-of-band with the maintainer's signing key before deploy — the
+shipped JS bytes have changed across this release.
+
+### Security (high)
+
+- **Double Ratchet — concurrent send race fixed.** `encryptMessage()`
+  and `decryptMessage()` mutate `Ns`/`Nr`/chain state/`DHs`/`DHr`/
+  `rootKey` across multiple `await` points. Two overlapping calls
+  (rapid double-tap on Send, paste-then-Enter, send-while-image-upload)
+  could observe a half-mutated state: counter already reserved on the
+  sending chain but `chainKeyMaterial` not yet ratcheted, so the
+  produced message key was `HMAC(CK_0, "MessageKey-1")` instead of
+  `HMAC(CK_1, "MessageKey-1")`. The peer could not derive it; AEAD
+  failed; the user saw a false MITM warning while the legitimate
+  message was rolled back. A promise-mutex now serialises every
+  state-mutating call through a single chain shared by both directions
+  (the receive-side DH ratchet rotates the sending chain too, so
+  per-direction locks would not have been enough). The WebSocket
+  inbound dispatch in `websocket.js` also runs through a serial queue
+  so application-level handlers in `app.js` observe messages in arrival
+  order.
+- **Double Ratchet — cross-DH late delivery fixed.** A delayed message
+  whose key was already sitting in `this.skippedKeys` (because the
+  receiver had ratcheted past it during a peer DH rotation) used to hit
+  the `isNewKey` branch first, since `header.dh` no longer matched
+  `this.DHrRaw`. That triggered a spurious `performDHRatchetOnReceive`
+  on what was actually an old key; AEAD failed and the message was
+  silently lost despite its key being on disk. The receive path now
+  checks `skippedKeys` *before* the `isNewKey` branch and returns the
+  plaintext flagged `_outOfOrder = true` without touching chain state.
+- **Double Ratchet DH keypairs imported / generated non-extractable.**
+  The handshake ECDH keypair was already created with
+  `extractable: false`, but the DH keypairs the Double Ratchet rotates
+  on every send-side and receive-side ratchet were `true`. The public
+  side of an asymmetric WebCrypto key is always extractable regardless
+  of the parameter, so `exportKey('raw', publicKey)` for header
+  construction still works; the `true` was only weakening the *private*
+  side under XSS / extension compromise. Same change applied to peer
+  DH public keys (`this.DHr`) — `skipMessageKeys` now reads raw bytes
+  from the existing `this.DHrRaw` cache instead of `exportKey`-ing the
+  imported handle.
+- **Bootstrap fragment preserved across the `/login` redirect.** The
+  `require_auth` middleware used to issue a bare `Redirect::to("/login")`
+  when an unauthenticated user clicked `/c/<uuid>#key=<base64>`. After
+  the round-trip, the fragment was lost and the user landed on `/` with
+  no way back to the room — usability bug *and*, depending on browser,
+  the bootstrap secret had transited through `/login`'s URL bar
+  visible to anything reading `window.location.hash` on the login page.
+  The middleware now redirects to `/login?redirect=<path-and-query>`
+  with an open-redirect guard, and a head-loaded `login-stash.js` runs
+  before the form renders to move the fragment into `sessionStorage`
+  keyed for the chat page and scrub the URL bar.
+- **Bootstrap key moved out of the URL bar on the chat page itself.**
+  `crypto.js#extractKeyFromURL` now stashes the fragment bytes in
+  `sessionStorage` and rewrites the URL via `history.replaceState`
+  immediately after the first successful AES-GCM import. Reload still
+  works (sessionStorage survives), `resetToBootstrapKey()` still works,
+  and the secret is no longer visible in the address bar for the
+  entire chat session.
+- **JTI conservation in the WebSocket upgrade.** `ws_handler` used to
+  call `state.consume_token(jti)` *before* the Origin allowlist check.
+  A cross-origin upgrade attempt (hostile script with a stolen session
+  cookie, browser navigation race) burned the JTI and locked the
+  legitimate client out for the remaining 30 s of TTL. The reorder
+  pushes `consume_token` to *last*, after every stateless gate
+  (subprotocol, JWT signature, room claim, Origin) has passed. New
+  `rejects_bad_origin_preserves_jti` test asserts the property
+  directly against `state.consumed_tokens`.
+
+### UX
+
+- **Identity keypair persisted in IndexedDB for SAS continuity.** The
+  ECDSA P-256 identity that signs DH headers was previously regenerated
+  on every page load, which meant the SAS code a user had verified
+  out-of-band stopped matching the next time they reopened the chat.
+  Pressure to skip verification followed mechanically. The keypair is
+  now stored in `pinchat_identity_v1` / `keys` IndexedDB with a 24-hour
+  TTL (aligned with the default `session_ttl_secs`) and a schema
+  version field. Private side is non-extractable both on creation and
+  after structured-clone round-trip (W3C IndexedDB §6 + WebCrypto §13
+  preserve `[[extractable]]`). `IdentityKeyManager.clearStoredIdentity()`
+  is the explicit forget gesture for "forget me on this device". A
+  `destroy()` call from a session abort no longer wipes the persisted
+  identity by default: SAS-mismatch / handshake-abort events point at
+  peer substitution, not at compromise of the user's own private key.
+  Privacy disclosure updated in `static/privacy.html`.
+
+### Defensive hardening
+
+- **Server-side `REPLAY_CACHE_MAX_PER_ROOM` default 10000 → 1000.**
+  The previous default extrapolated to roughly 1.4 GB worst case
+  across 1000 rooms on a small VPS, disproportionate given the cache
+  is advisory (the authoritative anti-replay is the client-side
+  Double Ratchet counter). The new default still buffers about
+  17 minutes of traffic at `MSG_RATE_LIMIT = 30 msg/s`. The
+  ~"640 KB" comment in the previous version was wrong — the entry
+  cost is closer to 136 B (hex SHA-256 String + DateTime + HashSet
+  overhead), not 64 B.
+- **WebSocket frame rate limiter now counts all non-Close frames.**
+  Previously the `frame_rate_limit` counter only fired inside the
+  `WsMessage::Text` branch of the receive loop; Binary / Ping / Pong
+  floods bypassed the budget even though `tungstenite` still woke the
+  recv task for each one. The classifier now matches the frame type up
+  front: Close terminates, Text falls through to per-type handling,
+  everything else is counted and dropped silently. Lifecycle gates
+  (room TTL, max connection age) were also hoisted above the
+  type-specific branch so an expired room is severed on the next
+  inbound frame regardless of type.
+
+### Hygiene
+
+- **`crypto.js` dead-code purge.** Removed roughly 200 LOC of legacy
+  in-class Chain Ratchet path (`sessionKey`, `sendingChain`,
+  `receivingChain`, `ratchetActive`, `initializeChainRatchet`,
+  `setSessionKey`, `resyncReceivingChain`, `getActiveKey`, `hasKey`)
+  and hash-based replay scaffolding (`seenMessageHashes`,
+  `hashTimestamps`, `startHashCleanup`, `cleanupOldHashes`,
+  `hashPayload`) that has never been written to since the Double
+  Ratchet rewrite. A perpetual `setInterval` is also gone.
+- **`otherPublicKey` ephemeral imported non-extractable.** The
+  stale "Must be extractable for SAS generation" comment in
+  `ecdh.js` predated the move of the SAS derivation to identity keys.
+- **`arraysEqual` comment de-overpromised.** The helper only ever
+  compares public DH key bytes for ratchet-direction detection — no
+  secret is being compared and JS engines do not give true wall-clock
+  constant-time guarantees. The comment now says so plainly.
+
+### Docs
+
+- `SECURITY.md`: SAS output corrected from 36 bit / 6 emoji to
+  48 bit / 8 emoji + hex; new "Identity Key Storage" subsection
+  documenting the IndexedDB persistence; Bootstrap Key lifecycle
+  updated to reflect the post-import sessionStorage move + URL scrub
+  and the login-stash flow.
+- `PROTOCOL.md`: AAD-TLV `BigUint64` field endianness specified as
+  little-endian (current implementation behaviour, asymmetric with
+  the explicit big-endian DH-header signature — a candidate for the
+  next protocol bump); Bootstrap Key prose updated to match; stale
+  TODO on `skipMessageKeys` replaced by the actual implementation
+  behaviour.
+- `README.md`: `REPLAY_CACHE_MAX_PER_ROOM` default fixed in the
+  configuration table; Bootstrap Key section now describes the
+  sessionStorage move and the login-stash flow; SAS section mentions
+  the identity-key persistence.
+
+### Tests
+
+- New `tests/test-ratchet-correctness.js` covering the three
+  regressions above: 50 concurrent encrypts produce strictly
+  sequential counters, 30 concurrent encrypts all decrypt at the
+  peer, late delivery across a DH ratchet round decrypts via
+  `skippedKeys` with `_outOfOrder = true`, and DH private keys are
+  non-extractable across `initialize` / send-side / receive-side
+  ratchets.
+- New `auth_middleware.rs` tests covering the `?redirect=` carry-through
+  for `require_auth`.
+- `tests/run-all-tests.js`: registered the new correctness suite.
+- Existing legacy `tests/test-double-ratchet.js` and
+  `tests/test-chain-ratchet.js` unchanged; they continue to import
+  inlined copies of the classes and serve as static spec checks. A
+  follow-up will migrate them to `require()` the production sources
+  (`crypto.js` / `identity.js` / `double-ratchet.js` now export under
+  CommonJS when `module.exports` is present).
+
+### Packaging
+
+- `static/chat.html`: SRI `integrity` attributes refreshed for
+  `crypto.js`, `identity.js`, `double-ratchet.js`, `ecdh.js`, and
+  `websocket.js`.
+- `static/login.html`: new `login-stash.js` loaded synchronously in
+  `<head>` with its own SRI integrity attribute.
+- `hashes.json.signed` (extension manifest) **must be regenerated
+  and re-signed** with the maintainer's offline signing key before
+  the production deploy — the shipped JS bytes have changed across
+  this release. See `extensions/README.md` and the signing helpers
+  under `extensions/` for the procedure.
+
 ## [2026-05-07] — v0.2.2
 
 Security patch release. Wire protocol unchanged (still v1); no client-side

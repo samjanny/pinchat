@@ -180,7 +180,9 @@ Anyone who gets the full room link can join the room unless participants perform
 
 The Bootstrap Key encrypts the initial ECDH key exchange. After the handshake completes, the ratchet-based session encryption takes over for message encryption.
 
-Protocol v1 hardening: once the ratchet is running, the in-memory Bootstrap Key is dropped. On reconnect, the key is re-extracted from the URL fragment. If the fragment is missing, for example because a browser extension cleared `window.location.hash`, the client surfaces a clear “please re-open the original room link” message instead of attempting a handshake without a Bootstrap Key.
+Protocol v1 hardening: once the ratchet is running, the in-memory Bootstrap Key is dropped. The Bootstrap Key bytes are moved out of `window.location.hash` into tab-scoped `sessionStorage` immediately after the first successful import and the URL bar is rewritten without the fragment, so the secret stops appearing in the address bar, browser history, screen-shares, or any same-origin code reading `window.location.hash`. On reconnect, the key is re-extracted from `sessionStorage` (or the URL fragment if the stash is unavailable). If neither source has it any more, for example because a browser extension cleared the storage, the client surfaces a clear “please re-open the original room link” message instead of attempting a handshake without a Bootstrap Key.
+
+When an unauthenticated user clicks an invite link and is redirected to `/login`, a small head-loaded script (`login-stash.js`) detects the fragment, stashes it for the eventual chat page, and scrubs the URL bar before the login form renders. The Bootstrap Key never lingers on the login page either.
 
 ## Encryption Architecture
 
@@ -313,6 +315,8 @@ PinChat includes a Short Authentication String, or SAS, so participants can comp
 If users skip SAS verification, the chat may still be encrypted against passive observers, but it is not strongly authenticated against an active relay/server man-in-the-middle during the initial exchange.
 
 For sensitive conversations, do not skip SAS verification.
+
+The long-term identity keypair used to sign DH header rotations is persisted client-side in IndexedDB (per-origin, never synced, 24-hour TTL) so the SAS that a user has verified out of band stays the same across reconnects, tab refreshes, and short browser restarts. The private side of the keypair is non-extractable both on creation and after round-tripping through IndexedDB structured-clone. Erasing site data (or calling the explicit forget gesture) discards the entry; the next session mints a fresh one and the SAS resets.
 
 ## System Architecture
 
@@ -479,7 +483,7 @@ These settings control application behavior only. They do not automatically conf
 | `LOGIN_BURST_SIZE` | `5` | Login attempts allowed per period |
 | `LOGIN_PERIOD_SECS` | `900` | Window for login rate limiting |
 | `TRUSTED_PROXIES` | empty | Comma-separated proxy IPs/CIDRs trusted for `X-Forwarded-For` |
-| `REPLAY_CACHE_MAX_PER_ROOM` | `10000` | Maximum anti-replay entries per room |
+| `REPLAY_CACHE_MAX_PER_ROOM` | `1000` | Maximum anti-replay entries per room. The cache is an advisory layer; the authoritative anti-replay is the Double Ratchet counter, checked client-side. |
 | `MAX_IMAGE_SIZE` | `300KB` | Maximum image size, as bytes or with `KB`/`MB` suffix |
 | `WEBSITE_DIR` | empty | Custom static files directory. Falls back to `/static` |
 
