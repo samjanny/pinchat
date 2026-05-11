@@ -40,6 +40,13 @@
                     <li><strong>Analytics, trackers, or advertising cookies.</strong> None are used.</li>
                 </ul>
 
+                <p>What is stored <strong>locally in your browser</strong> (never transmitted to the Controller):</p>
+                <ul>
+                    <li><strong>Long-term identity keypair (IndexedDB <code>pinchat_identity_v1</code>).</strong> An ECDSA P-256 keypair generated on first chat. The private side is created and re-imported as <em>non-extractable</em>: it remains an opaque handle inside the WebCrypto API and cannot be exported, even by malicious scripts running in the page. Used exclusively in your browser to sign your ephemeral Diffie-Hellman public keys (MITM defence — Signal Protocol). Persisted so that the Short Authentication String (SAS) you verify with your contact stays the same across reconnects and tab refreshes, instead of resetting every page load.</li>
+                    <li><strong>Bootstrap-key transit cache (sessionStorage).</strong> The room URL fragment is moved from the address bar into tab-scoped <code>sessionStorage</code> immediately after page load and erased from the URL bar, so the secret stops appearing in browser history, screen-shares, or window-title overlays for the rest of the chat session.</li>
+                </ul>
+                <p>This local data lives on your device, not on the server. You can erase it at any time from your browser's site-settings panel (Application → Storage → IndexedDB / Session Storage for Chromium-based browsers, or the equivalent in Firefox/Safari). The identity entry also expires automatically after 24 hours and is regenerated on next use.</p>
+
                 <h2>3. Purposes and Legal Bases</h2>
                 <ul>
                     <li>Operating the Service and protecting it against abuse (rate limiting, PoW, session authentication) — legal basis: <strong>legitimate interest</strong> (Art. 6(1)(f) GDPR) in providing a functional and secure service.</li>
@@ -54,6 +61,7 @@
                 <ul>
                     <li>Rooms and their in-memory metadata: until the TTL you configure (15 minutes to 24 hours) or the last participant disconnects, whichever comes first. No on-disk persistence.</li>
                     <li>Session cookie: valid for the session duration configured by the Operator (default 24 hours, sliding window), cleared on logout.</li>
+                    <li><strong>Local identity keypair (IndexedDB):</strong> 24 hours from creation, then automatically discarded and regenerated. Cleared immediately if you erase site data for the origin.</li>
                     <li><strong>Reverse-proxy and application logs:</strong> <span data-legal="OPERATOR_LOG_RETENTION">(log retention policy not configured)</span> <span data-legal="OPERATOR_HOSTING_PROVIDER_LOG_NOTE">(hosting provider log note not configured)</span></li>
                     <li><strong>Abuse report correspondence:</strong> retained for up to <span data-legal="OPERATOR_ABUSE_REPORT_RETENTION">(abuse report retention not configured)</span> from resolution of the report, then deleted.</li>
                 </ul>
