@@ -1,8 +1,8 @@
 {
   "data": {
     "version": "1.2.0",
-    "sequence": 31,
-    "generated": "2026-05-12T09:59:10.438Z",
+    "sequence": 32,
+    "generated": "2026-05-12T10:14:08.619Z",
     "site": "https://pinchat.io",
     "files": [
       {
@@ -31,7 +31,7 @@
       },
       {
         "path": "/static/js/ecdh.js",
-        "hash": "0e821a27ab1e9996e52f4844278468278b1a5035fb38cf3bcfec4875918257e6"
+        "hash": "a03b7ea58f3f173c6b77b9ee28fb99587ba36052673e282b766e06280c023f78"
       },
       {
         "path": "/static/js/emoji.js",
@@ -87,7 +87,7 @@
       },
       {
         "path": "/static/chat.html",
-        "hash": "836ab2c8fef751f898c9a267df581ec5d06ac4b336a3779d7ccb49c9379d9eec"
+        "hash": "177966d6cd7e106c12ac935f29672b16c6c9ae7812324d9977d701b7a31b658f"
       },
       {
         "path": "/static/terms.html",
@@ -103,5 +103,5 @@
       }
     ]
   },
-  "signature": "MEYCIQCzmV1LPraaZf3x878dbQHj/yNv/xzkr0weXbnwhMeu8gIhALzX5ItjVJFAneU6BAkzi6cx4q/WAL1lZ5H3IuJqE5kQ"
+  "signature": "MEUCICk85dtavqznMibVHGcX1krGiqJ5XGyJs/qKDgsMUAB+AiEAmI85kIWNhfEbyHApYZC2wRZtZ5viBgD1vYc/Zg8xKhU="
 }
