@@ -43,7 +43,18 @@ const OFFICIAL_DOMAIN = 'pinchat.io';
 
 // Official GitHub repository for manifest - DO NOT MODIFY for official pinchat.io usage
 const GITHUB_REPO = 'samjanny/pinchat';
-const GITHUB_BRANCH = 'main';
+// F-15: pin the manifest URL to a release tag, not a mutable branch.
+// Rationale: an attacker with GitHub-write access (account takeover, malicious
+// PR merge, stolen PAT) could otherwise push a freshly-signed-with-stolen-key
+// manifest to `main` and have every installed extension fetch it on the next
+// refresh. Pinning to a tag moves the trust anchor onto a string that cannot
+// be silently rewritten — a tag rebase shows up in `git log --tags --graph`
+// and the manifest is immutable at the GitHub raw URL once the tag is pushed.
+// Lifecycle: this constant MUST be bumped to the new tag on every extension
+// release. A server-side release that does NOT ship a new extension keeps
+// using the previous pinned manifest — that is the intended behaviour and
+// reinforces the trust anchor.
+const GITHUB_TAG = 'v0.2.6';
 
 // Minimum acceptable manifest sequence — hardcoded floor to defeat replay
 // attacks against fresh installs (where lastKnownSequence in storage is 0).
@@ -54,7 +65,7 @@ const MIN_KNOWN_SEQUENCE = 20;
 
 // Configuration
 const CONFIG = {
-    HASH_LIST_URL: `https://raw.githubusercontent.com/${GITHUB_REPO}/${GITHUB_BRANCH}/hashes.json.signed`,
+    HASH_LIST_URL: `https://raw.githubusercontent.com/${GITHUB_REPO}/${GITHUB_TAG}/hashes.json.signed`,
     SITE_URL: `https://${OFFICIAL_DOMAIN}`,
     PUBLIC_KEY: PINCHAT_PUBLIC_KEY,
     CHECK_INTERVAL_MINUTES: 5,

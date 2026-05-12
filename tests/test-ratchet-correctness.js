@@ -270,16 +270,114 @@ async function testDhPrivateNonExtractable() {
     pass('Peer DH public keys (DHr) imported non-extractable');
 }
 
+// ── Test 6: F-10 encrypt-path rollback on AEAD failure ──────────────────
+//
+// _encryptMessageImpl mutates Ns, sendingChain (counter + chainKeyMaterial)
+// and, on a send-side DH ratchet, DHs / rootKey / ratchetCount across multiple
+// await points. F-10 added a _drSnapshot + try/catch + Object.assign rollback
+// mirroring the decrypt path. We assert two invariants:
+//
+//   (a) when crypto.subtle.encrypt throws synthetically, encryptMessage
+//       rejects AND the public ratchet counters (Ns, ratchetCount, header.n
+//       that would have been emitted) remain unchanged;
+//   (b) the very next legitimate encrypt produces the SAME counter the
+//       failed one would have produced (i.e. the chain was not consumed).
+//       Bob can still decrypt it.
+
+async function testEncryptRollbackOnAeadFailure() {
+    const { alice, bob } = await setupPair();
+
+    // Warm up: send a few in-order messages so we are well past the initial
+    // state and any first-message branching.
+    for (let i = 0; i < 3; i++) {
+        const enc = await alice.encryptMessage(`warm-${i}`, ROOM, ALICE_ID);
+        await bob.decryptMessage(enc.payload, enc.header, ROOM, ALICE_ID);
+    }
+
+    // Capture state just before the synthetic-failure call.
+    const snapshot = {
+        Ns: alice.Ns,
+        ratchetCount: alice.ratchetCount,
+        sendingChainCounter: alice.sendingChain.messageNumber,
+        // chainKeyMaterial is a Uint8Array — copy bytes for byte-comparison
+        sendingChainKey: new Uint8Array(alice.sendingChain.chainKeyMaterial),
+        DHsSignature: alice.DHsSignature,
+    };
+
+    // Monkey-patch crypto.subtle.encrypt to throw on the next call only.
+    // The DoubleRatchet implementation reads `crypto.subtle.encrypt` directly,
+    // and Node 19+ aliases globalThis.crypto to webcrypto — so patching the
+    // bound encrypt on the global subtle reaches the production code.
+    const realEncrypt = webcrypto.subtle.encrypt.bind(webcrypto.subtle);
+    let nextEncryptThrows = true;
+    webcrypto.subtle.encrypt = async function patched(...args) {
+        if (nextEncryptThrows) {
+            nextEncryptThrows = false;
+            throw new Error('synthetic AES-GCM encrypt failure (F-10 regression)');
+        }
+        return realEncrypt(...args);
+    };
+
+    let threw = false;
+    try {
+        await alice.encryptMessage('would-fail', ROOM, ALICE_ID);
+    } catch (e) {
+        threw = true;
+    }
+    assert.strictEqual(threw, true, 'encryptMessage must propagate the synthetic encrypt failure');
+
+    // Assert state has been rolled back.
+    assert.strictEqual(alice.Ns, snapshot.Ns, 'Ns must be restored after rollback');
+    assert.strictEqual(alice.ratchetCount, snapshot.ratchetCount, 'ratchetCount must be restored');
+    assert.strictEqual(
+        alice.sendingChain.messageNumber,
+        snapshot.sendingChainCounter,
+        'sendingChain.messageNumber must be restored'
+    );
+    assert.strictEqual(alice.DHsSignature, snapshot.DHsSignature, 'DHsSignature must be restored');
+
+    // Byte-compare the chain key material. If the chain ratcheted forward
+    // during the failed encrypt and we did NOT roll back, this would differ.
+    assert.strictEqual(
+        alice.sendingChain.chainKeyMaterial.length,
+        snapshot.sendingChainKey.length,
+        'sendingChain.chainKeyMaterial length must match snapshot'
+    );
+    for (let i = 0; i < snapshot.sendingChainKey.length; i++) {
+        assert.strictEqual(
+            alice.sendingChain.chainKeyMaterial[i],
+            snapshot.sendingChainKey[i],
+            `sendingChain.chainKeyMaterial[${i}] must match snapshot (rollback)`
+        );
+    }
+
+    // Restore and assert forward progress: the next legitimate encrypt MUST
+    // produce the counter the failed one would have produced (chain was not
+    // consumed), and Bob MUST be able to decrypt.
+    webcrypto.subtle.encrypt = realEncrypt;
+    const recover = await alice.encryptMessage('after-rollback', ROOM, ALICE_ID);
+    assert.strictEqual(
+        recover.header.n,
+        snapshot.Ns,
+        'next encrypt after rollback must reuse the unconsumed counter'
+    );
+    const dec = await bob.decryptMessage(recover.payload, recover.header, ROOM, ALICE_ID);
+    assert.strictEqual(dec.text, 'after-rollback');
+
+    pass('encrypt path rolls back ratchet state on AEAD failure (F-10)');
+}
+
 // ── Runner ───────────────────────────────────────────────────────────────
 
 (async () => {
-    console.log('Ratchet correctness tests (regressions for C-01, C-02, C-05):');
+    console.log('Ratchet correctness tests (regressions for C-01, C-02, C-05, F-10):');
     try {
         await testSequentialBaseline();
         await testConcurrentEncryptMonotonicCounters();
         await testConcurrentEncryptAllDecryptable();
         await testDelayedCrossDhRound();
         await testDhPrivateNonExtractable();
+        await testEncryptRollbackOnAeadFailure();
         console.log('');
         console.log('All ratchet-correctness tests PASSED.');
         process.exit(0);

@@ -132,6 +132,33 @@ fn ip_in_cidr(ip: &IpAddr, cidr: &str) -> Option<bool> {
     }
 }
 
+/// Canonicalize an IP address string for rate-limit / cache identity.
+///
+/// IPv4 addresses are returned unchanged (the 32-bit space is already
+/// reasonably stable per-host).
+///
+/// IPv6 addresses are truncated to their /64 prefix: the lower 64 bits are
+/// zeroed before re-serialisation. This collapses every host suffix derived
+/// from the same /64 — SLAAC privacy-extensions rotations (RFC 4941), VPS
+/// providers that assign a /64 per tenant (Hetzner, Linode, OVH), and any
+/// other pattern where one logical "user" cycles through 2^64 addresses
+/// from the same prefix — into a single rate-limit bucket.
+///
+/// Inputs that fail to parse as `IpAddr` are returned unchanged. The HMAC
+/// downstream still produces a stable hash, just without the canonical
+/// /64 collapse.
+fn canonicalize_for_rate_limit(ip: &str) -> String {
+    match ip.parse::<IpAddr>() {
+        Ok(IpAddr::V4(_)) => ip.to_string(),
+        Ok(IpAddr::V6(v6)) => {
+            let s = v6.segments();
+            // Zero out segments 4..8 → /64 prefix
+            std::net::Ipv6Addr::new(s[0], s[1], s[2], s[3], 0, 0, 0, 0).to_string()
+        }
+        Err(_) => ip.to_string(),
+    }
+}
+
 /// Compute HMAC-SHA256 hash of IP address
 ///
 /// Returns hex-encoded hash string for use as cache/map key
@@ -141,6 +168,13 @@ fn ip_in_cidr(ip: &IpAddr, cidr: &str) -> Option<bool> {
 /// - IPv4 address space is only ~4 billion addresses
 /// - Plain SHA-256 vulnerable to rainbow tables (~4GB, 30 min on GPU)
 /// - HMAC with secret key makes precomputation infeasible
+///
+/// # IPv6 Canonicalization
+/// IPv6 addresses are truncated to /64 before HMAC (see
+/// `canonicalize_for_rate_limit`). Without this, an attacker with a /64
+/// allocation (typical residential or VPS assignment) could rotate
+/// through 2^64 host suffixes and each address would be a separate
+/// rate-limit / challenge-cache bucket — defeating per-host limits.
 ///
 /// # Development Mode
 /// When PRIVACY_MODE environment variable is set to "development",
@@ -152,9 +186,10 @@ pub fn hash_ip(ip: &str, secret: &[u8; 32]) -> String {
         return ip.to_string();
     }
 
-    // Production mode: return HMAC-SHA256(IP)
+    // Production mode: canonicalize then HMAC-SHA256
+    let canonical = canonicalize_for_rate_limit(ip);
     let mut mac = HmacSha256::new_from_slice(secret).expect("HMAC can take key of any size");
-    mac.update(ip.as_bytes());
+    mac.update(canonical.as_bytes());
     let result = mac.finalize();
     hex::encode(result.into_bytes())
 }
@@ -311,5 +346,86 @@ mod tests {
         let ip: IpAddr = "10.0.0.1".parse().unwrap();
         let trusted: Vec<String> = vec![];
         assert!(!is_trusted_proxy(&ip, &trusted));
+    }
+
+    // F-13 regression tests --------------------------------------------------
+
+    #[test]
+    fn test_canonicalize_ipv4_unchanged() {
+        // IPv4 addresses pass through verbatim — no /64 collapse applies.
+        assert_eq!(canonicalize_for_rate_limit("192.168.1.100"), "192.168.1.100");
+        assert_eq!(canonicalize_for_rate_limit("8.8.8.8"), "8.8.8.8");
+        assert_eq!(canonicalize_for_rate_limit("127.0.0.1"), "127.0.0.1");
+    }
+
+    #[test]
+    fn test_canonicalize_ipv6_collapses_to_64() {
+        // Two addresses sharing the same /64 prefix produce the same canonical form.
+        let a = canonicalize_for_rate_limit("2001:db8::1");
+        let b = canonicalize_for_rate_limit("2001:db8::ffff:ffff:ffff:ffff");
+        let c = canonicalize_for_rate_limit("2001:db8:0:0:dead:beef:cafe:babe");
+        assert_eq!(a, b, "Same /64 must canonicalize to same prefix");
+        assert_eq!(a, c, "Same /64 must canonicalize to same prefix (mid-suffix)");
+    }
+
+    #[test]
+    fn test_canonicalize_ipv6_distinct_64s_differ() {
+        // Different /64 prefixes must remain distinguishable.
+        let a = canonicalize_for_rate_limit("2001:db8:0::1");
+        let b = canonicalize_for_rate_limit("2001:db8:1::1");
+        let c = canonicalize_for_rate_limit("2001:db9:0::1");
+        assert_ne!(a, b);
+        assert_ne!(a, c);
+        assert_ne!(b, c);
+    }
+
+    #[test]
+    fn test_canonicalize_malformed_passthrough() {
+        // Non-IP strings (DNS hostnames, garbled input) pass through unchanged.
+        // HMAC downstream still produces a stable hash, but no canonicalization
+        // is applied. Important: this MUST NOT panic.
+        assert_eq!(canonicalize_for_rate_limit("not-an-ip"), "not-an-ip");
+        assert_eq!(canonicalize_for_rate_limit(""), "");
+        assert_eq!(canonicalize_for_rate_limit("999.999.999.999"), "999.999.999.999");
+    }
+
+    #[test]
+    fn test_hash_ip_ipv6_same_64_collides() {
+        // F-13: the production code path. Two addresses in the same /64 must
+        // hash to the same value, otherwise a /64-equipped attacker can spawn
+        // 2^64 distinct rate-limit buckets from one logical host.
+        let _env_guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        unsafe {
+            std::env::remove_var("PRIVACY_MODE");
+        }
+        let secret = [0u8; 32];
+        let h1 = hash_ip("2001:db8::1", &secret);
+        let h2 = hash_ip("2001:db8::dead:beef", &secret);
+        assert_eq!(h1, h2, "Same-/64 IPv6 addresses must HMAC to same value");
+    }
+
+    #[test]
+    fn test_hash_ip_ipv6_different_64_differ() {
+        let _env_guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        unsafe {
+            std::env::remove_var("PRIVACY_MODE");
+        }
+        let secret = [0u8; 32];
+        let h1 = hash_ip("2001:db8:0::1", &secret);
+        let h2 = hash_ip("2001:db8:1::1", &secret);
+        assert_ne!(h1, h2, "Different-/64 IPv6 addresses must HMAC to distinct values");
+    }
+
+    #[test]
+    fn test_hash_ip_ipv4_canonicalization_stable() {
+        // IPv4 hash must not change after introducing canonicalization.
+        // Without a way to roll back the secret, we just assert that the
+        // canonical form of an IPv4 string equals the input — which means
+        // the HMAC input is unchanged from the pre-F-13 implementation.
+        let _env_guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        unsafe {
+            std::env::remove_var("PRIVACY_MODE");
+        }
+        assert_eq!(canonicalize_for_rate_limit("192.0.2.42"), "192.0.2.42");
     }
 }

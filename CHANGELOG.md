@@ -4,6 +4,85 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Dates are the repository-local commit dates; entries are curated for user-visible impact
 rather than being a 1:1 mirror of `git log`.
 
+## [2026-05-12] — v0.2.6
+
+Second-pass audit follow-up. Three independent fixes that do not touch
+the wire format. `hashes.json.signed` must be regenerated and re-signed
+before deploy; the extension code that ships in v0.2.6 fetches the
+manifest from the **v0.2.6 release tag** (not `main`), so the tag must
+be pushed to GitHub *before* users update or install the extension.
+
+### Security
+
+- **IPv6 rate-limit bypass via /64 rotation closed (finding F-13).**
+  `hash_ip` (used as identity for the PoW challenge cache and the per-IP
+  rate limiters) HMAC'd the full string form of the client address. An
+  attacker with a typical residential or VPS /64 allocation could rotate
+  through 2^64 host suffixes (SLAAC privacy extensions, manual address
+  spawning) and each address would land in a separate cache / rate-limit
+  bucket, defeating per-host limits. A new `canonicalize_for_rate_limit`
+  helper now zeroes the lower 64 bits of every IPv6 address before
+  HMAC; IPv4 is unchanged (the 32-bit space is already host-stable).
+  Seven dedicated regression tests cover the canonicalization and the
+  HMAC collapse behaviour.
+
+- **Extension manifest URL pinned to release tag (finding F-15).**
+  Chrome and Firefox background scripts previously fetched
+  `hashes.json.signed` from
+  `https://raw.githubusercontent.com/samjanny/pinchat/main/...`. The
+  `main` branch is mutable: a GitHub-write compromise (account takeover,
+  malicious PR merge, stolen PAT) could overwrite the manifest the
+  extensions trust, even without compromising the signing key — though
+  the resulting manifest would still need a valid signature to be
+  accepted, so the threat is the conjunction of GitHub-write AND
+  signing-key compromise. Pinning to `v0.2.6` moves the trust anchor
+  onto a tag that cannot be silently rewritten (rebases show up in
+  `git log --tags --graph`). Lifecycle is now: every extension release
+  bumps `GITHUB_TAG` to its own tag, and server-side releases that do
+  not ship a new extension keep using the previous pinned manifest.
+  Same constant value and inline comment on both Chrome and Firefox.
+
+### Testing — regression coverage for v0.2.5 fixes (finding F-16)
+
+Three new tests close the gap flagged by the second-pass audit. The
+pre-v0.2.5 builds had tests for the *generic patterns* but not for
+the specific production code paths the fixes hardened.
+
+- **F-02 regression — `IdentityKeyManager` production path**
+  (`tests/test-security.js` test 5). The pre-v0.2.5 generic test (test 3)
+  only verified that `subtle.generateKey({ECDSA, P-256}, false, ...)`
+  yields a non-extractable private key. Test 5 instantiates the actual
+  `IdentityKeyManager`, calls `generateIdentityKeypair()`, asserts that
+  `pkcs8` export of the private side rejects, that `raw` export of the
+  public side succeeds (65 bytes, uncompressed P-256), and runs a full
+  sign+verify roundtrip through `IdentityKeyManager.sign` /
+  `IdentityKeyManager.verify`. Catches any future regression that
+  reintroduces an extractable intermediate.
+
+- **F-07 regression — JWT algorithm pin + required `exp`** (three
+  Rust tests in `src/jwt.rs`):
+  - `test_token_rejects_hs384_signature` and
+    `test_token_rejects_hs512_signature` forge tokens signed with the
+    same MAC secret but a different algorithm in the header, and
+    assert `verify_token` rejects them. The HS256-pin enforced by
+    `Validation::new(Algorithm::HS256)` is the gate under test.
+  - `test_token_rejects_missing_exp` builds a token whose payload
+    omits the `exp` claim entirely (using a side struct since
+    `WsTokenClaims` always has `exp: u64`), and asserts rejection by
+    the `set_required_spec_claims(["exp"])` gate.
+
+- **F-10 regression — encrypt-path rollback on AEAD failure**
+  (`tests/test-ratchet-correctness.js`). Warms up a Double Ratchet
+  pair, snapshots `Ns` / `ratchetCount` / `sendingChain.messageNumber`
+  / `sendingChain.chainKeyMaterial` (byte-copy) / `DHsSignature`,
+  monkey-patches `webcrypto.subtle.encrypt` to throw exactly once,
+  calls `encryptMessage`, asserts it propagates the throw, then
+  byte-compares every snapshotted field against post-failure state.
+  Finally restores the real `encrypt` and verifies that the next
+  legitimate `encryptMessage` produces the same counter the failed
+  one would have produced (chain was not consumed), and that the peer
+  decrypts the recovered message.
+
 ## [2026-05-12] — v0.2.5
 
 Cryptographic-audit follow-up patch release. Wire protocol unchanged

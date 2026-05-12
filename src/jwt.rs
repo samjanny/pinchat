@@ -166,4 +166,86 @@ mod tests {
         // Each token should have a unique JTI
         assert_ne!(claims1.jti, claims2.jti, "JTI should be unique per token");
     }
+
+    // F-07 regression tests --------------------------------------------------
+    //
+    // verify_token MUST reject:
+    //   (a) a token signed with any algorithm other than HS256, even if the
+    //       MAC key is correct. Otherwise an attacker who learned the secret
+    //       could downgrade the algorithm and we'd have to trust the
+    //       jsonwebtoken default-validation surface — which is documentation,
+    //       not type-system enforcement.
+    //   (b) a token missing the `exp` claim. The default Validation accepts
+    //       missing-exp silently, which means an attacker who can mint
+    //       claims could omit `exp` and produce a token that never expires.
+
+    #[test]
+    fn test_token_rejects_hs384_signature() {
+        let secret = [7u8; 32];
+        let claims = WsTokenClaims::new(Uuid::new_v4(), 30);
+
+        // Forge a token with HS384 (alg confusion attempt). Same secret bytes,
+        // just a different algorithm in the header.
+        let mut header = Header::default();
+        header.alg = Algorithm::HS384;
+        let encoding_key = EncodingKey::from_secret(&secret);
+        let forged = encode(&header, &claims, &encoding_key).expect("HS384 sign");
+
+        // Production verifier MUST reject this even though the MAC is valid
+        // under the same secret.
+        let result = verify_token(&forged, &secret);
+        assert!(
+            result.is_err(),
+            "HS384-signed token must be rejected by HS256-pinned verifier"
+        );
+    }
+
+    #[test]
+    fn test_token_rejects_missing_exp() {
+        // Build a claims struct that mimics WsTokenClaims but without the
+        // `exp` field. We use serde_json directly to construct the payload
+        // because WsTokenClaims always has `exp: u64`.
+        #[derive(serde::Serialize)]
+        struct NoExpClaims {
+            room_id: Uuid,
+            connection_id: Uuid,
+            jti: Uuid,
+        }
+
+        let secret = [3u8; 32];
+        let claims = NoExpClaims {
+            room_id: Uuid::new_v4(),
+            connection_id: Uuid::new_v4(),
+            jti: Uuid::new_v4(),
+        };
+        let header = Header::default(); // HS256
+        let encoding_key = EncodingKey::from_secret(&secret);
+        let signed = encode(&header, &claims, &encoding_key).expect("sign");
+
+        let result = verify_token(&signed, &secret);
+        assert!(
+            result.is_err(),
+            "Token missing `exp` must be rejected (set_required_spec_claims gate)"
+        );
+    }
+
+    #[test]
+    fn test_token_rejects_hs512_signature() {
+        // Same family of attack as HS384: a stronger MAC, still wrong algorithm.
+        // Pin-to-HS256 must reject. Keeps test triangulation on the alg-pin
+        // gate without bringing in the base64 dev-dep needed for alg=none.
+        let secret = [9u8; 32];
+        let claims = WsTokenClaims::new(Uuid::new_v4(), 30);
+
+        let mut header = Header::default();
+        header.alg = Algorithm::HS512;
+        let encoding_key = EncodingKey::from_secret(&secret);
+        let forged = encode(&header, &claims, &encoding_key).expect("HS512 sign");
+
+        let result = verify_token(&forged, &secret);
+        assert!(
+            result.is_err(),
+            "HS512-signed token must be rejected by HS256-pinned verifier"
+        );
+    }
 }
