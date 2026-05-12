@@ -4,6 +4,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Dates are the repository-local commit dates; entries are curated for user-visible impact
 rather than being a 1:1 mirror of `git log`.
 
+## [2026-05-12] — v0.2.4
+
+Single-fix patch release. Wire protocol unchanged; `hashes.json.signed`
+re-signed (only `static/js/app.js` and the chat HTML SRI line moved).
+
+### Fixed
+
+- **`Copy link` produced a fragment-less invite URL.** v0.2.3 moved the
+  bootstrap secret out of `window.location.hash` into `sessionStorage`
+  on first import (C-06), so `window.location.href` no longer carries
+  `#key=…` for the rest of the session. The header `Copy link` button
+  just read `location.href` and handed peers a URL with no key — they
+  loaded the chat page, `extractKeyFromURL` found neither a fragment
+  nor a stash for *their* tab, and the handshake never started.
+  `copyLink()` now falls back to `sessionStorage['pinchat_hash:'+pathname]`
+  when the live hash is empty, reconstructing `origin + pathname +
+  search + #key=…` before writing to the clipboard. The URL bar itself
+  stays scrubbed — that is intentional anti-leak behaviour from v0.2.3
+  and the button is the supported share channel.
+
 ## [2026-05-11] — v0.2.3
 
 Security and UX patch release driven by a full audit pass on the 1:1
