@@ -4,6 +4,94 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Dates are the repository-local commit dates; entries are curated for user-visible impact
 rather than being a 1:1 mirror of `git log`.
 
+## [2026-05-12] — v0.2.7
+
+Third-pass audit follow-up. Wire protocol unchanged (still v1). No
+`static/js/*` files changed, so the extension manifest does not need
+regeneration and the in-tree `hashes.json.signed` stays valid — the
+extension `GITHUB_TAG` pin remains `v0.2.6` (per the lifecycle rule
+documented in the extension code: server-side releases that do not
+ship a new extension keep using the previous pinned manifest).
+
+### Security (hygiene)
+
+- **CSRF token compare uses `subtle::ConstantTimeEq` (finding L-01).**
+  The hand-rolled XOR-accumulator with an early length-mismatch return
+  in `src/auth.rs` worked correctly — the HMAC tag length is fixed at
+  64 hex chars for SHA-256 and the attacker-controlled token length is
+  not a secret, so the practical impact was nil — but rolling our own
+  primitive is a posture we shouldn't maintain. The verifier now uses
+  the audited `subtle` crate (already present transitively in the
+  dependency tree; promoted to a direct dependency). The Choice-based
+  API short-circuits on length mismatch and otherwise runs in time
+  independent of slice contents.
+
+### Testing — Known Answer Tests (audit-3 M-03 assurance)
+
+A new `tests/test-kat.js` suite pins the byte-exact output of every
+KDF / HMAC step in the ratchet key schedule against an INDEPENDENT
+reference implementation (Node's built-in `crypto.hkdfSync` and
+`crypto.createHmac`). The reference path goes through completely
+different code than the production helpers (WebCrypto via
+`crypto.subtle.importKey` + `deriveBits`), so byte-exact equality
+across all four KATs is a meaningful cross-implementation check.
+
+- **KAT 1** — HKDF helper byte-exact for three tuples covering the
+  root-key bootstrap, initial sending-chain derivation (initiator
+  role), and DH-ratchet chain-key advancement under a non-zero salt.
+- **KAT 2** — initiator/responder chain labels (`InitiatorToResponder`
+  and `ResponderToInitiator`) produce distinct keys for identical IKM
+  and salt, AND initiator.sendingChain matches responder.receivingChain
+  (the labels-must-line-up symmetry that desynchronises Alice/Bob if
+  ever broken).
+- **KAT 3** — chain ratchet step `CK_{n+1} = HMAC-SHA256(CK_n,
+  "ChainRatchet")` pinned at `CK_1` and `CK_5` from a fixed `CK_0`.
+- **KAT 4** — canonical DH-header bytes (`"pinchat-drheader-v1" ||
+  u16_be(len(dh)) || dh || u32_be(rc)`) byte-exact against a hand-built
+  reference, plus an explicit tag-string assertion so a typo in the
+  domain-separation prefix fails loudly.
+
+Scope is deliberately narrow per the audit's own guidance: pin the
+deterministic primitives (KDFs, HMACs, canonical encodings) and leave
+the ECDH/ECDSA-driven paths to functional round-trip tests in
+`test-ratchet-correctness.js`. Tests that require importing a fixed
+ECDH/ECDSA private key would defeat the non-extractable property that
+v0.2.0 / v0.2.5 deliberately enforced.
+
+### Documentation — claim refinement (audit-3 H-01, H-02)
+
+The third-pass audit pushed back on language like "the server cannot
+read your messages" as too absolute given that the actual guarantee
+depends on user actions and software outside the chat client itself.
+README and SECURITY.md now carry an explicit **claim matrix** that
+spells out what is and isn't true under three real configurations:
+
+1. **SAS verified + integrity extension installed.** Client-side
+   Double-Ratchet AEAD with SRI-checked JS. No external crypto audit;
+   best-effort assurance only.
+2. **SAS verified, no integrity extension.** Client-side AEAD plus
+   peer identity confirmed out of band, but the server can still
+   serve modified JS on the next reload and there is no automatic
+   detection.
+3. **SAS skipped.** Client-side AEAD is still active — the traffic is
+   encrypted — but peer identity is not confirmed, so the server
+   operator can mount an active MITM at handshake time and become an
+   authenticated peer to each side.
+
+The phrase "server cannot read your messages" is only true in
+configurations 1 and 2. The matrix replaces ad-hoc absolute claims and
+makes it explicit in user-facing copy that SAS verification is the
+gate, not magic.
+
+Deferred to v0.3.0 (already planned): widen SAS to 72 bits / 12 emoji
+laid out in 4-column rows, **and** switch the SAS derivation from
+PBKDF2-SHA256 100K to HKDF / HMAC. Audit-3 M-02 correctly observed
+that PBKDF2 is the wrong tool for SAS — it stretches low-entropy
+passwords, but the SAS inputs are uniformly-high-entropy identity
+public keys plus room/transcript context. HKDF is the natural
+keyed-PRF construction for deriving display bytes from public
+material; the 100K iterations were never doing useful work.
+
 ## [2026-05-12] — v0.2.6
 
 Second-pass audit follow-up. Three independent fixes that do not touch

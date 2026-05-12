@@ -38,6 +38,11 @@ const TEST_SUITES = {
         name: 'Ratchet Correctness',
         file: 'test-ratchet-correctness.js',
         description: 'C-01 concurrency, C-02 cross-DH late delivery, C-05 non-extractable DH'
+    },
+    kat: {
+        name: 'Known Answer Tests',
+        file: 'test-kat.js',
+        description: 'KDF schedule + canonical DH-header bytes pinned against independent reference'
     }
 };
 

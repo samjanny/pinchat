@@ -406,6 +406,16 @@ Short Authentication String (SAS) verification is the mechanism by which users c
 
 **Recommendation:** Always complete SAS verification for sensitive conversations, especially with new contacts. Never skip SAS if you received the room link from an untrusted channel.
 
+**Claim matrix.** Different user actions place the session in different security states. The headline "end-to-end encrypted" claim does not survive uniformly across all of them:
+
+| Configuration | Effective property | What can the relay see / do? |
+|---|---|---|
+| SAS verified + integrity extension installed | Double-Ratchet AEAD over an SRI-checked client. Peer identity confirmed out of band. **No external crypto audit.** | Relay sees ciphertext only. JavaScript tampering requires defeating SRI + signed manifest. |
+| SAS verified, no integrity extension | Double-Ratchet AEAD. Peer identity confirmed out of band. | Relay sees ciphertext only, but can serve modified JS on the next page load and read everything from that moment forward — undetected. |
+| SAS skipped | Double-Ratchet AEAD — **encryption is still active**. Peer identity has not been confirmed. | Relay can mount an active MITM at handshake time by substituting identity keys for both peers, establish two ratchets it owns, and read/modify everything in plaintext. |
+
+The phrase "the server cannot read your messages" is only true in the first two rows. In the third row the chat is *encrypted* but *not authenticated against an active server operator*. Avoid promising the absolute version of the claim in user-facing copy.
+
 ---
 
 ### Bootstrap Key Temporarily Stored in `sessionStorage` During Login Redirects

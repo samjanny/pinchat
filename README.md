@@ -105,6 +105,18 @@ PinChat does not attempt to provide:
 - protection from coercion;
 - protection from traffic analysis.
 
+## What "Encrypted" Means In Practice
+
+Headline claims like "end-to-end encrypted" describe a *capability*, not a *guarantee*. The actual security PinChat delivers depends on what the user does and what software is between them and the network. Three realistic configurations:
+
+| Configuration | What you actually get |
+|---|---|
+| **SAS verified + integrity-extension installed** | Client-side AEAD with the Double Ratchet. Server-served JavaScript is checked against a signed manifest. Peer identity has been confirmed out of band. **No external audit** — best-effort assurance only. |
+| **SAS verified, no integrity extension** | Client-side AEAD with the Double Ratchet. Peer identity has been confirmed out of band. The server can still serve modified JavaScript on the next reload and you have no automatic way to notice. |
+| **SAS skipped** | Client-side AEAD with the Double Ratchet — the traffic is still encrypted and a passive observer cannot read it. However, the server operator (or anyone with active relay access) could have substituted both parties' identity keys at the ECDH exchange and now sits in the middle as an authenticated peer to each side. This is encryption without peer authentication. |
+
+The phrase "server cannot read your messages" is **only true** in the first two rows, and even there it is conditional on no external audit having found a defect. Marketing copy that omits the SAS condition is overstating the property. Use the matrix above when explaining the system to others.
+
 ## Threat Model
 
 ### Trusted Components
