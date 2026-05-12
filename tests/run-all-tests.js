@@ -43,6 +43,11 @@ const TEST_SUITES = {
         name: 'Known Answer Tests',
         file: 'test-kat.js',
         description: 'KDF schedule + canonical DH-header bytes pinned against independent reference'
+    },
+    wycheproof: {
+        name: 'Wycheproof Vectors',
+        file: 'test-wycheproof.js',
+        description: 'ECDSA P-256/SHA-256 + HKDF-SHA256 against vendored C2SP/wycheproof vectors'
     }
 };
 
