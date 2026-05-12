@@ -399,6 +399,34 @@ The long-term identity keypair used to sign DH header rotations is persisted cli
 - Rust 1.75 or later
 - OpenSSL, for local certificate generation
 - A modern browser with WebCrypto support
+- Node.js 18+ (only required to run the JS test suites; the client itself is build-less)
+
+### Running tests
+
+```bash
+cargo test                  # Rust server-side tests
+node tests/run-all-tests.js # JavaScript crypto suites
+```
+
+The JS runner has eight suites. Six (`chain`, `double`, `security`,
+`correctness`, `kat`, `wycheproof`) run without external dependencies.
+Two (`properties`, `fuzz`) require dev-dependencies installed via
+`npm ci` — `fast-check` for randomized property testing, and
+`@jazzer.js/core` for coverage-guided fuzzing of the decrypt path.
+
+If the dev-deps are not installed (offline clone, restricted npm
+registry, etc.), the runner reports those two suites as `[SKIP]`
+with an install hint and continues with a clean exit code 0. The
+"core verde, advanced skipped" state is intentional: fresh clones
+without npm access still get the cryptographic primitives test
+coverage.
+
+For long-running fuzz campaigns (the smoke run is 5s):
+
+```bash
+node tests/run-fuzz.js 3600   # 1-hour decrypt-path fuzz
+node tests/run-fuzz.js 86400  # 24-hour campaign
+```
 
 ### Installation
 

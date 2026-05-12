@@ -28,7 +28,18 @@
 
 const path = require('path');
 const fs = require('fs');
-const { startFuzzing } = require('@jazzer.js/core');
+
+// Defensive: when invoked directly by a user on a fresh clone without
+// dev-deps installed, fail with the SKIP exit code (77) and a clear
+// pointer instead of an opaque module-not-found stack trace.
+let startFuzzing;
+try {
+    ({ startFuzzing } = require('@jazzer.js/core'));
+} catch (e) {
+    console.log('SKIPPED: @jazzer.js/core not installed.');
+    console.log('  Install dev-deps with: npm ci');
+    process.exit(77);
+}
 
 const FUZZ_DIR = path.join(__dirname, 'fuzz');
 const CORPUS_DIR = path.join(FUZZ_DIR, 'corpus');

@@ -48,7 +48,19 @@
 
 const assert = require('assert');
 const { webcrypto } = require('crypto');
-const fc = require('fast-check');
+
+// Soft-skip the suite when the dev-dep is not installed (fresh clone
+// without `npm ci`, offline environments, etc.). Exit code 77 follows
+// the autotools convention for SKIPPED and is consumed by
+// tests/run-all-tests.js as a non-failing status.
+let fc;
+try {
+    fc = require('fast-check');
+} catch (e) {
+    console.log('SKIPPED: fast-check not installed.');
+    console.log('  Install dev-deps with: npm ci  (or: npm install)');
+    process.exit(77);
+}
 
 // Production-module bootstrap (mirrors test-ratchet-correctness.js).
 global.debugLog = () => {};

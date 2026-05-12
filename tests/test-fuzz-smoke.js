@@ -21,6 +21,18 @@
 const { spawnSync } = require('child_process');
 const path = require('path');
 
+// Soft-skip if @jazzer.js/core is not installed (no native binding,
+// offline clone, npm registry blocked). Exit 77 = SKIPPED per
+// autotools convention; the runner treats it as non-failing.
+try {
+    require('@jazzer.js/core');
+} catch (e) {
+    console.log('SKIPPED: @jazzer.js/core not installed.');
+    console.log('  Install dev-deps with: npm ci  (or: npm install)');
+    console.log('  Note: jazzer-js requires GLIBC ≥ 2.36 for the 2.x prebuilt binary.');
+    process.exit(77);
+}
+
 const SMOKE_SECONDS = parseInt(process.env.PINCHAT_FUZZ_SMOKE_SECS || '5', 10);
 
 console.log(`Fuzz smoke (${SMOKE_SECONDS}s decrypt-path campaign):`);
