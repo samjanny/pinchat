@@ -169,10 +169,9 @@ mod tests {
     fn auth_test_config() -> Config {
         // Pre-baked Argon2id hash for password "test-only" so is_auth_enabled
         // returns true. Real value irrelevant — we never authenticate here.
-        let hash =
-            "$argon2id$v=19$m=47104,t=1,p=1$YWJjZGVmZ2hpamtsbW5vcA$\
+        let hash = "$argon2id$v=19$m=47104,t=1,p=1$YWJjZGVmZ2hpamtsbW5vcA$\
              aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789abcdef0123456789abcdef01"
-                .to_string();
+            .to_string();
         Config {
             host: [127, 0, 0, 1],
             port: 0,
@@ -259,11 +258,8 @@ mod tests {
         // the room reference entirely.
         let addr = spawn_protected().await;
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        let (status, location) = get_with_path(
-            addr,
-            "/c/550e8400-e29b-41d4-a716-446655440000",
-        )
-        .await;
+        let (status, location) =
+            get_with_path(addr, "/c/550e8400-e29b-41d4-a716-446655440000").await;
         assert_eq!(status, 303);
         let loc = location.expect("missing Location header");
         assert_eq!(
@@ -278,8 +274,7 @@ mod tests {
         // eventual chat page receives the same room context after login.
         let addr = spawn_protected().await;
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        let (status, location) =
-            get_with_path(addr, "/c/abc?debug=1").await;
+        let (status, location) = get_with_path(addr, "/c/abc?debug=1").await;
         assert_eq!(status, 303);
         let loc = location.expect("missing Location header");
         // The query string `?debug=1` is part of the original URI and must

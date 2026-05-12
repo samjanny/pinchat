@@ -969,13 +969,8 @@ mod tests {
         let path = format!("/ws/{}", room_id);
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        let status = raw_upgrade_with_origin(
-            addr,
-            &path,
-            Some(&sp),
-            Some("https://evil.example.com"),
-        )
-        .await;
+        let status =
+            raw_upgrade_with_origin(addr, &path, Some(&sp), Some("https://evil.example.com")).await;
         assert_eq!(status, 403);
         assert!(
             !state.consumed_tokens.contains_key(&jti),

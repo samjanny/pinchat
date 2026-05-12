@@ -353,7 +353,10 @@ mod tests {
     #[test]
     fn test_canonicalize_ipv4_unchanged() {
         // IPv4 addresses pass through verbatim — no /64 collapse applies.
-        assert_eq!(canonicalize_for_rate_limit("192.168.1.100"), "192.168.1.100");
+        assert_eq!(
+            canonicalize_for_rate_limit("192.168.1.100"),
+            "192.168.1.100"
+        );
         assert_eq!(canonicalize_for_rate_limit("8.8.8.8"), "8.8.8.8");
         assert_eq!(canonicalize_for_rate_limit("127.0.0.1"), "127.0.0.1");
     }
@@ -365,7 +368,10 @@ mod tests {
         let b = canonicalize_for_rate_limit("2001:db8::ffff:ffff:ffff:ffff");
         let c = canonicalize_for_rate_limit("2001:db8:0:0:dead:beef:cafe:babe");
         assert_eq!(a, b, "Same /64 must canonicalize to same prefix");
-        assert_eq!(a, c, "Same /64 must canonicalize to same prefix (mid-suffix)");
+        assert_eq!(
+            a, c,
+            "Same /64 must canonicalize to same prefix (mid-suffix)"
+        );
     }
 
     #[test]
@@ -386,7 +392,10 @@ mod tests {
         // is applied. Important: this MUST NOT panic.
         assert_eq!(canonicalize_for_rate_limit("not-an-ip"), "not-an-ip");
         assert_eq!(canonicalize_for_rate_limit(""), "");
-        assert_eq!(canonicalize_for_rate_limit("999.999.999.999"), "999.999.999.999");
+        assert_eq!(
+            canonicalize_for_rate_limit("999.999.999.999"),
+            "999.999.999.999"
+        );
     }
 
     #[test]
@@ -413,7 +422,10 @@ mod tests {
         let secret = [0u8; 32];
         let h1 = hash_ip("2001:db8:0::1", &secret);
         let h2 = hash_ip("2001:db8:1::1", &secret);
-        assert_ne!(h1, h2, "Different-/64 IPv6 addresses must HMAC to distinct values");
+        assert_ne!(
+            h1, h2,
+            "Different-/64 IPv6 addresses must HMAC to distinct values"
+        );
     }
 
     #[test]
