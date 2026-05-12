@@ -201,43 +201,25 @@ class IdentityKeyManager {
 
         debugLog('[Identity] No stored identity found — generating fresh ECDSA P-256 keypair...');
 
-        // Step 1: Generate keypair with extractable=true (needed to re-import private key)
-        const tempKeyPair = await crypto.subtle.generateKey(
+        // F-02: generate the keypair directly with extractable=false. WebCrypto
+        // (W3C §13) sets [[extractable]] per side and for asymmetric ECDSA
+        // keypairs the public side is ALWAYS extractable regardless of the
+        // parameter — so exportKey('raw', publicKey) for peer exchange and SAS
+        // continues to work. The prior pattern (extractable=true → export PKCS#8
+        // → re-import non-extractable → fill(0) the buffer) created a window in
+        // which the raw private key bytes lived in the JS heap as a PKCS#8
+        // ArrayBuffer; an XSS or hostile extension running during this window
+        // could exfiltrate the long-term identity key. The fill(0) was
+        // best-effort and not GC-safe. The single-call form removes that
+        // window entirely: the private bytes never become reachable to JS.
+        this.identityKeyPair = await crypto.subtle.generateKey(
             {
                 name: 'ECDSA',
                 namedCurve: this.CURVE
             },
-            true,  // Temporarily extractable
+            false,  // Private side non-extractable from creation; public side stays exportable per spec.
             ['sign', 'verify']
         );
-
-        // Step 2: Export private key to re-import as non-extractable
-        const privateKeyPkcs8 = await crypto.subtle.exportKey('pkcs8', tempKeyPair.privateKey);
-
-        // Step 3: Re-import private key with extractable=false (SECURITY HARDENING)
-        // This prevents XSS/extension attacks from exfiltrating the private key
-        const nonExtractablePrivateKey = await crypto.subtle.importKey(
-            'pkcs8',
-            privateKeyPkcs8,
-            {
-                name: 'ECDSA',
-                namedCurve: this.CURVE
-            },
-            false,  // NON-EXTRACTABLE - cannot be exported after this point
-            ['sign']
-        );
-
-        // Step 4: Public key remains extractable (needed for peer exchange and SAS)
-        // No need to re-import, the original is already suitable
-        this.identityKeyPair = {
-            privateKey: nonExtractablePrivateKey,
-            publicKey: tempKeyPair.publicKey  // Remains extractable for export
-        };
-
-        // Clear sensitive data from memory (best effort)
-        // Note: JavaScript doesn't guarantee memory clearing, but this helps
-        const clearBuffer = new Uint8Array(privateKeyPkcs8);
-        clearBuffer.fill(0);
 
         // Persist for SAS continuity across reconnects / refreshes (C-04).
         // Best-effort: a write failure leaves us with an ephemeral identity

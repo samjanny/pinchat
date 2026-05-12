@@ -4,6 +4,98 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Dates are the repository-local commit dates; entries are curated for user-visible impact
 rather than being a 1:1 mirror of `git log`.
 
+## [2026-05-12] — v0.2.5
+
+Cryptographic-audit follow-up patch release. Wire protocol unchanged
+(still v1). Existing v1 clients remain interoperable with the patched
+server, and vice-versa. `hashes.json.signed` must be regenerated and
+re-signed out-of-band with the maintainer's signing key before deploy —
+`static/js/identity.js`, `static/js/double-ratchet.js` and the
+JWT-bearing path in the server binary have changed.
+
+### Security (hygiene)
+
+- **Identity private key no longer transits the JS heap as PKCS#8
+  (finding F-02).** `IdentityKeyManager.generateIdentityKeypair` used
+  to create the ECDSA P-256 keypair with `extractable: true`, export
+  the private side to PKCS#8, re-import it as `extractable: false`,
+  and `fill(0)` the buffer. The window between export and re-import
+  briefly placed the raw private key bytes in the JS heap as a
+  reachable ArrayBuffer; an XSS or hostile extension running during
+  identity creation (every 24 h on TTL refresh) could exfiltrate the
+  long-term identity key and from there forge ECDSA signatures on DH
+  ratchet rotations — bypassing the MITM defense introduced in v0.2.0.
+  The new code calls `generateKey(..., false, ['sign', 'verify'])`
+  directly: per WebCrypto §13, the public side of an asymmetric ECDSA
+  keypair is always extractable regardless of the parameter, so
+  peer-exchange and SAS still work; the private side is
+  non-extractable from creation and never reachable to JS.
+
+- **JWT verification pins HS256 explicitly (finding F-07).**
+  `verify_token` used `Validation::default()`, which in
+  `jsonwebtoken 10.x` happens to accept only HS256 — but as
+  documentation, not type-system enforcement. A future minor that
+  widened the default would silently weaken verification. The path
+  is now `Validation::new(Algorithm::HS256)` with
+  `set_required_spec_claims(["exp"])` so a token missing the
+  expiration claim is rejected outright instead of silently skipping
+  the expiry check.
+
+- **Encrypt path gained a `_drSnapshot` rollback for symmetry with
+  the decrypt path (finding F-10).** `_encryptMessageImpl` mutates
+  `Ns`, the sending chain, and (if a send-side DH ratchet fires)
+  `DHs`/`rootKey`/`ratchetCount` across multiple `await` points.
+  WebCrypto encrypt failure on valid AES-GCM inputs is practically
+  zero, so this is defence-in-depth rather than a bug fix, but the
+  asymmetry between encrypt (no snapshot) and decrypt (snapshot +
+  `Object.assign` on AEAD failure) was a code-review hazard. Both
+  directions now snapshot before mutation and roll back on any
+  thrown error.
+
+### Documentation
+
+- **`SECURITY.md` doc-drift reconciled (findings F-05, F-11).**
+  - Replay cache default corrected: 10 000 → 1 000 entries
+    (`src/config.rs`).
+  - Login-stash safety-net TTL corrected: 30 s → 5 min
+    (`static/js/login-stash.js`).
+  - PBKDF2-100K cost claim recalibrated: the previous "≈10 s on
+    consumer hardware" is off by ~100×. Updated to reflect actual
+    measurements (~30–100 ms on a modern desktop browser with
+    hardware SHA-256; ~25 000 PBKDF2-100K/s on an RTX 4090-class
+    GPU). The 48-bit SAS output is the binding constraint, not the
+    iteration count; protocol v2 will widen the SAS to 72 bits.
+  - SAS stability claim corrected: identity persistence (24 h
+    IndexedDB TTL) keeps the PBKDF2 *password* stable across
+    reconnects, but the *salt* incorporates per-handshake nonces and
+    timestamps, so the emoji code itself still changes on every
+    reconnect. `markSASVerified()` keeps the UI from re-prompting
+    within a single page lifetime; tab refresh re-prompts. Protocol
+    v2 will drop nonces/timestamps from the salt to make SAS truly
+    stable for the identity TTL.
+  - Bootstrap-key `sessionStorage` direct-path stash documented as
+    an **accepted trade-off**: the stash survives for the lifetime
+    of the tab because `copyLink()` (v0.2.4) and
+    `resetToBootstrapKey()` both depend on it. Mitigation is the
+    strict CSP + SRI bound on script execution, plus the
+    `extractable: false` import that keeps the live `CryptoKey`
+    handle opaque even when an attacker reads the raw fragment from
+    `sessionStorage`.
+  - Identity-keypair generation pattern updated to describe the
+    new single-call path (no PKCS#8 round-trip).
+
+### Outstanding (deferred to v0.3.0 protocol-v2)
+
+- F-01 (widen SAS to 72 bits / 12 emoji, drop per-handshake salt)
+- F-03 (bind room_id + sorted identity keys into the DH-header sig)
+- F-04 (collapse SAS salt to `(IK_A, IK_B, room_id)` only)
+- F-06 (`pn` in AAD)
+- F-08 (`v` in AAD)
+- F-09 (uniform BE on AAD numeric fields)
+
+All six require a wire-format change; hard cut from v1, no
+negotiation. See PROTOCOL.md at the next bump.
+
 ## [2026-05-12] — v0.2.4
 
 Single-fix patch release. Wire protocol unchanged; `hashes.json.signed`

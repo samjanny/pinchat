@@ -140,12 +140,20 @@ are persisted client-side in IndexedDB under the database name
 timestamp (24 h from creation, aligned with the default `session_ttl_secs`).
 
 **Properties:**
-- The private side is created `extractable: true` for a single re-import
-  round-trip, then re-imported as `extractable: false` and the
-  intermediate PKCS#8 buffer is zeroed (best-effort). All subsequent
-  observations of the private key — including the round-trip through
-  IndexedDB structured-clone (W3C IndexedDB §6 + WebCrypto §13) — yield
-  a non-extractable CryptoKey handle.
+- The private side is created `extractable: false` directly from
+  `crypto.subtle.generateKey` — no PKCS#8 round-trip. WebCrypto §13
+  applies `[[extractable]]` per side; for asymmetric ECDSA keypairs the
+  *public* side is always extractable regardless of the parameter, so
+  `exportKey('raw', publicKey)` for peer exchange and SAS continues to
+  work. The private bytes never become reachable to JS, even
+  momentarily. The pre-v0.2.5 build did this via a
+  `generateKey(true)` → `exportKey('pkcs8')` → `importKey(..., false)`
+  round-trip with a best-effort `fill(0)` on the buffer; that pattern
+  briefly placed the raw private key bytes in the JS heap, and is gone
+  as of v0.2.5 (finding F-02).
+- IndexedDB structured-clone (W3C IndexedDB §6 + WebCrypto §13)
+  preserves `[[extractable]]`, so restored CryptoKey handles remain
+  non-extractable across page loads.
 - The public side stays extractable so it can be serialised to raw
   bytes for transmission to the peer.
 - Scope: per-origin, never synced, never sent to the server.
@@ -280,16 +288,29 @@ Salt = roomId || sorted_nonces || sorted_timestamps
 ```
 
 **Security Properties**:
-- Brute-force resistant: 100K iterations adds computational cost (≈10s on
-  consumer hardware for a single SAS derivation)
+- Brute-force resistant: 100K iterations adds computational cost (~30–100 ms
+  on a modern desktop browser with hardware SHA-256, ~0.5–2 s on a low-end
+  mobile device). The benefit is bounded — a GPU attacker still computes
+  ~25 000 PBKDF2-100K/s on a single RTX 4090-class card. Combined with a
+  48-bit SAS output, a real-time MITM grinder needs minutes on commodity
+  hardware to find a SAS collision; protocol v2 widens the output to
+  72 bits (12 emoji) to lift that to days/weeks.
 - Context-bound: SAS changes per room and per handshake (nonces and
   timestamps are session-fresh)
 - Deterministic: Both parties compute identical output from the same
   inputs
 - Identity persistence (IndexedDB, 24 h TTL — see §"Identity Key
-  Storage") keeps the SAS stable across reconnects with the same human
-  peer, so a user who verified once does not face a different code on
-  every page reload.
+  Storage") keeps the PBKDF2 *password* (sorted identity public keys)
+  stable across reconnects with the same human peer. The *salt*, however,
+  incorporates per-handshake nonces and timestamps, so the SAS code itself
+  changes on every reconnect even when both peers retain the same identity
+  keypair. A user who verified an emoji code once will see a different
+  code on the next handshake; the `markSASVerified()` flag is kept in
+  memory on the IdentityKeyManager so the UI can skip the verification
+  modal as long as the page lives, but tab refresh re-prompts.
+  Protocol v2 drops nonces/timestamps from the salt to make the SAS a
+  function of `(IK_A, IK_B, room_id)` only, so it becomes stable for the
+  identity TTL.
 
 ---
 
@@ -367,7 +388,7 @@ After a message key or chain key is used, PinChat calls `Uint8Array.fill(0)` on 
 
 ### Server-Side Anti-Replay is Advisory, Not Authoritative
 
-The server maintains a per-room set of SHA-256 hashes of received encrypted payloads (bounded at `REPLAY_CACHE_MAX_PER_ROOM`, default 10 000 entries). If a ciphertext is resent verbatim, the server drops it.
+The server maintains a per-room set of SHA-256 hashes of received encrypted payloads (bounded at `REPLAY_CACHE_MAX_PER_ROOM`, default 1 000 entries — see `src/config.rs`). If a ciphertext is resent verbatim, the server drops it.
 
 **Limitation:** AES-GCM with a random 96-bit IV produces a different ciphertext for every encryption of the same plaintext, so identical ciphertexts are already an extremely strong indicator of a replay attack. The *authoritative* replay protection is the Double Ratchet's monotone message counter `n` (checked client-side against the AAD). The server-side hash check is a defense-in-depth layer that complements, but does not replace, the cryptographic guarantees of the protocol.
 
@@ -395,14 +416,21 @@ The bootstrap key is normally kept only in the URL fragment (`#key=<base64url>`)
 sessionStorage["pinchat_hash:/c/<room_id>"] = "#key=<base64url_key>"
 ```
 
-**Exposure window:** the value is stored from the moment of the 401 redirect until either (a) the post-login page reads and removes it via `sessionStorage.removeItem`, or (b) a 30-second `setTimeout` safety net fires and removes it automatically.
+**Exposure windows** — there are two paths that put the bootstrap key into `sessionStorage`:
 
-**Risk:** any same-origin JavaScript executing during this window (e.g., an XSS on `login.html` or another page opened in the same tab) can read the key. The bootstrap key is already visible in `window.location.hash` on the originating page, so this does not introduce a new attack surface — it extends the window by the login round-trip duration (typically 1–5 seconds, never more than 30 seconds before automatic cleanup).
+1. **Login-bounce path** (`static/js/login-stash.js`): triggered when an unauthenticated user clicks an invite link and the server redirects to `/login`. The fragment is moved to `sessionStorage` so it can be restored after the login round-trip. A 5-minute `setTimeout` safety net fires on `/login` to clear an abandoned stash; on successful post-login restore the chat page consumes and overwrites the stash.
+
+2. **Direct path** (`static/js/crypto.js` `extractKeyFromURL`): on a normal authenticated invite-link open, the fragment is read once, used to import a non-extractable `CryptoKey`, then written back to `sessionStorage` while the URL bar is scrubbed via `history.replaceState`. The stash lives for the lifetime of the tab. This is an **accepted trade-off**: the stash is required by `copyLink()` (v0.2.4) to reconstruct the shareable URL after the URL bar scrub, and by `resetToBootstrapKey()` for handshake-retry resilience. `sessionStorage` is tab-scoped and auto-cleared by the browser on tab close.
+
+**Risk:** any same-origin JavaScript executing during the exposure window (e.g., an XSS that bypassed the strict CSP, or a hostile browser extension running in the page) can read the raw key bytes from `sessionStorage`. The bootstrap key derives only the initial ECDH handshake AEAD — not message content (which is protected by the Double Ratchet chains established after the handshake). However, capture of the bootstrap key plus the initial handshake ciphertext allows recovery of the ECDH public keys and from there the session key; the SAS verification step is the only defense against that recovery in the absence of identity-key persistence.
 
 **Mitigations in place:**
 - `sessionStorage` is scoped to the tab (not shared across tabs or persisted after the tab closes)
-- `sessionStorage.removeItem` is called immediately on post-login key restoration
-- A 30-second `setTimeout` unconditionally removes the stash key as a safety net
+- Imported `CryptoKey` is non-extractable; only the raw fragment in `sessionStorage` is plaintext-readable
+- Strict CSP with no inline scripts and SRI on every external script (`hashes.json.signed`) bounds the XSS surface
+- `sessionStorage.removeItem` is called immediately on post-login key restoration (login-bounce path)
+- A 5-minute `setTimeout` on the login-bounce path clears an abandoned `/login` stash
+- The direct-path stash is **not** actively scrubbed during the session: this is a deliberate trade-off documented above
 
 ---
 

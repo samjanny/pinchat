@@ -255,89 +255,120 @@ class DoubleRatchet {
             throw new Error('Double Ratchet not initialized');
         }
 
-        // Signal Protocol: Do DH ratchet before sending if we have DHr but haven't ratcheted yet
-        // This triggers the first ratchet when responder sends their first message
-        if (this.DHr && !this.hasRatchetedSinceReceive) {
-            debugLog('[DoubleRatchet] 🔄 Performing send-side DH ratchet (direction change)...');
-            await this.performSendSideDHRatchet();
-        }
-
-        // Derive message key from sending chain
-        const { key: messageKey, counter: messageNumber } = await this.sendingChain.deriveMessageKey();
-
-        // Export our current DH public key for the header
-        const dhPublicKeyRaw = await crypto.subtle.exportKey('raw', this.DHs.publicKey);
-        const dhPublicKeyBase64 = this.arrayBufferToBase64url(dhPublicKeyRaw);
-
-        // Create message envelope (inner plaintext)
-        const envelope = {
-            ts: Date.now(),
-            text: plaintext
+        // F-10: snapshot ratchet state before any mutation, mirroring the
+        // decrypt path. WebCrypto encrypt failure on valid AES-GCM inputs is
+        // practically zero, but performSendSideDHRatchet rotates DHs / rootKey
+        // / sendingChain / ratchetCount and the chain ratchet itself zeroes
+        // chainKeyMaterial after deriveMessageKey + ratchet. A throw between
+        // those mutations and a successful return would leave the session in
+        // an inconsistent state where the peer cannot derive matching keys.
+        // Object.assign restores the snapshot on any thrown error.
+        const _drSnapshot = {
+            Nr: this.Nr,
+            Ns: this.Ns,
+            PN: this.PN,
+            DHr: this.DHr,
+            DHrRaw: this.DHrRaw ? new Uint8Array(this.DHrRaw) : null,
+            sendingChain: this.sendingChain ? this.sendingChain.clone() : null,
+            receivingChain: this.receivingChain ? this.receivingChain.clone() : null,
+            skippedKeys: new Map(this.skippedKeys),
+            ratchetCount: this.ratchetCount,
+            hasRatchetedSinceReceive: this.hasRatchetedSinceReceive,
+            DHs: this.DHs,
+            DHsSignature: this.DHsSignature,
+            rootKey: this.rootKey ? new Uint8Array(this.rootKey) : null,
+            maxRatchetSeen: this.maxRatchetSeen,
+            maxCounterSeen: this.maxCounterSeen,
         };
 
-        // Serialize envelope
-        const encoder = new TextEncoder();
-        const envelopeJson = JSON.stringify(envelope);
-        const plaintextBytes = encoder.encode(envelopeJson);
-
-        // Generate IV
-        const iv = crypto.getRandomValues(new Uint8Array(12));
-
-        // Create AAD with message context (prevents cross-context attacks)
-        // Include ratchetCount for binding ciphertext to specific ratchet state
-        const aad = encodeAADWithLengthPrefix([
-            {type: AAD_FIELD_TYPES.ROOM_ID, value: roomId},
-            {type: AAD_FIELD_TYPES.SENDER_ID, value: senderId},
-            {type: AAD_FIELD_TYPES.MESSAGE_NUMBER, value: messageNumber},
-            {type: AAD_FIELD_TYPES.MESSAGE_TYPE, value: msgType},
-            {type: AAD_FIELD_TYPES.RATCHET_COUNT, value: this.ratchetCount}
-        ]);
-
-        // Encrypt with AES-GCM
-        const ciphertext = await crypto.subtle.encrypt(
-            {
-                name: 'AES-GCM',
-                iv: iv,
-                additionalData: aad
-            },
-            messageKey,
-            plaintextBytes
-        );
-
-        // Ratchet sending chain
-        await this.sendingChain.ratchet();
-
-        // Combine IV + ciphertext
-        const combined = new Uint8Array(iv.length + ciphertext.byteLength);
-        combined.set(iv, 0);
-        combined.set(new Uint8Array(ciphertext), iv.length);
-
-        // Encode payload
-        const payload = this.arrayBufferToBase64url(combined);
-
-        // Increment sending counter
-        this.Ns++;
-
-        debugLog(`[DoubleRatchet] Message encrypted #${messageNumber} (ratchet: ${this.ratchetCount})`);
-
-        // Return message with header containing DH public key + signature (v1).
-        // The header allows the receiver to (a) verify authenticity of the DH
-        // public key via the cached identity signature, and (b) perform the DH
-        // ratchet when needed.
-        if (!this.DHsSignature) {
-            throw new Error('DHsSignature missing — signCurrentDHs must run after every DHs generation');
-        }
-        return {
-            payload: payload,
-            header: {
-                v: 1,                      // Protocol version
-                dh: dhPublicKeyBase64,     // Our current DH public key
-                pn: this.PN,               // Previous chain length (for skipped messages)
-                n: messageNumber,          // Message number in current chain
-                rc: this.ratchetCount,     // Ratchet count for debugging
-                sig: this.DHsSignature     // ECDSA signature over (tag || len || dh || rc)
+        try {
+            // Signal Protocol: Do DH ratchet before sending if we have DHr but haven't ratcheted yet
+            // This triggers the first ratchet when responder sends their first message
+            if (this.DHr && !this.hasRatchetedSinceReceive) {
+                debugLog('[DoubleRatchet] 🔄 Performing send-side DH ratchet (direction change)...');
+                await this.performSendSideDHRatchet();
             }
-        };
+
+            // Derive message key from sending chain
+            const { key: messageKey, counter: messageNumber } = await this.sendingChain.deriveMessageKey();
+
+            // Export our current DH public key for the header
+            const dhPublicKeyRaw = await crypto.subtle.exportKey('raw', this.DHs.publicKey);
+            const dhPublicKeyBase64 = this.arrayBufferToBase64url(dhPublicKeyRaw);
+
+            // Create message envelope (inner plaintext)
+            const envelope = {
+                ts: Date.now(),
+                text: plaintext
+            };
+
+            // Serialize envelope
+            const encoder = new TextEncoder();
+            const envelopeJson = JSON.stringify(envelope);
+            const plaintextBytes = encoder.encode(envelopeJson);
+
+            // Generate IV
+            const iv = crypto.getRandomValues(new Uint8Array(12));
+
+            // Create AAD with message context (prevents cross-context attacks)
+            // Include ratchetCount for binding ciphertext to specific ratchet state
+            const aad = encodeAADWithLengthPrefix([
+                {type: AAD_FIELD_TYPES.ROOM_ID, value: roomId},
+                {type: AAD_FIELD_TYPES.SENDER_ID, value: senderId},
+                {type: AAD_FIELD_TYPES.MESSAGE_NUMBER, value: messageNumber},
+                {type: AAD_FIELD_TYPES.MESSAGE_TYPE, value: msgType},
+                {type: AAD_FIELD_TYPES.RATCHET_COUNT, value: this.ratchetCount}
+            ]);
+
+            // Encrypt with AES-GCM
+            const ciphertext = await crypto.subtle.encrypt(
+                {
+                    name: 'AES-GCM',
+                    iv: iv,
+                    additionalData: aad
+                },
+                messageKey,
+                plaintextBytes
+            );
+
+            // Ratchet sending chain
+            await this.sendingChain.ratchet();
+
+            // Combine IV + ciphertext
+            const combined = new Uint8Array(iv.length + ciphertext.byteLength);
+            combined.set(iv, 0);
+            combined.set(new Uint8Array(ciphertext), iv.length);
+
+            // Encode payload
+            const payload = this.arrayBufferToBase64url(combined);
+
+            // Increment sending counter
+            this.Ns++;
+
+            debugLog(`[DoubleRatchet] Message encrypted #${messageNumber} (ratchet: ${this.ratchetCount})`);
+
+            // Return message with header containing DH public key + signature (v1).
+            // The header allows the receiver to (a) verify authenticity of the DH
+            // public key via the cached identity signature, and (b) perform the DH
+            // ratchet when needed.
+            if (!this.DHsSignature) {
+                throw new Error('DHsSignature missing — signCurrentDHs must run after every DHs generation');
+            }
+            return {
+                payload: payload,
+                header: {
+                    v: 1,                      // Protocol version
+                    dh: dhPublicKeyBase64,     // Our current DH public key
+                    pn: this.PN,               // Previous chain length (for skipped messages)
+                    n: messageNumber,          // Message number in current chain
+                    rc: this.ratchetCount,     // Ratchet count for debugging
+                    sig: this.DHsSignature     // ECDSA signature over (tag || len || dh || rc)
+                }
+            };
+        } catch (err) {
+            Object.assign(this, _drSnapshot);
+            throw err;
+        }
     }
 
     /**

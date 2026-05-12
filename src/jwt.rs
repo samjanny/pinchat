@@ -14,7 +14,7 @@
 //! - Slot saturation attacks (token rate-limited)
 //! - Ciphertext spam (only authenticated clients)
 
-use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation, decode, encode};
+use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
@@ -89,7 +89,14 @@ pub fn verify_token(
     secret: &[u8; 32],
 ) -> Result<WsTokenClaims, jsonwebtoken::errors::Error> {
     let decoding_key = DecodingKey::from_secret(secret);
-    let validation = Validation::default(); // Validates exp automatically
+    // F-07: pin algorithm explicitly. Validation::default() accepts only HS256
+    // in jsonwebtoken 10.x, but that is documentation rather than type-system
+    // enforcement; a future minor that widened the default would silently
+    // weaken verification. Algorithm::HS256 is the only acceptable algorithm
+    // because sign_token uses Header::default() (HS256). Also require `exp`
+    // — without it a token missing the claim would skip expiry checks.
+    let mut validation = Validation::new(Algorithm::HS256);
+    validation.set_required_spec_claims(&["exp"]);
 
     let token_data = decode::<WsTokenClaims>(token, &decoding_key, &validation)?;
     Ok(token_data.claims)
