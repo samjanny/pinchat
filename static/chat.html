@@ -365,7 +365,7 @@
                     </div>
                     <div class="sas-head-text">
                         <h3 id="sas-title">Verify your peer</h3>
-                        <p class="sas-sub">Compare these 8 emoji with your peer through a channel you trust — a voice call, Signal, in person. If both of you see the same sequence, there is no man-in-the-middle.</p>
+                        <p class="sas-sub">Compare these 12 emoji with your peer through a channel you trust — a voice call, Signal, in person. If both of you see the same sequence, there is no man-in-the-middle.</p>
                     </div>
                 </div>
 
@@ -403,7 +403,7 @@
                             <line x1="12" y1="16" x2="12" y2="12"/>
                             <line x1="12" y1="8" x2="12.01" y2="8"/>
                         </svg>
-                        <span>Derived from both identity keys via <b>PBKDF2-SHA256</b> · 100k iterations · 48 bits. An attacker would need to find a live collision in the 60s handshake window — not feasible.</span>
+                        <span>Derived from both identity keys via <b>HKDF-SHA256</b> · 72 bits · stable for this room and contact. Same code on every reconnect: verify once, you're done.</span>
                     </div>
 
                 </div>

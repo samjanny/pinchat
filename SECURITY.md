@@ -274,43 +274,79 @@ CK_{n+1} = HMAC-SHA256(CK_n, "ChainRatchet")
 - One-way: Cannot derive CK_n from CK_{n+1}
 - Independence: Compromise of MK_n does not reveal MK_{n+1}
 
-### SAS Generation
+### SAS Generation (v2 — current)
 
-**Algorithm**: PBKDF2-SHA256
-- Iterations: 100,000
-- Output: 48 bits (8 emoji from 64-character alphabet — 6 bits per emoji)
-- Also displayed as 12 hex characters
+**Algorithm**: HKDF-SHA256
+- Output: 72 bits (12 emoji from a 64-character alphabet — 6 bits per emoji)
+- Also displayed as 18 hex characters
 
-**Input Binding**:
+**Input binding**:
 ```
-Password = sorted(Identity_PubKey_A || Identity_PubKey_B)
-Salt = roomId || sorted_nonces || sorted_timestamps
+IKM   = sorted(Identity_PubKey_A_raw || Identity_PubKey_B_raw)   // 130 bytes for P-256
+salt  = roomId || "pinchat-sas-v2"                               // fixed for the room
+info  = "SAS-display-v2"                                         // domain separation
 ```
 
-**Security Properties**:
-- Brute-force resistant: 100K iterations adds computational cost (~30–100 ms
-  on a modern desktop browser with hardware SHA-256, ~0.5–2 s on a low-end
-  mobile device). The benefit is bounded — a GPU attacker still computes
-  ~25 000 PBKDF2-100K/s on a single RTX 4090-class card. Combined with a
-  48-bit SAS output, a real-time MITM grinder needs minutes on commodity
-  hardware to find a SAS collision; protocol v2 widens the output to
-  72 bits (12 emoji) to lift that to days/weeks.
-- Context-bound: SAS changes per room and per handshake (nonces and
-  timestamps are session-fresh)
-- Deterministic: Both parties compute identical output from the same
-  inputs
-- Identity persistence (IndexedDB, 24 h TTL — see §"Identity Key
-  Storage") keeps the PBKDF2 *password* (sorted identity public keys)
-  stable across reconnects with the same human peer. The *salt*, however,
-  incorporates per-handshake nonces and timestamps, so the SAS code itself
-  changes on every reconnect even when both peers retain the same identity
-  keypair. A user who verified an emoji code once will see a different
-  code on the next handshake; the `markSASVerified()` flag is kept in
-  memory on the IdentityKeyManager so the UI can skip the verification
-  modal as long as the page lives, but tab refresh re-prompts.
-  Protocol v2 drops nonces/timestamps from the salt to make the SAS a
-  function of `(IK_A, IK_B, room_id)` only, so it becomes stable for the
-  identity TTL.
+**Security properties**:
+- *Stable.* The SAS is a function of `(IK_A, IK_B, room_id)` only. Two
+  honest peers who retain their identity keypair across a reconnect
+  derive the same emoji code on every handshake — no per-handshake
+  nonces or timestamps are mixed into the salt. Identity persistence
+  (IndexedDB, 24 h TTL) keeps both identity keys alive for that window,
+  so a user who verified the code once does not face a different code
+  on the next page load. This eliminates the pre-v0.3.0 problem where
+  the SAS changed every reconnect and users learned to skip.
+- *Domain-separated.* The literal `"pinchat-sas-v2"` tag in the salt
+  prevents collisions with any other HKDF use of the same identity-key
+  pair (future safety-number computations, alternative display formats,
+  protocol-v3, …). The `"SAS-display-v2"` info string adds a second
+  layer of context separation in the HKDF expand stage.
+- *Symmetric.* Both peers sort the two identity public keys
+  lexicographically before concatenating, so the IKM bytes — and thus
+  the SAS output — are identical regardless of who initiated the
+  handshake.
+- *Grinding-resistant within a static identity.* 72 bits of output
+  defeats commodity GPU brute force at the timescale of a verification
+  window. On an RTX-4090-class card SHA-256 throughput is ~5 GH/s,
+  HKDF-SHA256 with one expand block is ~3 SHA-256 ops per derivation,
+  so ~1.6 billion SAS candidates per second per GPU. A birthday-style
+  collision search on a 72-bit space requires ~`2^36` derivations per
+  pool, i.e. ~43 seconds per pool * two pools = ~90 s of pure SHA work.
+  This is borderline but assumes the attacker can mint arbitrary
+  identity public keys at the same rate — which they cannot, because
+  forging a SAS match requires also finding ECDSA keypairs whose
+  raw exports hash into the target SAS. ECDSA keypair generation is
+  ~10000× slower than a SHA-256 op on a GPU, so the practical wall
+  time is hours-to-days, not seconds. 96 bits / 16 emoji would push
+  this to "intractable" but the UX cost is significant; 72 bits
+  is the chosen balance.
+
+**Why HKDF and not PBKDF2 (rationale, deferred-audit response):**
+PBKDF2 is a *password stretcher*. It is the correct tool when the input
+is a low-entropy human-chosen secret and the goal is to make brute force
+expensive. The SAS inputs are uniformly-random P-256 public keys — high
+entropy, zero password character — and the goal is deterministic
+display-byte derivation. HKDF is the keyed-PRF construction designed
+for exactly this. The pre-v0.3.0 path used PBKDF2 with 100 000 iterations,
+spending ~30-100 ms per derivation to slow down an attack that could
+not benefit from iteration count (any attacker who can grind PBKDF2
+faster than the user can also grind HKDF faster, and the per-derivation
+cost differential doesn't tilt the balance in either direction when
+the search space is the bottleneck). The 100K iterations were paying
+cost for no security property. v0.3.0 drops them.
+
+### SAS Generation (v1 — pre-v0.3.0, retained for historical context)
+
+The pre-v0.3.0 SAS used PBKDF2-SHA256 with 100K iterations, a 48-bit
+output (8 emoji), and a salt that incorporated `roomId || sorted_nonces
+|| sorted_timestamps`. The per-handshake nonces and timestamps made the
+SAS change on every reconnect even when both peers retained the same
+identity keypair, which trained users to skip verification — exactly
+the failure mode the SAS is supposed to prevent. v0.3.0 dropped the
+per-handshake material, widened to 72 bits, and switched to HKDF (see
+above). Pre-v0.3.0 clients still ship the old construction; mixed-version
+chats will display different codes on each side until both endpoints
+update.
 
 ---
 

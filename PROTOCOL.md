@@ -644,3 +644,52 @@ The following legacy mechanisms from the v0 implicit protocol have been removed:
   subprotocol auth. The query-string path is gone.
 - **Optional `header` on `message`/`image`**: mandatory in v1. Serde rejects
   any envelope that omits it.
+
+---
+
+## Backlog: wire-format items deferred to a future protocol bump
+
+The third-pass audit's `v0.3.0` proposal was originally a wire-format hard
+cut bundling six items. Five turned out to be defense-in-depth without a
+concrete current exploit; in v0.3.0 we shipped only the SAS overhaul,
+which is a client-coordinated change and does NOT touch the wire.
+
+The remaining four items are recorded here so the next wire-format break
+(group chat, MLS migration, a non-JS client, a concrete attack against
+one of them) can absorb them at no incremental cost:
+
+- **F-03** — Extend the DH-header signature canonical to bind
+  `room_id` and the sorted identity public key pair, not just
+  `dh_raw || rc`. Today the signature only proves "the identity-key
+  holder produced this DH public key at this ratchet round"; it does
+  not bind the session context. The canonical tag would bump to
+  `"pinchat-drheader-v2"` for domain separation. Not directly
+  exploitable today (DH keys are uniform over 2^256, so the binding
+  gap is fragile-not-broken), but a future feature that allowed
+  parallel sessions sharing an identity could turn it into a
+  cross-session graft.
+
+- **F-06** — Add `pn` (previous-chain length) to the message AAD.
+  Today an active relay can flip `pn` in transit; AEAD passes
+  because `pn` is not in AAD, and the receiver burns up to
+  `MAX_SKIP=100` skipped-key derivations before rejecting. Bounded
+  DoS, but a free handle. AAD field type: `PREV_CHAIN_LENGTH = 0x08`.
+
+- **F-08** — Add `v` (protocol version) to the message AAD.
+  Pure defensive: today the outer envelope rejects `header.v != 1`,
+  so the version check is fail-closed at the envelope layer. Adding
+  it to AAD prevents a future v2-with-same-AAD-shape from
+  cross-decrypting v1 ciphertext.
+  AAD field type: `PROTOCOL_VERSION = 0x00`.
+
+- **F-09** — Unify endianness on big-endian throughout. Today the
+  message AAD encodes 8-byte numeric fields via JavaScript's
+  `BigUint64Array(...).buffer`, which yields native (little-endian on
+  every browser PinChat runs on). The DH-header signature canonical
+  uses explicit big-endian. The asymmetry is intentional and
+  documented above; the cost is a usability footgun for any future
+  non-JavaScript client. The fix is a one-line change in the AAD
+  encoder + the corresponding PROTOCOL.md table.
+
+All four require a wire-format change, so they ship together at the
+next bump. None is rated higher than LOW by any audit pass.

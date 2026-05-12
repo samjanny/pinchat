@@ -4,6 +4,121 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Dates are the repository-local commit dates; entries are curated for user-visible impact
 rather than being a 1:1 mirror of `git log`.
 
+## [2026-05-12] — v0.3.0
+
+SAS overhaul release. Wire protocol unchanged (still v1). The SAS code
+is computed locally on both sides from material already on the wire
+(identity public keys, room id) — so this is a coordinated client
+change, not a wire-format break. Mixed-version chats during rollout
+will see different emoji codes on each side until both endpoints
+update; pre-v0.3.0 clients still produce the old SAS.
+
+`static/js/ecdh.js` and `static/chat.html` changed → `hashes.json.signed`
+regenerates and re-signs on commit (post-commit hook). The extension
+manifest URL pin bumps from `v0.2.6` to `v0.3.0` accordingly. Tag must
+be pushed to GitHub BEFORE users update or install the extension —
+the v0.3.0 extension will fail-loud (full-screen overlay) until the
+`/v0.3.0/hashes.json.signed` URL resolves.
+
+### Security — SAS v2 (audit-3 M-02, planned bundle items F-01 + F-04)
+
+The SAS derivation is rewritten end-to-end. The third-pass audit
+(M-02) correctly observed that PBKDF2 was the wrong tool: PBKDF2
+stretches low-entropy passwords, but the SAS inputs are
+uniformly-random P-256 identity public keys plus room context. HKDF
+is the natural keyed-PRF construction for deriving display bytes
+from high-entropy material with domain separation. The 100K
+iterations were paying ~30-100 ms per derivation for no security
+property.
+
+**New construction** (`static/js/ecdh.js` `generateSAS`):
+```
+IKM   = sorted(IK_A_raw || IK_B_raw)        // 130 bytes for P-256
+salt  = roomId || "pinchat-sas-v2"          // fixed for the room
+info  = "SAS-display-v2"                    // HKDF expand context
+bits  = 72                                  // 9 bytes, 12 emoji × 6 bits
+```
+
+Changes vs pre-v0.3.0:
+
+- **PBKDF2-SHA256 → HKDF-SHA256.** Semantically correct (keyed PRF
+  for high-entropy material vs password stretcher for human secrets).
+  Performance side-effect: SAS derivation drops from ~30-100 ms to
+  ~µs. We do not advertise the timing as security — it isn't.
+- **Salt no longer contains per-handshake material.** Pre-v0.3.0
+  used `roomId || sorted_nonces || sorted_timestamps`. The nonces
+  and timestamps were fresh per handshake, so the SAS changed every
+  reconnect — even when both peers retained the same identity
+  keypair via the IndexedDB persistence introduced in v0.2.0
+  (intended fix for C-04). v2 makes the SAS a function of
+  `(IK_A, IK_B, room_id)` only, so it is stable for the identity
+  TTL. Users who verified the code once do not face a different
+  code on the next handshake. This eliminates the "skip fatigue"
+  failure mode where users were trained to bypass MITM detection.
+- **48 bits → 72 bits.** With HKDF the per-derivation cost is ~µs,
+  so iteration count buys nothing against grinding. Output width is
+  the only friction. 72 bits / 12 emoji puts a birthday-style SAS
+  collision at hours-to-days on commodity GPU hardware (constrained
+  by the ECDSA-keypair search rate, not the SHA throughput) — up
+  from ~10 minutes at 48 bits.
+- **8 emoji → 12 emoji.** Rendered in the existing 4-column CSS grid
+  as 3 rows of 4. No CSS change needed — the grid template already
+  adapts. Mobile breakpoint at 400px uses 3 columns (4 rows).
+- **`sasObject` shape changed.** Was
+  `{ emoji, hex, bits: 48, iterations: 100000 }`; is now
+  `{ emoji, hex, bits: 72, version: 2 }`. The `iterations` field
+  is dropped (no iterations); `version: 2` lets the UI display
+  the version if ever useful.
+
+**New KAT** (`tests/test-kat.js` test 5) pins:
+- byte-exact HKDF output against Node's `crypto.hkdfSync` reference;
+- stability: two calls with the same identity keys + room id
+  produce the same SAS (no per-handshake material);
+- symmetry: Alice's view and Bob's view of `generateSAS` produce
+  identical output regardless of which side initiated;
+- shape: `{ bits: 72, version: 2 }`, exactly 12 emoji in the string.
+
+### UI
+
+- SAS modal subtitle in `static/chat.html` updated from "Compare
+  these 8 emoji" to "Compare these 12 emoji".
+- Info callout updated from "PBKDF2-SHA256 · 100k iterations · 48
+  bits" to "HKDF-SHA256 · 72 bits · stable for this room and contact".
+- The 4-column CSS grid was already in place from v0.2.x. 12 emoji
+  fill it as 3 rows × 4 cols on desktop, 4 rows × 3 cols on mobile.
+
+### Documentation
+
+- `SECURITY.md` `SAS Generation` section split into "v2 (current)"
+  and "v1 (pre-v0.3.0, retained for historical context)". The v2
+  section spells out the construction, the four security properties,
+  and the rationale for HKDF over PBKDF2 — directly addressing
+  audit-3 M-02.
+- `PROTOCOL.md` gains a "Backlog: wire-format items deferred to a
+  future protocol bump" section. The original v0.3.0 plan bundled
+  six items into a wire-format hard cut; five (F-03, F-06, F-08,
+  F-09 plus the SAS) were either coordinated-only or defense-in-depth.
+  v0.3.0 ships only the SAS. The remaining four are recorded with
+  their proposed wire-format change and the threat each closes,
+  ready to absorb at the next wire-format break.
+
+### Interop note
+
+Pre-v0.3.0 clients will continue to use PBKDF2-SHA256-100K with the
+old per-handshake salt and 48-bit output. v0.3.0 clients use HKDF
+with the new stable salt and 72-bit output. The two construction
+paths produce different bytes, so a mixed-version chat will display
+different emoji codes on each side. The recommended action for users
+who see a mismatch during the transition is: update both clients.
+After the upgrade, the SAS will stabilize and "verify once" becomes
+honest.
+
+This is a one-time UX cost during the v0.2.x → v0.3.0 rollout and
+is the price of fixing the recurring SAS-instability problem that
+the audit (M-02) identified as the real driver of "users skip
+verification" — itself a more serious security risk than the
+transition blip.
+
 ## [2026-05-12] — v0.2.7
 
 Third-pass audit follow-up. Wire protocol unchanged (still v1). No
