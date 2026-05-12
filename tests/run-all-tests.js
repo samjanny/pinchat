@@ -53,6 +53,11 @@ const TEST_SUITES = {
         name: 'Property-Based',
         file: 'test-properties.js',
         description: 'Double Ratchet round-trip / replay / reorder / state-integrity under random delivery (fast-check)'
+    },
+    fuzz: {
+        name: 'Fuzz Smoke',
+        file: 'test-fuzz-smoke.js',
+        description: 'jazzer-js coverage-guided decrypt-path fuzz, short smoke run (longer: node tests/run-fuzz.js N)'
     }
 };
 
