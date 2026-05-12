@@ -1,3 +1,6 @@
+# Node (dev-time test deps only; client is build-less)
+node_modules/
+
 # Rust
 target/
 **/Cargo.lock

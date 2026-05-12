@@ -48,6 +48,11 @@ const TEST_SUITES = {
         name: 'Wycheproof Vectors',
         file: 'test-wycheproof.js',
         description: 'ECDSA P-256/SHA-256 + HKDF-SHA256 against vendored C2SP/wycheproof vectors'
+    },
+    properties: {
+        name: 'Property-Based',
+        file: 'test-properties.js',
+        description: 'Double Ratchet round-trip / replay / reorder / state-integrity under random delivery (fast-check)'
     }
 };
 
