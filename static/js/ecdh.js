@@ -310,11 +310,9 @@ class ECDHKeyExchange {
         }
 
         // Import the peer's ephemeral ECDH public key.
-        // INFO-2: extractable=false. The SAS is now derived from the long-term
-        // IDENTITY keys (see ecdh.js#generateSAS), not from these ephemerals
-        // — so the original "Must be extractable for SAS generation" comment
-        // was stale. The ephemeral is only consumed by deriveBits as the
-        // `public` parameter, which does not require export.
+        // extractable=true: the Double Ratchet needs the raw bytes for DHrRaw
+        // (key-ID construction + ratchet-change detection). Public keys are not
+        // secret material, so making them extractable does not weaken PFS.
         this.otherPublicKey = await crypto.subtle.importKey(
             'raw',
             publicKeyRaw,
@@ -322,7 +320,7 @@ class ECDHKeyExchange {
                 name: 'ECDH',
                 namedCurve: this.CURVE
             },
-            false,
+            true,
             []
         );
 
