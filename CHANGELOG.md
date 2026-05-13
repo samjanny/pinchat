@@ -4,6 +4,45 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Dates are the repository-local commit dates; entries are curated for user-visible impact
 rather than being a 1:1 mirror of `git log`.
 
+## [2026-05-13] — v0.3.1
+
+Hotfix release for a v0.3.0 regression that broke the 1:1 ECDH
+handshake asymmetrically. Wire protocol unchanged (still v1).
+`static/js/ecdh.js` changed → `hashes.json.signed` regenerates and
+re-signs on commit; the extension manifest URL pin bumps from
+`v0.3.0` to `v0.3.1`. Tag must be pushed to GitHub BEFORE users
+update or install the extension.
+
+### Fixed
+
+- **1:1 handshake: initiator was aborting on Double Ratchet init.**
+  The peer's ephemeral ECDH public key was imported via
+  `crypto.subtle.importKey('raw', …, extractable=false, …)` in
+  `ECDHKeyExchange.decryptPublicKey`. The v0.3.0 Double Ratchet
+  initializer (`double-ratchet.js#initialize`) then calls
+  `crypto.subtle.exportKey('raw', theirPublicKey)` to populate
+  `DHrRaw` (the byte-level cache used for key-ID construction and
+  ratchet-change detection). The export threw
+  `DOMException: A parameter or an operation is not supported by
+  the underlying object` and only the **initiator** branch hit
+  that path — the responder leaves `DHr=null` to defer ratchet
+  setup until the first received message. Result: one side
+  rendered the SAS modal, the other aborted the handshake. The
+  fix imports the peer public key with `extractable=true`. Public
+  keys are not secret material so this does not weaken PFS; the
+  asymmetry came from a WebCrypto quirk where `generateKey()`'s
+  public half stays exportable regardless of the flag, while
+  `importKey(..., extractable=false)` is genuinely non-exportable.
+
+### Interop note
+
+v0.3.0 and v0.3.1 are wire-compatible. Mixed-version pairs work
+in both directions: a v0.3.0 responder pairs with a v0.3.1
+initiator (and vice versa) without seeing the abort — the bug
+was strictly client-local on the initiator side and depended on
+which client tried to call `exportKey` on a non-extractable
+imported key.
+
 ## [2026-05-12] — v0.3.0
 
 SAS overhaul release. Wire protocol unchanged (still v1). The SAS code
