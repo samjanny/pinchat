@@ -1,5 +1,20 @@
 # PinChat
 
+> ## ⚠️ EXPERIMENTAL TEST PROJECT — DO NOT USE FOR HIGH-SECURITY PURPOSES
+>
+> **PinChat is a test/research project.** It has **not** been independently audited, it has **not** received a formal cryptographic review, and it is **not** intended for protecting sensitive, confidential, personal, financial, life-critical, or otherwise high-risk communications.
+>
+> Do **not** use PinChat for:
+> - whistleblowing, source protection, or activist safety;
+> - protecting personal, financial, medical, or legal data;
+> - safety-critical or life-critical communications;
+> - evading state-level or otherwise capable adversaries;
+> - any scenario where a vulnerability in the software could cause real harm.
+>
+> If you need a serious secure-messaging tool, use an audited, mature application such as **Signal**. PinChat exists for experimentation, learning, and self-hosted low-risk conversations — nothing more.
+>
+> You use this software entirely at your own risk. See the full [Disclaimer](#disclaimer) at the bottom of this document.
+
 Experimental end-to-end encrypted, ephemeral, browser-based chat.
 
 PinChat is a small self-hostable web application for short-lived private conversations. Messages are encrypted in the browser before being relayed by the server. Room state is designed to live in application memory and expire after a configurable TTL.
