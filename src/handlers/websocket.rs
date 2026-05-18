@@ -134,8 +134,12 @@ pub async fn ws_handler(
         }
     }
 
-    // Validate JWT token before accepting the WebSocket upgrade
-    let claims = match verify_token(token, &state.jwt_secret) {
+    // Validate JWT token before accepting the WebSocket upgrade.
+    // Audit C-2: verify_token now pins both `aud` (WS_TOKEN_AUDIENCE) and
+    // `iss` (state.config.jwt_issuer) in addition to the algorithm and
+    // expiry. A token forged or replayed from another component, audience,
+    // or PinChat instance fails here even if the HMAC checks out.
+    let claims = match verify_token(token, &state.jwt_secret, &state.config.jwt_issuer) {
         Ok(claims) => claims,
         Err(e) => {
             tracing::warn!("Invalid JWT token for WebSocket: {}", e);
@@ -829,6 +833,7 @@ mod tests {
             pow_max_difficulty: 18,
             challenge_ttl_secs: 300,
             jwt_token_ttl_secs: 30,
+            jwt_issuer: crate::jwt::DEFAULT_JWT_ISSUER.to_string(),
             max_ws_connection_age_secs: 30 * 60,
             ecdh_burst_limit: 8,
             ecdh_burst_window_secs: 60,
@@ -943,7 +948,7 @@ mod tests {
         // only checks the status code; rejects_bad_origin_preserves_jti
         // below verifies the conservation property directly.
         let (addr, state, room_id) = spawn_test_server().await;
-        let claims = WsTokenClaims::new(room_id, 30);
+        let claims = WsTokenClaims::new(room_id, 30, &state.config.jwt_issuer);
         let token = sign_token(&claims, &state.jwt_secret).unwrap();
         let sp = format!("pinchat.v1, pinchat.v1.jwt.{}", token);
         let path = format!("/ws/{}", room_id);
@@ -962,7 +967,7 @@ mod tests {
         // request with a non-allowlisted Origin (403), then verify the JTI
         // is still absent from state.consumed_tokens.
         let (addr, state, room_id) = spawn_test_server().await;
-        let claims = WsTokenClaims::new(room_id, 30);
+        let claims = WsTokenClaims::new(room_id, 30, &state.config.jwt_issuer);
         let jti = claims.jti;
         let token = sign_token(&claims, &state.jwt_secret).unwrap();
         let sp = format!("pinchat.v1, pinchat.v1.jwt.{}", token);
@@ -1004,6 +1009,8 @@ mod tests {
             connection_id: Uuid::new_v4(),
             exp: 1, // 1970
             jti: Uuid::new_v4(),
+            aud: crate::jwt::WS_TOKEN_AUDIENCE.to_string(),
+            iss: state.config.jwt_issuer.clone(),
         };
         let token = sign_token(&expired, &state.jwt_secret).unwrap();
         let sp = format!("pinchat.v1, pinchat.v1.jwt.{}", token);
@@ -1016,7 +1023,7 @@ mod tests {
     async fn rejects_token_for_wrong_room() {
         let (addr, state, room_id) = spawn_test_server().await;
         let other_room = Uuid::new_v4();
-        let claims = WsTokenClaims::new(other_room, 30);
+        let claims = WsTokenClaims::new(other_room, 30, &state.config.jwt_issuer);
         let token = sign_token(&claims, &state.jwt_secret).unwrap();
         let sp = format!("pinchat.v1, pinchat.v1.jwt.{}", token);
         let path = format!("/ws/{}", room_id);
@@ -1028,7 +1035,7 @@ mod tests {
     async fn accepts_valid_subprotocol_and_jwt() {
         // Full success path: bound listener + valid single-use JWT → 101 + echoed subprotocol.
         let (addr, state, room_id) = spawn_test_server().await;
-        let claims = WsTokenClaims::new(room_id, 30);
+        let claims = WsTokenClaims::new(room_id, 30, &state.config.jwt_issuer);
         let token = sign_token(&claims, &state.jwt_secret).unwrap();
         let sp = format!("pinchat.v1, pinchat.v1.jwt.{}", token);
         let path = format!("/ws/{}", room_id);

@@ -81,6 +81,13 @@ pub struct Config {
     pub challenge_ttl_secs: u64,
     pub jwt_token_ttl_secs: u64,
 
+    // Issuer string stamped on every WebSocket JWT (`iss` claim) and
+    // required by the verifier. Operators running multiple PinChat
+    // instances behind a shared secret store SHOULD set `JWT_ISSUER` per
+    // instance (e.g. "pinchat-eu", "pinchat-us") so tokens from one
+    // instance cannot be replayed at another.
+    pub jwt_issuer: String,
+
     // Absolute hard cap on a single WebSocket connection's lifetime, in seconds.
     // Independent of the idle timeout: even an active client is forced to
     // reconnect (and thus restart the handshake) after this duration. Bounds
@@ -220,6 +227,16 @@ impl Config {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(30),
+
+            // JWT issuer (default: `crate::jwt::DEFAULT_JWT_ISSUER`).
+            // Audit C-2: the verifier requires an exact `iss` match. Leave
+            // unset for single-instance deployments; set explicitly when
+            // running multiple instances behind a shared HMAC key.
+            jwt_issuer: env::var("JWT_ISSUER")
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| crate::jwt::DEFAULT_JWT_ISSUER.to_string()),
 
             // Hard cap on WebSocket connection lifetime (default: 30 minutes).
             // Forces a reconnect that re-runs PoW/JWT and the handshake.

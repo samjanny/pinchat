@@ -87,6 +87,19 @@ class DoubleRatchet {
         // BOTH directions: the receive-side DH ratchet touches sendingChain
         // too, so per-direction locks are not sufficient.
         this._mutex = Promise.resolve();
+
+        // C-01b (audit C-1): synchronous fatal-auth gate. Set to true the
+        // moment SIGNATURE_INVALID is detected in _decryptMessageImpl. Once
+        // set, every subsequent encryptMessage / decryptMessage call —
+        // including those already queued on the mutex chain when detection
+        // fired — short-circuits at the entry gate and refuses to touch
+        // ratchet state. This eliminates the race window between
+        // SIGNATURE_INVALID detection and the asynchronous WS close: even
+        // if the WS layer drains buffered frames before the close handshake
+        // completes, no further decryption can advance state under attacker
+        // control. The flag is intentionally not resettable from inside
+        // this class — the only valid recovery is a full session refresh.
+        this.fatalAuthFailure = false;
     }
 
     /**
@@ -251,6 +264,12 @@ class DoubleRatchet {
     }
 
     async _encryptMessageImpl(plaintext, roomId, senderId, msgType = 'message') {
+        if (this.fatalAuthFailure) {
+            // Session is irreversibly compromised — refuse to emit ciphertext
+            // that could be observed by an attacker who already swapped DH
+            // keys. UI will surface SIGNATURE_INVALID via the receive path.
+            throw new Error('SIGNATURE_INVALID');
+        }
         if (!this.sendingChain) {
             throw new Error('Double Ratchet not initialized');
         }
@@ -394,11 +413,22 @@ class DoubleRatchet {
     }
 
     async _decryptMessageImpl(payloadBase64, header, roomId, senderId, msgType = 'message') {
+        // Audit C-1: synchronous fatal-auth gate. Any decryptMessage call
+        // queued on the mutex *before* SIGNATURE_INVALID detection fired but
+        // not yet executed will land here and short-circuit. Crucial because
+        // WS frame draining and the close handshake are not synchronous with
+        // the throw inside the detection branch below.
+        if (this.fatalAuthFailure) {
+            throw new Error('SIGNATURE_INVALID');
+        }
+
         if (!this.receivingChain) {
             throw new Error('Double Ratchet not initialized');
         }
 
-        // Protocol v1 header shape validation.
+        // Protocol v1 header shape validation. These checks read header
+        // fields only; they don't touch ratchet state, so they live outside
+        // the snapshot/rollback block.
         if (!header || typeof header !== 'object') {
             throw new Error('PROTOCOL_MISMATCH');
         }
@@ -419,15 +449,26 @@ class DoubleRatchet {
         // Check if this is a NEW DH public key (triggers DH ratchet)
         const dhPublicKeyRaw = this.base64urlToArrayBuffer(dhPublicKeyBase64);
 
-        // Verify identity signature over the canonical (tag || len || dh || rc) tuple.
-        // This is the MITM defense for the DH ratchet: without it, a MITM could swap
-        // the DH public key in the header and hijack the chain direction.
+        // Verify identity signature over the canonical (tag || len || dh || rc) tuple
+        // BEFORE any path that mutates state (skipped-key delete, chain ratchet,
+        // DH ratchet). This is the MITM defense for the DH ratchet: without it,
+        // a MITM could swap the DH public key in the header and hijack the chain
+        // direction.
+        //
+        // Audit H-2: this is intentionally outside the snapshot/rollback block —
+        // the verify path is pure (no this.* mutation), so a rollback would be a
+        // no-op. The throw path sets `this.fatalAuthFailure = true` SYNCHRONOUSLY
+        // before re-throwing (audit C-1), so any decryptMessage() / encryptMessage()
+        // calls already queued on the mutex chain at detection time will
+        // short-circuit at their entry gate when their turn comes — closing the
+        // race between detection and the async WS close handshake.
         try {
             const sigBytes = this.base64urlToArrayBuffer(header.sig);
             const canon = this._buildCanonicalBytes(dhPublicKeyRaw, ratchetCount);
             await this.identityManager.verify(canon, sigBytes);
         } catch (e) {
             debugError('[DoubleRatchet] DH header signature INVALID - MITM suspected:', e);
+            this.fatalAuthFailure = true;
             throw new Error('SIGNATURE_INVALID');
         }
 

@@ -203,7 +203,11 @@ pub async fn create_room(
 
             // Generate WebSocket token for room creator to avoid second PoW
             // This improves UX by eliminating the second challenge
-            let ws_claims = WsTokenClaims::new(room_id, state.config.jwt_token_ttl_secs);
+            let ws_claims = WsTokenClaims::new(
+                room_id,
+                state.config.jwt_token_ttl_secs,
+                &state.config.jwt_issuer,
+            );
             let connection_id = ws_claims.connection_id;
 
             let ws_token = match sign_token(&ws_claims, &state.jwt_secret) {

@@ -187,6 +187,7 @@ mod tests {
             pow_max_difficulty: 18,
             challenge_ttl_secs: 300,
             jwt_token_ttl_secs: 30,
+            jwt_issuer: crate::jwt::DEFAULT_JWT_ISSUER.to_string(),
             max_ws_connection_age_secs: 1800,
             ecdh_burst_limit: 8,
             ecdh_burst_window_secs: 60,
