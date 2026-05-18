@@ -1,8 +1,8 @@
 {
   "data": {
     "version": "1.2.0",
-    "sequence": 33,
-    "generated": "2026-05-13T06:38:02.058Z",
+    "sequence": 34,
+    "generated": "2026-05-18T08:57:26.658Z",
     "site": "https://pinchat.io",
     "files": [
       {
@@ -27,7 +27,7 @@
       },
       {
         "path": "/static/js/double-ratchet.js",
-        "hash": "e375ad9d489ebccf72a12c18eabb7281834c8eb3441e6afd4e83a8bceac93a97"
+        "hash": "0c12e63614c028a15f4abab815f4220927df88bf847a4cab35e36652d5a05562"
       },
       {
         "path": "/static/js/ecdh.js",
@@ -87,7 +87,7 @@
       },
       {
         "path": "/static/chat.html",
-        "hash": "61adf55fc7cc1b3d31d5895fa1fa4d30753b9a6d91890d8a27c9614c451b3b99"
+        "hash": "b248bef49609bbaec5d3e418e97e989acfb3970b203f8e73be5538339a1fdad3"
       },
       {
         "path": "/static/terms.html",
@@ -103,5 +103,5 @@
       }
     ]
   },
-  "signature": "MEUCIEcT8S+9f3r56hInfBC/YyPXp/aFMp0gcz6cwWx+ng/UAiEAjHGk/Pbr2ORTl6mXAjm+yLSlBSe2tMOs6vI8OawND6M="
+  "signature": "MEYCIQCeM9RSBLQ+mPQoPi2dYtzlXdbPX8bHnI9FI67z6q9gsQIhAM2XzB4PRudE9vJQ3U92eVb+bxtXCF88Xkw1A40k3lEM"
 }
