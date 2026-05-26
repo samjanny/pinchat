@@ -49,12 +49,7 @@ impl PowChallenge {
         // re-derives the mask from `self.difficulty`; the `mask` field is
         // a wire-protocol convenience for the client and is never trusted
         // by `verify`.
-        let challenge = format!(
-            "{}-{}-d{}",
-            id,
-            chrono::Utc::now().timestamp(),
-            difficulty
-        );
+        let challenge = format!("{}-{}-d{}", id, chrono::Utc::now().timestamp(), difficulty);
 
         Self {
             challenge,
