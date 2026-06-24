@@ -4,6 +4,78 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Dates are the repository-local commit dates; entries are curated for user-visible impact
 rather than being a 1:1 mirror of `git log`.
 
+## [2026-06-24] - v0.4.0
+
+Security release from an internal review. Two issues are fixed: a SAS
+man-in-the-middle weakness (SAS v3) and a server-side denial of service
+on the room page. The obsolete `test_sas.html` page is removed.
+
+Wire protocol unchanged (still v1). The SAS code is still computed
+locally on both sides, so this is a coordinated client change rather
+than a wire-format break: mixed-version pairs during rollout will see
+different emoji codes on each side until both endpoints update. SAS v3
+is not interoperable with the v0.3.x SAS, and a mismatch surfaces as a
+non-matching code (fail closed).
+
+`static/js/ecdh.js` and `static/chat.html` changed, so `hashes.json.signed`
+regenerates and re-signs (sequence bumped). The extension manifest URL
+pin (`GITHUB_TAG` in both `extensions/chrome/background.js` and
+`extensions/firefox/background.js`) bumps from `v0.3.1` to `v0.4.0`. The
+`v0.4.0` git tag must be pushed to GitHub BEFORE users update or install
+the extension, otherwise the `/v0.4.0/hashes.json.signed` URL does not
+resolve and the extension fails loud.
+
+### Security - SAS bound to the live session and widened to 96 bits (audit H1)
+
+The v0.3.x SAS was `HKDF(sorted(IK_A, IK_B), roomId)` only. `roomId` is a
+server-generated UUID known to the relay before the handshake and HKDF is
+microseconds per evaluation, so a double man-in-the-middle relay could
+mount an OFFLINE two-sided birthday search: present `IK_M1` to A and
+`IK_M2` to B (both real keypairs that validly sign the substituted
+ephemeral keys) and find a pair whose SAS codes collide. At 72 bits that
+is about 2^36 work and fully precomputable over the 24h identity TTL, so
+both users would see matching emoji and verify a man-in-the-middle.
+
+SAS v3 closes this two ways:
+
+- **Transcript binding.** The HKDF `info` now includes `SHA-256` of the
+  sorted live ECDH ephemeral public keys. The honest party's ephemeral
+  key is fresh per handshake and not attacker-controlled in advance, so
+  the SAS can no longer be precomputed and now authenticates the actual
+  session, not just the identity pair. Fails closed if the ephemeral keys
+  are not available.
+- **Width.** Output goes from 72 to 96 bits (16 emoji), lifting the
+  residual online-only birthday bound to about 2^48, infeasible within a
+  30-second handshake window.
+
+The displayed code now changes per handshake. Trust continuity is carried
+by identity-key persistence plus peer-identity-change detection, not by a
+static SAS. UI copy and the `ecdh.js` inline SRI hash are updated to match.
+
+### Security - room page denial of service (audit H2)
+
+`room_page` held a DashMap read guard (`state.rooms.get`) alive across the
+expired-room cleanup call to `state.remove_room`, which write-locks the
+same shard via `rooms.remove`. On a sharded RwLock that self-deadlocks the
+worker on any GET to an expired room page, hanging the task and holding the
+shard read lock: a single-request denial of service. The handler now reads
+the room fields into locals and drops the guard before `remove_room` runs.
+
+### Removed
+
+- `static/test_sas.html`: an obsolete PBKDF2-era test page that called
+  removed APIs, shipped in the production image, and was not covered by
+  the signed integrity manifest.
+
+### Tests
+
+- New regression tests for the room page deadlock (`src/handlers/http.rs`),
+  driven under a hard timeout so a regression fails the test instead of
+  hanging the suite.
+- The SAS known-answer test is updated to v3 (`tests/test-kat.js`):
+  byte-exact against an independent Node reference, Alice/Bob symmetry,
+  transcript sensitivity, 16 emoji.
+
 ## [2026-05-13] — v0.3.1
 
 Hotfix release for a v0.3.0 regression that broke the 1:1 ECDH
