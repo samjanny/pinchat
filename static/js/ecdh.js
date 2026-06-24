@@ -430,9 +430,10 @@ class ECDHKeyExchange {
      * Encode bytes to emoji using 64-emoji alphabet (6 bits per emoji)
      * Uses BigInt to avoid JavaScript's 32-bit overflow in bitwise operations.
      *
-     * Emoji count = floor(bytes.length * 8 / 6). For 9 input bytes (72 bits)
-     * this is 12 emoji — the v2 SAS layout. The pre-v2 path used 6 input
-     * bytes / 8 emoji; the encoding is the same algorithm, just shorter.
+     * Emoji count = floor(bytes.length * 8 / 6). For 12 input bytes (96 bits)
+     * this is 16 emoji - the v3 SAS layout. Earlier layouts used 9 bytes / 12
+     * emoji (v2) and 6 bytes / 8 emoji; the encoding is the same algorithm,
+     * just a different length.
      *
      * @param {Uint8Array} bytes - Input bytes (length × 8 must be a multiple of 6)
      * @returns {string} Emoji string of bytes.length × 8 / 6 emoji
@@ -466,49 +467,76 @@ class ECDHKeyExchange {
     }
 
     /**
-     * Generate Short Authentication String (SAS) for MITM detection — v2.
+     * Lexicographically order two byte arrays so both peers feed an identical,
+     * side-independent ordering into the SAS derivation. Returns [low, high].
      *
-     * SAS is a function of (sorted identity public keys, room id) only:
-     *   IKM   = sorted(IK_A_raw || IK_B_raw)        — high-entropy public material
-     *   salt  = roomId || "pinchat-sas-v2"          — fixed for the room
-     *   info  = "SAS-display-v2"                    — domain separation
-     *   bits  = 72                                  — 12 emoji × 6 bits
+     * @private
+     */
+    _sortKeyPair(a, b) {
+        return [a, b].sort((x, y) => {
+            for (let i = 0; i < Math.min(x.length, y.length); i++) {
+                if (x[i] !== y[i]) return x[i] - y[i];
+            }
+            return x.length - y.length;
+        });
+    }
+
+    /**
+     * Generate Short Authentication String (SAS) for MITM detection - v3.
      *
-     * Construction is HKDF-SHA256 via WebCrypto. This replaces the pre-v0.3.0
-     * PBKDF2-SHA256-100K-with-per-handshake-salt path. Audit-3 M-02 was
-     * correct: PBKDF2 is a password-stretcher for low-entropy human inputs.
-     * SAS inputs are not passwords. HKDF is the natural keyed-PRF construction
-     * for deriving display bytes from high-entropy public material plus
-     * domain context. The 100K iterations were not buying any security
-     * property — they were paying ~30-100ms per derivation for nothing.
+     * v3 derivation (HKDF-SHA256 via WebCrypto):
+     *   IKM   = sorted(IK_A_raw || IK_B_raw)        - the two identity public keys
+     *   salt  = roomId || "pinchat-sas-v3"          - fixed for the room
+     *   info  = "SAS-display-v3" || transcript      - domain separation + session binding
+     *   where transcript = SHA-256( sorted(EPH_A_raw || EPH_B_raw) )
+     *         EPH_x_raw   = the live ECDH ephemeral public keys of this handshake
+     *   bits  = 96                                  - 16 emoji × 6 bits
      *
-     * Why the new salt drops nonces/timestamps:
-     *   The pre-v0.3.0 salt incorporated `myNonce`, `otherNonce`,
-     *   `myTimestamp`, `otherTimestamp` from the current handshake. These
-     *   are fresh per handshake, so the SAS was fresh per handshake.
-     *   Users saw a different emoji code every reconnect, learned to skip
-     *   verification, and the C-04 fix (identity persistence) did not
-     *   deliver the "stable SAS" property it was supposed to. v2 makes the
-     *   SAS a function of (IK_A, IK_B, room_id) only — stable for the
-     *   identity TTL, so "verify once" is honest.
+     * Why v3 changes from v2 (audit H1):
+     *   v2 derived the SAS from (sorted identity keys, roomId) ONLY. That made
+     *   the displayed code precomputable: roomId is a server-generated UUID known
+     *   to the relay BEFORE the handshake, and HKDF is ~microseconds per eval, so
+     *   a malicious relay running a double-MITM could mount an OFFLINE two-sided
+     *   birthday search. It presents IK_M1 to A and IK_M2 to B (both attacker-
+     *   chosen real keypairs that validly sign the substituted ephemerals), and
+     *   looks for IK_M1, IK_M2 such that SAS_A == SAS_B. That is a collision over
+     *   two attacker-controlled inputs, i.e. ~2^(n/2) work, NOT an n-bit preimage.
+     *   At 72 bits the effective security was only ~2^36 and fully precomputable
+     *   over the 24h identity TTL - both users would then see identical codes and
+     *   "verify" a man-in-the-middle.
      *
-     * Why 72 bits:
-     *   At 48 bits a real-time MITM grinder on a single RTX-4090-class GPU
-     *   needs ~10 minutes to find a SAS collision (computing PBKDF2-100K
-     *   was ~250 K/s — the iteration count was the only friction left).
-     *   With HKDF the per-derivation cost drops to ~µs, so the only
-     *   defence against grinding is output width. 72 bits / 12 emoji
-     *   lifts collision-search to days-weeks on commodity hardware.
+     *   v3 closes this two ways:
+     *   1. Transcript binding. The info string folds in a hash of BOTH live ECDH
+     *      ephemeral public keys. The honest party's ephemeral key is fresh per
+     *      handshake and NOT under attacker control before the handshake starts,
+     *      so the SAS can no longer be precomputed: the attacker must grind ONLINE,
+     *      inside the live handshake window, against ephemerals it cannot fix in
+     *      advance. The transcript also makes the SAS authenticate the actual
+     *      session (the keys that derive the root key), not merely the identity
+     *      pair - closing the separate "SAS does not bind the session" gap.
+     *   2. Wider output. 96 bits lifts the residual (now online-only) birthday
+     *      bound to ~2^48, which is infeasible to grind within a single handshake.
      *
-     * Interop: pre-v0.3.0 clients use PBKDF2-100K + 48-bit + per-handshake
-     * salt. Mixed-version chats will display different codes on each side —
-     * users should update both endpoints. This is a one-time UX blip
-     * during the v0.2.x → v0.3.0 transition, and the new design eliminates
-     * the recurring instability that motivated the change.
+     *   Net effect: the only remaining attack is an online ~2^48 two-sided grind
+     *   that must complete before the handshake times out (30s) - not a thing.
+     *
+     * Stability note: because the transcript includes the per-handshake ephemeral
+     * keys, the SAS is fresh on every new handshake (including reconnects). The
+     * "verify once" UX is preserved by the identity-key persistence + peer-
+     * identity-change detection in app.js (a stable IDENTITY pair across reconnects
+     * keeps sasVerified set; only an identity-key change forces re-verification).
+     * The displayed emoji changing on reconnect is expected and is the price of
+     * binding the live session; identity continuity, not SAS stability, is what
+     * carries the user's trust decision forward.
+     *
+     * Interop: v3 is wire-incompatible with v2/pre-v0.3.0 SAS. Both endpoints must
+     * run this version or the displayed codes will differ. There is no security
+     * downgrade path - a mismatch surfaces as a non-matching SAS, which is the
+     * correct, fail-closed behaviour.
      *
      * @param {string} roomId - Room identifier for context binding
      * @returns {Promise<Object>} Object with emoji, hex, bits, version
-     * @throws {Error} If identity keys are not available
+     * @throws {Error} If identity keys or live ephemeral keys are not available
      */
     async generateSAS(roomId) {
         if (!this.identityManager || !this.identityManager.identityKeyPair) {
@@ -523,45 +551,55 @@ class ECDHKeyExchange {
             throw new Error('roomId required for SAS context binding');
         }
 
-        debugLog('[ECDH] Generating SAS v2 (HKDF-SHA256, 72 bits, stable salt)...');
+        // Transcript binding (audit H1) requires the LIVE ECDH ephemeral keys.
+        // generateSAS() is invoked before destroyEphemeralKeys() (see app.js), so
+        // both keys are present here. Fail closed rather than silently fall back
+        // to an identity-only (precomputable) SAS if they are missing.
+        if (!this.keyPair || !this.keyPair.publicKey || !this.otherPublicKey) {
+            throw new Error('[ECDH] Cannot generate SAS - live ephemeral ECDH keys not available (transcript binding required)');
+        }
 
-        // Export own identity public key (CryptoKey is intentionally extractable
-        // for transmission to the peer). Peer's key was imported as
-        // non-extractable, but the raw bytes were cached at import time, so we
-        // read them directly from the identity manager — never via exportKey.
+        debugLog('[ECDH] Generating SAS v3 (HKDF-SHA256, 96 bits, transcript-bound)...');
+
+        // --- IKM: sorted identity public keys -------------------------------
+        // The own identity CryptoKey public side is always exportable per
+        // WebCrypto; the peer key's raw bytes were cached at import time and are
+        // read directly (never via exportKey on the non-extractable handle).
         const myPublicKeyRaw = await crypto.subtle.exportKey('raw', this.identityManager.identityKeyPair.publicKey);
         const myKeyBytes = new Uint8Array(myPublicKeyRaw);
         const otherKeyBytes = new Uint8Array(this.identityManager.peerIdentityPublicKeyRaw);
 
-        // Sort public keys lexicographically so both parties feed the same
-        // bytes into HKDF regardless of which side they're on. The sort key
-        // is the full byte string; equal-length P-256 raw exports (65 bytes
-        // each) make this a clean lexicographic order.
-        const keys = [myKeyBytes, otherKeyBytes].sort((a, b) => {
-            for (let i = 0; i < Math.min(a.length, b.length); i++) {
-                if (a[i] !== b[i]) return a[i] - b[i];
-            }
-            return a.length - b.length;
-        });
+        const idKeys = this._sortKeyPair(myKeyBytes, otherKeyBytes);
+        const ikm = new Uint8Array(idKeys[0].length + idKeys[1].length);
+        ikm.set(idKeys[0], 0);
+        ikm.set(idKeys[1], idKeys[0].length);
 
-        const ikm = new Uint8Array(keys[0].length + keys[1].length);
-        ikm.set(keys[0], 0);
-        ikm.set(keys[1], keys[0].length);
+        // --- Transcript: SHA-256 of sorted live ephemeral ECDH public keys ---
+        // Both ephemeral public keys are public material; the public side of an
+        // asymmetric ECDH key is exportable even though the keypair was generated
+        // non-extractable. Sorting makes the transcript side-independent so both
+        // peers compute the same hash.
+        const myEphRaw = new Uint8Array(await crypto.subtle.exportKey('raw', this.keyPair.publicKey));
+        const otherEphRaw = new Uint8Array(await crypto.subtle.exportKey('raw', this.otherPublicKey));
+        const ephKeys = this._sortKeyPair(myEphRaw, otherEphRaw);
+        const transcriptInput = new Uint8Array(ephKeys[0].length + ephKeys[1].length);
+        transcriptInput.set(ephKeys[0], 0);
+        transcriptInput.set(ephKeys[1], ephKeys[0].length);
+        const transcriptHash = new Uint8Array(await crypto.subtle.digest('SHA-256', transcriptInput));
 
-        // Salt = roomId || "pinchat-sas-v2"
-        // The literal tag domain-separates the SAS derivation from any other
-        // HKDF use of these same identity keys (e.g. future safety-number
-        // computations or alternative display formats). Both pieces are
-        // public, both are fixed for the room, both peers compute the same
-        // salt — that is the entire point of v2.
+        // --- Salt = roomId || "pinchat-sas-v3" ------------------------------
         const encoder = new TextEncoder();
         const roomIdBytes = encoder.encode(roomId);
-        const tagBytes = encoder.encode('pinchat-sas-v2');
-        const salt = new Uint8Array(roomIdBytes.length + tagBytes.length);
+        const saltTagBytes = encoder.encode('pinchat-sas-v3');
+        const salt = new Uint8Array(roomIdBytes.length + saltTagBytes.length);
         salt.set(roomIdBytes, 0);
-        salt.set(tagBytes, roomIdBytes.length);
+        salt.set(saltTagBytes, roomIdBytes.length);
 
-        const info = encoder.encode('SAS-display-v2');
+        // --- info = "SAS-display-v3" || transcriptHash ----------------------
+        const infoTagBytes = encoder.encode('SAS-display-v3');
+        const info = new Uint8Array(infoTagBytes.length + transcriptHash.length);
+        info.set(infoTagBytes, 0);
+        info.set(transcriptHash, infoTagBytes.length);
 
         const baseKey = await crypto.subtle.importKey(
             'raw',
@@ -571,7 +609,7 @@ class ECDHKeyExchange {
             ['deriveBits']
         );
 
-        // 72 bits = 9 bytes = 12 emoji × 6 bits
+        // 96 bits = 12 bytes = 16 emoji × 6 bits
         const derivedBits = await crypto.subtle.deriveBits(
             {
                 name: 'HKDF',
@@ -580,7 +618,7 @@ class ECDHKeyExchange {
                 info: info
             },
             baseKey,
-            72
+            96
         );
 
         const sasBytes = new Uint8Array(derivedBits);
@@ -588,11 +626,11 @@ class ECDHKeyExchange {
         const sasObject = {
             emoji: this.encodeToEmoji(sasBytes),
             hex: this.encodeToHex(sasBytes),
-            bits: 72,
-            version: 2
+            bits: 96,
+            version: 3
         };
 
-        debugLog('[ECDH] ✅ SAS v2 generated (HKDF-SHA256, 72 bits):', sasObject);
+        debugLog('[ECDH] ✅ SAS v3 generated (HKDF-SHA256, 96 bits, transcript-bound):', sasObject);
         return sasObject;
     }
 

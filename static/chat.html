@@ -365,7 +365,7 @@
                     </div>
                     <div class="sas-head-text">
                         <h3 id="sas-title">Verify your peer</h3>
-                        <p class="sas-sub">Compare these 12 emoji with your peer through a channel you trust — a voice call, Signal, in person. If both of you see the same sequence, there is no man-in-the-middle.</p>
+                        <p class="sas-sub">Compare these 16 emoji with your peer through a channel you trust - a voice call, Signal, in person. If both of you see the same sequence, there is no man-in-the-middle.</p>
                     </div>
                 </div>
 
@@ -403,7 +403,7 @@
                             <line x1="12" y1="16" x2="12" y2="12"/>
                             <line x1="12" y1="8" x2="12.01" y2="8"/>
                         </svg>
-                        <span>Derived from both identity keys via <b>HKDF-SHA256</b> · 72 bits · stable for this room and contact. Same code on every reconnect: verify once, you're done.</span>
+                        <span>Derived from both identity keys and this session's live keys via <b>HKDF-SHA256</b> · 96 bits. The code changes each time a secure session is established; your verified contact carries over as long as their identity key does not change.</span>
                     </div>
 
                 </div>
@@ -444,7 +444,7 @@
     <script src="/static/js/crypto.js" integrity="sha256-+G3dj/6rf549i8ig137PN/83r95QPAhF1BjLP0/BOsU=" crossorigin="anonymous" ></script>
     <script src="/static/js/identity.js" integrity="sha256-fyQ1Rwp2wOfHnReiojL8xAOBG8XN9qGR2N3BvCQVyLs=" crossorigin="anonymous" ></script>
     <script src="/static/js/double-ratchet.js" integrity="sha256-DBLmNhTAKKFfSrq4FfQiCSffiL+EekyrNeNmUtWgVWI=" crossorigin="anonymous" ></script>
-    <script src="/static/js/ecdh.js" integrity="sha256-di3KThi7L0KX1FZ9GuL689civJLN3qv9V4LrbORdH2w=" crossorigin="anonymous" ></script>
+    <script src="/static/js/ecdh.js" integrity="sha256-o0iwCdvom1U1hKDdXOuFrIYWVqFVSep1hB4otWXy/SU=" crossorigin="anonymous" ></script>
     <script src="/static/js/websocket.js" integrity="sha256-ixcpU5MEMEueVzVI9CcM5Z3txpcgSSzL5os4W6fMbyg=" crossorigin="anonymous" ></script>
     <script src="/static/js/emoji.js" integrity="sha256-w67zAeAVHFA9AB+RnbDbadBSg6LDd5RS+4mvZksLUv8=" crossorigin="anonymous" ></script>
     <script src="/static/js/app.js" integrity="sha256-rNVzm8WtJmzYZQmK+TaHSuxerQ6n8251RO3+iAGkiNo=" crossorigin="anonymous" ></script>

@@ -33,7 +33,7 @@
 'use strict';
 
 const assert = require('assert');
-const { hkdfSync, createHmac } = require('crypto');
+const { hkdfSync, createHmac, createHash } = require('crypto');
 
 // Silence module-level debug helpers.
 global.debugLog = () => {};
@@ -211,29 +211,30 @@ async function testChainRatchetStep() {
     pass('chain ratchet CK_1 and CK_5 match HMAC-SHA256(prev, "ChainRatchet") reference');
 }
 
-// ── KAT 5: SAS v2 (HKDF-SHA256, 72 bits, stable salt) ───────────────────
+// ── KAT 5: SAS v3 (HKDF-SHA256, 96 bits, transcript-bound) ──────────────
 
-async function testSasV2() {
-    // SAS v2 derivation per static/js/ecdh.js#generateSAS:
-    //   IKM   = sorted(IK_A_raw || IK_B_raw)
-    //   salt  = roomId || "pinchat-sas-v2"
-    //   info  = "SAS-display-v2"
-    //   bits  = 72  (9 bytes, 12 emoji × 6 bits)
+async function testSasV3() {
+    // SAS v3 derivation per static/js/ecdh.js#generateSAS (audit H1):
+    //   IKM        = sorted(IK_A_raw || IK_B_raw)
+    //   salt       = roomId || "pinchat-sas-v3"
+    //   transcript = SHA-256( sorted(EPH_A_raw || EPH_B_raw) )
+    //   info       = "SAS-display-v3" || transcript
+    //   bits       = 96  (12 bytes, 16 emoji × 6 bits)
     //
-    // The test pins three properties:
+    // The test pins four properties:
     //   (a) byte-exact HKDF output against an independent Node reference,
-    //   (b) stability — two runs with the same identity keys + room id
-    //       produce the same SAS (no per-handshake salt material),
-    //   (c) symmetry — Alice and Bob compute the same SAS regardless of
-    //       which side calls generateSAS.
+    //   (b) stability - two runs with the SAME identity keys, room id, and
+    //       ephemeral keys produce the same SAS (transcript binding does not
+    //       break determinism for a fixed transcript),
+    //   (c) symmetry - Alice and Bob compute the same SAS regardless of which
+    //       side calls generateSAS (identity AND ephemeral keys cross over),
+    //   (d) transcript sensitivity - changing one ephemeral key changes the SAS
+    //       (proves the live session is actually bound).
 
-    // We need TWO real ECDSA P-256 public keys — synthetic 65-byte buffers
-    // are rejected by WebCrypto's importKey('raw', ...) because they're not
-    // valid curve points. We generate the keypairs here once: within a
-    // single test run their raw bytes are fixed, and we feed THE SAME bytes
-    // both into the reference HKDF and into the production generateSAS.
-    // That preserves determinism for the duration of the test (cross-impl
-    // byte equality) without needing a deterministic ECDSA generator.
+    // Real ECDSA P-256 identity keypairs (synthetic 65-byte buffers are
+    // rejected by importKey('raw', ...) as off-curve). Generated once; their
+    // raw bytes are fixed for the run and fed into both the reference HKDF and
+    // the production generateSAS.
     const kpA = await webcrypto.subtle.generateKey(
         { name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify']
     );
@@ -242,58 +243,66 @@ async function testSasV2() {
     );
     const ikA = new Uint8Array(await webcrypto.subtle.exportKey('raw', kpA.publicKey));
     const ikB = new Uint8Array(await webcrypto.subtle.exportKey('raw', kpB.publicKey));
+
+    // Live ECDH P-256 ephemeral keypairs for the transcript binding.
+    const ephKpA = await webcrypto.subtle.generateKey(
+        { name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveBits']
+    );
+    const ephKpB = await webcrypto.subtle.generateKey(
+        { name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveBits']
+    );
+    const ephA = new Uint8Array(await webcrypto.subtle.exportKey('raw', ephKpA.publicKey));
+    const ephB = new Uint8Array(await webcrypto.subtle.exportKey('raw', ephKpB.publicKey));
+
     const roomId = '00000000-0000-0000-0000-000000000001';
 
-    // Build the IKM the production code would build: sorted lexicographically.
-    const keys = [ikA, ikB].sort((a, b) => {
-        for (let i = 0; i < Math.min(a.length, b.length); i++) {
-            if (a[i] !== b[i]) return a[i] - b[i];
+    // Lexicographic sort matching the production _sortKeyPair helper.
+    const sortPair = (a, b) => [a, b].sort((x, y) => {
+        for (let i = 0; i < Math.min(x.length, y.length); i++) {
+            if (x[i] !== y[i]) return x[i] - y[i];
         }
-        return a.length - b.length;
+        return x.length - y.length;
     });
-    const ikm = new Uint8Array(keys[0].length + keys[1].length);
-    ikm.set(keys[0], 0);
-    ikm.set(keys[1], keys[0].length);
 
-    // Reference HKDF — independent of the production WebCrypto path.
-    const salt = Buffer.concat([Buffer.from(roomId, 'utf8'), Buffer.from('pinchat-sas-v2', 'utf8')]);
-    const info = Buffer.from('SAS-display-v2', 'utf8');
-    const expectedSasBytes = new Uint8Array(
-        hkdfSync('sha256', ikm, salt, info, 9)  // 9 bytes = 72 bits
-    );
+    // Reference IKM, transcript, salt, info - fully independent of production.
+    function referenceSasBytes(idRawA, idRawB, ephRawA, ephRawB) {
+        const idKeys = sortPair(idRawA, idRawB);
+        const ikm = new Uint8Array(idKeys[0].length + idKeys[1].length);
+        ikm.set(idKeys[0], 0);
+        ikm.set(idKeys[1], idKeys[0].length);
 
-    // Production path: stub out the identity manager with the raw bytes the
-    // SAS code reads, then drive generateSAS. The class deliberately uses
-    // `identityKeyPair.publicKey` via exportKey('raw', ...) for our side and
-    // `peerIdentityPublicKeyRaw` (a cached Uint8Array) for the peer — we
-    // provide both. Run the SAS function twice (Alice's view, Bob's view)
-    // and assert identical output: that is the symmetry property.
-    async function sasFromPerspective(myPubKeyCryptoKey, peerRawBytes) {
+        const ek = sortPair(ephRawA, ephRawB);
+        const transcriptInput = Buffer.concat([Buffer.from(ek[0]), Buffer.from(ek[1])]);
+        const transcript = createHash('sha256').update(transcriptInput).digest();
+
+        const salt = Buffer.concat([Buffer.from(roomId, 'utf8'), Buffer.from('pinchat-sas-v3', 'utf8')]);
+        const info = Buffer.concat([Buffer.from('SAS-display-v3', 'utf8'), transcript]);
+        return new Uint8Array(hkdfSync('sha256', ikm, salt, info, 12)); // 12 bytes = 96 bits
+    }
+
+    const expectedSasBytes = referenceSasBytes(ikA, ikB, ephA, ephB);
+
+    // Production path: stub the identity manager AND the ECDH ephemeral keys
+    // the SAS code now reads (this.keyPair.publicKey + this.otherPublicKey).
+    async function sasFromPerspective(myIdPubKey, peerIdRaw, myEphPubKey, peerEphPubKey) {
         const mgr = new IdentityKeyManager();
-        mgr.identityKeyPair = {
-            publicKey: myPubKeyCryptoKey,
-            privateKey: null,
-        };
-        // Peer side uses cached raw bytes only — no CryptoKey needed.
+        mgr.identityKeyPair = { publicKey: myIdPubKey, privateKey: null };
         mgr.peerIdentityPublicKey = {};  // truthy guard
-        mgr.peerIdentityPublicKeyRaw = peerRawBytes;
+        mgr.peerIdentityPublicKeyRaw = peerIdRaw;
 
         const ecdh = new ECDHKeyExchange(null, mgr);
+        // Live ephemeral keys for transcript binding.
+        ecdh.keyPair = { publicKey: myEphPubKey, privateKey: null };
+        ecdh.otherPublicKey = peerEphPubKey;
         return ecdh.generateSAS(roomId);
     }
 
-    // Real P-256 raw exports always start with 0x04 (uncompressed marker),
-    // so the lexicographic sort orders them by their X-coordinate first byte.
-    // Either order produces the same sorted IKM at the production side, so
-    // the SAS is identical from both perspectives — that's the symmetry
-    // assertion (c) below.
-    const sasAlice = await sasFromPerspective(kpA.publicKey, ikB);
-    const sasBob   = await sasFromPerspective(kpB.publicKey, ikA);
+    // Alice's view: own id = kpA, peer id = ikB; own eph = ephKpA, peer eph = ephKpB.
+    // Bob's view: the crossed assignment. Both must agree (symmetry).
+    const sasAlice = await sasFromPerspective(kpA.publicKey, ikB, ephKpA.publicKey, ephKpB.publicKey);
+    const sasBob   = await sasFromPerspective(kpB.publicKey, ikA, ephKpB.publicKey, ephKpA.publicKey);
 
-    // (a) Byte-exact match against Node's hkdfSync.
-    // We can't extract sasBytes directly from the production helper (it
-    // returns emoji+hex), but the hex string is bytes.toHex (uppercase with
-    // dashes) — strip the dashes and compare.
+    // (a) Byte-exact match against Node's hkdfSync reference.
     const aliceHexBytes = Buffer.from(sasAlice.hex.replace(/-/g, ''), 'hex');
     assert.strictEqual(
         hex(aliceHexBytes),
@@ -301,27 +310,37 @@ async function testSasV2() {
         `SAS bytes mismatch: actual=${hex(aliceHexBytes)} expected=${hex(expectedSasBytes)}`
     );
 
-    // (b) Stability: re-run from Alice's perspective, must produce the same
-    // emoji and hex. Since the salt is fixed for (roomId, "pinchat-sas-v2"),
-    // there is no per-handshake material at all.
-    const sasAliceAgain = await sasFromPerspective(kpA.publicKey, ikB);
-    assert.strictEqual(sasAlice.emoji, sasAliceAgain.emoji, 'SAS must be stable across calls');
-    assert.strictEqual(sasAlice.hex, sasAliceAgain.hex, 'SAS hex must be stable across calls');
+    // (b) Stability for a fixed transcript: same inputs → same SAS.
+    const sasAliceAgain = await sasFromPerspective(kpA.publicKey, ikB, ephKpA.publicKey, ephKpB.publicKey);
+    assert.strictEqual(sasAlice.emoji, sasAliceAgain.emoji, 'SAS must be stable for a fixed transcript');
+    assert.strictEqual(sasAlice.hex, sasAliceAgain.hex, 'SAS hex must be stable for a fixed transcript');
 
-    // (c) Symmetry: Alice's view and Bob's view must agree.
+    // (c) Symmetry: Alice's and Bob's views must agree.
     assert.strictEqual(sasAlice.emoji, sasBob.emoji, 'Alice and Bob must compute the same SAS emoji');
     assert.strictEqual(sasAlice.hex, sasBob.hex, 'Alice and Bob must compute the same SAS hex');
 
-    // (d) Shape sanity.
-    assert.strictEqual(sasAlice.bits, 72, 'SAS must be 72 bits');
-    assert.strictEqual(sasAlice.version, 2, 'SAS object must declare version 2');
-    assert.strictEqual(
-        Array.from(sasAlice.emoji).length,
-        12,
-        `SAS emoji must be 12 emoji; got ${Array.from(sasAlice.emoji).length}`
+    // (d) Transcript sensitivity: swap one ephemeral key for a fresh one and
+    // the SAS MUST change. This is the property that defeats the offline
+    // precompute attack - the displayed code depends on the live session keys.
+    const ephKpC = await webcrypto.subtle.generateKey(
+        { name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveBits']
+    );
+    const sasDifferentEph = await sasFromPerspective(kpA.publicKey, ikB, ephKpA.publicKey, ephKpC.publicKey);
+    assert.notStrictEqual(
+        sasAlice.hex, sasDifferentEph.hex,
+        'SAS must change when an ephemeral key changes (transcript binding active)'
     );
 
-    pass('SAS v2 — HKDF byte-exact vs reference, stable across calls, symmetric Alice/Bob, 12 emoji');
+    // (e) Shape sanity.
+    assert.strictEqual(sasAlice.bits, 96, 'SAS must be 96 bits');
+    assert.strictEqual(sasAlice.version, 3, 'SAS object must declare version 3');
+    assert.strictEqual(
+        Array.from(sasAlice.emoji).length,
+        16,
+        `SAS emoji must be 16 emoji; got ${Array.from(sasAlice.emoji).length}`
+    );
+
+    pass('SAS v3 - HKDF byte-exact vs reference, stable for fixed transcript, symmetric Alice/Bob, transcript-sensitive, 16 emoji');
 }
 
 // ── KAT 4: canonical DH-header bytes ────────────────────────────────────
@@ -377,7 +396,7 @@ async function testCanonicalDhHeaderBytes() {
         await testInitialChainLabels();
         await testChainRatchetStep();
         await testCanonicalDhHeaderBytes();
-        await testSasV2();
+        await testSasV3();
         console.log('');
         console.log('All KAT suites PASSED.');
         process.exit(0);
