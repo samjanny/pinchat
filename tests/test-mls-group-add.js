@@ -197,6 +197,71 @@ async function main() {
     assert(new TextDecoder().decode((await alice.decryptApplicationMessage(wireF)).plaintext)
         === 'all caught up', 'post-convergence message decrypts at epoch 3');
 
+    // 8. Member-initiated Update proposal (per-member PCS). Bob (leaf 1)
+    // re-keys its OWN leaf; Alice (creator, leaf 0) folds the proposal
+    // into a Commit. This is what heals a compromised member leaf key:
+    // Bob's fresh encryption key is not derivable from the old one.
+    console.log('# Member-initiated Update proposal (per-member PCS)');
+    {
+        const bobOldLeaf = require('../static/js/mls/ratchet-tree.js')
+            .leafFor(bobGroup.ratchetTree, bobGroup.myLeafIndex);
+        const bobOldEncKey = Buffer.from(bobOldLeaf.encryptionKey).toString('hex');
+
+        // Bob proposes; keeps the pending keypair to swap in on commit.
+        const { proposalMessage, pendingLeafKeyPair } = await bobGroup.proposeUpdate();
+        assert(proposalMessage instanceof Uint8Array && proposalMessage.length > 0,
+            'Bob produced an Update proposal message');
+
+        // Alice parses the proposal off the wire and folds it into a
+        // Commit (mirrors what mls-session does).
+        const MLSMessage = require('../static/js/mls/mls-message.js');
+        const PublicMessage = require('../static/js/mls/public-message.js');
+        const Proposal = require('../static/js/mls/proposal.js');
+        const Framing = require('../static/js/mls/framing.js');
+        const pframe = MLSMessage.parseMLSMessage(proposalMessage);
+        const ppm = PublicMessage.parsePublicMessage(pframe.body, (dec, ct) =>
+            (ct === Framing.ContentType.PROPOSAL ? Proposal.readProposal(dec) : null));
+        assert(ppm.content.parsed.proposalType === Proposal.ProposalType.UPDATE,
+            'proposal parses as UPDATE');
+        const proposerLeaf = ppm.content.sender.leafIndex;
+        assert(proposerLeaf === 1, 'proposal sender is Bob (leaf 1)');
+
+        const beforeEpoch = alice.epoch;
+        const { commitMessage: updCommit3 } = await alice.commitUpdate({
+            updateProposals: [{ proposal: ppm.content.parsed, senderLeafIndex: proposerLeaf }],
+        });
+        assert(alice.epoch === beforeEpoch + 1n, 'folded-Update commit advances Alice');
+        const aliceBobLeaf = require('../static/js/mls/ratchet-tree.js')
+            .leafFor(alice.ratchetTree, 1);
+        assert(Buffer.from(aliceBobLeaf.encryptionKey).toString('hex') !== bobOldEncKey,
+            'Bob leaf encryption_key rotated in Alice tree');
+        assert(Buffer.from(aliceBobLeaf.encryptionKey).toString('hex')
+            === Buffer.from(pendingLeafKeyPair.publicKeyBytes).toString('hex'),
+            'Alice tree carries exactly Bob proposed key');
+
+        // Bob processes the Commit with the pending self-update; his
+        // keypair swaps in and the group converges.
+        const res = await bobGroup.processCommit(updCommit3, { pendingSelfUpdate: pendingLeafKeyPair });
+        assert(res.selfUpdated === true, 'processCommit reports Bob self-updated');
+        assert(bobGroup.epoch === alice.epoch, 'Bob converges after folded Update');
+        assert(
+            Buffer.from(bobGroup.epochSecrets.encryptionSecret).toString('hex')
+                === Buffer.from(alice.epochSecrets.encryptionSecret).toString('hex'),
+            'encryption_secret converges after member Update'
+        );
+        assert(Buffer.from(bobGroup.leafKeyPair.publicKeyBytes).toString('hex')
+            === Buffer.from(pendingLeafKeyPair.publicKeyBytes).toString('hex'),
+            'Bob adopted the fresh leaf keypair');
+
+        // Post-rotation traffic decrypts both ways.
+        const wireM1 = await bobGroup.encryptApplicationMessage('bob after self-rekey');
+        assert(new TextDecoder().decode((await alice.decryptApplicationMessage(wireM1)).plaintext)
+            === 'bob after self-rekey', 'Bob -> Alice decrypts after member Update');
+        const wireM2 = await alice.encryptApplicationMessage('alice ack');
+        assert(new TextDecoder().decode((await bobGroup.decryptApplicationMessage(wireM2)).plaintext)
+            === 'alice ack', 'Alice -> Bob decrypts after member Update');
+    }
+
     console.log('');
     console.log(`group-add: ${passed} passed, ${failed} failed`);
     process.exit(failed === 0 ? 0 : 1);

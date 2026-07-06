@@ -101,10 +101,23 @@ The browser-facing flow runs entirely over MLS for group rooms:
   and signature checks, enforced under the OLD group context) instead
   of being lost. At most one previous epoch is retained; its key
   material is zeroed at expiry or on the next Commit.
-- **Periodic PCS rotation.** The creator broadcasts a path-only Commit
-  (empty proposal list plus UpdatePath, RFC 9420 compliant) every 10
-  minutes, re-keying its leaf and direct path so leaked epoch secrets
-  stop being useful even in membership-stable groups.
+- **Periodic PCS rotation.** Every ~10 minutes (with jitter) the
+  creator broadcasts a path-only Commit (empty proposal list plus
+  UpdatePath, RFC 9420 compliant) re-keying its own leaf and direct
+  path, and folds in any pending member Update proposals. This heals
+  leaked epoch-level secrets in membership-stable groups.
+- **Per-member PCS via Update proposals.** Each non-creator member
+  periodically sends an `Update` proposal (RFC 9420 §12.1.2): a fresh
+  leaf HPKE keypair signed with its existing identity key. The creator
+  folds the proposal into its next Commit (installing the new leaf
+  and blanking that leaf's direct path) and the proposing member swaps in
+  the fresh private key when the Commit lands (`processCommit` reports
+  `selfUpdated`). Because the leaf encryption key is separate from the
+  signature/identity key, a member whose leaf key was compromised can
+  still authenticate the proposal and rotate to a key the attacker does
+  not hold, so post-rotation traffic is unrecoverable to the attacker.
+  Single-committer is preserved (only the creator commits), so there
+  are no concurrent-commit forks.
 - The Rust server stays a blind relay: it forwards a single `mls`
   envelope kind with `wire_format` and an optional `ratchet_tree`
   side-channel, never inspecting the body.
@@ -149,14 +162,13 @@ loss-of-access.
   scenario the filter collapses to the full path (every parent on the
   creator's direct path has at least one non-blank receiver subtree),
   so the wire bytes are byte-identical in practice.
-- **Member-initiated Update proposals.** The creator's periodic
-  path-only Commit rotates the epoch secrets, which heals leakage of
-  epoch-level state. It does NOT heal a compromised MEMBER leaf
-  private key: the path-secret ciphertext addressed to that leaf
-  stays decryptable by whoever holds the key. Full per-member PCS
-  needs member-initiated `Update` proposals (each member periodically
-  re-keying its own leaf), which remain unimplemented in the
-  creator-only-commit architecture.
+- **Update proposal identity rotation.** Member Update proposals
+  re-key the leaf ENCRYPTION key but must keep the same signature key
+  (`verifyUpdateLeafBinding` rejects signature-key rotation). Rotating
+  the long-term identity/signature key mid-group is not supported;
+  compromise of a member's signature key is an identity compromise
+  that MLS PCS does not repair (the attacker can sign as that member
+  until removed).
 - **Joiner-side transcript-hash re-derivation (RFC §5.3).** A new
   joiner cannot independently re-derive
   `confirmed_transcript_hash[n]` because they don't have

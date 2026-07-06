@@ -1197,11 +1197,103 @@
     };
 
     /**
+     * Member-initiated Update proposal (RFC 9420 §12.1.2). Generates a
+     * FRESH leaf HPKE keypair, builds a source=UPDATE LeafNode signed
+     * with our identity key, and returns a signed PublicMessage(proposal)
+     * to broadcast plus the pending private keypair the caller must swap
+     * in once the committing member folds this proposal into a Commit.
+     *
+     * This is what closes per-member PCS in the single-committer model:
+     * a member whose leaf ENCRYPTION key was compromised picks a new one
+     * the attacker does not hold (its signature/identity key, kept
+     * separate, still authenticates the proposal), and the committer
+     * re-keys the tree so the old leaf key stops decrypting anything.
+     *
+     * Returns { proposalMessage, pendingLeafKeyPair, pendingLeafNode }.
+     * The caller (mls-session) holds pendingLeafKeyPair until it sees the
+     * Commit that carries this proposal land, then calls
+     * applyPendingSelfUpdate().
+     */
+    Group.prototype.proposeUpdate = async function proposeUpdate() {
+        if (this.myLeafIndex === undefined || this.myLeafIndex === null) {
+            throw new Error('proposeUpdate: observer cannot propose');
+        }
+        // Fresh leaf encryption keypair (the whole point of PCS).
+        const newLeafKeyPair = await HPKE.generateKeyPair();
+        const leaf = buildSelfLeaf({
+            encryptionKeyBytes: newLeafKeyPair.publicKeyBytes,
+            signatureKeyBytes: this.identity.signaturePublicKeyBytes,
+            credentialIdentity: this.identity.signaturePublicKeyBytes,
+            leafNodeSource: Nodes.LeafNodeSource.UPDATE,
+        });
+        // §7.6: a source=UPDATE LeafNode is signed over LeafNodeTBS with
+        // group_id and leaf_index appended (same TBS shape as commit).
+        leaf.signature = await signLeafNodeInCommit(
+            this.identity.signaturePrivateKey, leaf, this.groupId, this.myLeafIndex,
+        );
+
+        const proposal = { proposalType: Proposal.ProposalType.UPDATE, leafNode: leaf };
+        const proposalBodyBytes = Proposal.proposalBytes(proposal);
+        const content = {
+            groupId: this.groupId,
+            epoch: this.epoch,
+            sender: { senderType: Framing.SenderType.MEMBER, leafIndex: this.myLeafIndex },
+            authenticatedData: new Uint8Array(0),
+            contentType: Framing.ContentType.PROPOSAL,
+            payload: proposalBodyBytes,
+        };
+        const wireFormat = MLSMessage.WireFormat.MLS_PUBLIC_MESSAGE;
+        const signature = await PublicMessage.signFramedContent(
+            this.identity.signaturePrivateKey, wireFormat, content,
+            this._buildGroupContextStruct(),
+        );
+        const auth = { signature };
+        const membershipTag = await PublicMessage.computeMembershipTag(
+            this.epochSecrets.membershipKey, wireFormat, content, auth,
+            this._buildGroupContextStruct(),
+        );
+        const pm = { content, auth, membershipTag };
+        const pmBytes = PublicMessage.publicMessageBytes(pm);
+        const proposalMessage = MLSMessage.serializeMLSMessage(wireFormat, pmBytes);
+
+        return { proposalMessage, pendingLeafKeyPair: newLeafKeyPair, pendingLeafNode: leaf };
+    };
+
+    /**
+     * Swap in the leaf keypair we generated in proposeUpdate() once the
+     * Commit carrying that proposal has been applied. The updated leaf's
+     * public key is already in the tree (installed by processCommit);
+     * this makes our private state match it. Idempotent-safe: verifies
+     * the tree actually carries our proposed public key before swapping.
+     */
+    Group.prototype.applyPendingSelfUpdate = function applyPendingSelfUpdate(pendingLeafKeyPair) {
+        const myLeaf = RatchetTree.leafFor(this.ratchetTree, this.myLeafIndex);
+        if (!myLeaf || !equalBytes(myLeaf.encryptionKey, pendingLeafKeyPair.publicKeyBytes)) {
+            // The commit did not carry our update (superseded / dropped);
+            // keep the existing leafKeyPair untouched.
+            return false;
+        }
+        this.leafKeyPair = {
+            privateKey: pendingLeafKeyPair.privateKey,
+            publicKey: pendingLeafKeyPair.publicKey,
+            publicKeyBytes: pendingLeafKeyPair.publicKeyBytes,
+        };
+        return true;
+    };
+
+    /**
      * Path-only Commit (RFC 9420 allows a Commit with an empty proposal
      * list as long as it carries an UpdatePath): re-key the committer's
      * leaf and direct path and advance the epoch WITHOUT membership
      * change. Used for the periodic PCS rotation in membership-stable
      * groups.
+     *
+     * `updateProposals` (optional): an array of
+     * { proposal, senderLeafIndex } Update proposals to fold into this
+     * Commit. Each installs the proposer's fresh leaf and blanks that
+     * leaf's direct path BEFORE the committer builds its own UpdatePath,
+     * so the committer's re-key routes new path secrets to the updated
+     * members' new keys.
      *
      * Scope note: this heals leakage of the current epoch secrets (an
      * attacker holding epoch n secrets cannot follow into epoch n+1
@@ -1213,10 +1305,38 @@
      *
      * Returns { commitMessage }.
      */
-    Group.prototype.commitUpdate = async function commitUpdate() {
+    Group.prototype.commitUpdate = async function commitUpdate({ updateProposals = [] } = {}) {
         const newNLeaves = this.nLeaves;
         const newWidth = TreeMath.nodeWidth(newNLeaves);
         const newTree = Nodes.padRatchetTree(this.ratchetTree.slice(), newWidth);
+
+        // ---- 0. Apply Update proposals: install each proposer's fresh
+        // leaf and blank its direct path (RFC §12.4.2). Verify each
+        // proposal's LeafNode signature against the CURRENT leaf's
+        // signature key (no identity rotation in this MVP). Skip a
+        // proposal for a leaf we're not tracking or whose signer changed.
+        const proposalOrRefs = [];
+        for (const up of updateProposals) {
+            const li = up.senderLeafIndex;
+            if (li === this.myLeafIndex) {
+                throw new Error('commitUpdate: committer must use its own path re-key, not an Update proposal');
+            }
+            const curLeaf = RatchetTree.leafFor(this.ratchetTree, li);
+            if (!curLeaf) continue;
+            await verifyUpdateLeafBinding(
+                up.proposal.leafNode, curLeaf.signatureKey, this.groupId, li,
+            );
+            newTree[TreeMath.leafToNode(li)] = {
+                nodeType: Nodes.NodeType.LEAF, leaf: up.proposal.leafNode,
+            };
+            for (const ancestor of TreeMath.directPathWithRoot(TreeMath.leafToNode(li), newNLeaves)) {
+                newTree[ancestor] = null;
+            }
+            proposalOrRefs.push({
+                type: Proposal.ProposalOrRefType.PROPOSAL,
+                proposal: up.proposal,
+            });
+        }
 
         // ---- 1. Fresh leaf_secret + path-secret chain for committer ----
         const leafSecret = randomBytes(HPKE.Nh);
@@ -1311,8 +1431,8 @@
             nodes: updatePathNodes,
         };
 
-        // ---- 6. Commit struct: NO proposals, just the UpdatePath ----
-        const commitStruct = { proposals: [], path: updatePath };
+        // ---- 6. Commit struct: folded Update proposals + UpdatePath ----
+        const commitStruct = { proposals: proposalOrRefs, path: updatePath };
         const commitBodyBytes = Commit.commitBytes(commitStruct);
 
         // ---- 7. FramedContent + signature (under OLD context) ----
@@ -1408,7 +1528,14 @@
      *     not implemented.
      *   - Update proposals are not yet handled.
      */
-    Group.prototype.processCommit = async function processCommit(commitMessageBytes) {
+    Group.prototype.processCommit = async function processCommit(commitMessageBytes, opts = {}) {
+        // pendingSelfUpdate: the { publicKeyBytes, privateKey, ... } keypair
+        // we generated for an Update proposal that may be folded into this
+        // Commit. If the Commit installs our new leaf, we must decrypt the
+        // committer's UpdatePath with the NEW private key (the committer
+        // encrypted to it), so we swap leafKeyPair before the resolution
+        // walk. Ignored if this Commit does not carry our update.
+        const pendingSelfUpdate = opts.pendingSelfUpdate || null;
         const frame = MLSMessage.parseMLSMessage(commitMessageBytes);
         if (frame.wireFormat !== MLSMessage.WireFormat.MLS_PUBLIC_MESSAGE) {
             throw new Error(`processCommit: expected mls_public_message, got ${frame.wireFormat}`);
@@ -1470,6 +1597,9 @@
         let newNLeaves = this.nLeaves;
         let lastAddedLeafIndex = null;
         let lastRemovedLeafIndex = null;
+        // Leaves updated by a folded Update proposal, used below so the
+        // committing member can swap in its own pending keypair.
+        const updatedLeafIndices = [];
         for (const por of commit.proposals) {
             if (por.type !== Proposal.ProposalOrRefType.PROPOSAL) {
                 throw new Error('processCommit: proposal-by-reference not supported');
@@ -1484,6 +1614,45 @@
                     nodeType: Nodes.NodeType.LEAF, leaf: proposal.keyPackage.leafNode,
                 };
                 lastAddedLeafIndex = addLeafIndex;
+            } else if (proposal.proposalType === Proposal.ProposalType.UPDATE) {
+                // Member-initiated re-key (RFC §12.4.2): the proposal
+                // must have come from a member (its own leaf); the
+                // committer applies the new LeafNode and blanks that
+                // leaf's direct path. We cannot recover the leaf_index
+                // from the inline proposal alone, so we match the new
+                // LeafNode's signature key against an existing leaf (no
+                // identity rotation in this MVP) and verify the
+                // UPDATE-source LeafNode signature over that index.
+                const newLeaf = proposal.leafNode;
+                if (newLeaf.leafNodeSource !== Nodes.LeafNodeSource.UPDATE) {
+                    throw new Error('processCommit: Update proposal leaf not source=update');
+                }
+                let updLeafIndex = -1;
+                for (let li = 0; li < newNLeaves; li += 1) {
+                    const existing = RatchetTree.leafFor(newTree, li);
+                    if (existing && equalBytes(existing.signatureKey, newLeaf.signatureKey)) {
+                        updLeafIndex = li;
+                        break;
+                    }
+                }
+                if (updLeafIndex === -1) {
+                    throw new Error('processCommit: Update proposal for an unknown member');
+                }
+                if (updLeafIndex === senderLeafIndex) {
+                    throw new Error('processCommit: committer must re-key via its own path, not an Update');
+                }
+                await verifyUpdateLeafBinding(
+                    newLeaf, newLeaf.signatureKey, this.groupId, updLeafIndex,
+                );
+                newTree[TreeMath.leafToNode(updLeafIndex)] = {
+                    nodeType: Nodes.NodeType.LEAF, leaf: newLeaf,
+                };
+                for (const ancestor of TreeMath.directPathWithRoot(
+                    TreeMath.leafToNode(updLeafIndex), newNLeaves,
+                )) {
+                    newTree[ancestor] = null;
+                }
+                updatedLeafIndices.push(updLeafIndex);
             } else if (proposal.proposalType === Proposal.ProposalType.REMOVE) {
                 const rmIdx = proposal.removed;
                 if (typeof rmIdx !== 'number' || rmIdx < 0 || rmIdx >= newNLeaves) {
@@ -1578,6 +1747,23 @@
         };
         const provisionalGroupContextBytes =
             GroupContext.groupContextBytes(provisionalGroupContext);
+
+        // If a folded Update proposal re-keyed OUR leaf, adopt the
+        // pending private key now: the committer's UpdatePath below is
+        // encrypted to our NEW leaf encryption key, and the tree already
+        // carries the matching public key.
+        let selfUpdated = false;
+        if (pendingSelfUpdate && updatedLeafIndices.includes(this.myLeafIndex)) {
+            const myLeaf = RatchetTree.leafFor(newTree, this.myLeafIndex);
+            if (myLeaf && equalBytes(myLeaf.encryptionKey, pendingSelfUpdate.publicKeyBytes)) {
+                this.leafKeyPair = {
+                    privateKey: pendingSelfUpdate.privateKey,
+                    publicKey: pendingSelfUpdate.publicKey,
+                    publicKeyBytes: pendingSelfUpdate.publicKeyBytes,
+                };
+                selfUpdated = true;
+            }
+        }
 
         // ---- Find LCA and decrypt our share of path_secret ----
         let lcaIdxInPath = -1;
@@ -1738,6 +1924,8 @@
         return {
             addedLeafIndex: lastAddedLeafIndex,
             removedLeafIndex: lastRemovedLeafIndex,
+            updatedLeafIndices,
+            selfUpdated,
             committerLeafIndex: senderLeafIndex,
         };
     };
@@ -2075,6 +2263,37 @@
         );
         if (!ok) {
             throw new Error('verifyCommitLeaf: LeafNode signature invalid');
+        }
+    }
+
+    /**
+     * Verify an UPDATE-source LeafNode (member-initiated re-key). Same
+     * TBS shape as commit-source (LeafNodeTBS || group_id || leaf_index),
+     * and the new leaf must keep the member's existing signature key
+     * (no identity rotation in this MVP), so the re-key is bound to the
+     * same authenticated member.
+     */
+    async function verifyUpdateLeafBinding(leaf, expectedSignatureKey, groupId, leafIndex) {
+        if (leaf.leafNodeSource !== Nodes.LeafNodeSource.UPDATE) {
+            throw new Error(
+                `verifyUpdateLeaf: expected source=UPDATE, got ${leaf.leafNodeSource}`,
+            );
+        }
+        if (!equalBytes(leaf.signatureKey, expectedSignatureKey)) {
+            throw new Error(
+                'verifyUpdateLeaf: signature_key rotation in update not supported',
+            );
+        }
+        const sigPub = await Signature.importPublicKey(leaf.signatureKey);
+        const encoder = new Codec.Encoder();
+        Nodes.writeLeafNodeTbs(encoder, leaf);
+        encoder.writeOpaque(groupId);
+        encoder.writeU32(leafIndex);
+        const ok = await Labeled.verifyWithLabel(
+            sigPub, 'LeafNodeTBS', encoder.bytes(), leaf.signature,
+        );
+        if (!ok) {
+            throw new Error('verifyUpdateLeaf: LeafNode signature invalid');
         }
     }
 

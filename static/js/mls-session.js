@@ -190,6 +190,14 @@
             // message: a mismatch means the relay re-stamped the
             // envelope's sender_id.
             this._senderIdByLeaf = new Map();
+            // Creator-only: Update proposals received from members, keyed
+            // by proposer leaf index, awaiting the next periodic Commit.
+            this._pendingUpdateProposals = new Map();
+            // Member-only: our own in-flight Update ({ keyPair, leafNode })
+            // waiting for the creator's Commit that folds it in. Kept until
+            // processCommit reports selfUpdated (or a later proposal
+            // supersedes it).
+            this._pendingSelfUpdate = null;
         }
 
         /**
@@ -278,13 +286,15 @@
             }
 
             // Existing members (creator or already-joined joiners) process
-            // incoming Commit broadcasts to advance their epoch state.
-            // The creator filters their own echoes upstream via sender_id;
-            // joiners-still-awaiting-welcome buffer the most recent Commit
-            // so the Welcome handler can bind groupInfo.signer to it.
+            // incoming PublicMessage broadcasts. A PublicMessage is either
+            // a Commit (advance epoch) or a standalone Proposal (an Update
+            // proposal a member wants folded into the next Commit). We peek
+            // the content_type to route; the creator stores Update
+            // proposals, everyone processes Commits.
+            // Own echoes are filtered upstream via sender_id.
             if (wireFormat === MLS.MLSMessage.WireFormat.MLS_PUBLIC_MESSAGE
                 && this._state === 'joined') {
-                await this._handleIncomingCommit(payload);
+                await this._handlePublicMessage(payload, envelope.sender_id);
                 return;
             }
             if (wireFormat === MLS.MLSMessage.WireFormat.MLS_PUBLIC_MESSAGE
@@ -478,18 +488,83 @@
         }
 
         /**
-         * Apply an incoming Commit broadcast to the local group state.
-         * Re-wraps the body with MLSMessage framing so processCommit can
-         * dispatch off wire_format. Errors during processing are surfaced
-         * via onEvent — they should be rare in our scenario (creator-only
-         * adds), so we treat them as actionable rather than silent drops.
+         * Route an incoming PublicMessage: Commit vs standalone Proposal.
+         * We peek the FramedContent content_type without fully parsing the
+         * body (the parse callback returns null for both), then dispatch.
          */
-        async _handleIncomingCommit(mlsMessageBytes) {
+        async _handlePublicMessage(mlsMessageBytes, senderId) {
             const wrapped = MLS.MLSMessage.serializeMLSMessage(
                 MLS.MLSMessage.WireFormat.MLS_PUBLIC_MESSAGE, mlsMessageBytes,
             );
+            let contentType;
             try {
-                const result = await this.group.processCommit(wrapped);
+                const frame = MLS.MLSMessage.parseMLSMessage(wrapped);
+                const pm = MLS.PublicMessage.parsePublicMessage(frame.body, () => null);
+                contentType = pm.content.contentType;
+            } catch (err) {
+                this.onEvent({ kind: 'error',
+                    reason: `malformed PublicMessage: ${err.message}` });
+                return;
+            }
+            if (contentType === MLS.Framing.ContentType.PROPOSAL) {
+                await this._handleIncomingProposal(wrapped, senderId);
+                return;
+            }
+            await this._handleIncomingCommit(wrapped);
+        }
+
+        /**
+         * Creator-only: buffer a member's Update proposal so the next
+         * periodic Commit folds it in. Non-creators ignore proposals
+         * (the creator is the sole committer). The proposal is fully
+         * verified when applied (commitUpdate / processCommit run the
+         * signature checks); here we only parse and stash it, keyed by
+         * the proposer's leaf index so a re-proposal supersedes.
+         */
+        async _handleIncomingProposal(wrappedBytes, senderId) {
+            if (this.role !== 'creator') return;
+            let proposal;
+            let senderLeafIndex;
+            try {
+                const frame = MLS.MLSMessage.parseMLSMessage(wrappedBytes);
+                const pm = MLS.PublicMessage.parsePublicMessage(frame.body, (decoder, ct) => {
+                    if (ct === MLS.Framing.ContentType.PROPOSAL) {
+                        return MLS.Proposal.readProposal(decoder);
+                    }
+                    return null;
+                });
+                if (pm.content.sender.senderType !== MLS.Framing.SenderType.MEMBER) return;
+                senderLeafIndex = pm.content.sender.leafIndex;
+                proposal = pm.content.parsed;
+            } catch (err) {
+                this.onEvent({ kind: 'error',
+                    reason: `malformed Update proposal: ${err.message}` });
+                return;
+            }
+            if (!proposal || proposal.proposalType !== MLS.Proposal.ProposalType.UPDATE) {
+                // We only fold Update proposals; Add/Remove are creator-driven.
+                return;
+            }
+            this._pendingUpdateProposals.set(senderLeafIndex, { proposal, senderLeafIndex });
+            this.onEvent({ kind: 'update-proposal-received', senderLeafIndex });
+        }
+
+        /**
+         * Apply an incoming Commit broadcast to the local group state.
+         * `wrapped` is already MLSMessage-framed. Errors are surfaced via
+         * onEvent. If the Commit folds an Update proposal we authored,
+         * the pending keypair is swapped in inside processCommit.
+         */
+        async _handleIncomingCommit(wrapped) {
+            try {
+                const result = await this.group.processCommit(wrapped, {
+                    pendingSelfUpdate: this._pendingSelfUpdate
+                        ? this._pendingSelfUpdate.keyPair
+                        : null,
+                });
+                if (result.selfUpdated && this._pendingSelfUpdate) {
+                    this._pendingSelfUpdate = null;
+                }
                 this.onEvent({ kind: 'commit-applied', ...result });
             } catch (err) {
                 console.error('[MLS] processCommit failed:', err);
@@ -527,9 +602,16 @@
             if (this.role !== 'creator') return;
             if (this._state !== 'joined') return;
             if (!this.group || this.group.nLeaves < 2) return;
+            // Fold any pending member Update proposals into this Commit,
+            // dropping stale ones (proposer no longer in the tree).
+            const updateProposals = [];
+            for (const [li, entry] of this._pendingUpdateProposals) {
+                if (li < this.group.nLeaves) updateProposals.push(entry);
+            }
+            this._pendingUpdateProposals = new Map();
             let commitMessage;
             try {
-                ({ commitMessage } = await this.group.commitUpdate());
+                ({ commitMessage } = await this.group.commitUpdate({ updateProposals }));
             } catch (err) {
                 console.error('[MLS] commitUpdate failed:', err);
                 this.onEvent({ kind: 'error',
@@ -541,7 +623,43 @@
                 payload: base64UrlEncode(stripMlsWrapper(commitMessage)),
                 wire_format: MLS.MLSMessage.WireFormat.MLS_PUBLIC_MESSAGE,
             });
-            this.onEvent({ kind: 'update-committed', epoch: this.group.epoch.toString() });
+            this.onEvent({
+                kind: 'update-committed',
+                epoch: this.group.epoch.toString(),
+                foldedUpdates: updateProposals.length,
+            });
+        }
+
+        /**
+         * Member-only: broadcast an Update proposal that re-keys our own
+         * leaf (per-member PCS). The creator folds it into its next
+         * Commit; we hold the fresh keypair until that Commit lands and
+         * processCommit swaps it in. No-ops for the creator (it re-keys
+         * via its own periodic path Commit) or before we have joined.
+         */
+        async proposeUpdate() {
+            if (this.role !== 'joiner') return;
+            if (this._state !== 'joined') return;
+            if (!this.group) return;
+            let proposalMessage;
+            let pendingLeafKeyPair;
+            try {
+                ({ proposalMessage, pendingLeafKeyPair } = await this.group.proposeUpdate());
+            } catch (err) {
+                console.error('[MLS] proposeUpdate failed:', err);
+                this.onEvent({ kind: 'error',
+                    reason: `proposeUpdate failed: ${err.message}` });
+                return;
+            }
+            // Supersede any earlier in-flight self-update: only the most
+            // recent proposal can be folded, older keypairs are useless.
+            this._pendingSelfUpdate = { keyPair: pendingLeafKeyPair };
+            this.send({
+                type: 'mls',
+                payload: base64UrlEncode(stripMlsWrapper(proposalMessage)),
+                wire_format: MLS.MLSMessage.WireFormat.MLS_PUBLIC_MESSAGE,
+            });
+            this.onEvent({ kind: 'update-proposed' });
         }
 
         /**

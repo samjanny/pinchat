@@ -618,22 +618,34 @@ document.addEventListener('alpine:init', () => {
         },
 
         /**
-         * Creator-only PCS cadence: re-key our path with an empty
-         * (path-only) Commit every 10 minutes, so leaked epoch secrets
-         * stop being useful even in membership-stable groups. The
-         * session method no-ops when the group has a single leaf or the
-         * session is not joined, so the timer is safe to leave running.
+         * PCS cadence (every 10 minutes): the creator re-keys its own
+         * path with a path-only Commit that also folds in any pending
+         * member Update proposals; each member periodically proposes an
+         * Update that re-keys its own leaf (the fresh key an attacker who
+         * compromised the old leaf key does not hold). Together these
+         * heal both epoch-secret leakage and per-member leaf compromise.
+         *
+         * The session methods no-op off-role / before joined, so the
+         * timer is safe to leave running. Jitter avoids every member
+         * proposing on the same tick.
          */
         _startMlsUpdateTimer() {
             if (this.mlsUpdateTimer) return;
-            if (!this.mlsSession || this.mlsSession.role !== 'creator') return;
-            const MLS_UPDATE_INTERVAL_MS = 10 * 60 * 1000;
+            if (!this.mlsSession) return;
+            const BASE_MS = 10 * 60 * 1000;
+            const jitter = () => BASE_MS + Math.floor(Math.random() * 60 * 1000);
             const self = this;
-            this.mlsUpdateTimer = setInterval(() => {
+            const tick = () => {
                 if (self.mlsSession && self.connected) {
-                    void self.mlsSession.commitUpdate();
+                    if (self.mlsSession.role === 'creator') {
+                        void self.mlsSession.commitUpdate();
+                    } else {
+                        void self.mlsSession.proposeUpdate();
+                    }
                 }
-            }, MLS_UPDATE_INTERVAL_MS);
+                self.mlsUpdateTimer = setTimeout(tick, jitter());
+            };
+            this.mlsUpdateTimer = setTimeout(tick, jitter());
         },
 
         _handleMlsEvent(event) {
@@ -654,6 +666,13 @@ document.addEventListener('alpine:init', () => {
                 case 'joined':
                     this.mlsReady = true;
                     this.addSystemMessage('✅ Joined secure group');
+                    this._startMlsUpdateTimer();
+                    break;
+                case 'update-proposed':
+                    debugLog('[MLS] Sent self Update proposal (PCS)');
+                    break;
+                case 'update-proposal-received':
+                    debugLog('[MLS] Buffered member Update proposal, leaf', event.senderLeafIndex);
                     break;
                 case 'message': {
                     // attributionWarning: the relay stamped a sender_id
