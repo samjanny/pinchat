@@ -72,6 +72,7 @@
             require('./welcome.js'),
             require('./group-info.js'),
             require('./transcript-hashes.js'),
+            require('./parent-hash.js'),
         );
     } else {
         root.MLS = root.MLS || {};
@@ -84,7 +85,7 @@
             root.MLS.PublicMessage, root.MLS.Labeled,
             root.MLS.KeyPackage, root.MLS.Proposal, root.MLS.Commit,
             root.MLS.TreeKEM, root.MLS.Welcome, root.MLS.GroupInfo,
-            root.MLS.TranscriptHashes,
+            root.MLS.TranscriptHashes, root.MLS.ParentHash,
         );
     }
 })(typeof self !== 'undefined' ? self : this, function (
@@ -92,7 +93,7 @@
     TreeHash, GroupContext, KeySchedule, Framing, PrivateMessage,
     SecretTree, MLSMessage, PublicMessage, Labeled,
     KeyPackage, Proposal, Commit, TreeKEM, Welcome, GroupInfo,
-    TranscriptHashes,
+    TranscriptHashes, ParentHash,
 ) {
     'use strict';
 
@@ -728,27 +729,21 @@
             );
         }
 
-        // ---- 3. Build NEW committer leaf (commit-source) and place it ----
+        // ---- 3. Build NEW committer leaf (commit-source), unsigned ----
         const committerNewLeafPreSign = buildSelfLeaf({
             encryptionKeyBytes: leafNodePair.keyPair.publicKeyBytes,
             signatureKeyBytes: this.identity.signaturePublicKeyBytes,
             credentialIdentity: this.identity.signaturePublicKeyBytes,
             leafNodeSource: Nodes.LeafNodeSource.COMMIT,
         });
-        committerNewLeafPreSign.parentHash = new Uint8Array(0);
-        committerNewLeafPreSign.signature = await signLeafNodeInCommit(
-            this.identity.signaturePrivateKey,
-            committerNewLeafPreSign,
-            this.groupId,
-            this.myLeafIndex,
-        );
         newTree[TreeMath.leafToNode(this.myLeafIndex)] = {
             nodeType: Nodes.NodeType.LEAF, leaf: committerNewLeafPreSign,
         };
 
         // ---- 4. Set new parent encryption_keys on direct path ----
         // §5.3.1: intermediate nodes intersected by an UpdatePath have
-        // empty unmerged_leaves.
+        // empty unmerged_leaves. parent_hash is a placeholder here and
+        // is filled by the §7.9 chain computation below.
         for (let i = 0; i < committerDirectPath.length; i += 1) {
             newTree[committerDirectPath[i]] = {
                 nodeType: Nodes.NodeType.PARENT,
@@ -759,6 +754,18 @@
                 },
             };
         }
+
+        // ---- 4b. Parent-hash chaining (§7.9): stamp the direct path and
+        // bind the committer's LeafNode.parent_hash, THEN sign the leaf. ----
+        committerNewLeafPreSign.parentHash = await stampCommitterParentHashes(
+            newTree, this.myLeafIndex, newNLeaves,
+        );
+        committerNewLeafPreSign.signature = await signLeafNodeInCommit(
+            this.identity.signaturePrivateKey,
+            committerNewLeafPreSign,
+            this.groupId,
+            this.myLeafIndex,
+        );
 
         // ---- 5. Compute new tree hash + provisional GroupContext ----
         const newTreeHash = await TreeHash.hashRoot(newTree);
@@ -1020,20 +1027,13 @@
             );
         }
 
-        // ---- 3. Build NEW committer leaf (commit-source) ----
+        // ---- 3. Build NEW committer leaf (commit-source), unsigned ----
         const committerNewLeafPreSign = buildSelfLeaf({
             encryptionKeyBytes: leafNodePair.keyPair.publicKeyBytes,
             signatureKeyBytes: this.identity.signaturePublicKeyBytes,
             credentialIdentity: this.identity.signaturePublicKeyBytes,
             leafNodeSource: Nodes.LeafNodeSource.COMMIT,
         });
-        committerNewLeafPreSign.parentHash = new Uint8Array(0);
-        committerNewLeafPreSign.signature = await signLeafNodeInCommit(
-            this.identity.signaturePrivateKey,
-            committerNewLeafPreSign,
-            this.groupId,
-            this.myLeafIndex,
-        );
         newTree[TreeMath.leafToNode(this.myLeafIndex)] = {
             nodeType: Nodes.NodeType.LEAF, leaf: committerNewLeafPreSign,
         };
@@ -1049,6 +1049,17 @@
                 },
             };
         }
+
+        // ---- 4b. Parent-hash chaining (§7.9). ----
+        committerNewLeafPreSign.parentHash = await stampCommitterParentHashes(
+            newTree, this.myLeafIndex, newNLeaves,
+        );
+        committerNewLeafPreSign.signature = await signLeafNodeInCommit(
+            this.identity.signaturePrivateKey,
+            committerNewLeafPreSign,
+            this.groupId,
+            this.myLeafIndex,
+        );
 
         // ---- 5. New tree hash + provisional GroupContext ----
         const newTreeHash = await TreeHash.hashRoot(newTree);
@@ -1351,20 +1362,13 @@
             );
         }
 
-        // ---- 2. New committer leaf (commit-source) ----
+        // ---- 2. New committer leaf (commit-source), unsigned ----
         const committerNewLeafPreSign = buildSelfLeaf({
             encryptionKeyBytes: leafNodePair.keyPair.publicKeyBytes,
             signatureKeyBytes: this.identity.signaturePublicKeyBytes,
             credentialIdentity: this.identity.signaturePublicKeyBytes,
             leafNodeSource: Nodes.LeafNodeSource.COMMIT,
         });
-        committerNewLeafPreSign.parentHash = new Uint8Array(0);
-        committerNewLeafPreSign.signature = await signLeafNodeInCommit(
-            this.identity.signaturePrivateKey,
-            committerNewLeafPreSign,
-            this.groupId,
-            this.myLeafIndex,
-        );
         newTree[TreeMath.leafToNode(this.myLeafIndex)] = {
             nodeType: Nodes.NodeType.LEAF, leaf: committerNewLeafPreSign,
         };
@@ -1380,6 +1384,17 @@
                 },
             };
         }
+
+        // ---- 3b. Parent-hash chaining (§7.9). ----
+        committerNewLeafPreSign.parentHash = await stampCommitterParentHashes(
+            newTree, this.myLeafIndex, newNLeaves,
+        );
+        committerNewLeafPreSign.signature = await signLeafNodeInCommit(
+            this.identity.signaturePrivateKey,
+            committerNewLeafPreSign,
+            this.groupId,
+            this.myLeafIndex,
+        );
 
         // ---- 4. New tree hash + provisional GroupContext ----
         const newTreeHash = await TreeHash.hashRoot(newTree);
@@ -1733,6 +1748,26 @@
             };
         }
 
+        // Parent-hash chaining (§7.9). The UpdatePath carries only the
+        // parent encryption_keys, not their parent_hash values, so we
+        // recompute the chain from the tree we hold post-apply (stamping
+        // the parent nodes, exactly as the committer did) and confirm the
+        // committer's SIGNED LeafNode carries the expected leaf
+        // parent_hash. The signature over updatePath.leafNode was already
+        // verified (verifyCommitLeafBinding), so a matching parent_hash
+        // ties that signature to the full surrounding subtree shape and
+        // defeats subtree splicing. A mismatch aborts before we advance
+        // the epoch.
+        const expectedLeafParentHash = await stampCommitterParentHashes(
+            newTree, senderLeafIndex, newNLeaves,
+        );
+        if (!equalBytes(
+            updatePath.leafNode.parentHash || new Uint8Array(0),
+            expectedLeafParentHash,
+        )) {
+            throw new Error('parent-hash: committer LeafNode.parent_hash mismatch');
+        }
+
         // Provisional group context for HPKE info string.
         const newTreeHash = await TreeHash.hashRoot(newTree);
         const newEpoch = this.epoch + 1n;
@@ -2040,6 +2075,21 @@
             throw new Error('group.join: tree_hash mismatch');
         }
 
+        // Parent-hash chaining verification (§7.9). The GroupInfo signer
+        // is the member that committed the epoch this Welcome introduces,
+        // so its leaf is commit-source and its direct path carries the
+        // parent-hash chain. Recompute it from the received tree and
+        // confirm the signer's LeafNode.parent_hash matches, which binds
+        // the signer's already-verified signature to the surrounding tree
+        // shape, so a relay cannot hand us a spliced ratchet_tree.
+        const signerLeafForPh = RatchetTree.leafFor(tree, signerLeafIndex);
+        if (signerLeafForPh
+            && signerLeafForPh.leafNodeSource === Nodes.LeafNodeSource.COMMIT) {
+            await verifyCommitterParentHashes(
+                tree, signerLeafIndex, signerLeafForPh, nLeaves,
+            );
+        }
+
         // Walk our path_secret (gs.pathSecret = path_secret[LCA]) up the
         // direct path to root, deriving keypairs and verifying each
         // matches the encryption_key the committer placed in the tree.
@@ -2312,6 +2362,53 @@
         encoder.writeOpaque(groupId);
         encoder.writeU32(leafIndex);
         return Labeled.signWithLabel(signaturePrivateKey, 'LeafNodeTBS', encoder.bytes());
+    }
+
+    /**
+     * Committer side (RFC 9420 §7.9): after the committer's fresh parent
+     * encryption_keys are placed on `tree` (with placeholder empty
+     * parent_hash) and the committer's un-signed commit-source LeafNode
+     * is installed at its leaf, compute the top-down parent-hash chain,
+     * stamp each parent node's parent_hash, and return the value the
+     * committer LeafNode must carry. Mutates `tree` in place.
+     */
+    async function stampCommitterParentHashes(tree, committerLeafIndex, nLeaves) {
+        const { pathWithRoot, pathHashes, leafParentHash } =
+            await ParentHash.directPathParentHashes(tree, committerLeafIndex, nLeaves);
+        for (let i = 0; i < pathWithRoot.length; i += 1) {
+            const nodeIdx = pathWithRoot[i];
+            const slot = tree[nodeIdx];
+            if (slot && slot.nodeType === Nodes.NodeType.PARENT) {
+                slot.parent.parentHash = pathHashes[i];
+            }
+        }
+        return leafParentHash;
+    }
+
+    /**
+     * Receiver side (RFC 9420 §7.9): recompute the committer's direct-path
+     * parent-hash chain from the tree we hold post-apply, and verify each
+     * parent node carries the expected parent_hash and the committer's
+     * LeafNode carries the expected leaf parent_hash. Throws on mismatch;
+     * this is the check that turns parent hashes from decoration into a
+     * defence against subtree splicing.
+     */
+    async function verifyCommitterParentHashes(tree, committerLeafIndex, committerLeaf, nLeaves) {
+        const { pathWithRoot, pathHashes, leafParentHash } =
+            await ParentHash.directPathParentHashes(tree, committerLeafIndex, nLeaves);
+        for (let i = 0; i < pathWithRoot.length; i += 1) {
+            const nodeIdx = pathWithRoot[i];
+            const slot = tree[nodeIdx];
+            if (!slot || slot.nodeType !== Nodes.NodeType.PARENT) continue;
+            if (!equalBytes(slot.parent.parentHash, pathHashes[i])) {
+                throw new Error(
+                    `parent-hash: mismatch at node ${nodeIdx} on committer direct path`,
+                );
+            }
+        }
+        if (!equalBytes(committerLeaf.parentHash || new Uint8Array(0), leafParentHash)) {
+            throw new Error('parent-hash: committer LeafNode.parent_hash mismatch');
+        }
     }
 
     return Object.freeze({

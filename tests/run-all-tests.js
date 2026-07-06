@@ -94,6 +94,11 @@ const TEST_SUITES = {
         file: 'test-mls-tree-hash.js',
         description: 'LeafNode/ParentNode serde + tree-hash vs IETF tree-validation vectors'
     },
+    'mls-parent-hash': {
+        name: 'MLS parent-hash chaining',
+        file: 'test-mls-parent-hash.js',
+        description: 'Parent-hash chain round-trip + subtree-splice rejection (RFC 9420 §7.9)'
+    },
     'mls-ratchet-tree': {
         name: 'MLS ratchet-tree container',
         file: 'test-mls-ratchet-tree.js',

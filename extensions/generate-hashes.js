@@ -58,6 +58,7 @@ const JS_CSS_FILES = [
   '/static/js/mls/transcript-hashes.js',
   '/static/js/mls/nodes.js',
   '/static/js/mls/tree-hash.js',
+  '/static/js/mls/parent-hash.js',
   '/static/js/mls/ratchet-tree.js',
   '/static/js/mls/tree-kem.js',
   '/static/js/mls/group-context.js',

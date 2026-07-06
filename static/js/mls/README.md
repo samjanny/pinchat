@@ -31,6 +31,7 @@ See [`ciphersuite.js`](ciphersuite.js) for the full profile.
 | [`transcript-hashes.js`](transcript-hashes.js) | ✅ | [`test-mls-transcript-hashes.js`](../../../tests/test-mls-transcript-hashes.js) (IETF vectors) |
 | [`nodes.js`](nodes.js)                   |   ✅   | [`test-mls-tree-hash.js`](../../../tests/test-mls-tree-hash.js) (IETF vectors)               |
 | [`tree-hash.js`](tree-hash.js)           |   ✅   | [`test-mls-tree-hash.js`](../../../tests/test-mls-tree-hash.js) (IETF vectors)               |
+| [`parent-hash.js`](parent-hash.js)       |   ✅   | [`test-mls-parent-hash.js`](../../../tests/test-mls-parent-hash.js) (round-trip + splice rejection) |
 | [`ratchet-tree.js`](ratchet-tree.js)     |   ✅   | [`test-mls-ratchet-tree.js`](../../../tests/test-mls-ratchet-tree.js) (IETF vectors)         |
 | [`p256.js`](p256.js)                     |   ✅   | [`test-mls-treekem.js`](../../../tests/test-mls-treekem.js) (WebCrypto round-trip)           |
 | [`tree-kem.js`](tree-kem.js)             |   ✅   | [`test-mls-treekem.js`](../../../tests/test-mls-treekem.js) (IETF vectors: 62 update_paths × DeriveSecret/path closure + commit_secret + keypair-pub matches across filtered direct path) |
@@ -106,6 +107,21 @@ The browser-facing flow runs entirely over MLS for group rooms:
   UpdatePath, RFC 9420 compliant) re-keying its own leaf and direct
   path, and folds in any pending member Update proposals. This heals
   leaked epoch-level secrets in membership-stable groups.
+- **Parent-hash chaining (§7.9).** Every Commit computes the top-down
+  parent-hash chain over the committer's direct path
+  (`parent-hash.js`), stamps each parent node's `parent_hash`, and binds
+  the committer's commit-source LeafNode to it before signing. Receivers
+  recompute the chain from the tree they hold and reject a Commit (or a
+  Welcome/join whose signer leaf is commit-source) whose leaf
+  `parent_hash` does not match, which defeats subtree splicing: a
+  malicious member or relay can no longer graft a subtree from one tree
+  into another and still present validly-signed nodes. Implements
+  `ParentHashInput` with `original_sibling_tree_hash` (unmerged-leaf
+  filtering included, though our commits always write empty
+  `unmerged_leaves`). No IETF vectors for the chain ship in our local
+  cache, so coverage is behavioural: `test-mls-parent-hash.js` asserts
+  round-trip stamping, single-leaf empty hash, and rejection of both a
+  tampered leaf `parent_hash` and a tampered parent `encryption_key`.
 - **Per-member PCS via Update proposals.** Each non-creator member
   periodically sends an `Update` proposal (RFC 9420 §12.1.2): a fresh
   leaf HPKE keypair signed with its existing identity key. The creator
@@ -142,17 +158,6 @@ loss-of-access.
   across reconnects. Peer authentication rests entirely on the URL
   fragment PSK (the link is the capability) plus the TOFU
   `leaf -> sender_id` pinning described above.
-- **Parent-hash chaining (§7.9).** Commit-source LeafNodes are signed
-  with `parent_hash = empty`, and we don't enforce parent_hash on the
-  receive side. Both ends are consistent (we sign and verify the same
-  field), so signatures still validate — but a malicious member could
-  in principle splice subtrees without being caught. In our scenario
-  (creator-only commits, ephemeral rooms, blind relay) this is a
-  defence-in-depth gap rather than a usable vulnerability, and no IETF
-  reference vectors for the parent-hash chain shipped with our local
-  vector cache. Fixing it requires implementing
-  `original_sibling_tree_hash` plus the top-down chain walk in both
-  `commitAddMember` and `processCommit`.
 - **Filtered direct path on the wire (§7.6).** `commitAddMember` emits
   the *full* direct path with empty `encrypted_path_secret` lists where
   the copath sibling resolution is empty, instead of dropping those
