@@ -14,6 +14,18 @@
 const { webcrypto } = require('crypto');
 const { subtle } = webcrypto;
 
+// Required globals for production modules under Node.
+global.debugLog = () => {};
+global.debugError = () => {};
+global.debugWarn = () => {};
+
+// crypto.js must be required first so it promotes the AAD globals before
+// downstream modules evaluate. We don't use CryptoManager directly here
+// but loading identity.js as the real production module is the point of
+// the F-02 regression test below.
+require('../static/js/crypto.js');
+const { IdentityKeyManager } = require('../static/js/identity.js');
+
 async function runTests() {
     console.log('='.repeat(70));
     console.log('SECURITY PROPERTIES TEST SUITE');
@@ -153,6 +165,69 @@ async function runTests() {
             passed++;
         } else {
             console.log('FAILED: extractable key should export 32 raw bytes');
+            failed++;
+        }
+    } catch (e) {
+        console.log('FAILED:', e.message);
+        failed++;
+    }
+    console.log('');
+
+    // -------------------------------------------------------------------------
+    // Test 5: F-02 regression — IdentityKeyManager production path
+    // -------------------------------------------------------------------------
+    // Test 3 above verifies the GENERIC pattern (generateKey(false, ...) yields
+    // a non-extractable private key). Test 5 exercises the REAL production
+    // class `IdentityKeyManager.generateIdentityKeypair()`. Before v0.2.5 the
+    // class used a three-step round-trip (extractable=true → exportKey('pkcs8')
+    // → importKey(false) → fill(0)) that briefly placed the raw private key
+    // bytes in the JS heap. F-02 collapsed it to a single non-extractable
+    // generateKey. This test exists to catch any future regression that
+    // re-introduces an extractable intermediate.
+    console.log('--- Test 5: IdentityKeyManager produces non-extractable private (F-02) ---');
+    try {
+        const mgr = new IdentityKeyManager();
+        const kp = await mgr.generateIdentityKeypair();
+
+        // The class either restored a persisted keypair from IndexedDB (not
+        // available under Node, so we always hit the freshly-minted branch)
+        // or generated one. Either way, the private side must be unreadable.
+        let privateExportFailed = false;
+        try {
+            await subtle.exportKey('pkcs8', kp.privateKey);
+        } catch (e) {
+            privateExportFailed = true;
+            console.log(`  Private exportKey rejected (expected): ${e.name}`);
+        }
+
+        // Public side must still export (used by exportIdentityPublicKey + SAS).
+        let publicExportSucceeded = false;
+        try {
+            const pub = await subtle.exportKey('raw', kp.publicKey);
+            publicExportSucceeded = pub.byteLength === 65; // uncompressed P-256
+            console.log(`  Public exportKey succeeded: ${pub.byteLength} bytes`);
+        } catch (e) {
+            console.log(`  Public exportKey failed (unexpected): ${e.message}`);
+        }
+
+        // Sign+verify roundtrip exercises the actual usages array on the keypair.
+        let signVerifyOk = false;
+        try {
+            const data = new TextEncoder().encode('F-02 regression payload');
+            const sig = await mgr.sign(data);
+            await mgr.importPeerIdentityPublicKey(await subtle.exportKey('raw', kp.publicKey));
+            await mgr.verify(data, sig);
+            signVerifyOk = true;
+            console.log('  sign+verify roundtrip OK');
+        } catch (e) {
+            console.log(`  sign+verify failed (unexpected): ${e.message}`);
+        }
+
+        if (privateExportFailed && publicExportSucceeded && signVerifyOk) {
+            console.log('PASSED: F-02 — IdentityKeyManager generates non-extractable private with working public');
+            passed++;
+        } else {
+            console.log(`FAILED: privateExportFailed=${privateExportFailed}, publicExportSucceeded=${publicExportSucceeded}, signVerifyOk=${signVerifyOk}`);
             failed++;
         }
     } catch (e) {

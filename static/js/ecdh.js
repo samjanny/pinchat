@@ -309,7 +309,10 @@ class ECDHKeyExchange {
             throw new Error('🚨 MITM ATTACK DETECTED - Ephemeral key signature is invalid');
         }
 
-        // Import the public key (extractable: true needed for SAS generation)
+        // Import the peer's ephemeral ECDH public key.
+        // extractable=true: the Double Ratchet needs the raw bytes for DHrRaw
+        // (key-ID construction + ratchet-change detection). Public keys are not
+        // secret material, so making them extractable does not weaken PFS.
         this.otherPublicKey = await crypto.subtle.importKey(
             'raw',
             publicKeyRaw,
@@ -317,7 +320,7 @@ class ECDHKeyExchange {
                 name: 'ECDH',
                 namedCurve: this.CURVE
             },
-            true,  // Must be extractable for SAS generation
+            true,
             []
         );
 
@@ -425,9 +428,15 @@ class ECDHKeyExchange {
 
     /**
      * Encode bytes to emoji using 64-emoji alphabet (6 bits per emoji)
-     * Uses BigInt to avoid JavaScript's 32-bit overflow in bitwise operations
-     * @param {Uint8Array} bytes - Input bytes (6 bytes = 48 bits)
-     * @returns {string} Emoji string (always exactly 8 emoji)
+     * Uses BigInt to avoid JavaScript's 32-bit overflow in bitwise operations.
+     *
+     * Emoji count = floor(bytes.length * 8 / 6). For 12 input bytes (96 bits)
+     * this is 16 emoji - the v3 SAS layout. Earlier layouts used 9 bytes / 12
+     * emoji (v2) and 6 bytes / 8 emoji; the encoding is the same algorithm,
+     * just a different length.
+     *
+     * @param {Uint8Array} bytes - Input bytes (length × 8 must be a multiple of 6)
+     * @returns {string} Emoji string of bytes.length × 8 / 6 emoji
      */
     encodeToEmoji(bytes) {
         // Convert bytes to BigInt to avoid 32-bit overflow
@@ -436,9 +445,9 @@ class ECDHKeyExchange {
             value = (value << 8n) | BigInt(byte);
         }
 
-        // Always exactly 8 emoji (48 bits of entropy = 281 trillion combinations)
+        const emojiCount = Math.floor((bytes.length * 8) / 6);
         let result = '';
-        for (let i = 7; i >= 0; i--) {
+        for (let i = emojiCount - 1; i >= 0; i--) {
             const index = Number((value >> (BigInt(i) * 6n)) & 0x3Fn);
             result += this.EMOJI_ALPHABET[index];
         }
@@ -458,21 +467,76 @@ class ECDHKeyExchange {
     }
 
     /**
-     * Generate Short Authentication String (SAS) for MITM detection using PBKDF2
+     * Lexicographically order two byte arrays so both peers feed an identical,
+     * side-independent ordering into the SAS derivation. Returns [low, high].
      *
-     * SIGNAL PROTOCOL: SAS is generated from IDENTITY KEYS (not ephemeral keys)
-     * This allows the SAS to remain valid even after ephemeral keys are destroyed.
+     * @private
+     */
+    _sortKeyPair(a, b) {
+        return [a, b].sort((x, y) => {
+            for (let i = 0; i < Math.min(x.length, y.length); i++) {
+                if (x[i] !== y[i]) return x[i] - y[i];
+            }
+            return x.length - y.length;
+        });
+    }
+
+    /**
+     * Generate Short Authentication String (SAS) for MITM detection - v3.
      *
-     * SECURITY IMPROVEMENTS:
-     * - Uses PBKDF2 with 100K iterations to slow down brute-force attacks
-     * - Context binding with nonces prevents pre-computation attacks
-     * - 48-bit output (8 emoji) provides ~0.00003% nation-state success rate in 60s
+     * v3 derivation (HKDF-SHA256 via WebCrypto):
+     *   IKM   = sorted(IK_A_raw || IK_B_raw)        - the two identity public keys
+     *   salt  = roomId || "pinchat-sas-v3"          - fixed for the room
+     *   info  = "SAS-display-v3" || transcript      - domain separation + session binding
+     *   where transcript = SHA-256( sorted(EPH_A_raw || EPH_B_raw) )
+     *         EPH_x_raw   = the live ECDH ephemeral public keys of this handshake
+     *   bits  = 96                                  - 16 emoji × 6 bits
      *
-     * Both participants should see the same SAS if no MITM attack
+     * Why v3 changes from v2 (audit H1):
+     *   v2 derived the SAS from (sorted identity keys, roomId) ONLY. That made
+     *   the displayed code precomputable: roomId is a server-generated UUID known
+     *   to the relay BEFORE the handshake, and HKDF is ~microseconds per eval, so
+     *   a malicious relay running a double-MITM could mount an OFFLINE two-sided
+     *   birthday search. It presents IK_M1 to A and IK_M2 to B (both attacker-
+     *   chosen real keypairs that validly sign the substituted ephemerals), and
+     *   looks for IK_M1, IK_M2 such that SAS_A == SAS_B. That is a collision over
+     *   two attacker-controlled inputs, i.e. ~2^(n/2) work, NOT an n-bit preimage.
+     *   At 72 bits the effective security was only ~2^36 and fully precomputable
+     *   over the 24h identity TTL - both users would then see identical codes and
+     *   "verify" a man-in-the-middle.
+     *
+     *   v3 closes this two ways:
+     *   1. Transcript binding. The info string folds in a hash of BOTH live ECDH
+     *      ephemeral public keys. The honest party's ephemeral key is fresh per
+     *      handshake and NOT under attacker control before the handshake starts,
+     *      so the SAS can no longer be precomputed: the attacker must grind ONLINE,
+     *      inside the live handshake window, against ephemerals it cannot fix in
+     *      advance. The transcript also makes the SAS authenticate the actual
+     *      session (the keys that derive the root key), not merely the identity
+     *      pair - closing the separate "SAS does not bind the session" gap.
+     *   2. Wider output. 96 bits lifts the residual (now online-only) birthday
+     *      bound to ~2^48, which is infeasible to grind within a single handshake.
+     *
+     *   Net effect: the only remaining attack is an online ~2^48 two-sided grind
+     *   that must complete before the handshake times out (30s) - not a thing.
+     *
+     * Stability note: because the transcript includes the per-handshake ephemeral
+     * keys, the SAS is fresh on every new handshake (including reconnects). The
+     * "verify once" UX is preserved by the identity-key persistence + peer-
+     * identity-change detection in app.js (a stable IDENTITY pair across reconnects
+     * keeps sasVerified set; only an identity-key change forces re-verification).
+     * The displayed emoji changing on reconnect is expected and is the price of
+     * binding the live session; identity continuity, not SAS stability, is what
+     * carries the user's trust decision forward.
+     *
+     * Interop: v3 is wire-incompatible with v2/pre-v0.3.0 SAS. Both endpoints must
+     * run this version or the displayed codes will differ. There is no security
+     * downgrade path - a mismatch surfaces as a non-matching SAS, which is the
+     * correct, fail-closed behaviour.
      *
      * @param {string} roomId - Room identifier for context binding
-     * @returns {Promise<Object>} Object with emoji, hex, and bits properties
-     * @throws {Error} If identity keys are not available
+     * @returns {Promise<Object>} Object with emoji, hex, bits, version
+     * @throws {Error} If identity keys or live ephemeral keys are not available
      */
     async generateSAS(roomId) {
         if (!this.identityManager || !this.identityManager.identityKeyPair) {
@@ -483,110 +547,90 @@ class ECDHKeyExchange {
             throw new Error('[ECDH] Cannot generate SAS - peer identity public key not available');
         }
 
-        if (!this.myNonce || !this.myTimestamp || !this.otherNonce || !this.otherTimestamp) {
-            throw new Error('Handshake context (nonces/timestamps) not available for SAS generation');
-        }
-
         if (!roomId) {
             throw new Error('roomId required for SAS context binding');
         }
 
-        debugLog('[ECDH] Generating SAS with PBKDF2 (48-bit, 100K iterations)...');
-        debugLog('[ECDH] Using IDENTITY KEYS (not ephemeral keys) for SAS');
+        // Transcript binding (audit H1) requires the LIVE ECDH ephemeral keys.
+        // generateSAS() is invoked before destroyEphemeralKeys() (see app.js), so
+        // both keys are present here. Fail closed rather than silently fall back
+        // to an identity-only (precomputable) SAS if they are missing.
+        if (!this.keyPair || !this.keyPair.publicKey || !this.otherPublicKey) {
+            throw new Error('[ECDH] Cannot generate SAS - live ephemeral ECDH keys not available (transcript binding required)');
+        }
 
-        // Export own identity public key (CryptoKey is intentionally extractable
-        // for transmission to the peer). Peer's key was imported as
-        // non-extractable, but the raw bytes were cached at import time, so we
-        // read them directly from the identity manager — never via exportKey.
+        debugLog('[ECDH] Generating SAS v3 (HKDF-SHA256, 96 bits, transcript-bound)...');
+
+        // --- IKM: sorted identity public keys -------------------------------
+        // The own identity CryptoKey public side is always exportable per
+        // WebCrypto; the peer key's raw bytes were cached at import time and are
+        // read directly (never via exportKey on the non-extractable handle).
         const myPublicKeyRaw = await crypto.subtle.exportKey('raw', this.identityManager.identityKeyPair.publicKey);
-
-        // Convert to Uint8Array for sorting
         const myKeyBytes = new Uint8Array(myPublicKeyRaw);
         const otherKeyBytes = new Uint8Array(this.identityManager.peerIdentityPublicKeyRaw);
 
-        // Sort public keys to ensure both parties get same result (deterministic)
-        const keys = [myKeyBytes, otherKeyBytes].sort((a, b) => {
-            for (let i = 0; i < Math.min(a.length, b.length); i++) {
-                if (a[i] !== b[i]) return a[i] - b[i];
-            }
-            return a.length - b.length;
-        });
+        const idKeys = this._sortKeyPair(myKeyBytes, otherKeyBytes);
+        const ikm = new Uint8Array(idKeys[0].length + idKeys[1].length);
+        ikm.set(idKeys[0], 0);
+        ikm.set(idKeys[1], idKeys[0].length);
 
-        // Concatenate sorted keys as PBKDF2 "password"
-        const combined = new Uint8Array(keys[0].length + keys[1].length);
-        combined.set(keys[0], 0);
-        combined.set(keys[1], keys[0].length);
+        // --- Transcript: SHA-256 of sorted live ephemeral ECDH public keys ---
+        // Both ephemeral public keys are public material; the public side of an
+        // asymmetric ECDH key is exportable even though the keypair was generated
+        // non-extractable. Sorting makes the transcript side-independent so both
+        // peers compute the same hash.
+        const myEphRaw = new Uint8Array(await crypto.subtle.exportKey('raw', this.keyPair.publicKey));
+        const otherEphRaw = new Uint8Array(await crypto.subtle.exportKey('raw', this.otherPublicKey));
+        const ephKeys = this._sortKeyPair(myEphRaw, otherEphRaw);
+        const transcriptInput = new Uint8Array(ephKeys[0].length + ephKeys[1].length);
+        transcriptInput.set(ephKeys[0], 0);
+        transcriptInput.set(ephKeys[1], ephKeys[0].length);
+        const transcriptHash = new Uint8Array(await crypto.subtle.digest('SHA-256', transcriptInput));
 
-        // Create salt from context binding (sorted to ensure determinism)
+        // --- Salt = roomId || "pinchat-sas-v3" ------------------------------
         const encoder = new TextEncoder();
         const roomIdBytes = encoder.encode(roomId);
+        const saltTagBytes = encoder.encode('pinchat-sas-v3');
+        const salt = new Uint8Array(roomIdBytes.length + saltTagBytes.length);
+        salt.set(roomIdBytes, 0);
+        salt.set(saltTagBytes, roomIdBytes.length);
 
-        // Sort nonces and timestamps to ensure both parties compute same salt
-        const contexts = [
-            { nonce: this.myNonce, timestamp: this.myTimestamp },
-            { nonce: this.otherNonce, timestamp: this.otherTimestamp }
-        ].sort((a, b) => {
-            // Sort by timestamp first (more stable), then by nonce
-            if (a.timestamp !== b.timestamp) return a.timestamp - b.timestamp;
-            return a.nonce.localeCompare(b.nonce);
-        });
+        // --- info = "SAS-display-v3" || transcriptHash ----------------------
+        const infoTagBytes = encoder.encode('SAS-display-v3');
+        const info = new Uint8Array(infoTagBytes.length + transcriptHash.length);
+        info.set(infoTagBytes, 0);
+        info.set(transcriptHash, infoTagBytes.length);
 
-        const nonce1Bytes = this.base64urlToArrayBuffer(contexts[0].nonce);
-        const nonce2Bytes = this.base64urlToArrayBuffer(contexts[1].nonce);
-        const timestamp1Bytes = new Uint8Array(new BigUint64Array([BigInt(contexts[0].timestamp)]).buffer);
-        const timestamp2Bytes = new Uint8Array(new BigUint64Array([BigInt(contexts[1].timestamp)]).buffer);
-
-        // Concatenate: roomId || nonce1 || nonce2 || timestamp1 || timestamp2
-        const saltLength = roomIdBytes.length + nonce1Bytes.length + nonce2Bytes.length +
-                          timestamp1Bytes.length + timestamp2Bytes.length;
-        const salt = new Uint8Array(saltLength);
-        let offset = 0;
-        salt.set(roomIdBytes, offset); offset += roomIdBytes.length;
-        salt.set(nonce1Bytes, offset); offset += nonce1Bytes.length;
-        salt.set(nonce2Bytes, offset); offset += nonce2Bytes.length;
-        salt.set(timestamp1Bytes, offset); offset += timestamp1Bytes.length;
-        salt.set(timestamp2Bytes, offset);
-
-        debugLog(`[ECDH] PBKDF2 salt length: ${salt.length} bytes (roomId + sorted nonces + sorted timestamps)`);
-
-        // Import combined keys as PBKDF2 base key
         const baseKey = await crypto.subtle.importKey(
             'raw',
-            combined,
-            'PBKDF2',
-            false,  // Not extractable
+            ikm,
+            'HKDF',
+            false,
             ['deriveBits']
         );
 
-        // Derive 48 bits using PBKDF2 (100K iterations)
-        // 48 bits = 8 emoji = 281 trillion combinations
-        const iterations = 100000;
+        // 96 bits = 12 bytes = 16 emoji × 6 bits
         const derivedBits = await crypto.subtle.deriveBits(
             {
-                name: 'PBKDF2',
+                name: 'HKDF',
+                hash: 'SHA-256',
                 salt: salt,
-                iterations: iterations,
-                hash: 'SHA-256'
+                info: info
             },
             baseKey,
-            48  // 48 bits = 6 bytes = 8 emoji (6 bits each)
+            96
         );
 
-        // Use all 48 bits (6 bytes) for 8 emoji
         const sasBytes = new Uint8Array(derivedBits);
 
-        // Generate both emoji and hex formats
-        const sasEmoji = this.encodeToEmoji(sasBytes);
-        const sasHex = this.encodeToHex(sasBytes);
-
         const sasObject = {
-            emoji: sasEmoji,
-            hex: sasHex,
-            bits: 48,
-            iterations: iterations
+            emoji: this.encodeToEmoji(sasBytes),
+            hex: this.encodeToHex(sasBytes),
+            bits: 96,
+            version: 3
         };
 
-        debugLog('[ECDH] ✅ SAS generated (48-bit, PBKDF2 100K):', sasObject);
+        debugLog('[ECDH] ✅ SAS v3 generated (HKDF-SHA256, 96 bits, transcript-bound):', sasObject);
         return sasObject;
     }
 

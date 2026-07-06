@@ -105,7 +105,10 @@ URL format: https://host/c/{room_id}#key={base64url_encoded_key}
 - Never transmitted to server (URL fragment per RFC 3986)
 - Shared out-of-band (copy/paste, messaging app, QR code)
 - Used only for initial handshake encryption
-- Retained in memory for re-handshaking (reconnection scenarios)
+- Moved out of the URL bar and into tab-scoped `sessionStorage`
+  immediately after the first import (see Lifecycle step 6 below), so
+  the secret stops appearing in browser history, screen-shares, or any
+  same-origin code reading `window.location.hash`.
 
 **Usage**:
 - Encrypts ECDH public keys during handshake (AES-GCM with AAD)
@@ -119,9 +122,52 @@ URL format: https://host/c/{room_id}#key={base64url_encoded_key}
 3. URL shared with participants (out-of-band)
 4. Each participant extracts key from fragment
 5. Key used to encrypt/decrypt ECDH handshake
-6. Double Ratchet takes over for message encryption
-7. Bootstrap Key retained for potential re-handshake
+6. After successful import, the fragment bytes are stashed in
+   sessionStorage (key: `pinchat_hash:/static/chat.html`) and removed
+   from window.location.hash via history.replaceState. Reload survives.
+7. Double Ratchet takes over for message encryption
+8. cryptoManager.deleteBootstrapKey() nulls the in-memory CryptoKey
+   reference after handshake completion. resetToBootstrapKey() re-reads
+   the stash on reconnect / handshake retry.
 ```
+
+### Identity Key Storage
+
+ECDSA P-256 keypairs that authenticate each Double Ratchet DH header
+are persisted client-side in IndexedDB under the database name
+`pinchat_identity_v1` (object store `keys`, single entry under key
+`identity`). Entries carry a `version` field and an absolute `expiresAt`
+timestamp (24 h from creation, aligned with the default `session_ttl_secs`).
+
+**Properties:**
+- The private side is created `extractable: false` directly from
+  `crypto.subtle.generateKey` — no PKCS#8 round-trip. WebCrypto §13
+  applies `[[extractable]]` per side; for asymmetric ECDSA keypairs the
+  *public* side is always extractable regardless of the parameter, so
+  `exportKey('raw', publicKey)` for peer exchange and SAS continues to
+  work. The private bytes never become reachable to JS, even
+  momentarily. The pre-v0.2.5 build did this via a
+  `generateKey(true)` → `exportKey('pkcs8')` → `importKey(..., false)`
+  round-trip with a best-effort `fill(0)` on the buffer; that pattern
+  briefly placed the raw private key bytes in the JS heap, and is gone
+  as of v0.2.5 (finding F-02).
+- IndexedDB structured-clone (W3C IndexedDB §6 + WebCrypto §13)
+  preserves `[[extractable]]`, so restored CryptoKey handles remain
+  non-extractable across page loads.
+- The public side stays extractable so it can be serialised to raw
+  bytes for transmission to the peer.
+- Scope: per-origin, never synced, never sent to the server.
+- Expiry: 24 h, after which `generateIdentityKeypair()` discards the
+  stale entry and mints a fresh keypair.
+- Forget gesture: `IdentityKeyManager.clearStoredIdentity()` for an
+  explicit "forget me on this device" reset.
+
+The reason this entry is persisted at all is SAS continuity: pre-C-04
+the identity keypair was regenerated on every page load, which meant
+the SAS code that a user had verified out-of-band stopped matching the
+next time they reopened the chat. The pressure to skip verification
+followed mechanically. Persistence keeps the SAS stable so verification
+becomes a one-time gesture per device-day.
 
 ### Symmetric Encryption
 
@@ -228,22 +274,134 @@ CK_{n+1} = HMAC-SHA256(CK_n, "ChainRatchet")
 - One-way: Cannot derive CK_n from CK_{n+1}
 - Independence: Compromise of MK_n does not reveal MK_{n+1}
 
-### SAS Generation
+### SAS Generation (v3, current)
 
-**Algorithm**: PBKDF2-SHA256
-- Iterations: 100,000
-- Output: 36 bits (6 emoji from 64-character alphabet)
+**Algorithm**: HKDF-SHA256
+- Output: 96 bits (16 emoji from a 64-character alphabet, 6 bits per emoji)
+- Also displayed as 24 hex characters (12 dash-separated byte pairs)
 
-**Input Binding**:
+**Input binding**:
 ```
-Password = sorted(Identity_PubKey_A || Identity_PubKey_B)
-Salt = roomId || sorted_nonces || sorted_timestamps
+IKM        = sorted(Identity_PubKey_A_raw || Identity_PubKey_B_raw)   // 130 bytes for P-256
+transcript = SHA-256( sorted(Ephemeral_PubKey_A_raw || Ephemeral_PubKey_B_raw) )
+salt       = roomId || "pinchat-sas-v3"                               // fixed for the room
+info       = "SAS-display-v3" || transcript                           // session binding
 ```
 
-**Security Properties**:
-- Brute-force resistant: 100K iterations adds computational cost
-- Context-bound: SAS changes per room and session
-- Deterministic: Both parties compute identical output
+**What changed vs v2 (audit H1)**: v2 derived the SAS from the identity
+keys and roomId only. Both inputs are known to the relay BEFORE the
+handshake starts, so a malicious relay running a double MITM could
+grind two attacker-chosen identity keypairs OFFLINE until
+`SAS_A == SAS_B`: a two-sided birthday search of roughly `2^36` over
+the 72-bit space, precomputable across the 24h identity TTL. v3 closes
+this in two ways:
+
+1. *Transcript binding.* The info string folds in a hash of both live
+   ECDH ephemeral public keys. The honest side's ephemeral key is fresh
+   per handshake and not attacker-controlled in advance, so the grind
+   must happen ONLINE, inside the 30-second handshake window.
+2. *Wider output.* 96 bits lifts the residual (now online-only)
+   birthday bound to roughly `2^48`, infeasible within a single
+   handshake.
+
+**Security properties**:
+- *Session-bound.* The SAS authenticates the ephemeral keys that
+  actually derive the root key, not merely the identity pair.
+- *Fresh per handshake.* Because the transcript includes per-handshake
+  ephemerals, the displayed code changes on every reconnect. The
+  "verify once" UX is preserved by identity-key persistence plus
+  peer-identity-change detection: a stable identity pair keeps the
+  verified flag set, and only an identity-key change forces
+  re-verification.
+- *Domain-separated.* The `"pinchat-sas-v3"` salt tag and the
+  `"SAS-display-v3"` info prefix separate this derivation from any
+  other use of the same key material.
+- *Symmetric.* Identity keys and ephemeral keys are each sorted
+  lexicographically before concatenation/hashing, so both peers derive
+  identical bytes regardless of who initiated the handshake.
+
+### SAS Generation (v2, v0.3.x, retained for historical context)
+
+**Algorithm**: HKDF-SHA256
+- Output: 72 bits (12 emoji from a 64-character alphabet — 6 bits per emoji)
+- Also displayed as 18 hex characters
+
+**Input binding**:
+```
+IKM   = sorted(Identity_PubKey_A_raw || Identity_PubKey_B_raw)   // 130 bytes for P-256
+salt  = roomId || "pinchat-sas-v2"                               // fixed for the room
+info  = "SAS-display-v2"                                         // domain separation
+```
+
+**Security properties**:
+- *Stable.* The SAS is a function of `(IK_A, IK_B, room_id)` only. Two
+  honest peers who retain their identity keypair across a reconnect
+  derive the same emoji code on every handshake — no per-handshake
+  nonces or timestamps are mixed into the salt. Identity persistence
+  (IndexedDB, 24 h TTL) keeps both identity keys alive for that window,
+  so a user who verified the code once does not face a different code
+  on the next page load. This eliminates the pre-v0.3.0 problem where
+  the SAS changed every reconnect and users learned to skip.
+- *Domain-separated.* The literal `"pinchat-sas-v2"` tag in the salt
+  prevents collisions with any other HKDF use of the same identity-key
+  pair (future safety-number computations, alternative display formats,
+  protocol-v3, …). The `"SAS-display-v2"` info string adds a second
+  layer of context separation in the HKDF expand stage.
+- *Symmetric.* Both peers sort the two identity public keys
+  lexicographically before concatenating, so the IKM bytes — and thus
+  the SAS output — are identical regardless of who initiated the
+  handshake.
+- *Grinding-resistant within a static identity.* 72 bits of output
+  defeats commodity GPU brute force at the timescale of a verification
+  window. On an RTX-4090-class card SHA-256 throughput is ~5 GH/s,
+  HKDF-SHA256 with one expand block is ~3 SHA-256 ops per derivation,
+  so ~1.6 billion SAS candidates per second per GPU. A birthday-style
+  collision search on a 72-bit space requires ~`2^36` derivations per
+  pool, i.e. ~43 seconds per pool * two pools = ~90 s of pure SHA work.
+  This is borderline but assumes the attacker can mint arbitrary
+  identity public keys at the same rate — which they cannot, because
+  forging a SAS match requires also finding ECDSA keypairs whose
+  raw exports hash into the target SAS. ECDSA keypair generation is
+  ~10000× slower than a SHA-256 op on a GPU, so the practical wall
+  time is hours-to-days, not seconds. 96 bits / 16 emoji would push
+  this to "intractable" but the UX cost is significant; 72 bits
+  is the chosen balance.
+
+*Superseded in v0.4.0*: audit H1 showed that the relevant attack is a
+two-sided birthday search over attacker-chosen identity keys, fully
+precomputable offline against the v2 inputs (both are known to the
+relay before the handshake). The ECDSA-keygen cost argument above
+mitigates but does not eliminate that search within the 24h identity
+TTL. v3 (see above) therefore binds the live handshake transcript AND
+widens the output to 96 bits. This section is retained as the record
+of the v0.3.x design.
+
+**Why HKDF and not PBKDF2 (rationale, deferred-audit response):**
+PBKDF2 is a *password stretcher*. It is the correct tool when the input
+is a low-entropy human-chosen secret and the goal is to make brute force
+expensive. The SAS inputs are uniformly-random P-256 public keys — high
+entropy, zero password character — and the goal is deterministic
+display-byte derivation. HKDF is the keyed-PRF construction designed
+for exactly this. The pre-v0.3.0 path used PBKDF2 with 100 000 iterations,
+spending ~30-100 ms per derivation to slow down an attack that could
+not benefit from iteration count (any attacker who can grind PBKDF2
+faster than the user can also grind HKDF faster, and the per-derivation
+cost differential doesn't tilt the balance in either direction when
+the search space is the bottleneck). The 100K iterations were paying
+cost for no security property. v0.3.0 drops them.
+
+### SAS Generation (v1 — pre-v0.3.0, retained for historical context)
+
+The pre-v0.3.0 SAS used PBKDF2-SHA256 with 100K iterations, a 48-bit
+output (8 emoji), and a salt that incorporated `roomId || sorted_nonces
+|| sorted_timestamps`. The per-handshake nonces and timestamps made the
+SAS change on every reconnect even when both peers retained the same
+identity keypair, which trained users to skip verification — exactly
+the failure mode the SAS is supposed to prevent. v0.3.0 dropped the
+per-handshake material, widened to 72 bits, and switched to HKDF (see
+above). Pre-v0.3.0 clients still ship the old construction; mixed-version
+chats will display different codes on each side until both endpoints
+update.
 
 ---
 
@@ -321,7 +479,7 @@ After a message key or chain key is used, PinChat calls `Uint8Array.fill(0)` on 
 
 ### Server-Side Anti-Replay is Advisory, Not Authoritative
 
-The server maintains a per-room set of SHA-256 hashes of received encrypted payloads (bounded at `REPLAY_CACHE_MAX_PER_ROOM`, default 10 000 entries). If a ciphertext is resent verbatim, the server drops it.
+The server maintains a per-room set of SHA-256 hashes of received encrypted payloads (bounded at `REPLAY_CACHE_MAX_PER_ROOM`, default 1 000 entries — see `src/config.rs`). If a ciphertext is resent verbatim, the server drops it.
 
 **Limitation:** AES-GCM with a random 96-bit IV produces a different ciphertext for every encryption of the same plaintext, so identical ciphertexts are already an extremely strong indicator of a replay attack. The *authoritative* replay protection is the Double Ratchet's monotone message counter `n` (checked client-side against the AAD). The server-side hash check is a defense-in-depth layer that complements, but does not replace, the cryptographic guarantees of the protocol.
 
@@ -339,6 +497,16 @@ Short Authentication String (SAS) verification is the mechanism by which users c
 
 **Recommendation:** Always complete SAS verification for sensitive conversations, especially with new contacts. Never skip SAS if you received the room link from an untrusted channel.
 
+**Claim matrix.** Different user actions place the session in different security states. The headline "end-to-end encrypted" claim does not survive uniformly across all of them:
+
+| Configuration | Effective property | What can the relay see / do? |
+|---|---|---|
+| SAS verified + integrity extension installed | Double-Ratchet AEAD over an SRI-checked client. Peer identity confirmed out of band. **No external crypto audit.** | Relay sees ciphertext only. JavaScript tampering requires defeating SRI + signed manifest. |
+| SAS verified, no integrity extension | Double-Ratchet AEAD. Peer identity confirmed out of band. | Relay sees ciphertext only, but can serve modified JS on the next page load and read everything from that moment forward — undetected. |
+| SAS skipped | Double-Ratchet AEAD — **encryption is still active**. Peer identity has not been confirmed. | Relay can mount an active MITM at handshake time by substituting identity keys for both peers, establish two ratchets it owns, and read/modify everything in plaintext. |
+
+The phrase "the server cannot read your messages" is only true in the first two rows. In the third row the chat is *encrypted* but *not authenticated against an active server operator*. Avoid promising the absolute version of the claim in user-facing copy.
+
 ---
 
 ### Bootstrap Key Temporarily Stored in `sessionStorage` During Login Redirects
@@ -349,14 +517,21 @@ The bootstrap key is normally kept only in the URL fragment (`#key=<base64url>`)
 sessionStorage["pinchat_hash:/c/<room_id>"] = "#key=<base64url_key>"
 ```
 
-**Exposure window:** the value is stored from the moment of the 401 redirect until either (a) the post-login page reads and removes it via `sessionStorage.removeItem`, or (b) a 30-second `setTimeout` safety net fires and removes it automatically.
+**Exposure windows** — there are two paths that put the bootstrap key into `sessionStorage`:
 
-**Risk:** any same-origin JavaScript executing during this window (e.g., an XSS on `login.html` or another page opened in the same tab) can read the key. The bootstrap key is already visible in `window.location.hash` on the originating page, so this does not introduce a new attack surface — it extends the window by the login round-trip duration (typically 1–5 seconds, never more than 30 seconds before automatic cleanup).
+1. **Login-bounce path** (`static/js/login-stash.js`): triggered when an unauthenticated user clicks an invite link and the server redirects to `/login`. The fragment is moved to `sessionStorage` so it can be restored after the login round-trip. A 5-minute `setTimeout` safety net fires on `/login` to clear an abandoned stash; on successful post-login restore the chat page consumes and overwrites the stash.
+
+2. **Direct path** (`static/js/crypto.js` `extractKeyFromURL`): on a normal authenticated invite-link open, the fragment is read once, used to import a non-extractable `CryptoKey`, then written back to `sessionStorage` while the URL bar is scrubbed via `history.replaceState`. The stash lives for the lifetime of the tab. This is an **accepted trade-off**: the stash is required by `copyLink()` (v0.2.4) to reconstruct the shareable URL after the URL bar scrub, and by `resetToBootstrapKey()` for handshake-retry resilience. `sessionStorage` is tab-scoped and auto-cleared by the browser on tab close.
+
+**Risk:** any same-origin JavaScript executing during the exposure window (e.g., an XSS that bypassed the strict CSP, or a hostile browser extension running in the page) can read the raw key bytes from `sessionStorage`. The bootstrap key derives only the initial ECDH handshake AEAD — not message content (which is protected by the Double Ratchet chains established after the handshake). However, capture of the bootstrap key plus the initial handshake ciphertext allows recovery of the ECDH public keys and from there the session key; the SAS verification step is the only defense against that recovery in the absence of identity-key persistence.
 
 **Mitigations in place:**
 - `sessionStorage` is scoped to the tab (not shared across tabs or persisted after the tab closes)
-- `sessionStorage.removeItem` is called immediately on post-login key restoration
-- A 30-second `setTimeout` unconditionally removes the stash key as a safety net
+- Imported `CryptoKey` is non-extractable; only the raw fragment in `sessionStorage` is plaintext-readable
+- Strict CSP with no inline scripts and SRI on every external script (`hashes.json.signed`) bounds the XSS surface
+- `sessionStorage.removeItem` is called immediately on post-login key restoration (login-bounce path)
+- A 5-minute `setTimeout` on the login-bounce path clears an abandoned `/login` stash
+- The direct-path stash is **not** actively scrubbed during the session: this is a deliberate trade-off documented above
 
 ---
 

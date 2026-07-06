@@ -90,6 +90,13 @@ pub struct Config {
     pub challenge_ttl_secs: u64,
     pub jwt_token_ttl_secs: u64,
 
+    // Issuer string stamped on every WebSocket JWT (`iss` claim) and
+    // required by the verifier. Operators running multiple PinChat
+    // instances behind a shared secret store SHOULD set `JWT_ISSUER` per
+    // instance (e.g. "pinchat-eu", "pinchat-us") so tokens from one
+    // instance cannot be replayed at another.
+    pub jwt_issuer: String,
+
     // Absolute hard cap on a single WebSocket connection's lifetime, in seconds.
     // Independent of the idle timeout: even an active client is forced to
     // reconnect (and thus restart the handshake) after this duration. Bounds
@@ -240,6 +247,16 @@ impl Config {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(30),
 
+            // JWT issuer (default: `crate::jwt::DEFAULT_JWT_ISSUER`).
+            // Audit C-2: the verifier requires an exact `iss` match. Leave
+            // unset for single-instance deployments; set explicitly when
+            // running multiple instances behind a shared HMAC key.
+            jwt_issuer: env::var("JWT_ISSUER")
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| crate::jwt::DEFAULT_JWT_ISSUER.to_string()),
+
             // Hard cap on WebSocket connection lifetime (default: 30 minutes).
             // Forces a reconnect that re-runs PoW/JWT and the handshake.
             max_ws_connection_age_secs: env::var("MAX_WS_CONNECTION_AGE_SECS")
@@ -307,12 +324,24 @@ impl Config {
                 })
                 .unwrap_or_default(),
 
-            // Anti-replay cache max entries per room (default: 10000)
-            // With 64-byte hashes, 10k entries = ~640KB per room max
+            // Anti-replay cache max entries per room (default: 1000).
+            //
+            // Memory budget (worst-case, all rooms at full cache):
+            //   HashSet<(String,DateTime<Utc>)> overhead per entry ≈ 136 bytes
+            //   (64-byte hex SHA-256 + 24 bytes String header + 16 bytes
+            //   DateTime + ~32 bytes HashSet slot/load-factor amortised).
+            //   1000 entries × 1000 rooms × 136 B ≈ 136 MB worst case.
+            //
+            // The previous default was 10000, which extrapolated to ~1.4 GB
+            // worst case on a VPS — disproportionate given the cache is an
+            // advisory anti-replay layer (the authoritative defence is the
+            // Double Ratchet monotone counter, checked client-side). 1000
+            // entries still tolerate ~17 minutes at the msg_rate_limit of
+            // 30 msg/s before eviction starts mattering for a busy room.
             replay_cache_max_per_room: env::var("REPLAY_CACHE_MAX_PER_ROOM")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(10000),
+                .unwrap_or(1000),
 
             // Force Secure flag on cookies (default: false)
             // Set to true when behind a TLS-terminating proxy

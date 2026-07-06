@@ -9,6 +9,7 @@ use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
 use hmac::{Hmac, Mac};
 use rand::rngs::OsRng;
 use sha2::Sha256;
+use subtle::ConstantTimeEq;
 use uuid::Uuid;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -62,21 +63,17 @@ pub fn verify_csrf_token(token: &str, secret: &[u8; 32]) -> bool {
     mac.update(random_hex.as_bytes());
     let expected_signature = hex::encode(mac.finalize().into_bytes());
 
-    // Constant-time comparison to prevent timing attacks
-    constant_time_eq(provided_signature.as_bytes(), expected_signature.as_bytes())
-}
-
-/// Constant-time comparison to prevent timing attacks
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-
-    let mut result = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        result |= x ^ y;
-    }
-    result == 0
+    // L-01: use a vetted crate for the constant-time compare instead of the
+    // hand-rolled XOR-accumulator below. The HMAC tag length is fixed (64
+    // hex chars for SHA-256), and the attacker-provided length is not a
+    // secret, so the practical impact of the original early-length-return
+    // pattern was nil — but rolling our own is the position we don't want
+    // to maintain. `subtle::ConstantTimeEq` for `[u8]` short-circuits on
+    // length and otherwise runs in time independent of slice contents.
+    provided_signature
+        .as_bytes()
+        .ct_eq(expected_signature.as_bytes())
+        .into()
 }
 
 /// Hash a password using Argon2id with OWASP recommended parameters

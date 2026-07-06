@@ -5,7 +5,11 @@
  * This prevents MITM attacks during Double Ratchet key rotation.
  *
  * Architecture:
- * 1. Identity Keys (ECDSA P-256, long-lived) - Generated once per session
+ * 1. Identity Keys (ECDSA P-256, long-lived) - Persisted in IndexedDB for the
+ *    lifetime of the configured TTL (default 24h, aligned with session TTL).
+ *    Re-loaded on every page open so the SAS stays stable across reconnects
+ *    and tab refreshes (C-04). The private side is non-extractable both on
+ *    initial creation and after structured-clone restore from IndexedDB.
  * 2. Ephemeral Keys (ECDH P-256, short-lived) - Rotated during ratcheting
  * 3. Identity key authenticates all ephemeral keys via digital signatures
  *
@@ -14,6 +18,145 @@
  * - All subsequent ephemeral keys must be signed by verified identity key
  * - MITM cannot substitute ephemeral keys without detection (invalid signature)
  */
+
+// ── IndexedDB-backed identity persistence (C-04) ────────────────────────
+//
+// We store the ECDSA keypair as an opaque CryptoKey pair in IndexedDB. Per
+// W3C IndexedDB §6 + WebCrypto §13, structured-clone of a CryptoKey
+// preserves the [[extractable]] internal slot. Restoring a non-extractable
+// private key yields another non-extractable CryptoKey — the bytes never
+// become reachable to JS, even across page loads.
+//
+// The store is scoped to the origin, never synced, and auto-bounded by the
+// expiresAt timestamp written alongside the keys. A `version` field allows
+// future schema migrations without invalidating in-flight chats.
+
+const IDENTITY_DB_NAME = 'pinchat_identity_v1';
+const IDENTITY_STORE_NAME = 'keys';
+const IDENTITY_ENTRY_KEY = 'identity';
+const IDENTITY_TTL_MS = 24 * 60 * 60 * 1000;  // 24h, matches default session_ttl_secs
+const IDENTITY_SCHEMA_VERSION = 1;
+
+/**
+ * Open (or create) the identity database. Returns null on any error or
+ * when IndexedDB is unavailable (Node, locked-down browsers, private mode
+ * with storage blocked, …) — the caller falls back to ephemeral identity.
+ *
+ * @private
+ * @returns {Promise<IDBDatabase|null>}
+ */
+function _openIdentityDb() {
+    return new Promise((resolve) => {
+        if (typeof indexedDB === 'undefined') {
+            return resolve(null);
+        }
+        let req;
+        try {
+            req = indexedDB.open(IDENTITY_DB_NAME, 1);
+        } catch (_) {
+            return resolve(null);
+        }
+        req.onupgradeneeded = () => {
+            const db = req.result;
+            if (!db.objectStoreNames.contains(IDENTITY_STORE_NAME)) {
+                db.createObjectStore(IDENTITY_STORE_NAME);
+            }
+        };
+        req.onsuccess = () => resolve(req.result);
+        req.onerror = () => resolve(null);
+        req.onblocked = () => resolve(null);
+    });
+}
+
+/**
+ * Load the stored identity keypair if present, valid, and not expired.
+ * Returns null on any failure — the caller must regenerate.
+ *
+ * @private
+ * @returns {Promise<{privateKey: CryptoKey, publicKey: CryptoKey}|null>}
+ */
+async function _loadStoredIdentity() {
+    const db = await _openIdentityDb();
+    if (!db) return null;
+    return new Promise((resolve) => {
+        try {
+            const tx = db.transaction(IDENTITY_STORE_NAME, 'readonly');
+            const req = tx.objectStore(IDENTITY_STORE_NAME).get(IDENTITY_ENTRY_KEY);
+            req.onsuccess = () => {
+                const v = req.result;
+                if (!v
+                    || v.version !== IDENTITY_SCHEMA_VERSION
+                    || !v.privateKey
+                    || !v.publicKey
+                    || typeof v.expiresAt !== 'number'
+                ) {
+                    return resolve(null);
+                }
+                if (v.expiresAt < Date.now()) {
+                    // Expired entry: caller will overwrite with a fresh one.
+                    return resolve(null);
+                }
+                resolve({ privateKey: v.privateKey, publicKey: v.publicKey });
+            };
+            req.onerror = () => resolve(null);
+        } catch (_) {
+            resolve(null);
+        }
+    });
+}
+
+/**
+ * Persist the identity keypair. Best-effort: failure is logged via debugWarn
+ * and the in-memory keypair remains usable for the current session.
+ *
+ * @private
+ * @returns {Promise<boolean>}
+ */
+async function _saveStoredIdentity(privateKey, publicKey) {
+    const db = await _openIdentityDb();
+    if (!db) return false;
+    return new Promise((resolve) => {
+        try {
+            const tx = db.transaction(IDENTITY_STORE_NAME, 'readwrite');
+            const now = Date.now();
+            tx.objectStore(IDENTITY_STORE_NAME).put({
+                version: IDENTITY_SCHEMA_VERSION,
+                privateKey: privateKey,
+                publicKey: publicKey,
+                createdAt: now,
+                expiresAt: now + IDENTITY_TTL_MS,
+            }, IDENTITY_ENTRY_KEY);
+            tx.oncomplete = () => resolve(true);
+            tx.onerror = () => resolve(false);
+            tx.onabort = () => resolve(false);
+        } catch (_) {
+            resolve(false);
+        }
+    });
+}
+
+/**
+ * Remove the stored identity. Used by IdentityKeyManager.clearStoredIdentity
+ * (manual user-initiated reset).
+ *
+ * @private
+ * @returns {Promise<void>}
+ */
+async function _deleteStoredIdentity() {
+    const db = await _openIdentityDb();
+    if (!db) return;
+    return new Promise((resolve) => {
+        try {
+            const tx = db.transaction(IDENTITY_STORE_NAME, 'readwrite');
+            tx.objectStore(IDENTITY_STORE_NAME).delete(IDENTITY_ENTRY_KEY);
+            tx.oncomplete = () => resolve();
+            tx.onerror = () => resolve();
+            tx.onabort = () => resolve();
+        } catch (_) {
+            resolve();
+        }
+    });
+}
 
 class IdentityKeyManager {
     constructor() {
@@ -28,60 +171,87 @@ class IdentityKeyManager {
     }
 
     /**
-     * Generate long-term identity keypair (ECDSA)
+     * Obtain a long-term identity keypair (ECDSA P-256).
      *
-     * This key is used to sign ephemeral ECDH public keys during ratcheting.
-     * It should persist for the duration of the chat session.
+     * C-04: persistence-aware. Tries to load an existing keypair from
+     * IndexedDB first; only when none is present (first visit, expired
+     * TTL, IndexedDB unavailable) does it generate a fresh one and persist
+     * it. This keeps the SAS code stable across reconnects, tab refreshes,
+     * and short browser restarts within the TTL window — without that, the
+     * SAS would change on every page load and pressure users into the
+     * "Skip verification" path even with a trusted peer.
      *
-     * SECURITY: The private key is made non-extractable after generation to prevent
-     * exfiltration via XSS, malicious extensions, or console access. Only the public
-     * key remains extractable for transmission to the peer.
+     * SECURITY: The private key is non-extractable after generation. When
+     * later restored from IndexedDB via structured-clone, the
+     * [[extractable]] internal slot is preserved (W3C IndexedDB §6 +
+     * WebCrypto §13) — so the bytes never become reachable to JS, neither
+     * on creation nor across page loads.
      *
      * @returns {Promise<CryptoKeyPair>}
      */
     async generateIdentityKeypair() {
-        debugLog('[Identity] Generating ECDSA identity keypair (P-256)...');
+        // Try to restore an existing identity first. The stored CryptoKey
+        // private side comes back non-extractable; we use it as-is.
+        const stored = await _loadStoredIdentity();
+        if (stored) {
+            this.identityKeyPair = stored;
+            debugLog('[Identity] ✅ Restored existing identity from IndexedDB');
+            return this.identityKeyPair;
+        }
 
-        // Step 1: Generate keypair with extractable=true (needed to re-import private key)
-        const tempKeyPair = await crypto.subtle.generateKey(
+        debugLog('[Identity] No stored identity found — generating fresh ECDSA P-256 keypair...');
+
+        // F-02: generate the keypair directly with extractable=false. WebCrypto
+        // (W3C §13) sets [[extractable]] per side and for asymmetric ECDSA
+        // keypairs the public side is ALWAYS extractable regardless of the
+        // parameter — so exportKey('raw', publicKey) for peer exchange and SAS
+        // continues to work. The prior pattern (extractable=true → export PKCS#8
+        // → re-import non-extractable → fill(0) the buffer) created a window in
+        // which the raw private key bytes lived in the JS heap as a PKCS#8
+        // ArrayBuffer; an XSS or hostile extension running during this window
+        // could exfiltrate the long-term identity key. The fill(0) was
+        // best-effort and not GC-safe. The single-call form removes that
+        // window entirely: the private bytes never become reachable to JS.
+        this.identityKeyPair = await crypto.subtle.generateKey(
             {
                 name: 'ECDSA',
                 namedCurve: this.CURVE
             },
-            true,  // Temporarily extractable
+            false,  // Private side non-extractable from creation; public side stays exportable per spec.
             ['sign', 'verify']
         );
 
-        // Step 2: Export private key to re-import as non-extractable
-        const privateKeyPkcs8 = await crypto.subtle.exportKey('pkcs8', tempKeyPair.privateKey);
-
-        // Step 3: Re-import private key with extractable=false (SECURITY HARDENING)
-        // This prevents XSS/extension attacks from exfiltrating the private key
-        const nonExtractablePrivateKey = await crypto.subtle.importKey(
-            'pkcs8',
-            privateKeyPkcs8,
-            {
-                name: 'ECDSA',
-                namedCurve: this.CURVE
-            },
-            false,  // NON-EXTRACTABLE - cannot be exported after this point
-            ['sign']
+        // Persist for SAS continuity across reconnects / refreshes (C-04).
+        // Best-effort: a write failure leaves us with an ephemeral identity
+        // for this session, which is the pre-C-04 behaviour and remains
+        // cryptographically valid.
+        const saved = await _saveStoredIdentity(
+            this.identityKeyPair.privateKey,
+            this.identityKeyPair.publicKey,
         );
-
-        // Step 4: Public key remains extractable (needed for peer exchange and SAS)
-        // No need to re-import, the original is already suitable
-        this.identityKeyPair = {
-            privateKey: nonExtractablePrivateKey,
-            publicKey: tempKeyPair.publicKey  // Remains extractable for export
-        };
-
-        // Clear sensitive data from memory (best effort)
-        // Note: JavaScript doesn't guarantee memory clearing, but this helps
-        const clearBuffer = new Uint8Array(privateKeyPkcs8);
-        clearBuffer.fill(0);
-
-        debugLog('[Identity] ✅ Identity keypair generated (private key non-extractable)');
+        if (saved) {
+            debugLog('[Identity] ✅ Identity keypair generated and persisted to IndexedDB');
+        } else {
+            debugWarn('[Identity] Identity keypair generated; IndexedDB persistence unavailable (ephemeral session)');
+        }
         return this.identityKeyPair;
+    }
+
+    /**
+     * Forget the persisted identity. Next call to generateIdentityKeypair()
+     * will mint a fresh keypair and (if IndexedDB is available) persist it.
+     *
+     * Intended for an explicit "forget me on this device" user gesture or
+     * for a clean-slate reset after a confirmed compromise. NOT called by
+     * destroy(): SAS mismatch / handshake abort should NOT throw away the
+     * user's identity by default — those events typically point at peer
+     * substitution, not at compromise of the user's own private key.
+     *
+     * @returns {Promise<void>}
+     */
+    async clearStoredIdentity() {
+        await _deleteStoredIdentity();
+        debugLog('[Identity] Stored identity cleared (next session will mint a fresh keypair)');
     }
 
     /**
@@ -305,5 +475,9 @@ class IdentityKeyManager {
     }
 }
 
-// Expose globally
-window.IdentityKeyManager = IdentityKeyManager;
+// Expose globally (browser) or via CommonJS (Node test harness).
+if (typeof module !== 'undefined' && module.exports) {
+    module.exports = { IdentityKeyManager };
+} else {
+    window.IdentityKeyManager = IdentityKeyManager;
+}

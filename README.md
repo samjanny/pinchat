@@ -1,5 +1,22 @@
 # PinChat
 
+> ## ⚠️ EXPERIMENTAL TEST PROJECT — DO NOT USE FOR HIGH-SECURITY PURPOSES
+>
+> **PinChat is a test/research project.** It has **not** been independently audited, it has **not** received a formal cryptographic review, and it is **not** intended for protecting sensitive, confidential, personal, financial, life-critical, or otherwise high-risk communications.
+>
+> It may contain subtle bugs, incorrect assumptions, or security flaws that have not been caught. **Do not trust it for anything that matters.**
+>
+> Do **not** use PinChat for:
+> - whistleblowing, source protection, or activist safety;
+> - protecting personal, financial, medical, or legal data;
+> - safety-critical or life-critical communications;
+> - evading state-level or otherwise capable adversaries;
+> - any scenario where a vulnerability in the software could cause real harm.
+>
+> If you need a serious secure-messaging tool, use an audited, mature application such as **Signal**. PinChat exists for experimentation, learning, and self-hosted low-risk conversations — nothing more.
+>
+> You use this software entirely at your own risk. See the full [Disclaimer](#disclaimer) at the bottom of this document.
+
 Experimental end-to-end encrypted, ephemeral, browser-based chat.
 
 PinChat is a small self-hostable web application for short-lived private conversations. Messages are encrypted in the browser before being relayed by the server. Room state is designed to live in application memory and expire after a configurable TTL.
@@ -105,6 +122,18 @@ PinChat does not attempt to provide:
 - protection from coercion;
 - protection from traffic analysis.
 
+## What "Encrypted" Means In Practice
+
+Headline claims like "end-to-end encrypted" describe a *capability*, not a *guarantee*. The actual security PinChat delivers depends on what the user does and what software is between them and the network. Three realistic configurations:
+
+| Configuration | What you actually get |
+|---|---|
+| **SAS verified + integrity-extension installed** | Client-side AEAD with the Double Ratchet. Server-served JavaScript is checked against a signed manifest. Peer identity has been confirmed out of band. **No external audit** — best-effort assurance only. |
+| **SAS verified, no integrity extension** | Client-side AEAD with the Double Ratchet. Peer identity has been confirmed out of band. The server can still serve modified JavaScript on the next reload and you have no automatic way to notice. |
+| **SAS skipped** | Client-side AEAD with the Double Ratchet — the traffic is still encrypted and a passive observer cannot read it. However, the server operator (or anyone with active relay access) could have substituted both parties' identity keys at the ECDH exchange and now sits in the middle as an authenticated peer to each side. This is encryption without peer authentication. |
+
+The phrase "server cannot read your messages" is **only true** in the first two rows, and even there it is conditional on no external audit having found a defect. Marketing copy that omits the SAS condition is overstating the property. Use the matrix above when explaining the system to others.
+
 ## Threat Model
 
 ### Trusted Components
@@ -180,7 +209,9 @@ Anyone who gets the full room link can join the room unless participants perform
 
 The Bootstrap Key encrypts the initial ECDH key exchange. After the handshake completes, the ratchet-based session encryption takes over for message encryption.
 
-Protocol v1 hardening: once the ratchet is running, the in-memory Bootstrap Key is dropped. On reconnect, the key is re-extracted from the URL fragment. If the fragment is missing, for example because a browser extension cleared `window.location.hash`, the client surfaces a clear “please re-open the original room link” message instead of attempting a handshake without a Bootstrap Key.
+Protocol v1 hardening: once the ratchet is running, the in-memory Bootstrap Key is dropped. The Bootstrap Key bytes are moved out of `window.location.hash` into tab-scoped `sessionStorage` immediately after the first successful import and the URL bar is rewritten without the fragment, so the secret stops appearing in the address bar, browser history, screen-shares, or any same-origin code reading `window.location.hash`. On reconnect, the key is re-extracted from `sessionStorage` (or the URL fragment if the stash is unavailable). If neither source has it any more, for example because a browser extension cleared the storage, the client surfaces a clear “please re-open the original room link” message instead of attempting a handshake without a Bootstrap Key.
+
+When an unauthenticated user clicks an invite link and is redirected to `/login`, a small head-loaded script (`login-stash.js`) detects the fragment, stashes it for the eventual chat page, and scrubs the URL bar before the login form renders. The Bootstrap Key never lingers on the login page either.
 
 ## Encryption Architecture
 
@@ -267,7 +298,7 @@ PinChat should therefore be described as a browser-based encrypted relay with mi
 | Digital signatures | ECDSA P-256 | Authenticate identity keys and ratchet keys |
 | Key derivation | HKDF-SHA256 | Derive root keys, chain keys, and message keys |
 | Chain ratchet | HMAC-SHA256 | One-way message-key progression |
-| SAS generation | PBKDF2, 100K iterations | Human-comparable verification codes |
+| SAS generation | HKDF-SHA256, 96-bit output (SAS v3, transcript-bound) | Human-comparable verification codes |
 
 These primitives are used through browser WebCrypto on the client side.
 
@@ -313,6 +344,8 @@ PinChat includes a Short Authentication String, or SAS, so participants can comp
 If users skip SAS verification, the chat may still be encrypted against passive observers, but it is not strongly authenticated against an active relay/server man-in-the-middle during the initial exchange.
 
 For sensitive conversations, do not skip SAS verification.
+
+The long-term identity keypair used to sign DH header rotations is persisted client-side in IndexedDB (per-origin, never synced, 24-hour TTL) so the SAS that a user has verified out of band stays the same across reconnects, tab refreshes, and short browser restarts. The private side of the keypair is non-extractable both on creation and after round-tripping through IndexedDB structured-clone. Erasing site data (or calling the explicit forget gesture) discards the entry; the next session mints a fresh one and the SAS resets.
 
 ## System Architecture
 
@@ -383,6 +416,34 @@ For sensitive conversations, do not skip SAS verification.
 - Rust 1.75 or later
 - OpenSSL, for local certificate generation
 - A modern browser with WebCrypto support
+- Node.js 18+ (only required to run the JS test suites; the client itself is build-less)
+
+### Running tests
+
+```bash
+cargo test                  # Rust server-side tests
+node tests/run-all-tests.js # JavaScript crypto suites
+```
+
+The JS runner has eight suites. Six (`chain`, `double`, `security`,
+`correctness`, `kat`, `wycheproof`) run without external dependencies.
+Two (`properties`, `fuzz`) require dev-dependencies installed via
+`npm ci` — `fast-check` for randomized property testing, and
+`@jazzer.js/core` for coverage-guided fuzzing of the decrypt path.
+
+If the dev-deps are not installed (offline clone, restricted npm
+registry, etc.), the runner reports those two suites as `[SKIP]`
+with an install hint and continues with a clean exit code 0. The
+"core verde, advanced skipped" state is intentional: fresh clones
+without npm access still get the cryptographic primitives test
+coverage.
+
+For long-running fuzz campaigns (the smoke run is 5s):
+
+```bash
+node tests/run-fuzz.js 3600   # 1-hour decrypt-path fuzz
+node tests/run-fuzz.js 86400  # 24-hour campaign
+```
 
 ### Installation
 
@@ -479,7 +540,7 @@ These settings control application behavior only. They do not automatically conf
 | `LOGIN_BURST_SIZE` | `5` | Login attempts allowed per period |
 | `LOGIN_PERIOD_SECS` | `900` | Window for login rate limiting |
 | `TRUSTED_PROXIES` | empty | Comma-separated proxy IPs/CIDRs trusted for `X-Forwarded-For` |
-| `REPLAY_CACHE_MAX_PER_ROOM` | `10000` | Maximum anti-replay entries per room |
+| `REPLAY_CACHE_MAX_PER_ROOM` | `1000` | Maximum anti-replay entries per room. The cache is an advisory layer; the authoritative anti-replay is the Double Ratchet counter, checked client-side. |
 | `MAX_IMAGE_SIZE` | `300KB` | Maximum image size, as bytes or with `KB`/`MB` suffix |
 | `WEBSITE_DIR` | empty | Custom static files directory. Falls back to `/static` |
 

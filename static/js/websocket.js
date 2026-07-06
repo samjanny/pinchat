@@ -36,6 +36,13 @@ class WebSocketManager {
         this._fatalAuthFailure = false;
         this._connectionExhausted = false;
 
+        // C-01: serial dispatch queue for inbound messages. The DoubleRatchet
+        // has its own internal mutex, but app.js#handleWebSocketMessage also
+        // mutates non-cryptographic state (participantCount, peerUserId,
+        // ecdhHandshakeStatus, …) and must observe messages in arrival order.
+        // Errors do not poison the queue — see the .catch() in onmessage.
+        this._inboundQueue = Promise.resolve();
+
         // Token caching for reconnection (avoids PoW on every reconnect)
         this.cachedToken = null;
         this.tokenExpiresAt = 0;
@@ -410,10 +417,12 @@ class WebSocketManager {
                     console.log('WebSocket message received:', message.type);
 
                     if (this.onMessage) {
-                        // onMessage handler in app.js is async and may throw during
-                        // SIGNATURE_INVALID / handshake teardown paths; wrap so a
-                        // failed path doesn't leak as an unhandled rejection.
-                        void Promise.resolve()
+                        // C-01: enqueue on the inbound mutex. Each onMessage
+                        // call runs strictly after the previous one settles,
+                        // guaranteeing in-order delivery to app.js. The
+                        // .catch resets the chain so a single handler error
+                        // does not block subsequent messages.
+                        this._inboundQueue = this._inboundQueue
                             .then(() => this.onMessage(message))
                             .catch((err) => {
                                 console.error('[WS] Unhandled error in onMessage:', err);

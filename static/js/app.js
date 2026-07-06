@@ -805,9 +805,11 @@ document.addEventListener('alpine:init', () => {
                 this.pendingImage = null;
             } catch (error) {
                 console.error('Failed to send image:', error);
+                // Encrypt threw: drop the local echo only. Do NOT revoke the
+                // blob URL here: pendingImage still owns it (it is cleared
+                // only on the happy path above), so the composer preview
+                // stays usable for a retry.
                 this.messages.pop();
-                // Encrypt/send threw — local message gone, revoke its blob URL.
-                try { URL.revokeObjectURL(localImageUrl); } catch {}
                 this.error = '⚠️ Error encrypting image.';
             } finally {
                 this.sendingImage = false;
@@ -939,7 +941,20 @@ document.addEventListener('alpine:init', () => {
          * Copies the room link to the clipboard
          */
         async copyLink() {
-            const link = window.location.href;
+            // C-06: the bootstrap secret was moved from window.location.hash
+            // to sessionStorage on page load. window.location.href therefore
+            // no longer carries the #key=... fragment that recipients need.
+            // Reconstruct it from the stash.
+            let link = window.location.href;
+            if (!window.location.hash) {
+                try {
+                    const stash = sessionStorage.getItem(`pinchat_hash:${window.location.pathname}`);
+                    if (stash) {
+                        const frag = stash.startsWith('#') ? stash : '#' + stash;
+                        link = window.location.origin + window.location.pathname + window.location.search + frag;
+                    }
+                } catch (_) { /* sessionStorage unavailable: fall back to bare URL */ }
+            }
 
             try {
                 await navigator.clipboard.writeText(link);

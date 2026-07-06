@@ -209,7 +209,11 @@ pub async fn create_room(
 
             // Generate WebSocket token for room creator to avoid second PoW
             // This improves UX by eliminating the second challenge
-            let ws_claims = WsTokenClaims::new(room_id, state.config.jwt_token_ttl_secs);
+            let ws_claims = WsTokenClaims::new(
+                room_id,
+                state.config.jwt_token_ttl_secs,
+                &state.config.jwt_issuer,
+            );
             let connection_id = ws_claims.connection_id;
 
             let ws_token = match sign_token(&ws_claims, &state.jwt_secret) {
@@ -264,9 +268,24 @@ pub async fn room_page(
     State(state): State<AppState>,
     Path(room_id): Path<Uuid>,
 ) -> Result<Redirect, Response> {
-    // Verify that the room exists
-    let room = match state.rooms.get(&room_id) {
-        Some(room) => room,
+    // Read all room state needed below into locals, then drop the DashMap read
+    // guard before any path that mutates `state.rooms`.
+    //
+    // The guard returned by `state.rooms.get(...)` read-locks the shard that
+    // holds `room_id`. `remove_room` (called on the expired path) takes a write
+    // lock on that same shard via `rooms.remove(...)`. Holding the read guard
+    // across that call self-deadlocks the worker on a sharded RwLock. Scoping
+    // the guard so it is released here keeps the expired-room cleanup safe.
+    // `created_at` is only read by the debug-only timing log below; silence the
+    // unused-variable lint in release builds where that block is compiled out.
+    #[cfg_attr(not(debug_assertions), allow(unused_variables))]
+    let (room_is_expired, room_is_full, ttl_minutes, created_at) = match state.rooms.get(&room_id) {
+        Some(room) => (
+            room.is_expired(),
+            room.is_full(),
+            room.ttl_minutes,
+            room.created_at,
+        ),
         None => {
             tracing::warn!(
                 "Room page access failed - Room {}… not found",
@@ -280,21 +299,21 @@ pub async fn room_page(
     {
         use chrono::Utc;
         let now = Utc::now();
-        let time_since_creation = now.signed_duration_since(room.created_at);
+        let time_since_creation = now.signed_duration_since(created_at);
         tracing::debug!(
             "Room page accessed - ID: {}, Created {} seconds ago, TTL: {} minutes",
             room_id,
             time_since_creation.num_seconds(),
-            room.ttl_minutes
+            ttl_minutes
         );
     }
 
     // Verify that the room has not expired
-    if room.is_expired() {
+    if room_is_expired {
         tracing::warn!(
             "Room page access failed - Room {}… has expired (ttl_minutes: {})",
             short_room_id(&room_id),
-            room.ttl_minutes
+            ttl_minutes
         );
         state.remove_room(&room_id);
         return Err((StatusCode::GONE, "Room has expired").into_response());
@@ -305,7 +324,7 @@ pub async fn room_page(
     // Returns 404 (same as "not found") rather than 403 to avoid leaking room
     // existence to callers probing random UUIDs. UUIDv4 (122 bits) makes blind
     // enumeration infeasible, but unified responses remove a metadata side-channel.
-    if room.is_full() {
+    if room_is_full {
         tracing::warn!(
             "Room page access failed - Room {}… is full",
             short_room_id(&room_id)
@@ -323,4 +342,139 @@ pub async fn room_page(
     let redirect_url = format!("/static/chat.html?room={}", room_id);
 
     Ok(Redirect::to(&redirect_url))
+}
+
+#[cfg(test)]
+mod tests {
+    //! Regression tests for the room_page handler.
+    //!
+    //! The key property under test (audit H2): room_page must NOT hold a
+    //! DashMap read guard across `state.remove_room`, which write-locks the
+    //! same shard. Holding it self-deadlocks the worker on the sharded
+    //! RwLock. We exercise the expired-room cleanup path under a hard timeout
+    //! so that a regression surfaces as a failed assertion rather than a hung
+    //! test that blocks the whole suite forever.
+    use super::*;
+    use crate::config::Config;
+    use crate::models::{Room, RoomConfig, RoomType};
+    use crate::state::AppState;
+    use chrono::Duration as ChronoDuration;
+    use std::time::Duration;
+
+    fn test_config() -> Config {
+        Config {
+            host: [127, 0, 0, 1],
+            port: 0,
+            ws_conn_burst_size: 100,
+            ws_conn_period_secs: 60,
+            room_token_burst_size: 100,
+            room_token_period_secs: 600,
+            msg_rate_limit: 30,
+            msg_rate_window_secs: 1,
+            commit_rate_limit: 12,
+            commit_rate_window_secs: 60,
+            frame_rate_limit: 120,
+            protocol_error_limit: 10,
+            pow_min_difficulty: 12,
+            pow_max_difficulty: 18,
+            challenge_ttl_secs: 300,
+            jwt_token_ttl_secs: 30,
+            jwt_issuer: crate::jwt::DEFAULT_JWT_ISSUER.to_string(),
+            max_ws_connection_age_secs: 1800,
+            ecdh_burst_limit: 8,
+            ecdh_burst_window_secs: 60,
+            room_cleanup_interval_secs: 60,
+            challenge_cleanup_interval_secs: 60,
+            password_hashes: vec![],
+            session_ttl_secs: 86400,
+            login_burst_size: 5,
+            login_period_secs: 900,
+            trusted_proxies: vec![],
+            replay_cache_max_per_room: 1000,
+            force_secure_cookies: false,
+            max_image_size: 300 * 1024,
+            force_http: false,
+            website_dir: None,
+            allow_anonymous: true,
+            cors_allowed_origins: vec!["https://localhost:3000".to_string()],
+        }
+    }
+
+    /// H2 regression: hitting the page of an EXPIRED room triggers the
+    /// `state.remove_room` cleanup path. Before the fix the room read guard
+    /// was still alive at that call and the handler deadlocked. The fix reads
+    /// the needed fields and drops the guard first, so this must complete
+    /// promptly and return 410 GONE while removing the room.
+    #[tokio::test]
+    async fn expired_room_page_does_not_deadlock_and_removes_room() {
+        let state = AppState::new(1000, test_config());
+
+        let mut room = Room::new(RoomConfig {
+            room_type: RoomType::OneToOne,
+            ttl_minutes: 1,
+            max_participants: 2,
+        });
+        // Force the room well past its absolute TTL so is_expired() is true.
+        room.created_at = chrono::Utc::now() - ChronoDuration::minutes(10);
+        let room_id = room.id;
+        state.try_create_room(room).unwrap();
+        assert!(
+            state.rooms.contains_key(&room_id),
+            "room must exist pre-call"
+        );
+
+        // Wrap in a hard timeout: a deadlock regression manifests as elapsing
+        // here instead of returning. 5s is generous; the correct path returns
+        // in microseconds.
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            room_page(State(state.clone()), Path(room_id)),
+        )
+        .await;
+
+        let handler_result =
+            result.expect("room_page deadlocked on expired-room cleanup (audit H2)");
+
+        // Expired room -> Err(GONE).
+        let response =
+            handler_result.expect_err("expired room must return an error response, not a redirect");
+        assert_eq!(
+            response.status(),
+            StatusCode::GONE,
+            "expired room must yield 410 GONE"
+        );
+
+        // The cleanup path must actually have removed the room.
+        assert!(
+            !state.rooms.contains_key(&room_id),
+            "expired room must be removed by room_page"
+        );
+    }
+
+    /// Sanity counterpart: a live, non-full room redirects to the chat page
+    /// and does not touch the removal path.
+    #[tokio::test]
+    async fn live_room_page_redirects() {
+        let state = AppState::new(1000, test_config());
+        let room = Room::new(RoomConfig {
+            room_type: RoomType::OneToOne,
+            ttl_minutes: 60,
+            max_participants: 2,
+        });
+        let room_id = room.id;
+        state.try_create_room(room).unwrap();
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            room_page(State(state.clone()), Path(room_id)),
+        )
+        .await
+        .expect("room_page must not hang for a live room");
+
+        assert!(result.is_ok(), "live room must redirect, got error");
+        assert!(
+            state.rooms.contains_key(&room_id),
+            "live room must NOT be removed"
+        );
+    }
 }

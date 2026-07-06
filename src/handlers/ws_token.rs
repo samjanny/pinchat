@@ -231,7 +231,7 @@ pub async fn generate_ws_token(
 
     // Generate JWT claims with configurable TTL
     let ttl_secs = state.config.jwt_token_ttl_secs;
-    let claims = WsTokenClaims::new(room_id, ttl_secs);
+    let claims = WsTokenClaims::new(room_id, ttl_secs, &state.config.jwt_issuer);
     let connection_id = claims.connection_id;
 
     // Sign JWT token

@@ -1,0 +1,13 @@
+{
+  "name": "pinchat-tests",
+  "private": true,
+  "description": "Dev-time test tooling for PinChat. The client is plain <script>-loaded JS — there is no client build. This package.json exists only to pin Node-side test dependencies (property-based testing, fuzzing).",
+  "version": "0.0.0",
+  "scripts": {
+    "test": "node tests/run-all-tests.js"
+  },
+  "devDependencies": {
+    "@jazzer.js/core": "^2.1.0",
+    "fast-check": "^3.23.2"
+  }
+}

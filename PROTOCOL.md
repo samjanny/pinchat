@@ -105,6 +105,21 @@ Per RFC 3986, the URL fragment (everything after `#`) is processed client-side o
 2. Server logs do not contain key material
 3. Key distribution is inherently out-of-band
 
+**Post-load lifecycle.** After the first successful import, the client
+(`crypto.js#extractKeyFromURL`) moves the fragment bytes into tab-scoped
+`sessionStorage` under the key `pinchat_hash:${pathname}` and clears
+`window.location.hash` via `history.replaceState`. The key remains
+recoverable for reload and reconnect within the tab; it is no longer
+visible in the URL bar, browser history, or to any other same-origin
+code reading `window.location.hash`. The CryptoKey reference itself is
+dropped via `deleteBootstrapKey()` once the Double Ratchet takes over.
+
+If the user is unauthenticated and bounces through `/login`, a small
+head-loaded script (`login-stash.js`) detects the fragment, stashes it
+in `sessionStorage` keyed for the eventual `/static/chat.html` landing
+page, and scrubs the URL bar before the login form renders. This means
+the bootstrap secret never lingers on `/login` either.
+
 **Security Note**: The Bootstrap Key must be shared through a secure channel (encrypted messaging, voice call, in-person). If an attacker obtains both the room URL and the Bootstrap Key, they can join the room and participate in the encrypted conversation.
 
 ### WebSocket Connection (v1)
@@ -192,34 +207,36 @@ Handshake Message
 
 ### Handshake Protocol Flow
 
+The handshake is symmetric: as soon as a 1:1 room reaches two
+participants, BOTH clients build and send a single `ecdh_public_key`
+frame. There is no init/response pairing on the wire; each side
+processes the peer's frame independently.
+
 ```
-  Alice (Initiator)                              Bob (Responder)
-        |                                              |
-        |  1. Generate Identity Keypair (ECDSA)        |
-        |  2. Generate Ephemeral Keypair (ECDH)        |
-        |  3. Sign ephemeral pubkey with identity      |
-        |  4. Encrypt with AAD (room, sender, ts)      |
-        |                                              |
-        |-------- ECDH_INIT (encrypted, signed) ------>|
-        |                                              |
-        |                   5. Verify signature        |
-        |                   6. Decrypt ephemeral key   |
-        |                   7. Generate own keypair    |
-        |                   8. Sign own ephemeral      |
-        |                   9. Derive shared secret    |
-        |                                              |
-        |<------- ECDH_RESPONSE (encrypted, signed) ---|
-        |                                              |
-        | 10. Verify signature                         |
-        | 11. Decrypt ephemeral key                    |
-        | 12. Derive shared secret                     |
-        |                                              |
-        |  [Both parties now share secret S]           |
-        |                                              |
-        | 13. Initialize Double Ratchet               |
-        |     Root Key = HKDF(S, "DoubleRatchet-RootKey")
-        |                                              |
+  Alice                     Server (blind relay)                  Bob
+    |                              |                               |
+    |  1. Generate Identity Keypair (ECDSA, persisted, 24h TTL)    |
+    |  2. Generate Ephemeral Keypair (ECDH)                        |
+    |  3. Sign ephemeral pubkey with identity key                  |
+    |  4. Encrypt pubkey with Bootstrap Key + AAD                  |
+    |     (room, sender, timestamp, nonce)                         |
+    |                              |                               |
+    |------ ecdh_public_key ------>|------ ecdh_public_key ------->|
+    |<----- ecdh_public_key -------|<----- ecdh_public_key --------|
+    |                              |                               |
+    |  5. Verify signature on peer's ephemeral key                 |
+    |  6. Decrypt peer's ephemeral key (AAD validated)             |
+    |  7. Derive shared secret S = ECDH(own_priv, peer_pub)        |
+    |  8. Determine role: the lexicographically smaller            |
+    |     connection ID becomes Initiator                          |
+    |  9. Initialize Double Ratchet                                |
+    |     Root Key = HKDF(S, "DoubleRatchet-RootKey")              |
 ```
+
+Steps 1-4 run on both sides (the diagram shows one copy). Role
+determination requires no extra round trip: both clients compare the
+two server-assigned connection IDs as strings, and the smaller one
+takes the Initiator chain labels (see Double Ratchet Initialization).
 
 ### AAD Structure for Handshake
 
@@ -333,13 +350,26 @@ chainKey' = HMAC-SHA256(chainKey, "ChainRatchet")
 chainKey = chainKey'
 ```
 
-### Sliding Window (Out-of-Order Tolerance)
+### Skipped-Key Store (Out-of-Order Tolerance)
 
-- Window size: 16 messages
-- Pre-derived keys stored for future messages
-- Keys outside window are deleted (PFS)
+Out-of-order delivery is handled entirely by the Double Ratchet's
+skipped-key store; the ChainRatchet itself derives keys strictly from
+its current position. (Earlier revisions documented a 16-entry sliding
+window of pre-derived keys inside the ChainRatchet; that mechanism was
+vestigial and has been removed.)
 
-> **TODO**: Improve support for out-of-order messages older than the current receive counter (n < Nr) within the same chain. A `skipMessageKeys(messageNumber)` function should be implemented when `messageNumber > this.Nr`, storing skipped keys in a `skippedKeys` map for later decryption of delayed messages.
+- `skipMessageKeys(until)` is invoked when `messageNumber > Nr` (forward
+  jump within the current chain) and on receive-side DH ratchet when
+  `prevChainLength > Nr` (carry across chain rotation). Skipped keys
+  are indexed by `${dh_public_key_base64}:${n}` and bounded globally by
+  `MAX_SKIPPED_KEYS_TOTAL = 1000` with FIFO eviction. The receive path
+  short-circuits on a `skippedKeys` hit before any ratchet branch fires,
+  so a late message from a previous DH chain decrypts via its stored
+  key without triggering a spurious DH ratchet.
+- Per-chain forward jumps are capped at `MAX_SKIP = 100` (DoS bound).
+- Skipped keys are single-use (deleted after successful AEAD), and keys
+  from chains more than one ratchet round old are pruned on every DH
+  ratchet (PFS).
 
 ---
 
@@ -415,13 +445,18 @@ AAD = TLV([
   "type": "image",
   "payload": "<base64url>",
   "header": {
+    "v": 1,
     "dh": "<base64url>",
     "pn": 0,
     "n": 6,
-    "rc": 2
+    "rc": 2,
+    "sig": "<base64url>"
   }
 }
 ```
+
+The header carries the same mandatory `v` and `sig` fields as text
+messages; the server rejects an image envelope without them.
 
 ### Image Plaintext Envelope
 
@@ -442,8 +477,7 @@ AAD = TLV([
 
 | Type | Direction | Description |
 |------|-----------|-------------|
-| `ecdh_init` | C -> S | Initial key exchange |
-| `ecdh_response` | C -> S | Key exchange response |
+| `ecdh_public_key` | C -> S -> C | Encrypted ephemeral key exchange (relayed to the peer; both sides send one) |
 | `message` | Bidirectional | Encrypted text message |
 | `image` | Bidirectional | Encrypted image |
 | `join` | S -> C | Participant joined |
@@ -520,20 +554,33 @@ If receivedCounter > expectedCounter:
 
 ## SAS Verification Protocol
 
-### SAS Generation
+### SAS Generation (v3, current)
 
 ```
-1. Export identity public keys (both parties)
-2. Sort keys lexicographically
-3. Concatenate: password = key1 || key2
-4. Create salt:
-   - Sort nonces and timestamps
-   - salt = roomId || nonce1 || nonce2 || ts1 || ts2
-5. Derive SAS:
-   sas = PBKDF2(password, salt, 100000, SHA-256, 48 bits)
-6. Encode as 8 emoji (64-emoji alphabet, 6 bits each)
-   Also display as 12 hex characters (e.g., A3-F7-B2-C9-1D-4E)
+1. IKM        = sorted(IK_A_raw || IK_B_raw)
+                (identity public keys, lexicographically sorted)
+2. transcript = SHA-256( sorted(EPH_A_raw || EPH_B_raw) )
+                (live ECDH ephemeral public keys of this handshake)
+3. salt       = roomId || "pinchat-sas-v3"
+4. info       = "SAS-display-v3" || transcript
+5. sas        = HKDF-SHA256(IKM, salt, info, 96 bits)
+6. Encode as 16 emoji (64-emoji alphabet, 6 bits each)
+   Also display as 24 hex characters (12 dash-separated byte pairs)
 ```
+
+The transcript binding makes the SAS authenticate the live session (the
+ephemeral keys that derive the root key), not merely the identity pair,
+and prevents offline precomputation by a malicious relay (audit H1; see
+SECURITY.md for the full rationale). Because the ephemerals are fresh
+per handshake, the displayed code changes on every reconnect: the
+"verify once" UX is carried by identity-key persistence plus
+peer-identity-change detection in the client, not by SAS stability.
+
+Historical: v1 (pre-v0.3.0) used PBKDF2 with per-handshake nonces and
+timestamps in the salt, 48-bit output, 8 emoji. v2 (v0.3.x) switched to
+HKDF over the identity keys and roomId only, 72-bit output, 12 emoji.
+Both are wire-incompatible with v3 at the display level; a version
+mismatch surfaces as non-matching codes (fail closed).
 
 ### Verification Flow
 
@@ -569,15 +616,14 @@ Alice                                    Bob
 | HMAC Hash | SHA-256 |
 | Chain Key Size | 256 bits |
 | Message Key Size | 256 bits |
-| PBKDF2 Iterations | 100,000 |
-| SAS Output | 48 bits (8 emoji / 12 hex chars) |
+| SAS Output | 96 bits (16 emoji / 24 hex chars) |
 
 ### Protocol Limits
 
 | Parameter | Value |
 |-----------|-------|
 | Max Skip (DoS protection) | 100 messages |
-| Sliding Window Size | 16 messages |
+| Max Skipped Keys (global, FIFO eviction) | 1000 |
 | Max Message Age | 5 minutes |
 | Future Tolerance (clock skew) | 30 seconds |
 | Handshake Timeout | 30 seconds |
@@ -591,11 +637,23 @@ Alice                                    Bob
 |------|-------|------|
 | ROOM_ID | 0x01 | Variable (UTF-8) |
 | SENDER_ID | 0x02 | Variable (UTF-8) |
-| TIMESTAMP | 0x03 | 8 bytes (BigUint64) |
+| TIMESTAMP | 0x03 | 8 bytes (BigUint64, **little-endian**) |
 | NONCE | 0x04 | 16 bytes |
-| MESSAGE_NUMBER | 0x05 | 8 bytes (BigUint64) |
+| MESSAGE_NUMBER | 0x05 | 8 bytes (BigUint64, **little-endian**) |
 | MESSAGE_TYPE | 0x06 | Variable (UTF-8) |
-| RATCHET_COUNT | 0x07 | 8 bytes (BigUint64) |
+| RATCHET_COUNT | 0x07 | 8 bytes (BigUint64, **little-endian**) |
+
+**Endianness note.** The current reference implementation produces the
+BigUint64 fields by writing them through `BigUint64Array(...).buffer`,
+which yields the native byte order. On every browser platform PinChat
+runs on today this is little-endian; the wire format is therefore
+little-endian for these three fields. The DH-header signature
+(`pinchat-drheader-v1 || len:u16_be || dh || rc:u32_be`) uses an
+explicit big-endian convention for its `len` and `rc` fields — that is
+a separate canonicalisation and the asymmetry is intentional. A future
+non-JavaScript client MUST emit AAD numeric fields in little-endian to
+remain interoperable. Migrating both structures to a uniform endianness
+is a candidate for the next protocol version bump.
 
 ---
 
@@ -611,3 +669,52 @@ The following legacy mechanisms from the v0 implicit protocol have been removed:
   subprotocol auth. The query-string path is gone.
 - **Optional `header` on `message`/`image`**: mandatory in v1. Serde rejects
   any envelope that omits it.
+
+---
+
+## Backlog: wire-format items deferred to a future protocol bump
+
+The third-pass audit's `v0.3.0` proposal was originally a wire-format hard
+cut bundling six items. Five turned out to be defense-in-depth without a
+concrete current exploit; in v0.3.0 we shipped only the SAS overhaul,
+which is a client-coordinated change and does NOT touch the wire.
+
+The remaining four items are recorded here so the next wire-format break
+(group chat, MLS migration, a non-JS client, a concrete attack against
+one of them) can absorb them at no incremental cost:
+
+- **F-03** — Extend the DH-header signature canonical to bind
+  `room_id` and the sorted identity public key pair, not just
+  `dh_raw || rc`. Today the signature only proves "the identity-key
+  holder produced this DH public key at this ratchet round"; it does
+  not bind the session context. The canonical tag would bump to
+  `"pinchat-drheader-v2"` for domain separation. Not directly
+  exploitable today (DH keys are uniform over 2^256, so the binding
+  gap is fragile-not-broken), but a future feature that allowed
+  parallel sessions sharing an identity could turn it into a
+  cross-session graft.
+
+- **F-06** — Add `pn` (previous-chain length) to the message AAD.
+  Today an active relay can flip `pn` in transit; AEAD passes
+  because `pn` is not in AAD, and the receiver burns up to
+  `MAX_SKIP=100` skipped-key derivations before rejecting. Bounded
+  DoS, but a free handle. AAD field type: `PREV_CHAIN_LENGTH = 0x08`.
+
+- **F-08** — Add `v` (protocol version) to the message AAD.
+  Pure defensive: today the outer envelope rejects `header.v != 1`,
+  so the version check is fail-closed at the envelope layer. Adding
+  it to AAD prevents a future v2-with-same-AAD-shape from
+  cross-decrypting v1 ciphertext.
+  AAD field type: `PROTOCOL_VERSION = 0x00`.
+
+- **F-09** — Unify endianness on big-endian throughout. Today the
+  message AAD encodes 8-byte numeric fields via JavaScript's
+  `BigUint64Array(...).buffer`, which yields native (little-endian on
+  every browser PinChat runs on). The DH-header signature canonical
+  uses explicit big-endian. The asymmetry is intentional and
+  documented above; the cost is a usability footgun for any future
+  non-JavaScript client. The fix is a one-line change in the AAD
+  encoder + the corresponding PROTOCOL.md table.
+
+All four require a wire-format change, so they ship together at the
+next bump. None is rated higher than LOW by any audit pass.

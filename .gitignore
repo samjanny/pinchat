@@ -1,3 +1,13 @@
+# Node (dev-time test deps only; client is build-less)
+node_modules/
+
+# jazzer-js fuzz corpus & crash artifacts — local-only
+tests/fuzz/corpus/
+tests/fuzz/crash-*
+tests/fuzz/leak-*
+tests/fuzz/oom-*
+tests/fuzz/timeout-*
+
 # Rust
 target/
 **/Cargo.lock

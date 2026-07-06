@@ -380,7 +380,7 @@
                     </div>
                     <div class="sas-head-text">
                         <h3 id="sas-title">Verify your peer</h3>
-                        <p class="sas-sub">Compare these 8 emoji with your peer through a channel you trust — a voice call, Signal, in person. If both of you see the same sequence, there is no man-in-the-middle.</p>
+                        <p class="sas-sub">Compare these 16 emoji with your peer through a channel you trust - a voice call, Signal, in person. If both of you see the same sequence, there is no man-in-the-middle.</p>
                     </div>
                 </div>
 
@@ -418,7 +418,7 @@
                             <line x1="12" y1="16" x2="12" y2="12"/>
                             <line x1="12" y1="8" x2="12.01" y2="8"/>
                         </svg>
-                        <span>Derived from both identity keys via <b>PBKDF2-SHA256</b> · 100k iterations · 48 bits. An attacker would need to find a live collision in the 60s handshake window — not feasible.</span>
+                        <span>Derived from both identity keys and this session's live keys via <b>HKDF-SHA256</b> · 96 bits. The code changes each time a secure session is established; your verified contact carries over as long as their identity key does not change.</span>
                     </div>
 
                 </div>
@@ -456,10 +456,10 @@
 
     <!-- Include JS modules -->
     <script src="/static/js/debug.js" integrity="sha256-nY3zkFVKF7x6KVbWq1mwcHq4Y/g8O10iOmLAFfiDsJ8=" crossorigin="anonymous" ></script>
-    <script src="/static/js/crypto.js" integrity="sha256-nqjsL3brCZtOO4fKuIo+kEsMswNKPv8Q1VWS9OES8VE=" crossorigin="anonymous" ></script>
-    <script src="/static/js/identity.js" integrity="sha256-sl6g0+ZjI05UtvwqOLcdGj8jGsnC8o3NC2uGdckKMVk=" crossorigin="anonymous" ></script>
-    <script src="/static/js/double-ratchet.js" integrity="sha256-6a2KO3OPMaEsIlWVMLCvEY9QSTE9NALAjOsZaQV/ECQ=" crossorigin="anonymous" ></script>
-    <script src="/static/js/ecdh.js" integrity="sha256-CVN4eN0i8sQBgVu52unHdpXxUJ9pjq82mYZn3yoYCgo=" crossorigin="anonymous" ></script>
+    <script src="/static/js/crypto.js" integrity="sha256-v9kUX2+i938aSIvic0aX75xw65D482Yq64E0+l6mwaA=" crossorigin="anonymous" ></script>
+    <script src="/static/js/identity.js" integrity="sha256-fyQ1Rwp2wOfHnReiojL8xAOBG8XN9qGR2N3BvCQVyLs=" crossorigin="anonymous" ></script>
+    <script src="/static/js/double-ratchet.js" integrity="sha256-Z0GYpW/Uu2N+O0A7Ux0SsQJRMBY3cHHETtz8NVvnnSA=" crossorigin="anonymous" ></script>
+    <script src="/static/js/ecdh.js" integrity="sha256-o0iwCdvom1U1hKDdXOuFrIYWVqFVSep1hB4otWXy/SU=" crossorigin="anonymous" ></script>
     <!--
       MLS (RFC 9420) custom implementation — loaded in topological dependency
       order. Each module attaches its exports to window.MLS. The signed
@@ -493,9 +493,9 @@
     <script src="/static/js/mls/group.js" integrity="sha256-sPqcIUf4zf8fy81dDB/poy+obuVINaOuLobtn50mJK8=" crossorigin="anonymous" ></script>
     <script src="/static/js/mls-session.js" integrity="sha256-+vOpggnNKJ1WHVx1hpfHDQ11zjk9vlasuHlQ5zWQaEs=" crossorigin="anonymous" ></script>
     <!-- end MLS -->
-    <script src="/static/js/websocket.js" integrity="sha256-LfJjh7GbF7UfEnlPXLYfLsoTdLRlnldSMilPNQqJtSY=" crossorigin="anonymous" ></script>
+    <script src="/static/js/websocket.js" integrity="sha256-ZboPFoWdqHGrRhkPdugTufEWj4Mz53pscjpeA2R9IxA=" crossorigin="anonymous" ></script>
     <script src="/static/js/emoji.js" integrity="sha256-w67zAeAVHFA9AB+RnbDbadBSg6LDd5RS+4mvZksLUv8=" crossorigin="anonymous" ></script>
-    <script src="/static/js/app.js" integrity="sha256-OuWzl2trPzKUsDmo7M3YJXoLK6dP1s1t6u74Oph7EpU=" crossorigin="anonymous" ></script>
+    <script src="/static/js/app.js" integrity="sha256-CPO8smUNVNqls+Ox4hgPiC9XhgaOikOpHn+x7nkOy/k=" crossorigin="anonymous" ></script>
     <script src="/static/js/alpine-csp.min.js" integrity="sha256-58hj2liWaS9dR44Q2uCJ5hZP7RxcG2offLv3qbCT8FU=" crossorigin="anonymous" defer></script>
 
     <!-- Lucide icon sprite (ISC license, https://lucide.dev) -->

@@ -34,6 +34,31 @@ const TEST_SUITES = {
         file: 'test-security.js',
         description: 'Key extractability invariants (bootstrap key, identity key)'
     },
+    correctness: {
+        name: 'Ratchet Correctness',
+        file: 'test-ratchet-correctness.js',
+        description: 'C-01 concurrency, C-02 cross-DH late delivery, C-05 non-extractable DH'
+    },
+    kat: {
+        name: 'Known Answer Tests',
+        file: 'test-kat.js',
+        description: 'KDF schedule + canonical DH-header bytes pinned against independent reference'
+    },
+    wycheproof: {
+        name: 'Wycheproof Vectors',
+        file: 'test-wycheproof.js',
+        description: 'ECDSA P-256/SHA-256 + HKDF-SHA256 against vendored C2SP/wycheproof vectors'
+    },
+    properties: {
+        name: 'Property-Based',
+        file: 'test-properties.js',
+        description: 'Double Ratchet round-trip / replay / reorder / state-integrity under random delivery (fast-check)'
+    },
+    fuzz: {
+        name: 'Fuzz Smoke',
+        file: 'test-fuzz-smoke.js',
+        description: 'jazzer-js coverage-guided decrypt-path fuzz, short smoke run (longer: node tests/run-fuzz.js N)'
+    },
     'mls-tree-math': {
         name: 'MLS tree math',
         file: 'test-mls-tree-math.js',
@@ -164,7 +189,17 @@ function runTest(suiteName) {
         });
 
         proc.on('close', (code) => {
-            resolve({ name: suiteName, passed: code === 0 });
+            // Exit code 77 = SKIPPED (autotools convention). The two
+            // suites that depend on optional npm dev-deps (fast-check,
+            // @jazzer.js/core) emit 77 when their require() throws on a
+            // fresh clone without `npm ci`. The runner treats SKIP as
+            // non-failing — `npm ci` is required for full coverage but
+            // the core suites stay usable offline.
+            let status;
+            if (code === 0) status = 'passed';
+            else if (code === 77) status = 'skipped';
+            else status = 'failed';
+            resolve({ name: suiteName, status });
         });
 
         proc.on('error', (err) => {
@@ -210,7 +245,7 @@ async function main() {
             results.push(result);
         } catch (err) {
             console.error(`Error running ${suite}:`, err.message);
-            results.push({ name: suite, passed: false });
+            results.push({ name: suite, status: 'failed' });
         }
     }
 
@@ -221,22 +256,30 @@ async function main() {
     console.log('*'.repeat(74));
     console.log('');
 
-    let allPassed = true;
+    let anyFailed = false;
+    let skipped = 0;
     for (const result of results) {
-        const status = result.passed ? 'PASSED' : 'FAILED';
-        const icon = result.passed ? '[OK]' : '[X]';
-        console.log(`  ${icon} ${TEST_SUITES[result.name].name}: ${status}`);
-        if (!result.passed) allPassed = false;
+        let icon, label;
+        switch (result.status) {
+            case 'passed':  icon = '[OK]';   label = 'PASSED';  break;
+            case 'skipped': icon = '[SKIP]'; label = 'SKIPPED'; skipped++; break;
+            case 'failed':
+            default:        icon = '[X]';    label = 'FAILED';  anyFailed = true;
+        }
+        console.log(`  ${icon} ${TEST_SUITES[result.name].name}: ${label}`);
     }
 
     console.log('');
 
-    if (allPassed) {
-        console.log('ALL TEST SUITES PASSED');
-        process.exit(0);
-    } else {
+    if (anyFailed) {
         console.log('SOME TEST SUITES FAILED');
         process.exit(1);
+    } else if (skipped > 0) {
+        console.log(`ALL TEST SUITES PASSED (${skipped} SKIPPED — install dev-deps with \`npm ci\` for full coverage)`);
+        process.exit(0);
+    } else {
+        console.log('ALL TEST SUITES PASSED');
+        process.exit(0);
     }
 }
 
