@@ -76,6 +76,7 @@ document.addEventListener('alpine:init', () => {
         // Captured at init() before wsManager.connect() consumes the creator
         // token from sessionStorage. 'creator' | 'joiner' | null.
         mlsRole: null,
+        mlsUpdateTimer: null,  // creator-only PCS rotation interval handle
 
         // ECDH Key Exchange (for 1:1 rooms with PFS)
         identityManager: null,      // Identity key manager used for authenticated handshakes
@@ -616,6 +617,25 @@ document.addEventListener('alpine:init', () => {
             }
         },
 
+        /**
+         * Creator-only PCS cadence: re-key our path with an empty
+         * (path-only) Commit every 10 minutes, so leaked epoch secrets
+         * stop being useful even in membership-stable groups. The
+         * session method no-ops when the group has a single leaf or the
+         * session is not joined, so the timer is safe to leave running.
+         */
+        _startMlsUpdateTimer() {
+            if (this.mlsUpdateTimer) return;
+            if (!this.mlsSession || this.mlsSession.role !== 'creator') return;
+            const MLS_UPDATE_INTERVAL_MS = 10 * 60 * 1000;
+            const self = this;
+            this.mlsUpdateTimer = setInterval(() => {
+                if (self.mlsSession && self.connected) {
+                    void self.mlsSession.commitUpdate();
+                }
+            }, MLS_UPDATE_INTERVAL_MS);
+        },
+
         _handleMlsEvent(event) {
             switch (event.kind) {
                 case 'keypackage-published':
@@ -624,6 +644,12 @@ document.addEventListener('alpine:init', () => {
                 case 'welcome-sent':
                     this.mlsReady = true;
                     this.addSystemMessage('✅ Secure group established');
+                    this._startMlsUpdateTimer();
+                    break;
+                case 'update-committed':
+                    // Periodic PCS rotation; intentionally silent in the
+                    // chat (a system message every interval would be noise).
+                    debugLog('[MLS] Path re-keyed (Update commit), epoch', event.epoch);
                     break;
                 case 'joined':
                     this.mlsReady = true;

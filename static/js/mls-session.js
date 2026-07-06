@@ -517,6 +517,34 @@
         }
 
         /**
+         * Creator-only: broadcast a path-only Update commit that re-keys
+         * our leaf and direct path (periodic PCS rotation). No-ops
+         * unless we are the joined creator of a group with at least one
+         * other leaf. Errors are surfaced via onEvent but never thrown:
+         * the caller is typically a timer.
+         */
+        async commitUpdate() {
+            if (this.role !== 'creator') return;
+            if (this._state !== 'joined') return;
+            if (!this.group || this.group.nLeaves < 2) return;
+            let commitMessage;
+            try {
+                ({ commitMessage } = await this.group.commitUpdate());
+            } catch (err) {
+                console.error('[MLS] commitUpdate failed:', err);
+                this.onEvent({ kind: 'error',
+                    reason: `commitUpdate failed: ${err.message}` });
+                return;
+            }
+            this.send({
+                type: 'mls',
+                payload: base64UrlEncode(stripMlsWrapper(commitMessage)),
+                wire_format: MLS.MLSMessage.WireFormat.MLS_PUBLIC_MESSAGE,
+            });
+            this.onEvent({ kind: 'update-committed', epoch: this.group.epoch.toString() });
+        }
+
+        /**
          * Creator-only: emit a Remove commit for a peer that left the
          * room. Bound to a sender_id from the relay so we can map the
          * disconnected peer to their leaf index. Silently no-ops if we

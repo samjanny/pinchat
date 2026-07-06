@@ -94,6 +94,17 @@ The browser-facing flow runs entirely over MLS for group rooms:
   if the relay later re-stamps a different `sender_id` on that leaf's
   traffic, keeps the pinned identity and raises a UI warning instead of
   trusting the relay's field.
+- **Previous-epoch grace window.** On every epoch transition the
+  outgoing epoch's decrypt-only context (old tree, old secrets, old
+  chains) is retained for 60 seconds, so application messages already
+  in flight when the Commit landed still decrypt (once; same replay
+  and signature checks, enforced under the OLD group context) instead
+  of being lost. At most one previous epoch is retained; its key
+  material is zeroed at expiry or on the next Commit.
+- **Periodic PCS rotation.** The creator broadcasts a path-only Commit
+  (empty proposal list plus UpdatePath, RFC 9420 compliant) every 10
+  minutes, re-keying its leaf and direct path so leaked epoch secrets
+  stop being useful even in membership-stable groups.
 - The Rust server stays a blind relay: it forwards a single `mls`
   envelope kind with `wire_format` and an optional `ratchet_tree`
   side-channel, never inspecting the body.
@@ -112,14 +123,6 @@ loss-of-access.
   a page reload. If the creator leaves or reloads, remaining members
   can keep chatting in the current epoch but nobody can join or be
   removed any more; the group must be re-created from a fresh room.
-- **Epoch-boundary message loss.** `decryptApplicationMessage`
-  requires an exact epoch match, so an application message encrypted
-  under epoch n but delivered after the receiver advanced to n+1
-  fails with a decrypt error and is lost. The relay's total broadcast
-  order keeps the window small (it opens between a Commit landing on
-  the relay and a sender processing it), but every Add/Remove can
-  drop in-flight messages. Keeping the previous epoch's chains alive
-  briefly would close this.
 - **No out-of-band verification ceremony.** Group identities are
   fresh per-session signature keys whose credential is the key
   itself; there is no SAS equivalent and no identity continuity
@@ -146,11 +149,14 @@ loss-of-access.
   scenario the filter collapses to the full path (every parent on the
   creator's direct path has at least one non-blank receiver subtree),
   so the wire bytes are byte-identical in practice.
-- **Update proposals.** `Add` and `Remove` are wired through end-to-end
-  with tree blanking and re-keying on the committer's path. Periodic
-  `Update` commits (member-initiated key rotation without membership
-  change) are not yet implemented; PCS therefore advances on every
-  Add/Remove rather than on a separate cadence.
+- **Member-initiated Update proposals.** The creator's periodic
+  path-only Commit rotates the epoch secrets, which heals leakage of
+  epoch-level state. It does NOT heal a compromised MEMBER leaf
+  private key: the path-secret ciphertext addressed to that leaf
+  stays decryptable by whoever holds the key. Full per-member PCS
+  needs member-initiated `Update` proposals (each member periodically
+  re-keying its own leaf), which remain unimplemented in the
+  creator-only-commit architecture.
 - **Joiner-side transcript-hash re-derivation (RFC §5.3).** A new
   joiner cannot independently re-derive
   `confirmed_transcript_hash[n]` because they don't have

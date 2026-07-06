@@ -126,6 +126,13 @@
     const MAX_GENERATION_SKIP = 256;
     const MAX_SKIPPED_PER_CHAIN = 256;
 
+    // How long the previous epoch's decrypt-only context is retained
+    // after a Commit, so application messages already in flight when
+    // the epoch turned still decrypt instead of being lost. Bounded FS
+    // cost: the retained chains keep deleting keys as they are used,
+    // and the whole context is zeroed at expiry or on the next Commit.
+    const PREV_EPOCH_GRACE_MS = 60 * 1000;
+
     // --- Group class ------------------------------------------------------
 
     class Group {
@@ -145,6 +152,10 @@
             // single-use keys for skipped generations. Reset (and zeroed)
             // on every epoch transition.
             this._chainStates = new Map();
+            // Decrypt-only context of the previous epoch (grace window
+            // for in-flight messages across a Commit). See
+            // _snapshotPrevEpoch / _decryptFromPreviousEpoch.
+            this._prevEpoch = null;
         }
 
         _markGenerationConsumed(leafIndex, generation) {
@@ -191,6 +202,48 @@
         }
 
         /**
+         * Retain a bounded decrypt-only context for the epoch we are
+         * about to leave, so application messages already in flight when
+         * the Commit landed still decrypt instead of being lost. MUST be
+         * called BEFORE the epoch fields are overwritten. Replaces (and
+         * zeroes) any older retained context: at most ONE previous epoch
+         * is kept, for at most PREV_EPOCH_GRACE_MS.
+         */
+        _snapshotPrevEpoch() {
+            this._dropPrevEpoch();
+            this._prevEpoch = {
+                epoch: this.epoch,
+                nLeaves: this.nLeaves,
+                ratchetTree: this.ratchetTree,
+                groupContext: this._buildGroupContextStruct(),
+                senderDataSecret: this.epochSecrets.senderDataSecret,
+                encryptionSecret: this.epochSecrets.encryptionSecret,
+                chainStates: this._chainStates,
+                consumedByLeaf: this.consumedByLeaf,
+                expiresAt: Date.now() + PREV_EPOCH_GRACE_MS,
+            };
+            // Chain-state ownership moved into the snapshot; the new
+            // epoch starts fresh (re-rooted on first use).
+            this._chainStates = new Map();
+        }
+
+        /**
+         * Zero and drop the retained previous-epoch context.
+         */
+        _dropPrevEpoch() {
+            if (!this._prevEpoch) return;
+            for (const st of this._prevEpoch.chainStates.values()) {
+                if (st.secret) st.secret.fill(0);
+                for (const v of st.skipped.values()) {
+                    v.key.fill(0);
+                    v.nonce.fill(0);
+                }
+                st.skipped.clear();
+            }
+            this._prevEpoch = null;
+        }
+
+        /**
          * Stateful key/nonce provider for PrivateMessage encrypt/decrypt
          * (intra-epoch forward secrecy, RFC 9420 §9.2 deletion schedule).
          *
@@ -209,15 +262,22 @@
          * to the relay dropping the message, which it can always do.
          */
         async _chainKeyNonce(leafIndex, which, generation) {
+            return this._chainKeyNonceIn(
+                this._chainStates, this.epochSecrets.encryptionSecret,
+                this.nLeaves, leafIndex, which, generation,
+            );
+        }
+
+        async _chainKeyNonceIn(chainStates, encryptionSecret, nLeaves, leafIndex, which, generation) {
             const id = `${leafIndex}:${which}`;
-            let st = this._chainStates.get(id);
+            let st = chainStates.get(id);
             if (!st) {
                 const leafSec = await SecretTree.leafSecret(
-                    this.epochSecrets.encryptionSecret, leafIndex, this.nLeaves,
+                    encryptionSecret, leafIndex, nLeaves,
                 );
                 const chainRoot = await SecretTree.leafChainRoot(leafSec, which);
                 st = { nextGeneration: 0, secret: chainRoot, skipped: new Map() };
-                this._chainStates.set(id, st);
+                chainStates.set(id, st);
             }
             if (generation < st.nextGeneration) {
                 const cached = st.skipped.get(generation);
@@ -460,7 +520,9 @@
                 throw new Error('group: group_id mismatch on incoming application message');
             }
             if (pm.epoch !== this.epoch) {
-                throw new Error(`group: wrong epoch (got ${pm.epoch}, expected ${this.epoch})`);
+                // Grace window: a message encrypted under the epoch we
+                // just left may still be in flight when the Commit lands.
+                return this._decryptFromPreviousEpoch(pm);
             }
 
             const out = await PrivateMessage.decryptPrivateMessage({
@@ -522,6 +584,81 @@
             }
 
             this._markGenerationConsumed(senderLeafIndex, generation);
+
+            return { plaintext: out.content.payloadBytes, senderLeafIndex };
+        }
+
+        /**
+         * Decrypt an application message from the PREVIOUS epoch using
+         * the retained grace-window context. Same verification chain as
+         * the current-epoch path (bounds, replay, signature under the
+         * OLD group context and OLD tree); the retained chains delete
+         * consumed keys exactly like the live ones.
+         */
+        async _decryptFromPreviousEpoch(pm) {
+            const pe = this._prevEpoch;
+            if (!pe || pm.epoch !== pe.epoch) {
+                throw new Error(`group: wrong epoch (got ${pm.epoch}, expected ${this.epoch})`);
+            }
+            if (Date.now() > pe.expiresAt) {
+                this._dropPrevEpoch();
+                throw new Error('group: previous-epoch grace window expired');
+            }
+
+            const out = await PrivateMessage.decryptPrivateMessage({
+                pm,
+                senderDataSecret: pe.senderDataSecret,
+                encryptionSecret: pe.encryptionSecret,
+                nLeaves: pe.nLeaves,
+                keyNonceProvider: (li, which, gen) => this._chainKeyNonceIn(
+                    pe.chainStates, pe.encryptionSecret, pe.nLeaves, li, which, gen,
+                ),
+            });
+
+            const senderLeafIndex = out.senderData.leafIndex;
+            const generation = out.senderData.generation;
+            if (!Number.isInteger(senderLeafIndex) || senderLeafIndex < 0
+                || senderLeafIndex >= pe.nLeaves) {
+                throw new Error(
+                    `group: sender leaf_index ${senderLeafIndex} out of range [0,${pe.nLeaves}) (prev epoch)`,
+                );
+            }
+            let consumedSet = pe.consumedByLeaf.get(senderLeafIndex);
+            if (consumedSet && consumedSet.has(generation)) {
+                throw new Error(
+                    `group: replayed application message (leaf=${senderLeafIndex}, gen=${generation}, prev epoch)`,
+                );
+            }
+
+            const senderLeaf = RatchetTree.leafFor(pe.ratchetTree, senderLeafIndex);
+            if (!senderLeaf) {
+                throw new Error(`group: unknown sender leaf_index ${senderLeafIndex} (prev epoch)`);
+            }
+            const sigPub = await Signature.importPublicKey(senderLeaf.signatureKey);
+            const content = {
+                groupId: pm.groupId,
+                epoch: pm.epoch,
+                sender: { senderType: Framing.SenderType.MEMBER, leafIndex: senderLeafIndex },
+                authenticatedData: pm.authenticatedData,
+                contentType: pm.contentType,
+                payload: out.content.payloadBytes,
+            };
+            const sigOk = await PublicMessage.verifyFramedContent(
+                sigPub,
+                MLSMessage.WireFormat.MLS_PRIVATE_MESSAGE,
+                content,
+                pe.groupContext,
+                out.content.auth.signature,
+            );
+            if (!sigOk) {
+                throw new Error('group: application message signature invalid (prev epoch)');
+            }
+
+            if (!consumedSet) {
+                consumedSet = new Set();
+                pe.consumedByLeaf.set(senderLeafIndex, consumedSet);
+            }
+            consumedSet.add(generation);
 
             return { plaintext: out.content.payloadBytes, senderLeafIndex };
         }
@@ -804,6 +941,9 @@
         );
 
         // ---- 12. Apply commit to local state ----
+        // Retain the outgoing epoch's decrypt context first (grace
+        // window for in-flight messages), then overwrite.
+        this._snapshotPrevEpoch();
         this.ratchetTree = newTree;
         this.nLeaves = newNLeaves;
         this.epoch = newEpoch;
@@ -826,11 +966,10 @@
         }
         // Replay protection state is per-epoch — every commit advances
         // the epoch and re-keys the secret tree, so old generations no
-        // longer collide with anything new. Drop the consumed set so it
-        // doesn't grow unboundedly across long-lived groups. Chain
-        // states are zeroed for the same reason (and forward secrecy).
+        // longer collide with anything new. The old consumed set and
+        // chain states now live in the grace-window snapshot; fresh
+        // maps start the new epoch.
         this.consumedByLeaf = new Map();
-        this._resetChainStates();
 
         return { commitMessage, welcomeMessage };
     };
@@ -1033,6 +1172,9 @@
         const commitMessage = MLSMessage.serializeMLSMessage(wireFormat, pmBytes);
 
         // ---- 11. Apply commit to local state ----
+        // Retain the outgoing epoch's decrypt context first (grace
+        // window for in-flight messages), then overwrite.
+        this._snapshotPrevEpoch();
         this.ratchetTree = newTree;
         this.epoch = newEpoch;
         this.treeHash = newTreeHash;
@@ -1050,7 +1192,204 @@
             this.parentKeyPairs.set(committerDirectPath[i], chain[i].keyPair);
         }
         this.consumedByLeaf = new Map();
-        this._resetChainStates();
+
+        return { commitMessage };
+    };
+
+    /**
+     * Path-only Commit (RFC 9420 allows a Commit with an empty proposal
+     * list as long as it carries an UpdatePath): re-key the committer's
+     * leaf and direct path and advance the epoch WITHOUT membership
+     * change. Used for the periodic PCS rotation in membership-stable
+     * groups.
+     *
+     * Scope note: this heals leakage of the current epoch secrets (an
+     * attacker holding epoch n secrets cannot follow into epoch n+1
+     * without the committer's fresh path secret). It does NOT heal a
+     * compromised MEMBER leaf private key: the ciphertext addressed to
+     * that leaf remains decryptable by whoever holds it. Full PCS for
+     * member compromise needs member-initiated Update proposals, which
+     * are still post-MVP.
+     *
+     * Returns { commitMessage }.
+     */
+    Group.prototype.commitUpdate = async function commitUpdate() {
+        const newNLeaves = this.nLeaves;
+        const newWidth = TreeMath.nodeWidth(newNLeaves);
+        const newTree = Nodes.padRatchetTree(this.ratchetTree.slice(), newWidth);
+
+        // ---- 1. Fresh leaf_secret + path-secret chain for committer ----
+        const leafSecret = randomBytes(HPKE.Nh);
+        const leafNodePair = await TreeKEM.leafKeyPairFromSecret(leafSecret, this.myLeafIndex);
+        const chain = await TreeKEM.pathSecretChain(leafSecret, this.myLeafIndex, newNLeaves);
+        const committerDirectPath = TreeMath.directPathWithRoot(
+            TreeMath.leafToNode(this.myLeafIndex), newNLeaves,
+        );
+        if (chain.length !== committerDirectPath.length) {
+            throw new Error(
+                `commitUpdate: chain length ${chain.length} != direct path ${committerDirectPath.length}`,
+            );
+        }
+
+        // ---- 2. New committer leaf (commit-source) ----
+        const committerNewLeafPreSign = buildSelfLeaf({
+            encryptionKeyBytes: leafNodePair.keyPair.publicKeyBytes,
+            signatureKeyBytes: this.identity.signaturePublicKeyBytes,
+            credentialIdentity: this.identity.signaturePublicKeyBytes,
+            leafNodeSource: Nodes.LeafNodeSource.COMMIT,
+        });
+        committerNewLeafPreSign.parentHash = new Uint8Array(0);
+        committerNewLeafPreSign.signature = await signLeafNodeInCommit(
+            this.identity.signaturePrivateKey,
+            committerNewLeafPreSign,
+            this.groupId,
+            this.myLeafIndex,
+        );
+        newTree[TreeMath.leafToNode(this.myLeafIndex)] = {
+            nodeType: Nodes.NodeType.LEAF, leaf: committerNewLeafPreSign,
+        };
+
+        // ---- 3. New parent encryption_keys on committer's direct path ----
+        for (let i = 0; i < committerDirectPath.length; i += 1) {
+            newTree[committerDirectPath[i]] = {
+                nodeType: Nodes.NodeType.PARENT,
+                parent: {
+                    encryptionKey: chain[i].keyPair.publicKeyBytes,
+                    parentHash: new Uint8Array(0),
+                    unmergedLeaves: [],
+                },
+            };
+        }
+
+        // ---- 4. New tree hash + provisional GroupContext ----
+        const newTreeHash = await TreeHash.hashRoot(newTree);
+        const newEpoch = this.epoch + 1n;
+        const provisionalGroupContext = {
+            version: PROTOCOL_VERSION,
+            cipherSuite: CIPHERSUITE,
+            groupId: this.groupId,
+            epoch: newEpoch,
+            treeHash: newTreeHash,
+            confirmedTranscriptHash: this.confirmedTranscriptHash,
+            extensions: [],
+        };
+        const provisionalGroupContextBytes =
+            GroupContext.groupContextBytes(provisionalGroupContext);
+
+        // ---- 5. Encrypt path_secrets to resolution(copath_sibling) ----
+        const updatePathNodes = [];
+        for (let i = 0; i < committerDirectPath.length; i += 1) {
+            const childOnPath = i === 0
+                ? TreeMath.leafToNode(this.myLeafIndex)
+                : committerDirectPath[i - 1];
+            const copathSibling = TreeMath.sibling(childOnPath, newNLeaves);
+            const res = RatchetTree.resolution(newTree, copathSibling);
+            const ciphertexts = [];
+            for (const targetNode of res) {
+                const targetSlot = newTree[targetNode];
+                if (!targetSlot) {
+                    throw new Error(
+                        `commitUpdate: resolution target ${targetNode} unexpectedly blank`,
+                    );
+                }
+                const encKey = targetSlot.nodeType === Nodes.NodeType.LEAF
+                    ? targetSlot.leaf.encryptionKey
+                    : targetSlot.parent.encryptionKey;
+                const { kemOutput, ciphertext } = await Labeled.encryptWithLabel(
+                    encKey, 'UpdatePathNode',
+                    provisionalGroupContextBytes, chain[i].pathSecret,
+                );
+                ciphertexts.push({ kemOutput, ciphertext });
+            }
+            updatePathNodes.push({
+                encryptionKey: chain[i].keyPair.publicKeyBytes,
+                encryptedPathSecret: ciphertexts,
+            });
+        }
+        const updatePath = {
+            leafNode: committerNewLeafPreSign,
+            nodes: updatePathNodes,
+        };
+
+        // ---- 6. Commit struct: NO proposals, just the UpdatePath ----
+        const commitStruct = { proposals: [], path: updatePath };
+        const commitBodyBytes = Commit.commitBytes(commitStruct);
+
+        // ---- 7. FramedContent + signature (under OLD context) ----
+        const content = {
+            groupId: this.groupId,
+            epoch: this.epoch,
+            sender: { senderType: Framing.SenderType.MEMBER, leafIndex: this.myLeafIndex },
+            authenticatedData: new Uint8Array(0),
+            contentType: Framing.ContentType.COMMIT,
+            payload: commitBodyBytes,
+        };
+        const wireFormat = MLSMessage.WireFormat.MLS_PUBLIC_MESSAGE;
+        const signature = await PublicMessage.signFramedContent(
+            this.identity.signaturePrivateKey,
+            wireFormat, content, this._buildGroupContextStruct(),
+        );
+
+        // ---- 8. Transcript + new epoch secrets ----
+        const cthInput = new Codec.Encoder();
+        cthInput.writeU16(wireFormat);
+        Framing.writeFramedContent(cthInput, content);
+        cthInput.writeOpaque(signature);
+        const newConfirmedTranscriptHash = await TranscriptHashes.confirmedTranscriptHash(
+            this.interimTranscriptHash, cthInput.bytes(),
+        );
+        const epochGroupContext = {
+            ...provisionalGroupContext,
+            confirmedTranscriptHash: newConfirmedTranscriptHash,
+        };
+        const epochGroupContextBytes = GroupContext.groupContextBytes(epochGroupContext);
+
+        const rootChainEntry = chain[chain.length - 1];
+        const epochSecrets = await KeySchedule.deriveEpoch({
+            initSecretPrev: this.epochSecrets.initSecret,
+            commitSecret: await TreeKEM.commitSecret(rootChainEntry.pathSecret),
+            pskSecret: this.pskSecret,
+            groupContext: epochGroupContextBytes,
+        });
+
+        const confirmationTag = await TranscriptHashes.confirmationTag(
+            epochSecrets.confirmationKey, newConfirmedTranscriptHash,
+        );
+        const newInterimTranscriptHash = await TranscriptHashes.interimTranscriptHash(
+            newConfirmedTranscriptHash, confirmationTag,
+        );
+        const auth = { signature, confirmationTag };
+
+        // ---- 9. PublicMessage with membership_tag ----
+        const membershipTag = await PublicMessage.computeMembershipTag(
+            this.epochSecrets.membershipKey, wireFormat, content, auth,
+            this._buildGroupContextStruct(),
+        );
+        const pm = { content, auth, membershipTag };
+        const pmBytes = PublicMessage.publicMessageBytes(pm);
+        const commitMessage = MLSMessage.serializeMLSMessage(wireFormat, pmBytes);
+
+        // ---- 10. Apply commit to local state ----
+        // Retain the outgoing epoch's decrypt context first (grace
+        // window for in-flight messages), then overwrite.
+        this._snapshotPrevEpoch();
+        this.ratchetTree = newTree;
+        this.epoch = newEpoch;
+        this.treeHash = newTreeHash;
+        this.confirmedTranscriptHash = newConfirmedTranscriptHash;
+        this.interimTranscriptHash = newInterimTranscriptHash;
+        this.epochSecrets = epochSecrets;
+        this.senderRatchetGeneration = 0;
+        this.leafKeyPair = {
+            privateKey: leafNodePair.keyPair.privateKey,
+            publicKey: leafNodePair.keyPair.publicKey,
+            publicKeyBytes: leafNodePair.keyPair.publicKeyBytes,
+        };
+        this.parentKeyPairs = new Map();
+        for (let i = 0; i < committerDirectPath.length; i += 1) {
+            this.parentKeyPairs.set(committerDirectPath[i], chain[i].keyPair);
+        }
+        this.consumedByLeaf = new Map();
 
         return { commitMessage };
     };
@@ -1360,6 +1699,9 @@
         );
 
         // ---- Commit the new state ----
+        // Retain the outgoing epoch's decrypt context first (grace
+        // window for in-flight messages), then overwrite.
+        this._snapshotPrevEpoch();
         this.ratchetTree = newTree;
         this.nLeaves = newNLeaves;
         this.epoch = newEpoch;
@@ -1389,10 +1731,9 @@
         this.parentKeyPairs = survivors;
         // Replay protection state is per-epoch — drop the consumed
         // generations now that we've advanced past the epoch they
-        // applied to. Chain states are zeroed for the same reason
-        // (and forward secrecy).
+        // applied to. The old consumed set and chain states now live in
+        // the grace-window snapshot; fresh maps start the new epoch.
         this.consumedByLeaf = new Map();
-        this._resetChainStates();
 
         return {
             addedLeafIndex: lastAddedLeafIndex,

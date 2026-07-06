@@ -142,6 +142,61 @@ async function main() {
     assert(new TextDecoder().decode(pt2.plaintext) === 'ciao alice!',
         'Bob → Alice application message at epoch 1 decrypts');
 
+    // 6. Path-only Update commit: PCS rotation without membership change.
+    const secretBefore = Buffer.from(alice.epochSecrets.encryptionSecret).toString('hex');
+    const { commitMessage: updCommit } = await alice.commitUpdate();
+    await bobGroup.processCommit(updCommit);
+    assert(alice.epoch === 2n && bobGroup.epoch === 2n,
+        'Update commit advances both members to epoch 2');
+    assert(
+        Buffer.from(alice.epochSecrets.encryptionSecret).toString('hex')
+            === Buffer.from(bobGroup.epochSecrets.encryptionSecret).toString('hex'),
+        'epoch 2 encryption_secret converges after Update commit'
+    );
+    assert(
+        Buffer.from(alice.epochSecrets.encryptionSecret).toString('hex') !== secretBefore,
+        'Update commit rotates the encryption_secret'
+    );
+    const wireU1 = await alice.encryptApplicationMessage('post-update alice');
+    assert(new TextDecoder().decode((await bobGroup.decryptApplicationMessage(wireU1)).plaintext)
+        === 'post-update alice', 'Alice -> Bob message at epoch 2 decrypts');
+    const wireU2 = await bobGroup.encryptApplicationMessage('post-update bob');
+    assert(new TextDecoder().decode((await alice.decryptApplicationMessage(wireU2)).plaintext)
+        === 'post-update bob', 'Bob -> Alice message at epoch 2 decrypts');
+
+    // 7. Previous-epoch grace window: a message encrypted under epoch 2
+    // and delivered after the receiver advanced to epoch 3 must still
+    // decrypt, exactly once, until the window expires.
+    const inFlight = await bobGroup.encryptApplicationMessage('sent at epoch 2');
+    const { commitMessage: updCommit2 } = await alice.commitUpdate();  // alice -> epoch 3
+    assert(alice.epoch === 3n && bobGroup.epoch === 2n,
+        'alice at epoch 3, bob still at epoch 2 (commit in flight)');
+    const late = await alice.decryptApplicationMessage(inFlight);
+    assert(new TextDecoder().decode(late.plaintext) === 'sent at epoch 2',
+        'in-flight epoch-2 message decrypts via the grace window');
+    let threwGraceReplay = false;
+    try {
+        await alice.decryptApplicationMessage(inFlight);
+    } catch (_e) { threwGraceReplay = true; }
+    assert(threwGraceReplay, 'replay through the grace window rejected');
+
+    // Force the window shut: an old-epoch message is now rejected.
+    const inFlight2 = await bobGroup.encryptApplicationMessage('too late');
+    alice._prevEpoch.expiresAt = Date.now() - 1;
+    let threwExpired = false;
+    try {
+        await alice.decryptApplicationMessage(inFlight2);
+    } catch (_e) { threwExpired = true; }
+    assert(threwExpired, 'old-epoch message after grace expiry rejected');
+    assert(alice._prevEpoch === null, 'expired grace context dropped and zeroed');
+
+    // Bob catches up and the group converges at epoch 3.
+    await bobGroup.processCommit(updCommit2);
+    assert(bobGroup.epoch === 3n, 'bob converges to epoch 3');
+    const wireF = await bobGroup.encryptApplicationMessage('all caught up');
+    assert(new TextDecoder().decode((await alice.decryptApplicationMessage(wireF)).plaintext)
+        === 'all caught up', 'post-convergence message decrypts at epoch 3');
+
     console.log('');
     console.log(`group-add: ${passed} passed, ${failed} failed`);
     process.exit(failed === 0 ? 0 : 1);
