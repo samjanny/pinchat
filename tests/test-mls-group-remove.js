@@ -115,7 +115,7 @@ async function main() {
 
     // Sanity at epoch 2: Bob can decrypt.
     const wireA = await alice.encryptApplicationMessage('hello at epoch 2');
-    assert(new TextDecoder().decode(await bobGroup.decryptApplicationMessage(wireA)) === 'hello at epoch 2',
+    assert(new TextDecoder().decode((await bobGroup.decryptApplicationMessage(wireA)).plaintext) === 'hello at epoch 2',
         'Bob decrypts Alice at epoch 2');
 
     // ---- Remove Bob (leaf 1) ----
@@ -136,7 +136,7 @@ async function main() {
 
     // Application message at epoch 3: Carol decrypts Alice.
     const wireA3 = await alice.encryptApplicationMessage('only us now');
-    assert(new TextDecoder().decode(await carolGroup.decryptApplicationMessage(wireA3)) === 'only us now',
+    assert(new TextDecoder().decode((await carolGroup.decryptApplicationMessage(wireA3)).plaintext) === 'only us now',
         'Alice → Carol app msg at epoch 3');
 
     // Bob (still at epoch 2) cannot decrypt epoch 3 traffic.
@@ -197,11 +197,11 @@ async function main() {
     assert(daveGroup.myLeafIndex === 3, 'Dave joined at leaf 3 (after blank Bob slot)');
 
     const wireA4 = await alice.encryptApplicationMessage('post-remove epoch');
-    assert(new TextDecoder().decode(await daveGroup.decryptApplicationMessage(wireA4)) === 'post-remove epoch',
+    assert(new TextDecoder().decode((await daveGroup.decryptApplicationMessage(wireA4)).plaintext) === 'post-remove epoch',
         'Alice → Dave app msg at epoch 4');
-    assert(new TextDecoder().decode(await carolGroup.decryptApplicationMessage(
+    assert(new TextDecoder().decode((await carolGroup.decryptApplicationMessage(
         await daveGroup.encryptApplicationMessage('hi from dave'),
-    )) === 'hi from dave',
+    )).plaintext) === 'hi from dave',
         'Dave → Carol app msg at epoch 4');
 
     console.log('');

@@ -134,12 +134,12 @@ async function main() {
     // 5. Exchange application messages at epoch 1.
     const wire1 = await alice.encryptApplicationMessage('ciao bob, eccoci');
     const pt1 = await bobGroup.decryptApplicationMessage(wire1);
-    assert(new TextDecoder().decode(pt1) === 'ciao bob, eccoci',
+    assert(new TextDecoder().decode(pt1.plaintext) === 'ciao bob, eccoci',
         'Alice → Bob application message at epoch 1 decrypts');
 
     const wire2 = await bobGroup.encryptApplicationMessage('ciao alice!');
     const pt2 = await alice.decryptApplicationMessage(wire2);
-    assert(new TextDecoder().decode(pt2) === 'ciao alice!',
+    assert(new TextDecoder().decode(pt2.plaintext) === 'ciao alice!',
         'Bob → Alice application message at epoch 1 decrypts');
 
     console.log('');

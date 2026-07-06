@@ -181,6 +181,15 @@
             // a single peer can publish many KeyPackages, growing the
             // tree arbitrarily and exhausting committer resources.
             this._leafBySenderId = new Map();
+            // Reverse binding leafIndex → sender_id used for E2E message
+            // attribution. The MLS signature authenticates the sender's
+            // LEAF; the relay's sender_id is unauthenticated transport
+            // metadata. The creator seeds this map at commit time; every
+            // member pins the first observed association (TOFU). On a
+            // later mismatch we keep the pinned identity and flag the
+            // message: a mismatch means the relay re-stamped the
+            // envelope's sender_id.
+            this._senderIdByLeaf = new Map();
         }
 
         /**
@@ -315,6 +324,7 @@
             }
             if (senderId !== undefined) {
                 this._leafBySenderId.set(senderId, addedLeafIndex);
+                this._senderIdByLeaf.set(addedLeafIndex, senderId);
             }
             const ratchetTreeBytes = MLS.Nodes.ratchetTreeBytes(this.group.ratchetTree);
 
@@ -397,14 +407,33 @@
             const wrapped = MLS.MLSMessage.serializeMLSMessage(
                 MLS.MLSMessage.WireFormat.MLS_PRIVATE_MESSAGE, mlsMessageBytes,
             );
-            let pt;
+            let res;
             try {
-                pt = await this.group.decryptApplicationMessage(wrapped);
+                res = await this.group.decryptApplicationMessage(wrapped);
             } catch (err) {
                 this.onEvent({ kind: 'error',
                     reason: `decrypt failed: ${err.message}` });
                 return;
             }
+            const pt = res.plaintext;
+            const senderLeafIndex = res.senderLeafIndex;
+
+            // E2E attribution (audit fix): senderLeafIndex is the
+            // signature-verified sender; the envelope's sender_id is
+            // relay-stamped and unauthenticated. Pin the first observed
+            // association and keep the pinned value on mismatch.
+            let attributedSenderId = senderId;
+            let attributionWarning = false;
+            const pinned = this._senderIdByLeaf.get(senderLeafIndex);
+            if (pinned === undefined) {
+                if (senderId) this._senderIdByLeaf.set(senderLeafIndex, senderId);
+            } else if (senderId && senderId !== pinned) {
+                attributedSenderId = pinned;
+                attributionWarning = true;
+            } else {
+                attributedSenderId = pinned;
+            }
+
             if (pt.length === 0) {
                 this.onEvent({ kind: 'error', reason: 'empty application payload' });
                 return;
@@ -414,7 +443,9 @@
                 this.onEvent({
                     kind: 'message',
                     text: new TextDecoder().decode(pt.subarray(1)),
-                    senderId,
+                    senderId: attributedSenderId,
+                    senderLeafIndex,
+                    attributionWarning,
                 });
                 return;
             }
@@ -434,7 +465,9 @@
                     kind: 'image',
                     mimeType,
                     data,
-                    senderId,
+                    senderId: attributedSenderId,
+                    senderLeafIndex,
+                    attributionWarning,
                 });
                 return;
             }
@@ -496,6 +529,7 @@
             if (!this._leafBySenderId.has(senderId)) return;
             const leafIndex = this._leafBySenderId.get(senderId);
             this._leafBySenderId.delete(senderId);
+            this._senderIdByLeaf.delete(leafIndex);
 
             let commitMessage;
             try {

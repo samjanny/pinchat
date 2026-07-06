@@ -141,23 +141,23 @@ async function main() {
 
     // Pairwise application messages at epoch 2.
     const wireAB = await alice.encryptApplicationMessage('hello bob');
-    assert(new TextDecoder().decode(await bobGroup.decryptApplicationMessage(wireAB)) === 'hello bob',
+    assert(new TextDecoder().decode((await bobGroup.decryptApplicationMessage(wireAB)).plaintext) === 'hello bob',
         'Alice → Bob app msg at epoch 2');
 
     const wireAC = await alice.encryptApplicationMessage('hello carol');
-    assert(new TextDecoder().decode(await carolGroup.decryptApplicationMessage(wireAC)) === 'hello carol',
+    assert(new TextDecoder().decode((await carolGroup.decryptApplicationMessage(wireAC)).plaintext) === 'hello carol',
         'Alice → Carol app msg at epoch 2');
 
     const wireBC = await bobGroup.encryptApplicationMessage('hi carol from bob');
-    assert(new TextDecoder().decode(await carolGroup.decryptApplicationMessage(wireBC)) === 'hi carol from bob',
+    assert(new TextDecoder().decode((await carolGroup.decryptApplicationMessage(wireBC)).plaintext) === 'hi carol from bob',
         'Bob → Carol app msg at epoch 2');
 
     const wireCA = await carolGroup.encryptApplicationMessage('hi alice from carol');
-    assert(new TextDecoder().decode(await alice.decryptApplicationMessage(wireCA)) === 'hi alice from carol',
+    assert(new TextDecoder().decode((await alice.decryptApplicationMessage(wireCA)).plaintext) === 'hi alice from carol',
         'Carol → Alice app msg at epoch 2');
 
     const wireCB = await carolGroup.encryptApplicationMessage('hi bob from carol');
-    assert(new TextDecoder().decode(await bobGroup.decryptApplicationMessage(wireCB)) === 'hi bob from carol',
+    assert(new TextDecoder().decode((await bobGroup.decryptApplicationMessage(wireCB)).plaintext) === 'hi bob from carol',
         'Carol → Bob app msg at epoch 2');
 
     // ----- Epoch 2 → 3: add Dave -----
@@ -208,7 +208,7 @@ async function main() {
     ]) {
         const w = await from.encryptApplicationMessage(`hi from ${name}`);
         const pt = await to.decryptApplicationMessage(w);
-        assert(new TextDecoder().decode(pt) === `hi from ${name}`,
+        assert(new TextDecoder().decode(pt.plaintext) === `hi from ${name}`,
             `${name} app msg at epoch 3`);
     }
 
@@ -463,7 +463,7 @@ async function main() {
     {
         const wireReplay = await alice.encryptApplicationMessage('once');
         const pt1 = await bobGroup.decryptApplicationMessage(wireReplay);
-        assert(new TextDecoder().decode(pt1) === 'once',
+        assert(new TextDecoder().decode(pt1.plaintext) === 'once',
             'first decrypt of replay candidate succeeds');
         let threwReplay = false;
         try {
@@ -511,7 +511,7 @@ async function main() {
         await daveGroup.processCommit(rEve.commitMessage);
         const wireFresh = await alice.encryptApplicationMessage('after rekey');
         const ptFresh = await bobGroup.decryptApplicationMessage(wireFresh);
-        assert(new TextDecoder().decode(ptFresh) === 'after rekey',
+        assert(new TextDecoder().decode(ptFresh.plaintext) === 'after rekey',
             'gen=0 in new epoch accepted (replay state cleared on rekey)');
     }
 

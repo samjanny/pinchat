@@ -272,7 +272,9 @@
      * Returns { senderData, content } where `content` is the parsed
      * PrivateMessageContent (payloadBytes/Parsed + auth + paddingLen).
      */
-    async function decryptPrivateMessage({ pm, senderDataSecret, encryptionSecret, nLeaves }) {
+    async function decryptPrivateMessage({
+        pm, senderDataSecret, encryptionSecret, nLeaves, keyNonceProvider,
+    }) {
         // 1. Decrypt sender_data.
         const { key: sdKey, nonce: sdNonce } = await SecretTree.senderDataKeyNonce(
             senderDataSecret, pm.ciphertext
@@ -281,14 +283,26 @@
         const sdPlain = await aesGcmDecrypt(sdKey, sdNonce, sdAad, pm.encryptedSenderData);
         const senderData = parseSenderData(sdPlain);
 
-        // 2. Derive the per-leaf ratchet secret.
+        // 2. Derive the per-leaf ratchet key/nonce. When the caller
+        // supplies a keyNonceProvider (Group's stateful forward-secret
+        // chains), that is authoritative: it deletes consumed keys and
+        // rejects replays. The stateless fallback derives from the chain
+        // root and is retained for the IETF vector tests.
         const which = (pm.contentType === Framing.ContentType.APPLICATION)
             ? 'application' : 'handshake';
-        const leafSec = await SecretTree.leafSecret(encryptionSecret, senderData.leafIndex, nLeaves);
-        const chainRoot = await SecretTree.leafChainRoot(leafSec, which);
-        const { key, nonce: baseNonce } = await SecretTree.keyNonceAtGeneration(
-            chainRoot, senderData.generation
-        );
+        let key;
+        let baseNonce;
+        if (keyNonceProvider) {
+            ({ key, nonce: baseNonce } = await keyNonceProvider(
+                senderData.leafIndex, which, senderData.generation,
+            ));
+        } else {
+            const leafSec = await SecretTree.leafSecret(encryptionSecret, senderData.leafIndex, nLeaves);
+            const chainRoot = await SecretTree.leafChainRoot(leafSec, which);
+            ({ key, nonce: baseNonce } = await SecretTree.keyNonceAtGeneration(
+                chainRoot, senderData.generation
+            ));
+        }
         const nonce = applyReuseGuard(baseNonce, senderData.reuseGuard);
 
         // 3. Decrypt the ciphertext.
@@ -312,18 +326,28 @@
         groupId, epoch, contentType, authenticatedData,
         payloadBytes, auth,
         senderData, paddingLen = 0,
-        senderDataSecret, encryptionSecret, nLeaves,
+        senderDataSecret, encryptionSecret, nLeaves, keyNonceProvider,
     }) {
-        // Derive ratchet key/nonce for this sender/generation.
+        // Derive ratchet key/nonce for this sender/generation. Stateful
+        // provider preferred (forward secrecy); stateless fallback for
+        // the IETF vector tests.
         const which = (contentType === Framing.ContentType.APPLICATION)
             ? 'application' : 'handshake';
-        const leafSec = await SecretTree.leafSecret(
-            encryptionSecret, senderData.leafIndex, nLeaves
-        );
-        const chainRoot = await SecretTree.leafChainRoot(leafSec, which);
-        const { key, nonce: baseNonce } = await SecretTree.keyNonceAtGeneration(
-            chainRoot, senderData.generation
-        );
+        let key;
+        let baseNonce;
+        if (keyNonceProvider) {
+            ({ key, nonce: baseNonce } = await keyNonceProvider(
+                senderData.leafIndex, which, senderData.generation,
+            ));
+        } else {
+            const leafSec = await SecretTree.leafSecret(
+                encryptionSecret, senderData.leafIndex, nLeaves
+            );
+            const chainRoot = await SecretTree.leafChainRoot(leafSec, which);
+            ({ key, nonce: baseNonce } = await SecretTree.keyNonceAtGeneration(
+                chainRoot, senderData.generation
+            ));
+        }
         const nonce = applyReuseGuard(baseNonce, senderData.reuseGuard);
 
         const plaintext = privateMessageContentBytes(contentType, payloadBytes, auth, paddingLen);

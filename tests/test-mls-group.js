@@ -140,9 +140,14 @@ async function main() {
             'epoch 0 secrets derived'
         );
         // A single-member group can still encrypt to itself (loopback).
+        // With the stateful forward-secret chains the SENDER consumes its
+        // own generation at encrypt time, so self-decrypt on the same
+        // instance is (correctly) rejected as a replay. Decrypt through a
+        // state clone, which re-roots its own chains.
         const ct = await group.encryptApplicationMessage('hello self');
         assert(ct instanceof Uint8Array && ct.length > 0, 'encrypt returns bytes');
-        const pt = await group.decryptApplicationMessage(ct);
+        const receiver = Group.Group.fromState({ ...group });
+        const pt = (await receiver.decryptApplicationMessage(ct)).plaintext;
         assert(
             new TextDecoder().decode(pt) === 'hello self',
             'single-leaf loopback encrypt → decrypt'
@@ -162,13 +167,13 @@ async function main() {
         // Alice → Bob
         const m1 = 'hey bob from alice';
         const wire1 = await alice.encryptApplicationMessage(m1);
-        const got1 = new TextDecoder().decode(await bob.decryptApplicationMessage(wire1));
+        const got1 = new TextDecoder().decode((await bob.decryptApplicationMessage(wire1)).plaintext);
         assert(got1 === m1, 'Alice → Bob message 0 decrypts');
 
         // Bob → Alice
         const m2 = 'hey alice from bob';
         const wire2 = await bob.encryptApplicationMessage(m2);
-        const got2 = new TextDecoder().decode(await alice.decryptApplicationMessage(wire2));
+        const got2 = new TextDecoder().decode((await alice.decryptApplicationMessage(wire2)).plaintext);
         assert(got2 === m2, 'Bob → Alice message 0 decrypts');
 
         // Sequential messages — generation chain advances.
@@ -179,7 +184,7 @@ async function main() {
         }
         // All four must decrypt in order.
         for (let i = 0; i < wires.length; i += 1) {
-            const pt = new TextDecoder().decode(await bob.decryptApplicationMessage(wires[i]));
+            const pt = new TextDecoder().decode((await bob.decryptApplicationMessage(wires[i])).plaintext);
             assert(pt === messages[i], `sequential message ${i} decrypts`);
         }
 
@@ -193,6 +198,37 @@ async function main() {
             threw = true;
         }
         assert(threw, 'tampered ciphertext rejected');
+    }
+
+    console.log('# Group: forward-secret chains, out-of-order + replay + attribution');
+    {
+        const { alice, bob } = await buildSynthetic2LeafGroup();
+        const w0 = await alice.encryptApplicationMessage('m0');
+        const w1 = await alice.encryptApplicationMessage('m1');
+        const w2 = await alice.encryptApplicationMessage('m2');
+
+        // Deliver gen 2 first: bob's chain for alice's leaf jumps ahead,
+        // caching single-use keys for generations 0 and 1.
+        assert(new TextDecoder().decode((await bob.decryptApplicationMessage(w2)).plaintext) === 'm2',
+            'out-of-order head (gen 2) decrypts');
+        assert(new TextDecoder().decode((await bob.decryptApplicationMessage(w0)).plaintext) === 'm0',
+            'late gen 0 decrypts from skipped-key cache');
+        assert(new TextDecoder().decode((await bob.decryptApplicationMessage(w1)).plaintext) === 'm1',
+            'late gen 1 decrypts from skipped-key cache');
+
+        // Replays: cached keys are single-use and chain positions are
+        // consumed, so every replay must be rejected.
+        for (const [w, name] of [[w0, 'gen 0'], [w1, 'gen 1'], [w2, 'gen 2']]) {
+            let threwReplay = false;
+            try { await bob.decryptApplicationMessage(w); } catch (_e) { threwReplay = true; }
+            assert(threwReplay, `replayed ${name} rejected (key deleted)`);
+        }
+
+        // The authenticated sender leaf is surfaced for E2E attribution.
+        const w3 = await alice.encryptApplicationMessage('m3');
+        const res3 = await bob.decryptApplicationMessage(w3);
+        assert(res3.senderLeafIndex === alice.myLeafIndex,
+            'decrypt surfaces the authenticated sender leaf index');
     }
 
     console.log('');

@@ -630,6 +630,13 @@ document.addEventListener('alpine:init', () => {
                     this.addSystemMessage('✅ Joined secure group');
                     break;
                 case 'message': {
+                    // attributionWarning: the relay stamped a sender_id
+                    // that contradicts the MLS-authenticated sender leaf.
+                    // The session already attributes by the pinned value;
+                    // surface the anomaly so the user knows.
+                    if (event.attributionWarning) {
+                        this.addSystemMessage('🔐 Security warning: relay sender attribution mismatch; showing the cryptographically pinned sender');
+                    }
                     const nickname = event.senderId
                         ? generateNickname(event.senderId).display
                         : 'Peer';
@@ -646,6 +653,9 @@ document.addEventListener('alpine:init', () => {
                     break;
                 }
                 case 'image': {
+                    if (event.attributionWarning) {
+                        this.addSystemMessage('🔐 Security warning: relay sender attribution mismatch; showing the cryptographically pinned sender');
+                    }
                     const nicknameImg = event.senderId
                         ? generateNickname(event.senderId).display
                         : 'Peer';

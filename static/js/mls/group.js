@@ -7,7 +7,8 @@
  *   Group.create({ identity, groupId? })                 → Group
  *   Group.joinFromEpochState(state)                       → Group
  *   group.encryptApplicationMessage(plaintext)            → MLSMessage bytes
- *   group.decryptApplicationMessage(mlsMessageBytes)      → plaintext
+ *   group.decryptApplicationMessage(mlsMessageBytes)      → { plaintext,
+ *                                                             senderLeafIndex }
  *
  * Scope
  * -----
@@ -60,6 +61,7 @@
             require('./key-schedule.js'),
             require('./framing.js'),
             require('./private-message.js'),
+            require('./secret-tree.js'),
             require('./mls-message.js'),
             require('./public-message.js'),
             require('./labeled.js'),
@@ -77,7 +79,8 @@
             root.MLS.Codec, root.MLS.HPKE, root.MLS.Signature,
             root.MLS.Nodes, root.MLS.RatchetTree, root.MLS.TreeMath,
             root.MLS.TreeHash, root.MLS.GroupContext, root.MLS.KeySchedule,
-            root.MLS.Framing, root.MLS.PrivateMessage, root.MLS.MLSMessage,
+            root.MLS.Framing, root.MLS.PrivateMessage, root.MLS.SecretTree,
+            root.MLS.MLSMessage,
             root.MLS.PublicMessage, root.MLS.Labeled,
             root.MLS.KeyPackage, root.MLS.Proposal, root.MLS.Commit,
             root.MLS.TreeKEM, root.MLS.Welcome, root.MLS.GroupInfo,
@@ -87,7 +90,7 @@
 })(typeof self !== 'undefined' ? self : this, function (
     Codec, HPKE, Signature, Nodes, RatchetTree, TreeMath,
     TreeHash, GroupContext, KeySchedule, Framing, PrivateMessage,
-    MLSMessage, PublicMessage, Labeled,
+    SecretTree, MLSMessage, PublicMessage, Labeled,
     KeyPackage, Proposal, Commit, TreeKEM, Welcome, GroupInfo,
     TranscriptHashes,
 ) {
@@ -116,6 +119,13 @@
         return diff === 0;
     }
 
+    // Out-of-order tolerance bounds for the stateful secret-tree chains.
+    // A forward jump larger than MAX_GENERATION_SKIP is rejected (DoS
+    // bound on chain derivations); at most MAX_SKIPPED_PER_CHAIN cached
+    // keys are kept per sender chain, FIFO-evicted and zeroed.
+    const MAX_GENERATION_SKIP = 256;
+    const MAX_SKIPPED_PER_CHAIN = 256;
+
     // --- Group class ------------------------------------------------------
 
     class Group {
@@ -123,8 +133,18 @@
             Object.assign(this, state);
             // Replay protection: per-epoch set of (leafIndex, generation)
             // pairs we have already accepted. Reset on every epoch
-            // transition; cap per-leaf to bound memory growth.
+            // transition; cap per-leaf to bound memory growth. With the
+            // stateful chains below this is defense-in-depth: the chain
+            // state itself rejects replays because consumed keys are
+            // deleted and cannot be re-derived.
             this.consumedByLeaf = new Map();
+            // Stateful per-sender secret-tree chains (intra-epoch forward
+            // secrecy). Keyed by `${leafIndex}:${which}`; each entry holds
+            // only the CURRENT chain position's secret, which is
+            // overwritten as the chain advances, plus a bounded cache of
+            // single-use keys for skipped generations. Reset (and zeroed)
+            // on every epoch transition.
+            this._chainStates = new Map();
         }
 
         _markGenerationConsumed(leafIndex, generation) {
@@ -147,6 +167,95 @@
         _isGenerationConsumed(leafIndex, generation) {
             const set = this.consumedByLeaf.get(leafIndex);
             return set ? set.has(generation) : false;
+        }
+
+        /**
+         * Zero and drop all stateful chain material. Called on every
+         * epoch transition: the next epoch's chains re-root from the new
+         * encryption_secret on first use.
+         */
+        _resetChainStates() {
+            if (!this._chainStates) {
+                this._chainStates = new Map();
+                return;
+            }
+            for (const st of this._chainStates.values()) {
+                if (st.secret) st.secret.fill(0);
+                for (const v of st.skipped.values()) {
+                    v.key.fill(0);
+                    v.nonce.fill(0);
+                }
+                st.skipped.clear();
+            }
+            this._chainStates = new Map();
+        }
+
+        /**
+         * Stateful key/nonce provider for PrivateMessage encrypt/decrypt
+         * (intra-epoch forward secrecy, RFC 9420 §9.2 deletion schedule).
+         *
+         * Invariants:
+         *   - the stored secret is always at position `nextGeneration`;
+         *     old positions are overwritten (fill(0)) as the chain moves,
+         *     so past generations cannot be re-derived from live state;
+         *   - keys for skipped generations are cached single-use and
+         *     zeroed on eviction;
+         *   - a generation below the chain position with no cached key
+         *     is a replay (or fell out of the skip window) and throws.
+         *
+         * Note: the key is consumed at derivation time, BEFORE the AEAD
+         * runs. A tampered ciphertext therefore burns its generation and
+         * the original cannot be decrypted afterwards; that is equivalent
+         * to the relay dropping the message, which it can always do.
+         */
+        async _chainKeyNonce(leafIndex, which, generation) {
+            const id = `${leafIndex}:${which}`;
+            let st = this._chainStates.get(id);
+            if (!st) {
+                const leafSec = await SecretTree.leafSecret(
+                    this.epochSecrets.encryptionSecret, leafIndex, this.nLeaves,
+                );
+                const chainRoot = await SecretTree.leafChainRoot(leafSec, which);
+                st = { nextGeneration: 0, secret: chainRoot, skipped: new Map() };
+                this._chainStates.set(id, st);
+            }
+            if (generation < st.nextGeneration) {
+                const cached = st.skipped.get(generation);
+                if (!cached) {
+                    throw new Error(
+                        `group: replayed or expired application message (leaf=${leafIndex}, gen=${generation})`,
+                    );
+                }
+                st.skipped.delete(generation);
+                return cached;
+            }
+            if (generation - st.nextGeneration > MAX_GENERATION_SKIP) {
+                throw new Error(
+                    `group: generation jump too large (leaf=${leafIndex}, `
+                    + `gen=${generation}, next=${st.nextGeneration}, max skip=${MAX_GENERATION_SKIP})`,
+                );
+            }
+            // Advance to `generation`, caching (bounded) skipped keys so
+            // out-of-order arrivals within the window still decrypt.
+            let secret = st.secret;
+            for (let g = st.nextGeneration; g < generation; g += 1) {
+                const step = await SecretTree.keyNonceStep(secret, g);
+                st.skipped.set(g, { key: step.key, nonce: step.nonce });
+                if (st.skipped.size > MAX_SKIPPED_PER_CHAIN) {
+                    const oldest = st.skipped.keys().next().value;
+                    const evicted = st.skipped.get(oldest);
+                    evicted.key.fill(0);
+                    evicted.nonce.fill(0);
+                    st.skipped.delete(oldest);
+                }
+                secret.fill(0);
+                secret = step.nextSecret;
+            }
+            const fin = await SecretTree.keyNonceStep(secret, generation);
+            secret.fill(0);
+            st.secret = fin.nextSecret;
+            st.nextGeneration = generation + 1;
+            return { key: fin.key, nonce: fin.nonce };
         }
 
         // ------------------------------------------------------------------
@@ -320,6 +429,7 @@
                 senderDataSecret: this.epochSecrets.senderDataSecret,
                 encryptionSecret: this.epochSecrets.encryptionSecret,
                 nLeaves: this.nLeaves,
+                keyNonceProvider: (li, which, gen) => this._chainKeyNonce(li, which, gen),
             });
             const pmBytes = PrivateMessage.privateMessageBytes(pm);
             return MLSMessage.serializeMLSMessage(wireFormat, pmBytes);
@@ -330,6 +440,12 @@
          * application payload. Verifies the sender's signature against
          * their LeafNode's signature_key, rejects wrong-epoch or
          * non-application messages.
+         *
+         * Returns { plaintext, senderLeafIndex }: the leaf index is the
+         * CRYPTOGRAPHICALLY authenticated sender (signature verified
+         * against that leaf's signature_key in the tree), as opposed to
+         * the relay envelope's unauthenticated sender_id. Callers doing
+         * sender attribution MUST use this value.
          */
         async decryptApplicationMessage(mlsMessageBytes) {
             const frame = MLSMessage.parseMLSMessage(mlsMessageBytes);
@@ -352,6 +468,7 @@
                 senderDataSecret: this.epochSecrets.senderDataSecret,
                 encryptionSecret: this.epochSecrets.encryptionSecret,
                 nLeaves: this.nLeaves,
+                keyNonceProvider: (li, which, gen) => this._chainKeyNonce(li, which, gen),
             });
 
             const senderLeafIndex = out.senderData.leafIndex;
@@ -406,7 +523,7 @@
 
             this._markGenerationConsumed(senderLeafIndex, generation);
 
-            return out.content.payloadBytes;
+            return { plaintext: out.content.payloadBytes, senderLeafIndex };
         }
     }
 
@@ -710,8 +827,10 @@
         // Replay protection state is per-epoch — every commit advances
         // the epoch and re-keys the secret tree, so old generations no
         // longer collide with anything new. Drop the consumed set so it
-        // doesn't grow unboundedly across long-lived groups.
+        // doesn't grow unboundedly across long-lived groups. Chain
+        // states are zeroed for the same reason (and forward secrecy).
         this.consumedByLeaf = new Map();
+        this._resetChainStates();
 
         return { commitMessage, welcomeMessage };
     };
@@ -931,6 +1050,7 @@
             this.parentKeyPairs.set(committerDirectPath[i], chain[i].keyPair);
         }
         this.consumedByLeaf = new Map();
+        this._resetChainStates();
 
         return { commitMessage };
     };
@@ -1269,8 +1389,10 @@
         this.parentKeyPairs = survivors;
         // Replay protection state is per-epoch — drop the consumed
         // generations now that we've advanced past the epoch they
-        // applied to.
+        // applied to. Chain states are zeroed for the same reason
+        // (and forward secrecy).
         this.consumedByLeaf = new Map();
+        this._resetChainStates();
 
         return {
             addedLeafIndex: lastAddedLeafIndex,

@@ -155,6 +155,27 @@
     }
 
     /**
+     * Single ratchet step for stateful chain consumers. `secret` must be
+     * the chain secret AT position `generation`; returns the AEAD key +
+     * nonce for that generation plus the secret for generation + 1.
+     *
+     * Unlike keyNonceAtGeneration (which walks from the chain root every
+     * call and therefore keeps the root derivable), this lets a caller
+     * hold only the current position's secret, overwrite it as the chain
+     * advances, and delete consumed keys: forward secrecy within the
+     * epoch. Byte-identical derivation to keyNonceAtGeneration.
+     */
+    async function keyNonceStep(secret, generation) {
+        if (generation < 0) throw new Error('secret-tree: generation must be >= 0');
+        const key   = await KeySchedule.expandWithLabel(secret, 'key',   u32be(generation), HPKE.Nk);
+        const nonce = await KeySchedule.expandWithLabel(secret, 'nonce', u32be(generation), HPKE.Nn);
+        const nextSecret = await KeySchedule.expandWithLabel(
+            secret, 'secret', u32be(generation), HPKE.Nh,
+        );
+        return { key, nonce, nextSecret };
+    }
+
+    /**
      * Sender-data key + nonce (RFC 9420 §9.4.2). The sample is the first
      * Nh bytes of the application ciphertext, zero-padded if shorter.
      */
@@ -171,6 +192,7 @@
         leafSecret,
         leafChainRoot,
         keyNonceAtGeneration,
+        keyNonceStep,
         senderDataKeyNonce,
     });
 });

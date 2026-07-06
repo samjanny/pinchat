@@ -76,9 +76,24 @@ The browser-facing flow runs entirely over MLS for group rooms:
 - The orchestrator (`mls-session.js`) tags every application payload with
   one byte (`0x01` text / `0x02` image), so images travel the same MLS
   path as text without falling back to the 1:1 Double Ratchet. KeyPackages
-  are bound to the relay's `sender_id` (one leaf per WebSocket sender)
-  and incoming application messages reject duplicate `(leaf, generation)`
-  tuples within an epoch.
+  are bound to the relay's `sender_id` (one leaf per WebSocket sender).
+- **Forward secrecy within the epoch.** Application AEAD keys come from
+  stateful per-sender chains (`Group._chainKeyNonce`): only the current
+  chain position's secret is kept (overwritten as the chain advances),
+  consumed keys are deleted, and keys for skipped generations live in a
+  bounded single-use cache (256 per chain, FIFO-evicted and zeroed on
+  eviction). Replays are rejected because the key for a consumed
+  generation no longer exists; the per-epoch `(leaf, generation)` set is
+  retained as defense-in-depth. Out-of-order tolerance: up to 256
+  generations of forward jump per message. This also makes decryption
+  O(1) per message instead of O(generation).
+- **E2E sender attribution.** `decryptApplicationMessage` returns the
+  signature-verified sender leaf index alongside the plaintext;
+  `mls-session.js` pins the first observed `leaf -> sender_id`
+  association (the creator seeds it from the KeyPackage envelope) and,
+  if the relay later re-stamps a different `sender_id` on that leaf's
+  traffic, keeps the pinned identity and raises a UI warning instead of
+  trusting the relay's field.
 - The Rust server stays a blind relay: it forwards a single `mls`
   envelope kind with `wire_format` and an optional `ratchet_tree`
   side-channel, never inspecting the body.
@@ -91,6 +106,26 @@ loss-of-access.
 
 ## Known gaps (post-MVP)
 
+- **Creator is a single point of failure.** Only the creator commits
+  (Add/Remove), its group state lives in memory only, and its role is
+  derived from the creator-token optimization, which does not survive
+  a page reload. If the creator leaves or reloads, remaining members
+  can keep chatting in the current epoch but nobody can join or be
+  removed any more; the group must be re-created from a fresh room.
+- **Epoch-boundary message loss.** `decryptApplicationMessage`
+  requires an exact epoch match, so an application message encrypted
+  under epoch n but delivered after the receiver advanced to n+1
+  fails with a decrypt error and is lost. The relay's total broadcast
+  order keeps the window small (it opens between a Commit landing on
+  the relay and a sender processing it), but every Add/Remove can
+  drop in-flight messages. Keeping the previous epoch's chains alive
+  briefly would close this.
+- **No out-of-band verification ceremony.** Group identities are
+  fresh per-session signature keys whose credential is the key
+  itself; there is no SAS equivalent and no identity continuity
+  across reconnects. Peer authentication rests entirely on the URL
+  fragment PSK (the link is the capability) plus the TOFU
+  `leaf -> sender_id` pinning described above.
 - **Parent-hash chaining (§7.9).** Commit-source LeafNodes are signed
   with `parent_hash = empty`, and we don't enforce parent_hash on the
   receive side. Both ends are consistent (we sign and verify the same
