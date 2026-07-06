@@ -298,7 +298,7 @@ PinChat should therefore be described as a browser-based encrypted relay with mi
 | Digital signatures | ECDSA P-256 | Authenticate identity keys and ratchet keys |
 | Key derivation | HKDF-SHA256 | Derive root keys, chain keys, and message keys |
 | Chain ratchet | HMAC-SHA256 | One-way message-key progression |
-| SAS generation | PBKDF2, 100K iterations | Human-comparable verification codes |
+| SAS generation | HKDF-SHA256, 96-bit output (SAS v3, transcript-bound) | Human-comparable verification codes |
 
 These primitives are used through browser WebCrypto on the client side.
 

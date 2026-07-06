@@ -68,8 +68,6 @@ class ChainRatchet {
     constructor() {
         this.chainKeyMaterial = null;
         this.messageNumber = 0;
-        this.messageKeyWindow = new Map();
-        this.WINDOW_SIZE = 16;
     }
 
     async initialize(keyMaterial) {
@@ -78,7 +76,6 @@ class ChainRatchet {
         }
         this.chainKeyMaterial = new Uint8Array(keyMaterial);
         this.messageNumber = 0;
-        this.messageKeyWindow = new Map();
     }
 
     async deriveMessageKey() {
@@ -89,29 +86,11 @@ class ChainRatchet {
 
         const messageKey = await this._deriveKeyForCounter(myCounter, myCounter);
 
-        for (let i = 1; i <= this.WINDOW_SIZE; i++) {
-            const futureCounter = myCounter + i;
-            const futureKey = await this._deriveKeyForCounter(futureCounter, myCounter);
-            this.messageKeyWindow.set(futureCounter, futureKey);
-        }
-
-        // PFS: drop any entry at or behind the counter we just consumed.
-        for (const [counter] of this.messageKeyWindow) {
-            if (counter < this.messageNumber) this.messageKeyWindow.delete(counter);
-        }
-
         return { key: messageKey, counter: myCounter };
     }
 
     async deriveMessageKeyForCounter(counter) {
         if (!this.chainKeyMaterial) throw new Error('Chain ratchet not initialized');
-
-        if (this.messageKeyWindow.has(counter)) {
-            // Single-use: remove on read
-            const key = this.messageKeyWindow.get(counter);
-            this.messageKeyWindow.delete(counter);
-            return key;
-        }
 
         const currentCounter = this.messageNumber;
         return await this._deriveKeyForCounter(counter, currentCounter);
@@ -149,16 +128,12 @@ class ChainRatchet {
             { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
         const nextChainKeyRaw = await subtle.sign('HMAC', hmacKey, info);
         this.chainKeyMaterial = new Uint8Array(nextChainKeyRaw);
-        // PFS: drop message keys tied to the pre-ratchet chain state.
-        this.messageKeyWindow.clear();
     }
 
     clone() {
         const c = new ChainRatchet();
         c.chainKeyMaterial = this.chainKeyMaterial ? new Uint8Array(this.chainKeyMaterial) : null;
         c.messageNumber = this.messageNumber;
-        c.messageKeyWindow = this.messageKeyWindow ? new Map(this.messageKeyWindow) : new Map();
-        c.WINDOW_SIZE = this.WINDOW_SIZE ?? 16;
         return c;
     }
 
@@ -168,7 +143,6 @@ class ChainRatchet {
             this.chainKeyMaterial = null;
         }
         this.messageNumber = 0;
-        this.messageKeyWindow.clear();
     }
 }
 

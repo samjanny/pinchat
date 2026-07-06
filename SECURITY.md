@@ -274,7 +274,53 @@ CK_{n+1} = HMAC-SHA256(CK_n, "ChainRatchet")
 - One-way: Cannot derive CK_n from CK_{n+1}
 - Independence: Compromise of MK_n does not reveal MK_{n+1}
 
-### SAS Generation (v2 — current)
+### SAS Generation (v3, current)
+
+**Algorithm**: HKDF-SHA256
+- Output: 96 bits (16 emoji from a 64-character alphabet, 6 bits per emoji)
+- Also displayed as 24 hex characters (12 dash-separated byte pairs)
+
+**Input binding**:
+```
+IKM        = sorted(Identity_PubKey_A_raw || Identity_PubKey_B_raw)   // 130 bytes for P-256
+transcript = SHA-256( sorted(Ephemeral_PubKey_A_raw || Ephemeral_PubKey_B_raw) )
+salt       = roomId || "pinchat-sas-v3"                               // fixed for the room
+info       = "SAS-display-v3" || transcript                           // session binding
+```
+
+**What changed vs v2 (audit H1)**: v2 derived the SAS from the identity
+keys and roomId only. Both inputs are known to the relay BEFORE the
+handshake starts, so a malicious relay running a double MITM could
+grind two attacker-chosen identity keypairs OFFLINE until
+`SAS_A == SAS_B`: a two-sided birthday search of roughly `2^36` over
+the 72-bit space, precomputable across the 24h identity TTL. v3 closes
+this in two ways:
+
+1. *Transcript binding.* The info string folds in a hash of both live
+   ECDH ephemeral public keys. The honest side's ephemeral key is fresh
+   per handshake and not attacker-controlled in advance, so the grind
+   must happen ONLINE, inside the 30-second handshake window.
+2. *Wider output.* 96 bits lifts the residual (now online-only)
+   birthday bound to roughly `2^48`, infeasible within a single
+   handshake.
+
+**Security properties**:
+- *Session-bound.* The SAS authenticates the ephemeral keys that
+  actually derive the root key, not merely the identity pair.
+- *Fresh per handshake.* Because the transcript includes per-handshake
+  ephemerals, the displayed code changes on every reconnect. The
+  "verify once" UX is preserved by identity-key persistence plus
+  peer-identity-change detection: a stable identity pair keeps the
+  verified flag set, and only an identity-key change forces
+  re-verification.
+- *Domain-separated.* The `"pinchat-sas-v3"` salt tag and the
+  `"SAS-display-v3"` info prefix separate this derivation from any
+  other use of the same key material.
+- *Symmetric.* Identity keys and ephemeral keys are each sorted
+  lexicographically before concatenation/hashing, so both peers derive
+  identical bytes regardless of who initiated the handshake.
+
+### SAS Generation (v2, v0.3.x, retained for historical context)
 
 **Algorithm**: HKDF-SHA256
 - Output: 72 bits (12 emoji from a 64-character alphabet — 6 bits per emoji)
@@ -320,6 +366,15 @@ info  = "SAS-display-v2"                                         // domain separ
   time is hours-to-days, not seconds. 96 bits / 16 emoji would push
   this to "intractable" but the UX cost is significant; 72 bits
   is the chosen balance.
+
+*Superseded in v0.4.0*: audit H1 showed that the relevant attack is a
+two-sided birthday search over attacker-chosen identity keys, fully
+precomputable offline against the v2 inputs (both are known to the
+relay before the handshake). The ECDSA-keygen cost argument above
+mitigates but does not eliminate that search within the 24h identity
+TTL. v3 (see above) therefore binds the live handshake transcript AND
+widens the output to 96 bits. This section is retained as the record
+of the v0.3.x design.
 
 **Why HKDF and not PBKDF2 (rationale, deferred-audit response):**
 PBKDF2 is a *password stretcher*. It is the correct tool when the input

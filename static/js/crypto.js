@@ -156,8 +156,6 @@ class ChainRatchet {
 
         this.chainKeyMaterial = new Uint8Array(keyMaterial);  // Copy to prevent mutations
         this.messageNumber = 0;
-        this.messageKeyWindow = new Map();  // Sliding window for out-of-order message tolerance
-        this.WINDOW_SIZE = 16;              // Pre-derive next 16 keys for resilience
 
         debugLog('[ChainRatchet] Initialized with 32-byte key material');
     }
@@ -165,14 +163,11 @@ class ChainRatchet {
     /**
      * Return a deep copy of this chain's mutable state.
      * Used by DoubleRatchet to snapshot state before tentative decrypt.
-     * CryptoKey references inside messageKeyWindow are opaque and safe to share.
      */
     clone() {
         const c = new ChainRatchet();
         c.chainKeyMaterial = this.chainKeyMaterial ? new Uint8Array(this.chainKeyMaterial) : null;
         c.messageNumber = this.messageNumber;
-        c.messageKeyWindow = this.messageKeyWindow ? new Map(this.messageKeyWindow) : new Map();
-        c.WINDOW_SIZE = this.WINDOW_SIZE ?? 16;
         return c;
     }
 
@@ -199,23 +194,7 @@ class ChainRatchet {
         // Derive current message key using helper (0 steps ahead = no ratchet simulation)
         const messageKey = await this._deriveKeyForCounter(myCounter, myCounter);
 
-        // Pre-derive the next WINDOW_SIZE keys by simulating the chain state at each position
-        for (let i = 1; i <= this.WINDOW_SIZE; i++) {
-            const futureCounter = myCounter + i;
-            const futureKey = await this._deriveKeyForCounter(futureCounter, myCounter);
-            this.messageKeyWindow.set(futureCounter, futureKey);
-        }
-
-        // PFS: remove any key at or behind the counter we just consumed.
-        // Using this.messageNumber (= myCounter + 1) as cutoff also drops the
-        // just-consumed counter if it ever lingered in the window.
-        for (const [counter] of this.messageKeyWindow) {
-            if (counter < this.messageNumber) {
-                this.messageKeyWindow.delete(counter);
-            }
-        }
-
-        debugLog(`[ChainRatchet] Derived message key #${myCounter} (window: ${myCounter+1}..${myCounter+this.WINDOW_SIZE})`);
+        debugLog(`[ChainRatchet] Derived message key #${myCounter}`);
 
         // Return both key and counter (counter needed for AAD binding)
         return { key: messageKey, counter: myCounter };
@@ -224,8 +203,10 @@ class ChainRatchet {
     /**
      * Derive message key for a specific counter (used by Double Ratchet for decryption)
      *
-     * First checks the sliding window for pre-derived keys (common case for in-order messages).
-     * Falls back to direct derivation for out-of-order messages within tolerance.
+     * Derives directly from the current chain position (messageNumber is kept
+     * aligned with chainKeyMaterial by the Double Ratchet receive path).
+     * Out-of-order tolerance lives one layer up: DoubleRatchet.skipMessageKeys
+     * pre-derives and stores the keys of skipped counters in its skippedKeys map.
      *
      * @param {number} counter - Message counter to derive key for
      * @returns {Promise<CryptoKey>} AES-GCM key for this counter
@@ -235,17 +216,7 @@ class ChainRatchet {
             throw new Error('Chain ratchet not initialized');
         }
 
-        // Check sliding window first (common case). Single-use: remove on read
-        // so a consumed message key cannot be reused and is dropped from memory.
-        if (this.messageKeyWindow.has(counter)) {
-            debugLog(`[ChainRatchet] Using pre-derived key from window for #${counter}`);
-            const key = this.messageKeyWindow.get(counter);
-            this.messageKeyWindow.delete(counter);
-            return key;
-        }
-
-        // Derive key directly (out-of-order message)
-        debugLog(`[ChainRatchet] Deriving key for counter #${counter} (not in window)`);
+        debugLog(`[ChainRatchet] Deriving key for counter #${counter}`);
         const currentCounter = this.messageNumber;
         const messageKey = await this._deriveKeyForCounter(counter, currentCounter);
 
@@ -345,11 +316,6 @@ class ChainRatchet {
         // Overwrite old chain key material to keep the ratchet one-way
         this.chainKeyMaterial = new Uint8Array(nextChainKeyRaw);
 
-        // PFS: drop any pre-derived message keys pinned to the pre-ratchet chain
-        // state. They represented future counters that are no longer reachable
-        // from the post-ratchet chain key.
-        this.messageKeyWindow.clear();
-
         // NOTE: messageNumber is incremented in deriveMessageKey() to prevent race conditions
         debugLog(`[ChainRatchet] Ratcheted forward (counter now at #${this.messageNumber})`);
     }
@@ -365,12 +331,6 @@ class ChainRatchet {
             this.chainKeyMaterial = null;
         }
         this.messageNumber = 0;
-        // Drop all pre-derived message keys (AES-GCM CryptoKey handles). JS
-        // cannot zero the underlying key bytes, but dropping references lets
-        // the runtime reclaim them and prevents reuse after reset.
-        if (this.messageKeyWindow) {
-            this.messageKeyWindow.clear();
-        }
         debugLog('[ChainRatchet] Reset (chain key destroyed)');
     }
 }

@@ -4,6 +4,55 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Dates are the repository-local commit dates; entries are curated for user-visible impact
 rather than being a 1:1 mirror of `git log`.
 
+## [2026-07-06] - v0.4.1
+
+Maintenance release from an internal 1:1 chat review. No wire-format or
+cryptographic behavior changes.
+
+### Removed - vestigial ChainRatchet sliding window
+
+The 16-entry pre-derived message-key window inside `ChainRatchet` was
+dead code: it was only ever populated on the sending chain and cleared
+by the very next `ratchet()` call, and the receive path never populated
+it. Out-of-order tolerance is (and already was) handled entirely by the
+Double Ratchet's skipped-key store. Removing the window drops 16 wasted
+HMAC derivations per outgoing message. Key derivation is unchanged, so
+mixed versions interoperate. The inline `ChainRatchet` copies in
+`tests/test-chain-ratchet.js` and `tests/test-double-ratchet.js` were
+synced, and the window-specific tests replaced with an out-of-order
+derivation consistency check.
+
+### Fixed - image send error path in `app.js`
+
+In the `sendImage` catch block, `localImageUrl` was referenced outside
+its declaring `try` scope; the resulting ReferenceError was swallowed
+by the inner try/catch, so the intended `revokeObjectURL` never ran.
+The blob URL is intentionally not revoked there (the composer preview
+still owns it for retry); the broken call and misleading comment are
+gone.
+
+### Documentation - SAS v3 and handshake reality
+
+`PROTOCOL.md`, `SECURITY.md`, and `README.md` disagreed on the SAS
+construction (describing v1/PBKDF2, v2/72-bit, and PBKDF2 respectively)
+while the code has shipped SAS v3 (HKDF-SHA256, 96 bits, 16 emoji,
+transcript-bound) since v0.4.0. All three now describe v3, with v1/v2
+retained as historical context. `PROTOCOL.md` also now documents the
+actual symmetric `ecdh_public_key` handshake (the spec previously
+described a fictional `ecdh_init`/`ecdh_response` pairing), the
+mandatory `v`/`sig` fields on image headers, and the skipped-key store
+instead of the removed sliding window.
+
+`static/js/app.js`, `static/js/crypto.js`, `static/js/double-ratchet.js`
+and `static/chat.html` changed, so `hashes.json.signed` regenerates and
+re-signs (sequence bumped to 37). The extension manifest URL pin
+(`GITHUB_TAG` in both `extensions/chrome/background.js` and
+`extensions/firefox/background.js`) bumps from `v0.4.0` to `v0.4.1` and
+`MIN_KNOWN_SEQUENCE` from 20 to 37. The `v0.4.1` git tag must be pushed
+to GitHub BEFORE users update or install the extension, otherwise the
+`/v0.4.1/hashes.json.signed` URL does not resolve and the extension
+fails loud.
+
 ## [2026-06-24] - v0.4.0
 
 Security release from an internal review. Two issues are fixed: a SAS

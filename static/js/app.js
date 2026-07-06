@@ -578,9 +578,11 @@ document.addEventListener('alpine:init', () => {
 
             } catch (error) {
                 console.error('Failed to send image:', error);
+                // Encrypt threw: drop the local echo only. Do NOT revoke the
+                // blob URL here: pendingImage still owns it (it is cleared
+                // only on the happy path above), so the composer preview
+                // stays usable for a retry.
                 this.messages.pop();
-                // Encrypt/send threw — local message gone, revoke its blob URL.
-                try { URL.revokeObjectURL(localImageUrl); } catch {}
                 this.error = '⚠️ Error encrypting image.';
             } finally {
                 this.sendingImage = false;

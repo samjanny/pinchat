@@ -1000,10 +1000,8 @@ class DoubleRatchet {
         // Zero out sensitive key material
         if (this.rootKey) this.rootKey.fill(0);
 
-        // Reset chains first: this zeroes chainKeyMaterial and drops every
-        // pre-derived message key in messageKeyWindow before we let the chain
-        // references go. Without this, pre-derived AES-GCM CryptoKey handles
-        // would linger until GC.
+        // Reset chains first: this zeroes chainKeyMaterial before we let the
+        // chain references go.
         if (this.sendingChain) this.sendingChain.reset();
         if (this.receivingChain) this.receivingChain.reset();
 

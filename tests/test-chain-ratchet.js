@@ -20,8 +20,6 @@ class ChainRatchet {
     constructor() {
         this.chainKeyMaterial = null;
         this.messageNumber = 0;
-        this.messageKeyWindow = new Map();
-        this.WINDOW_SIZE = 16;
     }
 
     async initialize(keyMaterial) {
@@ -30,7 +28,6 @@ class ChainRatchet {
         }
         this.chainKeyMaterial = new Uint8Array(keyMaterial);
         this.messageNumber = 0;
-        this.messageKeyWindow = new Map();
     }
 
     async deriveMessageKey() {
@@ -43,33 +40,12 @@ class ChainRatchet {
 
         const messageKey = await this._deriveKeyForCounter(myCounter, myCounter);
 
-        // Sliding window
-        for (let i = 1; i <= this.WINDOW_SIZE; i++) {
-            const futureCounter = myCounter + i;
-            const futureKey = await this._deriveKeyForCounter(futureCounter, myCounter);
-            this.messageKeyWindow.set(futureCounter, futureKey);
-        }
-
-        // PFS: drop any entry at or behind the counter we just consumed.
-        for (const [counter] of this.messageKeyWindow) {
-            if (counter < this.messageNumber) {
-                this.messageKeyWindow.delete(counter);
-            }
-        }
-
         return { key: messageKey, counter: myCounter };
     }
 
     async deriveMessageKeyForCounter(counter) {
         if (!this.chainKeyMaterial) {
             throw new Error('Chain ratchet not initialized');
-        }
-
-        if (this.messageKeyWindow.has(counter)) {
-            // Single-use: remove on read
-            const key = this.messageKeyWindow.get(counter);
-            this.messageKeyWindow.delete(counter);
-            return key;
         }
 
         const currentCounter = this.messageNumber;
@@ -134,8 +110,6 @@ class ChainRatchet {
 
         const nextChainKeyRaw = await subtle.sign('HMAC', hmacKey, info);
         this.chainKeyMaterial = new Uint8Array(nextChainKeyRaw);
-        // PFS: drop message keys tied to the pre-ratchet chain state.
-        this.messageKeyWindow.clear();
     }
 
     reset() {
@@ -144,7 +118,6 @@ class ChainRatchet {
             this.chainKeyMaterial = null;
         }
         this.messageNumber = 0;
-        this.messageKeyWindow.clear();
     }
 }
 
@@ -386,30 +359,42 @@ async function runTests() {
     console.log('');
 
     // -------------------------------------------------------------------------
-    // Test 6: Sliding Window Pre-derivation
+    // Test 6: Out-of-Order Derivation Consistency
     // -------------------------------------------------------------------------
-    console.log('--- Test 6: Sliding Window Pre-derivation ---');
+    // A receiver that is still at chain position 0 must be able to derive the
+    // key for a future counter directly (this is what the Double Ratchet's
+    // skipMessageKeys relies on), and it must match the key a sender produces
+    // by advancing the chain normally (derive + ratchet per message).
+    console.log('--- Test 6: Out-of-Order Derivation Consistency ---');
     try {
         const chainKey = hexToBytes('cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc');
-        const chain = new ChainRatchet();
-        await chain.initialize(chainKey);
 
-        await chain.deriveMessageKey();  // counter 0
-
-        // Check that window contains keys 1-16
-        let windowOk = true;
-        for (let i = 1; i <= 16; i++) {
-            if (!chain.messageKeyWindow.has(i)) {
-                windowOk = false;
-                console.log(`  Missing key ${i} in window`);
+        // Sender advances normally up to counter 5.
+        const sender = new ChainRatchet();
+        await sender.initialize(chainKey);
+        let senderKey5Hex = null;
+        for (let i = 0; i <= 5; i++) {
+            const { key, counter } = await sender.deriveMessageKey();
+            if (counter === 5) {
+                senderKey5Hex = await exportKeyToHex(key);
             }
+            await sender.ratchet();
         }
 
-        if (windowOk && chain.messageKeyWindow.size === 16) {
-            console.log(`PASSED: Sliding window contains 16 pre-derived keys (1-16)`);
+        // Receiver at position 0 derives counter 5 in one shot.
+        const receiver = new ChainRatchet();
+        await receiver.initialize(new Uint8Array(chainKey));
+        const recvKey5 = await receiver.deriveMessageKeyForCounter(5);
+        const recvKey5Hex = await exportKeyToHex(recvKey5);
+
+        console.log(`  Sender key 5:   ${senderKey5Hex.substring(0, 32)}...`);
+        console.log(`  Receiver key 5: ${recvKey5Hex.substring(0, 32)}...`);
+
+        if (senderKey5Hex && senderKey5Hex === recvKey5Hex) {
+            console.log('PASSED: Direct derivation for a future counter matches the advanced chain');
             passed++;
         } else {
-            console.log(`FAILED: Window size is ${chain.messageKeyWindow.size}`);
+            console.log('FAILED: Out-of-order derivation mismatch');
             failed++;
         }
     } catch (e) {
@@ -427,16 +412,17 @@ async function runTests() {
         const chain = new ChainRatchet();
         await chain.initialize(chainKey);
 
-        // Derive key 0 (normal)
+        // Derive key 0 (normal), then advance the chain past it
         const { key: key0 } = await chain.deriveMessageKey();
         const hex0 = await exportKeyToHex(key0);
+        await chain.ratchet();
 
-        // Get key 5 from window (out of order)
+        // Derive key 5 ahead of the current position (out of order)
         const key5 = await chain.deriveMessageKeyForCounter(5);
         const hex5 = await exportKeyToHex(key5);
 
         console.log(`  Key 0: ${hex0.substring(0, 32)}...`);
-        console.log(`  Key 5 (from window): ${hex5.substring(0, 32)}...`);
+        console.log(`  Key 5 (derived ahead): ${hex5.substring(0, 32)}...`);
 
         if (hex0 !== hex5) {
             console.log('PASSED: Retrieved different key from window');
@@ -521,8 +507,7 @@ async function runTests() {
 
         const isReset = (
             chain.chainKeyMaterial === null &&
-            chain.messageNumber === 0 &&
-            chain.messageKeyWindow.size === 0
+            chain.messageNumber === 0
         );
 
         if (isReset) {
