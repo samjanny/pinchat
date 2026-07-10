@@ -56,8 +56,7 @@ class DoubleRatchet {
         this.MAX_SKIP = 100;                  // Maximum messages to skip per chain (DoS protection)
         this.MAX_SKIPPED_KEYS_TOTAL = 1000;   // Global cap across all ratchet rounds (anti-DoS)
 
-        // Cached signature over the current DHs public key (protocol v1).
-        // Recomputed whenever DHs is generated; reused across messages in the same chain.
+        // Cached signature for the current DH key and ratchet counters.
         this.DHsSignature = null;
 
         // Ratchet state
@@ -121,21 +120,26 @@ class DoubleRatchet {
      * current DH public key at a given ratchet round. Deterministic and
      * length-prefixed to avoid concatenation ambiguity.
      *
-     *   tag || len(dh_raw):u16_be || dh_raw || rc:u32_be
+     *   tag || len(dh_raw):u16_be || dh_raw || pn:u32_be || n:u32_be || rc:u32_be
      *
      * @private
      * @param {ArrayBuffer|Uint8Array} dhRaw - raw exported DH public key
+     * @param {number} pn - previous sending-chain length
+     * @param {number} n - message number in the current chain
      * @param {number} rc - ratchet count at signing time
      * @returns {Uint8Array}
      */
-    _buildCanonicalBytes(dhRaw, rc) {
-        const tag = new TextEncoder().encode('pinchat-drheader-v1');
+    _buildCanonicalBytes(dhRaw, pn, n, rc) {
+        const tag = new TextEncoder().encode('pinchat-drheader-v2');
         const dhBytes = dhRaw instanceof Uint8Array ? dhRaw : new Uint8Array(dhRaw);
-        const out = new Uint8Array(tag.length + 2 + dhBytes.byteLength + 4);
+        const out = new Uint8Array(tag.length + 2 + dhBytes.byteLength + 12);
         out.set(tag, 0);
         new DataView(out.buffer).setUint16(tag.length, dhBytes.byteLength, false);
         out.set(dhBytes, tag.length + 2);
-        new DataView(out.buffer).setUint32(tag.length + 2 + dhBytes.byteLength, rc, false);
+        const view = new DataView(out.buffer);
+        view.setUint32(tag.length + 2 + dhBytes.byteLength, pn, false);
+        view.setUint32(tag.length + 6 + dhBytes.byteLength, n, false);
+        view.setUint32(tag.length + 10 + dhBytes.byteLength, rc, false);
         return out;
     }
 
@@ -144,12 +148,12 @@ class DoubleRatchet {
      * the base64url signature. Must be invoked after every fresh DHs keypair
      * generation (initialize, performDHRatchetOnReceive, performSendSideDHRatchet).
      */
-    async signCurrentDHs() {
+    async signCurrentDHs(pn = this.PN, n = this.Ns) {
         if (!this.identityManager) {
             throw new Error('identityManager required for signed DH ratchet (protocol v1)');
         }
         const raw = await crypto.subtle.exportKey('raw', this.DHs.publicKey);
-        const canon = this._buildCanonicalBytes(raw, this.ratchetCount);
+        const canon = this._buildCanonicalBytes(raw, pn, n, this.ratchetCount);
         const sigBuf = await this.identityManager.sign(canon);
         this.DHsSignature = this.arrayBufferToBase64url(sigBuf);
     }
@@ -179,8 +183,13 @@ class DoubleRatchet {
         this.isInitiator = isInitiator;
         debugLog(`[DoubleRatchet] Initializing (role: ${isInitiator ? 'initiator' : 'responder'})...`);
 
-        // Derive initial root key from shared secret using HKDF
-        this.rootKey = await this.hkdf(sharedSecret, new Uint8Array(32), 'DoubleRatchet-RootKey', 32);
+        // Derive independent initial root and chain keys. Chain keys MUST NOT
+        // be derivable from the retained root key: doing so lets a state
+        // compromise reconstruct every prior message in the current chain.
+        const initialMaterial = await this.hkdf(
+            sharedSecret, new Uint8Array(32), 'DoubleRatchet-Init-v1', 96,
+        );
+        this.rootKey = initialMaterial.slice(0, 32);
 
         // Store initial DH state from handshake
         if (myKeypair) {
@@ -218,8 +227,12 @@ class DoubleRatchet {
         const sendingLabel = isInitiator ? 'InitiatorToResponder' : 'ResponderToInitiator';
         const receivingLabel = isInitiator ? 'ResponderToInitiator' : 'InitiatorToResponder';
 
-        const sendingChainKey = await this.hkdf(this.rootKey, new Uint8Array(32), sendingLabel, 32);
-        const receivingChainKey = await this.hkdf(this.rootKey, new Uint8Array(32), receivingLabel, 32);
+        const sendingChainKey = isInitiator
+            ? initialMaterial.slice(32, 64)
+            : initialMaterial.slice(64, 96);
+        const receivingChainKey = isInitiator
+            ? initialMaterial.slice(64, 96)
+            : initialMaterial.slice(32, 64);
 
         // Initialize Chain Ratchets
         this.sendingChain = new ChainRatchet();
@@ -311,6 +324,11 @@ class DoubleRatchet {
             // Derive message key from sending chain
             const { key: messageKey, counter: messageNumber } = await this.sendingChain.deriveMessageKey();
 
+            // The signature authenticates every semantic header field. The
+            // message number is reserved before the await above, so sign the
+            // exact values that will be emitted on the wire.
+            await this.signCurrentDHs(this.PN, messageNumber);
+
             // Export our current DH public key for the header
             const dhPublicKeyRaw = await crypto.subtle.exportKey('raw', this.DHs.publicKey);
             const dhPublicKeyBase64 = this.arrayBufferToBase64url(dhPublicKeyRaw);
@@ -336,7 +354,8 @@ class DoubleRatchet {
                 {type: AAD_FIELD_TYPES.SENDER_ID, value: senderId},
                 {type: AAD_FIELD_TYPES.MESSAGE_NUMBER, value: messageNumber},
                 {type: AAD_FIELD_TYPES.MESSAGE_TYPE, value: msgType},
-                {type: AAD_FIELD_TYPES.RATCHET_COUNT, value: this.ratchetCount}
+                {type: AAD_FIELD_TYPES.RATCHET_COUNT, value: this.ratchetCount},
+                {type: AAD_FIELD_TYPES.PREVIOUS_CHAIN_LENGTH, value: this.PN}
             ]);
 
             // Encrypt with AES-GCM
@@ -381,7 +400,7 @@ class DoubleRatchet {
                     pn: this.PN,               // Previous chain length (for skipped messages)
                     n: messageNumber,          // Message number in current chain
                     rc: this.ratchetCount,     // Ratchet count for debugging
-                    sig: this.DHsSignature     // ECDSA signature over (tag || len || dh || rc)
+                    sig: this.DHsSignature     // ECDSA signature over all header counters
                 }
             };
         } catch (err) {
@@ -449,7 +468,7 @@ class DoubleRatchet {
         // Check if this is a NEW DH public key (triggers DH ratchet)
         const dhPublicKeyRaw = this.base64urlToArrayBuffer(dhPublicKeyBase64);
 
-        // Verify identity signature over the canonical (tag || len || dh || rc) tuple
+        // Verify identity signature over the canonical (tag || len || dh || pn || n || rc) tuple
         // BEFORE any path that mutates state (skipped-key delete, chain ratchet,
         // DH ratchet). This is the MITM defense for the DH ratchet: without it,
         // a MITM could swap the DH public key in the header and hijack the chain
@@ -464,7 +483,9 @@ class DoubleRatchet {
         // race between detection and the async WS close handshake.
         try {
             const sigBytes = this.base64urlToArrayBuffer(header.sig);
-            const canon = this._buildCanonicalBytes(dhPublicKeyRaw, ratchetCount);
+            const canon = this._buildCanonicalBytes(
+                dhPublicKeyRaw, prevChainLength, messageNumber, ratchetCount,
+            );
             await this.identityManager.verify(canon, sigBytes);
         } catch (e) {
             debugError('[DoubleRatchet] DH header signature INVALID - MITM suspected:', e);
@@ -498,7 +519,8 @@ class DoubleRatchet {
                     {type: AAD_FIELD_TYPES.SENDER_ID, value: senderId},
                     {type: AAD_FIELD_TYPES.MESSAGE_NUMBER, value: messageNumber},
                     {type: AAD_FIELD_TYPES.MESSAGE_TYPE, value: msgType},
-                    {type: AAD_FIELD_TYPES.RATCHET_COUNT, value: ratchetCount}
+                    {type: AAD_FIELD_TYPES.RATCHET_COUNT, value: ratchetCount},
+                    {type: AAD_FIELD_TYPES.PREVIOUS_CHAIN_LENGTH, value: prevChainLength}
                 ]);
                 const plaintextBytes = await crypto.subtle.decrypt(
                     { name: 'AES-GCM', iv: iv, additionalData: aad },
@@ -642,7 +664,8 @@ class DoubleRatchet {
                     {type: AAD_FIELD_TYPES.SENDER_ID, value: senderId},
                     {type: AAD_FIELD_TYPES.MESSAGE_NUMBER, value: messageNumber},
                     {type: AAD_FIELD_TYPES.MESSAGE_TYPE, value: msgType},
-                    {type: AAD_FIELD_TYPES.RATCHET_COUNT, value: ratchetCount}
+                    {type: AAD_FIELD_TYPES.RATCHET_COUNT, value: ratchetCount},
+                    {type: AAD_FIELD_TYPES.PREVIOUS_CHAIN_LENGTH, value: prevChainLength}
                 ]);
 
                 // Decrypt with AES-GCM — this is the AEAD authentication point.
@@ -754,9 +777,9 @@ class DoubleRatchet {
 
         // Derive new root key and receiving chain key
         const dhBytes1 = new Uint8Array(dhOutput1);
-        const newRootKey1 = await this.hkdf(this.rootKey, dhBytes1, 'DoubleRatchet-RootKey', 32);
-        // Use 'ChainKey' label - must match send-side ratchet so both parties derive same key
-        const newReceivingChainKey = await this.hkdf(newRootKey1, new Uint8Array(32), 'ChainKey', 32);
+        const material1 = await this.hkdf(this.rootKey, dhBytes1, 'DoubleRatchet-RootKey', 64);
+        const newRootKey1 = material1.slice(0, 32);
+        const newReceivingChainKey = material1.slice(32, 64);
 
         // Initialize new receiving chain
         this.receivingChain = new ChainRatchet();
@@ -781,9 +804,9 @@ class DoubleRatchet {
 
         // Derive new root key and sending chain key
         const dhBytes2 = new Uint8Array(dhOutput2);
-        const newRootKey2 = await this.hkdf(newRootKey1, dhBytes2, 'DoubleRatchet-RootKey', 32);
-        // Use 'ChainKey' label - must match receive-side on other party
-        const newSendingChainKey = await this.hkdf(newRootKey2, new Uint8Array(32), 'ChainKey', 32);
+        const material2 = await this.hkdf(newRootKey1, dhBytes2, 'DoubleRatchet-RootKey', 64);
+        const newRootKey2 = material2.slice(0, 32);
+        const newSendingChainKey = material2.slice(32, 64);
 
         // Initialize new sending chain
         this.sendingChain = new ChainRatchet();
@@ -854,9 +877,9 @@ class DoubleRatchet {
         );
 
         const dhBytes = new Uint8Array(dhOutput);
-        const newRootKey = await this.hkdf(this.rootKey, dhBytes, 'DoubleRatchet-RootKey', 32);
-        // Use 'ChainKey' label (same as receive-side) so both parties derive the same key
-        const newSendingChainKey = await this.hkdf(newRootKey, new Uint8Array(32), 'ChainKey', 32);
+        const material = await this.hkdf(this.rootKey, dhBytes, 'DoubleRatchet-RootKey', 64);
+        const newRootKey = material.slice(0, 32);
+        const newSendingChainKey = material.slice(32, 64);
 
         // Initialize new sending chain
         this.sendingChain = new ChainRatchet();

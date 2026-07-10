@@ -347,7 +347,8 @@ async function testSasV3() {
 
 async function testCanonicalDhHeaderBytes() {
     // Production layout (see DoubleRatchet._buildCanonicalBytes):
-    //   "pinchat-drheader-v1" || u16_be(len(dh_raw)) || dh_raw || u32_be(rc)
+    //   "pinchat-drheader-v2" || u16_be(len(dh_raw)) || dh_raw ||
+    //   u32_be(pn) || u32_be(n) || u32_be(rc)
     //
     // We construct this by hand, byte by byte, and assert against the
     // production helper. A typo in the tag, a flipped byte order, or an
@@ -356,22 +357,28 @@ async function testCanonicalDhHeaderBytes() {
 
     // Fixed dh = 65 bytes of 0x42 (mimics uncompressed P-256 point shape).
     const dh = new Uint8Array(65).fill(0x42);
+    const pn = 0x05060708;
+    const n = 0x090a0b0c;
     const rc = 0x01020304;
 
-    const actual = dr._buildCanonicalBytes(dh, rc);
+    const actual = dr._buildCanonicalBytes(dh, pn, n, rc);
 
     // Hand-built reference.
-    const tag = Buffer.from('pinchat-drheader-v1', 'utf8');
+    const tag = Buffer.from('pinchat-drheader-v2', 'utf8');
     const lenBuf = Buffer.alloc(2);
     lenBuf.writeUInt16BE(65, 0);
+    const pnBuf = Buffer.alloc(4);
+    pnBuf.writeUInt32BE(pn, 0);
+    const nBuf = Buffer.alloc(4);
+    nBuf.writeUInt32BE(n, 0);
     const rcBuf = Buffer.alloc(4);
     rcBuf.writeUInt32BE(rc, 0);
-    const expected = Buffer.concat([tag, lenBuf, Buffer.from(dh), rcBuf]);
+    const expected = Buffer.concat([tag, lenBuf, Buffer.from(dh), pnBuf, nBuf, rcBuf]);
 
     assert.strictEqual(
         actual.byteLength,
-        tag.length + 2 + dh.byteLength + 4,
-        `canonical length mismatch: actual=${actual.byteLength} expected=${tag.length + 2 + dh.byteLength + 4}`
+        tag.length + 2 + dh.byteLength + 12,
+        `canonical length mismatch: actual=${actual.byteLength} expected=${tag.length + 2 + dh.byteLength + 12}`
     );
     assert.strictEqual(
         hex(actual),
@@ -382,7 +389,7 @@ async function testCanonicalDhHeaderBytes() {
     // Also check the tag value didn't drift (a one-byte off-tag would be
     // invisible in functional round-trip tests until v1↔v2 interop).
     const tagPrefix = Buffer.from(actual.slice(0, tag.length));
-    assert.strictEqual(tagPrefix.toString('utf8'), 'pinchat-drheader-v1', 'canonical tag must be "pinchat-drheader-v1"');
+    assert.strictEqual(tagPrefix.toString('utf8'), 'pinchat-drheader-v2', 'canonical tag must be "pinchat-drheader-v2"');
 
     pass('canonical DH-header bytes byte-exact + tag string pinned');
 }

@@ -10,8 +10,9 @@ use crate::models::RoomType;
 /// the ephemeral DH pubkey to the peer's long-term identity key (protocol v1).
 ///
 /// The signature is computed over the canonical tuple
-///   "pinchat-drheader-v1" || len(dh_raw):u16_be || dh_raw || rc:u32_be
-/// which binds the signature to the current ratchet round.
+///   "pinchat-drheader-v2" || len(dh_raw):u16_be || dh_raw ||
+///   pn:u32_be || n:u32_be || rc:u32_be
+/// which binds the signature to the complete semantic header.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MessageHeader {
     /// Protocol version (must equal PINCHAT_PROTOCOL_VERSION).

@@ -56,7 +56,8 @@ const AAD_FIELD_TYPES = {
     NONCE: 0x04,          // Binary data (typically 16 bytes)
     MESSAGE_NUMBER: 0x05, // 8 bytes (BigUint64) - Enhanced Chain Ratchet: prevents message reordering
     MESSAGE_TYPE: 0x06,   // UTF-8 string - binds message type to ciphertext
-    RATCHET_COUNT: 0x07   // 8 bytes (BigUint64) - binds ratchet count to ciphertext
+    RATCHET_COUNT: 0x07,  // 8 bytes (BigUint64) - binds ratchet count to ciphertext
+    PREVIOUS_CHAIN_LENGTH: 0x08 // 8 bytes (BigUint64) - binds pn to ciphertext
 };
 
 /**
@@ -96,7 +97,8 @@ function encodeAADWithLengthPrefix(fields) {
         // Convert value to Uint8Array based on type
         if (field.type === AAD_FIELD_TYPES.TIMESTAMP ||
             field.type === AAD_FIELD_TYPES.MESSAGE_NUMBER ||
-            field.type === AAD_FIELD_TYPES.RATCHET_COUNT) {
+            field.type === AAD_FIELD_TYPES.RATCHET_COUNT ||
+            field.type === AAD_FIELD_TYPES.PREVIOUS_CHAIN_LENGTH) {
             // Numeric fields (timestamp, message counter, ratchet count): convert to 8-byte BigUint64
             valueBytes = new Uint8Array(
                 new BigUint64Array([BigInt(field.value)]).buffer

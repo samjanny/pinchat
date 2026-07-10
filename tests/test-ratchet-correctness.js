@@ -45,7 +45,7 @@ global.PINCHAT_PROTOCOL_VERSION = 1;
 // crypto.js must be required FIRST so it promotes AAD_FIELD_TYPES,
 // encodeAADWithLengthPrefix and ChainRatchet onto globalThis before
 // double-ratchet.js evaluates and references them.
-require('../static/js/crypto.js');
+const { ChainRatchet, AAD_FIELD_TYPES, encodeAADWithLengthPrefix } = require('../static/js/crypto.js');
 const { IdentityKeyManager } = require('../static/js/identity.js');
 const { DoubleRatchet } = require('../static/js/double-ratchet.js');
 
@@ -367,6 +367,45 @@ async function testEncryptRollbackOnAeadFailure() {
     pass('encrypt path rolls back ratchet state on AEAD failure (F-10)');
 }
 
+async function testStateCompromiseDoesNotRecoverPastMessages() {
+    const { alice } = await setupPair();
+    const captured = await alice.encryptMessage('pfs-past', ROOM, ALICE_ID);
+    for (let i = 0; i < 4; i++) {
+        await alice.encryptMessage(`pfs-${i}`, ROOM, ALICE_ID);
+    }
+
+    // A compromised current root key must not be a parent of the initial
+    // sending chain. Reconstructing CK0 here would break PFS.
+    const attemptedInitialChain = await alice.hkdf(
+        alice.rootKey, new Uint8Array(32), 'InitiatorToResponder', 32,
+    );
+    const chain = new ChainRatchet();
+    await chain.initialize(attemptedInitialChain);
+    const { key } = await chain.deriveMessageKey();
+    const raw = alice.base64urlToArrayBuffer(captured.payload);
+    const aad = encodeAADWithLengthPrefix([
+        { type: AAD_FIELD_TYPES.ROOM_ID, value: ROOM },
+        { type: AAD_FIELD_TYPES.SENDER_ID, value: ALICE_ID },
+        { type: AAD_FIELD_TYPES.MESSAGE_NUMBER, value: 0 },
+        { type: AAD_FIELD_TYPES.MESSAGE_TYPE, value: 'message' },
+        { type: AAD_FIELD_TYPES.RATCHET_COUNT, value: 0 },
+        { type: AAD_FIELD_TYPES.PREVIOUS_CHAIN_LENGTH, value: 0 },
+    ]);
+
+    let recovered = true;
+    try {
+        await webcrypto.subtle.decrypt(
+            { name: 'AES-GCM', iv: raw.slice(0, 12), additionalData: aad },
+            key,
+            raw.slice(12),
+        );
+    } catch (_) {
+        recovered = false;
+    }
+    assert.strictEqual(recovered, false, 'current root must not regenerate a past message key');
+    pass('state compromise does not recover past chain messages (PFS)');
+}
+
 // ── Runner ───────────────────────────────────────────────────────────────
 
 (async () => {
@@ -378,6 +417,7 @@ async function testEncryptRollbackOnAeadFailure() {
         await testDelayedCrossDhRound();
         await testDhPrivateNonExtractable();
         await testEncryptRollbackOnAeadFailure();
+        await testStateCompromiseDoesNotRecoverPastMessages();
         console.log('');
         console.log('All ratchet-correctness tests PASSED.');
         process.exit(0);

@@ -232,8 +232,24 @@ impl AppState {
 
     /// Removes a room and all its connections
     pub fn remove_room(&self, room_id: &Uuid) {
-        // Remove every connection associated with the room
-        self.connections.retain(|_, rid| rid != room_id);
+        // Remove every connection associated with the room and all of its
+        // per-connection limiter state. The socket tasks may run their final
+        // cleanup after this method; removing the connection mapping first
+        // would otherwise make that cleanup a no-op and leak these entries
+        // forever across room churn.
+        let connection_ids: Vec<Uuid> = self
+            .connections
+            .iter()
+            .filter(|entry| entry.value() == room_id)
+            .map(|entry| *entry.key())
+            .collect();
+        for connection_id in connection_ids {
+            self.connections.remove(&connection_id);
+            self.connection_message_timestamps.remove(&connection_id);
+            self.connection_frame_timestamps.remove(&connection_id);
+            self.connection_protocol_errors.remove(&connection_id);
+            self.connection_ecdh_timestamps.remove(&connection_id);
+        }
 
         // Remove the broadcast channel
         self.broadcast_channels.remove(room_id);
