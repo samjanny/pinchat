@@ -183,9 +183,8 @@ document.addEventListener('alpine:init', () => {
                 }
             };
 
-            this.wsManager.onMessage = (message) => {
+            this.wsManager.onMessage = (message) =>
                 this.handleWebSocketMessage(message);
-            };
 
             this.wsManager.onError = (error) => {
                 const msg = error && error.message;
@@ -456,6 +455,12 @@ document.addEventListener('alpine:init', () => {
          * If this is a NEW key, decryption will trigger DH ratchet automatically.
          */
         async handleIncomingMessage(message) {
+            // A changed peer identity is not trusted until the user confirms
+            // the new SAS. Do not display authenticated-but-unverified
+            // plaintext during that decision window.
+            if (this.sasReverifyRequired) {
+                return;
+            }
             try {
                 // Pass header to decryption (contains DH public key for ratchet)
                 const { text: plaintext, outOfOrder } = await window.cryptoManager.decryptMessage(
@@ -875,6 +880,9 @@ document.addEventListener('alpine:init', () => {
          * Handles incoming encrypted image message
          */
         async handleIncomingImage(message) {
+            if (this.sasReverifyRequired) {
+                return;
+            }
             try {
                 // Decrypt image data
                 const imageData = await window.cryptoManager.decryptImage(

@@ -178,7 +178,7 @@
                 <!-- Welcome message -->
                 <div class="system-message" x-show="messages.length === 0 && connected">
                     <p><svg class="icon icon-success" aria-hidden="true"><use href="#i-check-circle"/></svg> Connected to the secure chat</p>
-                    <p>Messages are end-to-end encrypted. No one else, not even the server, can read them.</p>
+                    <p>Messages are encrypted in your browser. Verify the security code to authenticate your peer.</p>
                     <p><strong>Share the link</strong> to invite more participants.</p>
                 </div>
 
@@ -456,9 +456,9 @@
 
     <!-- Include JS modules -->
     <script src="/static/js/debug.js" integrity="sha256-nY3zkFVKF7x6KVbWq1mwcHq4Y/g8O10iOmLAFfiDsJ8=" crossorigin="anonymous" ></script>
-    <script src="/static/js/crypto.js" integrity="sha256-v9kUX2+i938aSIvic0aX75xw65D482Yq64E0+l6mwaA=" crossorigin="anonymous" ></script>
+    <script src="/static/js/crypto.js" integrity="sha256-9j0P62XrOZzY90Lz62/pSP762PeaEebS6Z/Agtm7lpA=" crossorigin="anonymous" ></script>
     <script src="/static/js/identity.js" integrity="sha256-fyQ1Rwp2wOfHnReiojL8xAOBG8XN9qGR2N3BvCQVyLs=" crossorigin="anonymous" ></script>
-    <script src="/static/js/double-ratchet.js" integrity="sha256-Z0GYpW/Uu2N+O0A7Ux0SsQJRMBY3cHHETtz8NVvnnSA=" crossorigin="anonymous" ></script>
+    <script src="/static/js/double-ratchet.js" integrity="sha256-V3R0zJ6YAvxGYULXKSj5pg1KdJKdlndMz9g2gHK4W6Y=" crossorigin="anonymous" ></script>
     <script src="/static/js/ecdh.js" integrity="sha256-o0iwCdvom1U1hKDdXOuFrIYWVqFVSep1hB4otWXy/SU=" crossorigin="anonymous" ></script>
     <!--
       MLS (RFC 9420) custom implementation — loaded in topological dependency
@@ -496,7 +496,7 @@
     <!-- end MLS -->
     <script src="/static/js/websocket.js" integrity="sha256-ZboPFoWdqHGrRhkPdugTufEWj4Mz53pscjpeA2R9IxA=" crossorigin="anonymous" ></script>
     <script src="/static/js/emoji.js" integrity="sha256-w67zAeAVHFA9AB+RnbDbadBSg6LDd5RS+4mvZksLUv8=" crossorigin="anonymous" ></script>
-    <script src="/static/js/app.js" integrity="sha256-qK0Xs+jAe4Dd16Qm07EJ3uMR3TGei0CUwOr5dPkVMFc=" crossorigin="anonymous" ></script>
+    <script src="/static/js/app.js" integrity="sha256-+MDhlu4PYPBK4jAXM5f7W5cm84+JltNe2mApNNCUY1E=" crossorigin="anonymous" ></script>
     <script src="/static/js/alpine-csp.min.js" integrity="sha256-58hj2liWaS9dR44Q2uCJ5hZP7RxcG2offLv3qbCT8FU=" crossorigin="anonymous" defer></script>
 
     <!-- Lucide icon sprite (ISC license, https://lucide.dev) -->
