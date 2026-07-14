@@ -14,12 +14,27 @@ class ECDHKeyExchange {
     constructor(bootstrapKey, identityManager) {
         this.bootstrapKey = bootstrapKey;       // From URL fragment (AES-256 key)
         this.identityManager = identityManager; // Identity key manager (ECDSA)
-        this.keyPair = null;                    // ECDH keypair (P-256)
-        this.otherPublicKey = null;             // Other participant's public key
+
+        // Handshake v2 (PFS key separation). Two distinct ECDH P-256 keypairs:
+        //   handshakeKeyPair - derives the initial shared secret S, then is
+        //                      DESTROYED. Its private side never reaches the
+        //                      Double Ratchet, so S is not recomputable after
+        //                      cleanup (closes the "initial secret recoverable
+        //                      after destroyEphemeralKeys" PFS gap).
+        //   ratchetKeyPair   - becomes the Double Ratchet's initial DHs. Its
+        //                      private side does NOT reconstruct S.
+        this.handshakeKeyPair = null;           // Derives S (destroyed after handshake)
+        this.ratchetKeyPair = null;             // Becomes Double Ratchet DHs
+        this.otherHandshakePublicKey = null;    // Peer handshake public key (for S)
+        this.otherRatchetPublicKey = null;      // Peer ratchet public key (for DHr)
+
         this.sessionKey = null;                 // Derived AES-256 key for messages
         this.handshakeComplete = false;
         this.handshakeTimeout = null;
         this.keysDestroyed = false;             // Flag to prevent key re-use after destruction
+
+        // Wire/protocol version of the handshake envelope this instance speaks.
+        this.HANDSHAKE_VERSION = 2;
 
         // Context data for SAS generation (stored during handshake)
         this.myNonce = null;                    // Our nonce (sent during handshake)
@@ -65,42 +80,112 @@ class ECDHKeyExchange {
     }
 
     /**
-     * Generate ECDH keypair (P-256)
-     * @returns {Promise<CryptoKeyPair>}
+     * Generate the two ephemeral ECDH keypairs for handshake v2 (P-256).
+     *
+     * handshakeKeyPair derives the initial shared secret S and is destroyed
+     * after the handshake; ratchetKeyPair is handed to the Double Ratchet as
+     * its initial DHs. Keeping these separate is what guarantees PFS: after
+     * cleanup no reachable private key can recompute S.
+     *
+     * @returns {Promise<void>}
      */
     async generateKeypair() {
-        debugLog('[ECDH] Generating P-256 keypair...');
+        debugLog('[ECDH] Generating P-256 keypairs (handshake + ratchet)...');
 
-        this.keyPair = await crypto.subtle.generateKey(
-            {
-                name: 'ECDH',
-                namedCurve: this.CURVE
-            },
+        const genOpts = [
+            { name: 'ECDH', namedCurve: this.CURVE },
             false,  // Not extractable (ephemeral, RAM-only)
-            ['deriveKey', 'deriveBits']  // Add 'deriveBits' for Chain Ratchet raw key export
-        );
+            ['deriveKey', 'deriveBits'],
+        ];
+        this.handshakeKeyPair = await crypto.subtle.generateKey(...genOpts);
+        this.ratchetKeyPair = await crypto.subtle.generateKey(...genOpts);
 
-        debugLog('[ECDH] ✅ Keypair generated (ephemeral)');
-        return this.keyPair;
+        debugLog('[ECDH] ✅ Keypairs generated (handshake + ratchet, ephemeral)');
     }
 
     /**
-     * Export public key and encrypt it with bootstrap key + AAD context binding
+     * Length-prefix a byte array as u16-be(len) || bytes. Used to build
+     * unambiguous concatenations for the signed transcript and the encrypted
+     * envelope (mirrors the TLV discipline of encodeAADWithLengthPrefix).
+     * @private
+     */
+    _lenPrefix(bytes) {
+        const b = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+        if (b.length > 0xffff) throw new Error('field too long for u16 length prefix');
+        const out = new Uint8Array(2 + b.length);
+        new DataView(out.buffer).setUint16(0, b.length, false);
+        out.set(b, 2);
+        return out;
+    }
+
+    /** Concatenate a list of Uint8Arrays. @private */
+    _concat(parts) {
+        const total = parts.reduce((n, p) => n + p.length, 0);
+        const out = new Uint8Array(total);
+        let off = 0;
+        for (const p of parts) { out.set(p, off); off += p.length; }
+        return out;
+    }
+
+    /**
+     * Read a u16-be length-prefixed field at `offset`. Returns [bytes, next].
+     * Throws on truncation so a malformed envelope fails closed.
+     * @private
+     */
+    _readLenPrefixed(u8, offset) {
+        if (offset + 2 > u8.length) throw new Error('envelope truncated (length prefix)');
+        const len = new DataView(u8.buffer, u8.byteOffset, u8.byteLength).getUint16(offset, false);
+        const start = offset + 2;
+        const end = start + len;
+        if (end > u8.length) throw new Error('envelope truncated (field body)');
+        return [u8.slice(start, end), end];
+    }
+
+    /**
+     * Canonical bytes signed by the identity key to authenticate BOTH ephemeral
+     * public keys and the handshake context. Binding the ratchet key here means
+     * any substitution or corruption of it yields an invalid signature (fail
+     * closed) and is reflected in the SAS transcript.
      *
-     * SIGNAL PROTOCOL ENHANCEMENT:
-     * - Includes identity public key for long-term authentication
-     * - Signs ephemeral public key with identity private key (MITM protection)
+     *   "pinchat-handshake-v2"
+     *     || lp(roomId) || lp(senderId) || lp(timestampAscii) || lp(nonce)
+     *     || lp(handshakePubRaw) || lp(ratchetPubRaw)
+     * @private
+     */
+    _buildHandshakeTranscript(roomId, senderId, timestamp, nonceBytes, handshakePubRaw, ratchetPubRaw) {
+        const enc = new TextEncoder();
+        return this._concat([
+            enc.encode('pinchat-handshake-v2'),
+            this._lenPrefix(enc.encode(roomId)),
+            this._lenPrefix(enc.encode(senderId)),
+            this._lenPrefix(enc.encode(String(timestamp))),
+            this._lenPrefix(nonceBytes),
+            this._lenPrefix(new Uint8Array(handshakePubRaw)),
+            this._lenPrefix(new Uint8Array(ratchetPubRaw)),
+        ]);
+    }
+
+    /**
+     * Build the handshake v2 envelope: AES-GCM(bootstrapKey) over both ephemeral
+     * public keys (handshake + ratchet) plus the identity key and a signature
+     * over the canonical transcript.
+     *
+     * HANDSHAKE v2:
+     * - Carries two ephemeral keys: handshake (derives S, destroyed) + ratchet (DHs)
+     * - Identity key + signature are ENCRYPTED (anti-correlation: no cleartext
+     *   long-term identity for a passive relay to link across rooms)
+     * - Signature covers both ephemeral keys + room/sender/timestamp/nonce
      *
      * SECURITY: AAD prevents cross-context replay attacks by binding the
-     * encrypted public key to a specific room, sender, and session.
+     * envelope to a specific room, sender, and session.
      *
      * @param {string} roomId - Room identifier (prevents cross-room replay)
      * @param {string} myConnectionId - Sender's connection/user ID (prevents impersonation)
-     * @returns {Promise<Object>} Object with {encryptedKey, identityPublicKey, signature, timestamp, nonce}
+     * @returns {Promise<Object>} Object with {version, encryptedEnvelope, timestamp, nonce}
      */
     async encryptPublicKey(roomId, myConnectionId) {
-        if (!this.keyPair) {
-            throw new Error('ECDH keypair not generated');
+        if (!this.handshakeKeyPair || !this.ratchetKeyPair) {
+            throw new Error('ECDH keypairs not generated');
         }
 
         if (!this.identityManager || !this.identityManager.identityKeyPair) {
@@ -111,38 +196,41 @@ class ECDHKeyExchange {
             throw new Error('roomId and myConnectionId required for AAD binding');
         }
 
-        debugLog('[ECDH] Exporting and encrypting public key with AAD context binding...');
+        debugLog('[ECDH] Building v2 handshake envelope (encrypted identity + dual keys)...');
         debugLog(`[ECDH] Context: roomId=${roomId}, myConnectionId=${myConnectionId}`);
 
-        // Export ephemeral public key to raw format
-        const publicKeyRaw = await crypto.subtle.exportKey(
-            'raw',
-            this.keyPair.publicKey
-        );
+        // Export both ephemeral public keys to raw format.
+        const handshakePubRaw = new Uint8Array(await crypto.subtle.exportKey('raw', this.handshakeKeyPair.publicKey));
+        const ratchetPubRaw = new Uint8Array(await crypto.subtle.exportKey('raw', this.ratchetKeyPair.publicKey));
 
-        // Sign the ephemeral public key with the identity private key
-        debugLog('[ECDH] Signing ephemeral public key with identity key...');
-        const signature = await this.identityManager.sign(publicKeyRaw);
-        debugLog('[ECDH] ✅ Ephemeral key signed (MITM protection active)');
-
-        // Export the identity public key alongside the ephemeral material
-        const identityPublicKeyRaw = await this.identityManager.exportIdentityPublicKey();
-
-        // Generate IV for AES-GCM encryption
-        const iv = crypto.getRandomValues(new Uint8Array(12));
-
-        // Generate nonce (16 bytes) for session uniqueness
+        // Generate nonce (16 bytes) and timestamp; both are also fed into the
+        // signed transcript so a replay with a different context fails.
         const nonce = crypto.getRandomValues(new Uint8Array(16));
-
-        // Generate timestamp (milliseconds since epoch)
         const timestamp = Date.now();
 
-        // Create AAD: roomId + myConnectionId + timestamp + nonce
-        // This binds the encrypted key to a specific context
-        //
-        // SECURITY: TLV encoding prevents parsing ambiguity
-        // Without length prefixes, different field splits could produce
-        // the same binary output, enabling cross-context replay attacks
+        // Sign the canonical transcript covering BOTH public keys + context.
+        // This authenticates the ratchet key too (v1 only signed one ephemeral).
+        const transcript = this._buildHandshakeTranscript(
+            roomId, myConnectionId, timestamp, nonce, handshakePubRaw, ratchetPubRaw,
+        );
+        const signature = new Uint8Array(await this.identityManager.sign(transcript));
+        debugLog('[ECDH] ✅ Handshake transcript signed (both ephemeral keys bound)');
+
+        const identityPublicKeyRaw = new Uint8Array(await this.identityManager.exportIdentityPublicKey());
+
+        // Plaintext envelope. Identity key + signature move INSIDE the AES-GCM
+        // ciphertext (anti-correlation: a passive relay no longer sees the
+        // long-term identity key that would link a user across rooms).
+        //   u8(version) || lp(handshakePub) || lp(ratchetPub) || lp(identityPub) || lp(signature)
+        const envelope = this._concat([
+            new Uint8Array([this.HANDSHAKE_VERSION]),
+            this._lenPrefix(handshakePubRaw),
+            this._lenPrefix(ratchetPubRaw),
+            this._lenPrefix(identityPublicKeyRaw),
+            this._lenPrefix(signature),
+        ]);
+
+        // AAD still binds room/sender/timestamp/nonce (defense in depth).
         const aad = encodeAADWithLengthPrefix([
             {type: AAD_FIELD_TYPES.ROOM_ID, value: roomId},
             {type: AAD_FIELD_TYPES.SENDER_ID, value: myConnectionId},
@@ -150,45 +238,30 @@ class ECDHKeyExchange {
             {type: AAD_FIELD_TYPES.NONCE, value: nonce}
         ]);
 
-        debugLog(`[ECDH] AAD length: ${aad.length} bytes (TLV-encoded: roomId + connectionId + timestamp + nonce)`);
-
-        // Encrypt public key with bootstrap key + AAD
+        const iv = crypto.getRandomValues(new Uint8Array(12));
         const ciphertext = await crypto.subtle.encrypt(
-            {
-                name: 'AES-GCM',
-                iv: iv,
-                additionalData: aad  // Context binding for the encrypted key
-            },
+            { name: 'AES-GCM', iv: iv, additionalData: aad },
             this.bootstrapKey,
-            publicKeyRaw
+            envelope,
         );
 
-        // Combine IV + ciphertext
         const combined = new Uint8Array(iv.length + ciphertext.byteLength);
         combined.set(iv, 0);
         combined.set(new Uint8Array(ciphertext), iv.length);
-
-        // Encode to Base64url
-        const encryptedKey = this.arrayBufferToBase64url(combined);
-        const identityPublicKey = this.arrayBufferToBase64url(identityPublicKeyRaw);
-        const signatureBase64 = this.arrayBufferToBase64url(signature);
 
         // Store our context data for SAS generation
         this.myTimestamp = timestamp;
         this.myNonce = this.arrayBufferToBase64url(nonce);
 
-        // Return object with all context information needed for decryption
         const result = {
-            encryptedKey: encryptedKey,
-            identityPublicKey: identityPublicKey,
-            signature: signatureBase64,
+            version: this.HANDSHAKE_VERSION,
+            encryptedEnvelope: this.arrayBufferToBase64url(combined),
             timestamp: timestamp,
-            nonce: this.myNonce
+            nonce: this.myNonce,
         };
 
-        debugLog('[ECDH] ✅ Public key encrypted with AAD binding + identity key + signature');
+        debugLog('[ECDH] ✅ v2 envelope built (identity + signature encrypted, dual keys)');
         debugLog(`[ECDH] Timestamp: ${timestamp}, Nonce: ${result.nonce.substring(0, 16)}...`);
-        debugLog(`[ECDH] Identity public key: ${identityPublicKey.substring(0, 20)}...`);
 
         return result;
     }
@@ -203,34 +276,35 @@ class ECDHKeyExchange {
      * SECURITY: Validates AAD to prevent cross-context replay attacks.
      * Ensures the encrypted key was intended for this specific room, sender, and session.
      *
-     * @param {string} encryptedPublicKey - Base64url-encoded encrypted public key
+     * @param {string} encryptedEnvelope - Base64url-encoded encrypted v2 envelope
      * @param {string} expectedRoomId - Expected room identifier
      * @param {string} senderConnectionId - Sender's connection/user ID
      * @param {number} timestamp - Timestamp from sender (ms since epoch)
      * @param {string} nonceBase64url - Base64url-encoded nonce from sender
-     * @param {string} identityPublicKeyBase64 - Peer's identity public key (Base64url)
-     * @param {string} signatureBase64 - Signature on the ephemeral key (Base64url)
+     * @param {number} version - Handshake envelope version (must be 2)
      * @returns {Promise<CryptoKey>}
      */
-    async decryptPublicKey(encryptedPublicKey, expectedRoomId, senderConnectionId, timestamp, nonceBase64url, identityPublicKeyBase64, signatureBase64) {
-        if (!expectedRoomId || !senderConnectionId || !timestamp || !nonceBase64url) {
+    async decryptPublicKey(encryptedEnvelope, expectedRoomId, senderConnectionId, timestamp, nonceBase64url, version) {
+        if (typeof expectedRoomId !== 'string' || expectedRoomId.length === 0
+            || typeof senderConnectionId !== 'string' || senderConnectionId.length === 0
+            || typeof encryptedEnvelope !== 'string' || encryptedEnvelope.length === 0
+            || typeof nonceBase64url !== 'string' || nonceBase64url.length === 0) {
             throw new Error('AAD validation requires: expectedRoomId, senderConnectionId, timestamp, nonce');
         }
 
-        // Validate identity key and signature parameters before decryption
-        if (!identityPublicKeyBase64 || !signatureBase64) {
-            throw new Error('Signal Protocol requires: identityPublicKey, signature');
+        // Fail closed on any non-v2 handshake. There is no downgrade path: a v1
+        // peer (single-keypair, cleartext identity) cannot establish the PFS
+        // guarantees v2 provides, so we refuse rather than interoperate.
+        if (version !== this.HANDSHAKE_VERSION) {
+            throw new Error(`Unsupported handshake version ${version} (expected ${this.HANDSHAKE_VERSION}) - refusing legacy/v1 peer`);
         }
 
-        debugLog('[ECDH] Decrypting other public key with AAD validation...');
-        debugLog(`[ECDH] Expected context: roomId=${expectedRoomId}, sender=${senderConnectionId}`);
-        debugLog(`[ECDH] Timestamp: ${timestamp}, Nonce: ${nonceBase64url.substring(0, 16)}...`);
+        if (!Number.isSafeInteger(timestamp) || timestamp <= 0) {
+            throw new Error('invalid ECDH timestamp');
+        }
 
-        // Import peer's identity public key for signature verification
-        debugLog('[ECDH] Importing peer identity public key...');
-        const identityPublicKeyRaw = this.base64urlToArrayBuffer(identityPublicKeyBase64);
-        await this.identityManager.importPeerIdentityPublicKey(identityPublicKeyRaw);
-        debugLog('[ECDH] ✅ Peer identity public key imported');
+        debugLog('[ECDH] Decrypting v2 handshake envelope with AAD validation...');
+        debugLog(`[ECDH] Expected context: roomId=${expectedRoomId}, sender=${senderConnectionId}`);
 
         // SECURITY: Validate timestamp freshness (max 60 seconds age)
         const now = Date.now();
@@ -248,18 +322,12 @@ class ECDHKeyExchange {
 
         debugLog(`[ECDH] ✅ Timestamp freshness validated (age: ${age}ms)`);
 
-        // Decode nonce from Base64url
         const nonce = this.base64urlToArrayBuffer(nonceBase64url);
+        if (nonce.byteLength !== 16) {
+            throw new Error('invalid ECDH nonce length');
+        }
 
-        // Store other participant's context data for SAS generation
-        this.otherTimestamp = timestamp;
-        this.otherNonce = nonceBase64url;
-
-        // Reconstruct AAD using the SAME process as encryption
-        // AAD = roomId + senderConnectionId + timestamp + nonce
-        //
-        // SECURITY: TLV encoding prevents parsing ambiguity
-        // Must exactly match the encoding used during encryption
+        // Reconstruct AAD (must match encryption context exactly).
         const aad = encodeAADWithLengthPrefix([
             {type: AAD_FIELD_TYPES.ROOM_ID, value: expectedRoomId},
             {type: AAD_FIELD_TYPES.SENDER_ID, value: senderConnectionId},
@@ -267,65 +335,98 @@ class ECDHKeyExchange {
             {type: AAD_FIELD_TYPES.NONCE, value: nonce}
         ]);
 
-        debugLog(`[ECDH] AAD reconstructed (${aad.length} bytes, TLV-encoded)`);
-
-        // Decode from Base64url
-        const combined = this.base64urlToArrayBuffer(encryptedPublicKey);
-
-        // Extract IV and ciphertext
+        const combined = this.base64urlToArrayBuffer(encryptedEnvelope);
+        // 12-byte IV + at least the 16-byte AES-GCM authentication tag.
+        if (combined.byteLength < 28) {
+            throw new Error('encrypted handshake envelope is truncated');
+        }
         const iv = combined.slice(0, 12);
         const ciphertext = combined.slice(12);
 
-        // Decrypt with bootstrap key + AAD validation
-        // If AAD doesn't match, AES-GCM will throw authentication error
-        let publicKeyRaw;
+        let envelope;
         try {
-            publicKeyRaw = await crypto.subtle.decrypt(
-                {
-                    name: 'AES-GCM',
-                    iv: iv,
-                    additionalData: aad  // ← SECURITY: AAD must match encryption context
-                },
+            envelope = new Uint8Array(await crypto.subtle.decrypt(
+                { name: 'AES-GCM', iv: iv, additionalData: aad },
                 this.bootstrapKey,
-                ciphertext
-            );
+                ciphertext,
+            ));
             debugLog('[ECDH] ✅ AAD validation passed (context matches)');
         } catch (error) {
             debugError('[ECDH] ❌ AAD validation failed:', error);
             throw new Error('ECDH AAD validation failed - possible cross-context replay attack or wrong room/sender');
         }
 
-        // Verify the signature on the ephemeral public key
-        // This is the CRITICAL MITM detection step - if signature verification fails,
-        // an attacker has attempted to substitute the ephemeral key
-        debugLog('[ECDH] Verifying signature on ephemeral public key...');
-        const signature = this.base64urlToArrayBuffer(signatureBase64);
-
-        try {
-            await this.identityManager.verify(publicKeyRaw, signature);
-            debugLog('[ECDH] ✅ Signature verified - ephemeral key authenticated (MITM protection)');
-        } catch (error) {
-            debugError('[ECDH] ❌ SIGNATURE VERIFICATION FAILED:', error);
-            throw new Error('🚨 MITM ATTACK DETECTED - Ephemeral key signature is invalid');
+        // Parse envelope: u8(version) || lp(handshakePub) || lp(ratchetPub)
+        //                 || lp(identityPub) || lp(signature)
+        if (envelope.length < 1 || envelope[0] !== this.HANDSHAKE_VERSION) {
+            throw new Error('handshake envelope version mismatch');
+        }
+        let off = 1;
+        let handshakePubRaw, ratchetPubRaw, identityPubRaw, signature;
+        [handshakePubRaw, off] = this._readLenPrefixed(envelope, off);
+        [ratchetPubRaw, off] = this._readLenPrefixed(envelope, off);
+        [identityPubRaw, off] = this._readLenPrefixed(envelope, off);
+        [signature, off] = this._readLenPrefixed(envelope, off);
+        if (off !== envelope.length) {
+            throw new Error('trailing bytes in handshake envelope');
+        }
+        // P-256 raw public keys are exactly 65 bytes (0x04 || X32 || Y32),
+        // and WebCrypto ECDSA/P-256 signatures use fixed-width P1363 r||s.
+        // Strict schema checks keep malformed-but-authenticated envelopes from
+        // reaching any state mutation.
+        if (handshakePubRaw.length !== 65 || handshakePubRaw[0] !== 0x04
+            || ratchetPubRaw.length !== 65 || ratchetPubRaw[0] !== 0x04) {
+            throw new Error('invalid ephemeral public key encoding');
+        }
+        if (identityPubRaw.length !== 65 || identityPubRaw[0] !== 0x04) {
+            throw new Error('invalid identity public key encoding');
+        }
+        if (signature.length !== 64) {
+            throw new Error('invalid handshake signature length');
         }
 
-        // Import the peer's ephemeral ECDH public key.
-        // extractable=true: the Double Ratchet needs the raw bytes for DHrRaw
-        // (key-ID construction + ratchet-change detection). Public keys are not
-        // secret material, so making them extractable does not weaken PFS.
-        this.otherPublicKey = await crypto.subtle.importKey(
-            'raw',
-            publicKeyRaw,
-            {
-                name: 'ECDH',
-                namedCurve: this.CURVE
-            },
-            true,
-            []
+        // Verify the transcript signature with a TEMPORARY key BEFORE committing
+        // any peer state. A bad signature must not mutate the identity manager.
+        const transcript = this._buildHandshakeTranscript(
+            expectedRoomId, senderConnectionId, timestamp, nonce, handshakePubRaw, ratchetPubRaw,
+        );
+        const tempIdentity = await crypto.subtle.importKey(
+            'raw', identityPubRaw, { name: 'ECDSA', namedCurve: this.CURVE }, false, ['verify'],
+        );
+        const sigOk = await crypto.subtle.verify(
+            { name: 'ECDSA', hash: 'SHA-256' }, tempIdentity, signature, transcript,
+        );
+        if (!sigOk) {
+            debugError('[ECDH] ❌ SIGNATURE VERIFICATION FAILED');
+            throw new Error('🚨 MITM ATTACK DETECTED - handshake transcript signature is invalid');
+        }
+        debugLog('[ECDH] ✅ Transcript signature verified (both ephemeral keys bound)');
+
+        // Validate/import BOTH ECDH points into local variables before touching
+        // any peer state. A participant can validly sign arbitrary bytes; an
+        // off-curve point must therefore fail without leaving a partially
+        // committed identity, context, or handshake key behind.
+        // extractable=true is safe for public material and is required by the
+        // SAS transcript / Double Ratchet key-ID construction.
+        const importedHandshakePublicKey = await crypto.subtle.importKey(
+            'raw', handshakePubRaw, { name: 'ECDH', namedCurve: this.CURVE }, true, [],
+        );
+        const importedRatchetPublicKey = await crypto.subtle.importKey(
+            'raw', ratchetPubRaw, { name: 'ECDH', namedCurve: this.CURVE }, true, [],
         );
 
-        debugLog('[ECDH] ✅ Other public key decrypted and imported');
-        return this.otherPublicKey;
+        // Atomic commit: every fallible async operation has completed. These
+        // synchronous assignments run without an event-loop turn in between,
+        // so observers can see either the old state or the complete new state,
+        // never a partially imported peer.
+        this.identityManager.commitPeerIdentityPublicKey(identityPubRaw, tempIdentity);
+        this.otherHandshakePublicKey = importedHandshakePublicKey;
+        this.otherRatchetPublicKey = importedRatchetPublicKey;
+        this.otherTimestamp = timestamp;
+        this.otherNonce = nonceBase64url;
+
+        debugLog('[ECDH] ✅ v2 envelope decrypted - handshake + ratchet keys imported');
+        return this.otherRatchetPublicKey;
     }
 
     /**
@@ -346,19 +447,21 @@ class ECDHKeyExchange {
             throw new Error('[ECDH] Cannot derive session key - ephemeral keys have been destroyed (PFS requirement)');
         }
 
-        if (!this.keyPair || !this.otherPublicKey) {
-            throw new Error('ECDH keypair or other public key missing');
+        if (!this.handshakeKeyPair || !this.otherHandshakePublicKey) {
+            throw new Error('ECDH handshake keypair or peer handshake public key missing');
         }
 
-        debugLog('[ECDH] Deriving session key material from shared secret...');
+        debugLog('[ECDH] Deriving session key material from handshake shared secret...');
 
-        // Derive shared secret using ECDH (as raw bits, not CryptoKey)
+        // Derive S from the HANDSHAKE keypair (never the ratchet keypair). The
+        // handshake private key is destroyed after cleanup, so S is not
+        // recomputable from any state the Double Ratchet retains.
         const sharedSecretBits = await crypto.subtle.deriveBits(
             {
                 name: 'ECDH',
-                public: this.otherPublicKey
+                public: this.otherHandshakePublicKey
             },
-            this.keyPair.privateKey,
+            this.handshakeKeyPair.privateKey,
             256  // 256 bits = 32 bytes
         );
 
@@ -374,15 +477,15 @@ class ECDHKeyExchange {
     }
 
     /**
-     * Drop the bootstrap key reference after handshake completion (protocol v1).
+     * Drop the bootstrap key reference after handshake completion.
      *
      * Previously this was a no-op to support re-handshaking without re-reading
-     * the URL fragment. v1 hardening: we null the reference. Re-handshake is
+     * the URL fragment. PFS hardening: we null the reference. Re-handshake is
      * driven from CryptoManager.resetToBootstrapKey() which rebuilds an
      * ECDHKeyExchange with a freshly-extracted bootstrap key.
      */
     deleteBootstrapKey() {
-        debugLog('[ECDH] Dropping bootstrap key reference (v1 hardening)');
+        debugLog('[ECDH] Dropping bootstrap key reference (PFS hardening)');
         this.bootstrapKey = null;
     }
 
@@ -410,9 +513,16 @@ class ECDHKeyExchange {
 
         debugLog('[ECDH] 🔥 Destroying ephemeral keys (PFS requirement)');
 
-        // Nullify ECDH keypair (prevents session key re-derivation)
-        this.keyPair = null;
-        this.otherPublicKey = null;
+        // Drop the HANDSHAKE keypair: this is the private key that derived S.
+        // It was never handed to the Double Ratchet, so once this reference is
+        // gone S cannot be recomputed by anything reachable in the page.
+        this.handshakeKeyPair = null;
+        this.otherHandshakePublicKey = null;
+
+        // The ratchet keypair is now owned by the Double Ratchet (DHs); release
+        // our references so the ECDH manager no longer holds a second handle.
+        this.ratchetKeyPair = null;
+        this.otherRatchetPublicKey = null;
 
         // Clear handshake context data (no longer needed)
         this.myNonce = null;
@@ -431,7 +541,7 @@ class ECDHKeyExchange {
      * Uses BigInt to avoid JavaScript's 32-bit overflow in bitwise operations.
      *
      * Emoji count = floor(bytes.length * 8 / 6). For 12 input bytes (96 bits)
-     * this is 16 emoji - the v3 SAS layout. Earlier layouts used 9 bytes / 12
+     * this is 16 emoji - the v4 SAS layout. Earlier layouts used 9 bytes / 12
      * emoji (v2) and 6 bytes / 8 emoji; the encoding is the same algorithm,
      * just a different length.
      *
@@ -482,15 +592,20 @@ class ECDHKeyExchange {
     }
 
     /**
-     * Generate Short Authentication String (SAS) for MITM detection - v3.
+     * Generate Short Authentication String (SAS) for MITM detection - v4.
      *
-     * v3 derivation (HKDF-SHA256 via WebCrypto):
+     * v4 derivation (HKDF-SHA256 via WebCrypto):
      *   IKM   = sorted(IK_A_raw || IK_B_raw)        - the two identity public keys
-     *   salt  = roomId || "pinchat-sas-v3"          - fixed for the room
-     *   info  = "SAS-display-v3" || transcript      - domain separation + session binding
-     *   where transcript = SHA-256( sorted(EPH_A_raw || EPH_B_raw) )
-     *         EPH_x_raw   = the live ECDH ephemeral public keys of this handshake
+     *   salt  = roomId || "pinchat-sas-v4"          - fixed for the room
+     *   info  = "SAS-display-v4" || transcript      - domain separation + session binding
+     *   where transcript = SHA-256( sorted(BLOCK_A, BLOCK_B) )
+     *         BLOCK_x     = handshakePub_x || ratchetPub_x  (both live ECDH keys)
      *   bits  = 96                                  - 16 emoji × 6 bits
+     *
+     * v4 changes from v3 (handshake key separation): the transcript now folds
+     * in BOTH ephemeral public keys per side (the S-deriving handshake key AND
+     * the ratchet key that becomes DHs), so the out-of-band code authenticates
+     * the entire v2 handshake. v3 bound only the single ephemeral key.
      *
      * Why v3 changes from v2 (audit H1):
      *   v2 derived the SAS from (sorted identity keys, roomId) ONLY. That made
@@ -529,10 +644,10 @@ class ECDHKeyExchange {
      * binding the live session; identity continuity, not SAS stability, is what
      * carries the user's trust decision forward.
      *
-     * Interop: v3 is wire-incompatible with v2/pre-v0.3.0 SAS. Both endpoints must
-     * run this version or the displayed codes will differ. There is no security
-     * downgrade path - a mismatch surfaces as a non-matching SAS, which is the
-     * correct, fail-closed behaviour.
+     * Interop: v4 is wire-incompatible with v3 and earlier SAS layouts. Both
+     * endpoints must run this version or the displayed codes will differ. There
+     * is no security downgrade path - a mismatch surfaces as a non-matching SAS,
+     * which is the correct, fail-closed behaviour.
      *
      * @param {string} roomId - Room identifier for context binding
      * @returns {Promise<Object>} Object with emoji, hex, bits, version
@@ -555,11 +670,12 @@ class ECDHKeyExchange {
         // generateSAS() is invoked before destroyEphemeralKeys() (see app.js), so
         // both keys are present here. Fail closed rather than silently fall back
         // to an identity-only (precomputable) SAS if they are missing.
-        if (!this.keyPair || !this.keyPair.publicKey || !this.otherPublicKey) {
+        if (!this.handshakeKeyPair || !this.handshakeKeyPair.publicKey || !this.otherHandshakePublicKey
+            || !this.ratchetKeyPair || !this.ratchetKeyPair.publicKey || !this.otherRatchetPublicKey) {
             throw new Error('[ECDH] Cannot generate SAS - live ephemeral ECDH keys not available (transcript binding required)');
         }
 
-        debugLog('[ECDH] Generating SAS v3 (HKDF-SHA256, 96 bits, transcript-bound)...');
+        debugLog('[ECDH] Generating SAS v4 (HKDF-SHA256, 96 bits, dual-key transcript-bound)...');
 
         // --- IKM: sorted identity public keys -------------------------------
         // The own identity CryptoKey public side is always exportable per
@@ -574,29 +690,35 @@ class ECDHKeyExchange {
         ikm.set(idKeys[0], 0);
         ikm.set(idKeys[1], idKeys[0].length);
 
-        // --- Transcript: SHA-256 of sorted live ephemeral ECDH public keys ---
-        // Both ephemeral public keys are public material; the public side of an
-        // asymmetric ECDH key is exportable even though the keypair was generated
-        // non-extractable. Sorting makes the transcript side-independent so both
-        // peers compute the same hash.
-        const myEphRaw = new Uint8Array(await crypto.subtle.exportKey('raw', this.keyPair.publicKey));
-        const otherEphRaw = new Uint8Array(await crypto.subtle.exportKey('raw', this.otherPublicKey));
-        const ephKeys = this._sortKeyPair(myEphRaw, otherEphRaw);
-        const transcriptInput = new Uint8Array(ephKeys[0].length + ephKeys[1].length);
-        transcriptInput.set(ephKeys[0], 0);
-        transcriptInput.set(ephKeys[1], ephKeys[0].length);
+        // --- Transcript: SHA-256 over both peers' (handshake||ratchet) keys ---
+        // v4 binds BOTH ephemeral public keys of each side. Each side forms a
+        // per-side block = handshakePubRaw || ratchetPubRaw; the two blocks are
+        // sorted so the transcript is side-independent. Substituting or
+        // corrupting either key on either side changes the SAS, so the user's
+        // out-of-band comparison authenticates the full v2 handshake, not just
+        // the S-deriving key.
+        const myBlock = this._concat([
+            new Uint8Array(await crypto.subtle.exportKey('raw', this.handshakeKeyPair.publicKey)),
+            new Uint8Array(await crypto.subtle.exportKey('raw', this.ratchetKeyPair.publicKey)),
+        ]);
+        const otherBlock = this._concat([
+            new Uint8Array(await crypto.subtle.exportKey('raw', this.otherHandshakePublicKey)),
+            new Uint8Array(await crypto.subtle.exportKey('raw', this.otherRatchetPublicKey)),
+        ]);
+        const blocks = this._sortKeyPair(myBlock, otherBlock);
+        const transcriptInput = this._concat([blocks[0], blocks[1]]);
         const transcriptHash = new Uint8Array(await crypto.subtle.digest('SHA-256', transcriptInput));
 
-        // --- Salt = roomId || "pinchat-sas-v3" ------------------------------
+        // --- Salt = roomId || "pinchat-sas-v4" ------------------------------
         const encoder = new TextEncoder();
         const roomIdBytes = encoder.encode(roomId);
-        const saltTagBytes = encoder.encode('pinchat-sas-v3');
+        const saltTagBytes = encoder.encode('pinchat-sas-v4');
         const salt = new Uint8Array(roomIdBytes.length + saltTagBytes.length);
         salt.set(roomIdBytes, 0);
         salt.set(saltTagBytes, roomIdBytes.length);
 
-        // --- info = "SAS-display-v3" || transcriptHash ----------------------
-        const infoTagBytes = encoder.encode('SAS-display-v3');
+        // --- info = "SAS-display-v4" || transcriptHash ----------------------
+        const infoTagBytes = encoder.encode('SAS-display-v4');
         const info = new Uint8Array(infoTagBytes.length + transcriptHash.length);
         info.set(infoTagBytes, 0);
         info.set(transcriptHash, infoTagBytes.length);
@@ -627,10 +749,10 @@ class ECDHKeyExchange {
             emoji: this.encodeToEmoji(sasBytes),
             hex: this.encodeToHex(sasBytes),
             bits: 96,
-            version: 3
+            version: 4
         };
 
-        debugLog('[ECDH] ✅ SAS v3 generated (HKDF-SHA256, 96 bits, transcript-bound):', sasObject);
+        debugLog('[ECDH] ✅ SAS v4 generated (HKDF-SHA256, 96 bits, dual-key transcript-bound):', sasObject);
         return sasObject;
     }
 

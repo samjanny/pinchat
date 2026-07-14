@@ -1,8 +1,8 @@
 {
   "data": {
     "version": "1.2.0",
-    "sequence": 38,
-    "generated": "2026-07-10T13:23:32.137Z",
+    "sequence": 40,
+    "generated": "2026-07-14T12:47:57.136Z",
     "site": "https://pinchat.io",
     "files": [
       {
@@ -15,7 +15,7 @@
       },
       {
         "path": "/static/js/app.js",
-        "hash": "53b75f60d82348aa45cfeceb2210c9cfcc2080d56306c6d628f3c87cb4ee6e6e"
+        "hash": "a2e2d771d56fc04a31d1f9abc325e3aa2a9e3ad62b59b8d6a29faf0e4465447e"
       },
       {
         "path": "/static/js/cookie-notice.js",
@@ -23,7 +23,7 @@
       },
       {
         "path": "/static/js/crypto.js",
-        "hash": "751993b101de56d848e1f48f2d8521c55b75be93ab833840873b82bcd8a23795"
+        "hash": "e4fd3a30b50ed6248a52a944230e11081d631ea213871118120b57bfca9302b6"
       },
       {
         "path": "/static/js/double-ratchet.js",
@@ -31,7 +31,7 @@
       },
       {
         "path": "/static/js/ecdh.js",
-        "hash": "a348b009dbe89b553584a0dd5ceb85ac861656a15549ea75841e28b565f2fd25"
+        "hash": "23ab8a1ddfaeb35bbe0000932e6ed8a16d1f52ab368775bc49b26da1a10ccee5"
       },
       {
         "path": "/static/js/emoji.js",
@@ -43,7 +43,7 @@
       },
       {
         "path": "/static/js/identity.js",
-        "hash": "7f2435470a76c0e7c79d17a2a232fcc403811bc5cdf6a191d8ddc1bc2415c8bb"
+        "hash": "9b27f881f49ac5fd7e1f287e759c577ef7523ebfee5671ad0ce3fa907c8d3a3e"
       },
       {
         "path": "/static/js/legal.js",
@@ -87,7 +87,7 @@
       },
       {
         "path": "/static/chat.html",
-        "hash": "87697a99a15e6eaeab52a77eb187d7a7166fed03bd2a89882ec18868c72ebf92"
+        "hash": "332ee9aae6f1fb36e4cb7096ec7794b4646c33fdab3197273400e717baa9efd6"
       },
       {
         "path": "/static/terms.html",
@@ -103,5 +103,5 @@
       }
     ]
   },
-  "signature": "MEUCIQDpqXmFNa+LBRhHKCAOj/QukFFwq9aQhlfMdV+etNoh/QIgTEYsc5AR/lZ66TCjTIq63Uqh/Uj8PROFXTcWJafFwZ4="
+  "signature": "MEQCIHaEFoAdjUqGAhW2SHfU6AX6Ff60pvF84jE7zc9dS3FmAiB7Hn+zOiRyPudL1aRQ3E5otQ7K6jJpQM0TTrSJ4l40/w=="
 }

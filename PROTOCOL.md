@@ -182,28 +182,59 @@ optional `ws_token` so the creator-optimization path can gate identically:
 
 ## Key Exchange Protocol
 
-### Handshake Message Structure
+### Handshake Message Structure (v2)
+
+The wire message carries only routing/context fields; all key material and the
+identity signature are inside the AES-GCM envelope encrypted under the bootstrap
+key (from the URL fragment). A passive relay therefore does not receive a stable
+identity public key that can act as a cross-room correlator. This property does
+not hide transport metadata such as IP addresses, timing, or connection data.
 
 ```
-Handshake Message
+ecdh_public_key payload (JSON)
 +--------------------------------------------------+
 | Field               | Size      | Description    |
 +--------------------------------------------------+
-| encryptedKey        | Variable  | ECDH pubkey    |
-|                     |           | (AES-GCM enc)  |
+| version             | JSON int  | 2 (fail-closed |
+|                     |           |  on non-v2)    |
 +--------------------------------------------------+
-| identityPublicKey   | 65 bytes  | ECDSA pubkey   |
-|                     | (base64)  | (uncompressed) |
+| encryptedEnvelope   | Variable  | AES-GCM(boot,  |
+|                     | (base64)  |  envelope,AAD) |
 +--------------------------------------------------+
-| signature           | 64 bytes  | ECDSA sig on   |
-|                     | (base64)  | ephemeral key  |
+| timestamp           | JSON int  | Unix ms epoch  |
 +--------------------------------------------------+
-| timestamp           | 8 bytes   | Unix ms epoch  |
+| nonce               | Variable  | Base64url of a |
+|                     | (base64)  | 16-byte nonce  |
 +--------------------------------------------------+
-| nonce               | 16 bytes  | Random nonce   |
-|                     | (base64)  |                |
-+--------------------------------------------------+
+
+Envelope plaintext (inside AES-GCM), length-prefixed (u16-be):
+  u8(version=2)
+  || lp(handshakePublicKey)   65B  - derives S, then DESTROYED
+  || lp(ratchetPublicKey)     65B  - becomes Double Ratchet DHs
+  || lp(identityPublicKey)    65B  - ECDSA, encrypted (anti-correlation)
+  || lp(signature)            64B  - P1363 ECDSA over transcript below
+
+AAD (unchanged): roomId || senderId || timestamp || nonce  (TLV)
+
+Signed transcript (identity key signs this):
+  "pinchat-handshake-v2"
+    || lp(roomId) || lp(senderId) || lp(timestampAscii) || lp(nonce)
+    || lp(handshakePublicKey) || lp(ratchetPublicKey)
 ```
+
+PFS key separation: the private key that derives the initial shared secret S
+(handshakeKeyPair) is NEVER handed to the Double Ratchet and is destroyed after
+the handshake. The ratchet retains only ratchetKeyPair, whose private side does
+not reconstruct S. This closes the "initial secret recomputable after cleanup"
+gap: `extractable:false` prevented key exfiltration but not its use as an ECDH
+oracle, so under a later client compromise a retained S-deriving key would still
+have let an attacker rebuild the initial chain keys and decrypt captured
+initial-chain messages.
+
+Note: this bumps only the E2E handshake envelope to v2. The WebSocket frame
+subprotocol (`pinchat.v1`) and `PINCHAT_PROTOCOL_VERSION` are unchanged - the
+relay is a blind forwarder of the opaque payload and performs no server-side
+crypto.
 
 ### Handshake Protocol Flow
 
@@ -216,25 +247,28 @@ processes the peer's frame independently.
   Alice                     Server (blind relay)                  Bob
     |                              |                               |
     |  1. Generate Identity Keypair (ECDSA, persisted, 24h TTL)    |
-    |  2. Generate Ephemeral Keypair (ECDH)                        |
-    |  3. Sign ephemeral pubkey with identity key                  |
-    |  4. Encrypt pubkey with Bootstrap Key + AAD                  |
-    |     (room, sender, timestamp, nonce)                         |
+    |  2. Generate handshake + ratchet ECDH keypairs               |
+    |  3. Sign transcript binding both public keys + context       |
+    |  4. Encrypt keys + identity + signature with Bootstrap Key   |
+    |     and AAD (room, sender, timestamp, nonce)                  |
     |                              |                               |
     |------ ecdh_public_key ------>|------ ecdh_public_key ------->|
     |<----- ecdh_public_key -------|<----- ecdh_public_key --------|
     |                              |                               |
-    |  5. Verify signature on peer's ephemeral key                 |
-    |  6. Decrypt peer's ephemeral key (AAD validated)             |
-    |  7. Derive shared secret S = ECDH(own_priv, peer_pub)        |
-    |  8. Determine role: the lexicographically smaller            |
+    |  5. Decrypt envelope and validate AAD/schema                 |
+    |  6. Verify signature and import all keys into temporaries    |
+    |  7. Atomically commit peer identity, keys, and context       |
+    |  8. Derive S = ECDH(own_handshake_priv, peer_handshake_pub)  |
+    |  9. Determine role: the lexicographically smaller            |
     |     connection ID becomes Initiator                          |
-    |  9. Initialize Double Ratchet                                |
-    |     Root Key = HKDF(S, "DoubleRatchet-RootKey")              |
+    | 10. Initialize Double Ratchet with ratchetKeyPair as DHs     |
+    |     initialMaterial = HKDF(S, "DoubleRatchet-Init-v1", 96B)  |
 ```
 
-Steps 1-4 run on both sides (the diagram shows one copy). Role
-determination requires no extra round trip: both clients compare the
+Steps 1-4 run on both sides (the diagram shows one copy). All parsing,
+signature verification, and P-256 point imports complete before step 7; a
+malformed or signed off-curve point therefore leaves peer state unchanged.
+Role determination requires no extra round trip: both clients compare the
 two server-assigned connection IDs as strings, and the smaller one
 takes the Initiator chain labels (see Double Ratchet Initialization).
 
@@ -267,20 +301,20 @@ TLV Format: [type:1 byte][length:2 bytes BE][value:n bytes]
 ```
 Input: sharedSecret (32 bytes), isInitiator (boolean)
 
-1. rootKey = HKDF(sharedSecret, zeros(32), "DoubleRatchet-RootKey", 32)
+1. initialMaterial = HKDF(sharedSecret, zeros(32),
+                          "DoubleRatchet-Init-v1", 96)
+   rootKey = initialMaterial[0..32]
 
 2. If isInitiator:
-     sendingLabel = "InitiatorToResponder"
-     receivingLabel = "ResponderToInitiator"
+     sendingChainKey   = initialMaterial[32..64]
+     receivingChainKey = initialMaterial[64..96]
    Else:
-     sendingLabel = "ResponderToInitiator"
-     receivingLabel = "InitiatorToResponder"
+     sendingChainKey   = initialMaterial[64..96]
+     receivingChainKey = initialMaterial[32..64]
 
-3. sendingChainKey = HKDF(rootKey, zeros(32), sendingLabel, 32)
-4. receivingChainKey = HKDF(rootKey, zeros(32), receivingLabel, 32)
-
-5. Initialize sending chain with sendingChainKey
-6. Initialize receiving chain with receivingChainKey
+3. Initialize sending chain with sendingChainKey
+4. Initialize receiving chain with receivingChainKey
+5. Clear the caller's sharedSecret buffer after SAS generation
 ```
 
 ### DH Ratchet (Receive-Side)
@@ -477,7 +511,7 @@ messages; the server rejects an image envelope without them.
 
 | Type | Direction | Description |
 |------|-----------|-------------|
-| `ecdh_public_key` | C -> S -> C | Encrypted ephemeral key exchange (relayed to the peer; both sides send one) |
+| `ecdh_public_key` | C -> S -> C | Opaque handshake-v2 envelope with separate handshake/ratchet keys (both sides send one) |
 | `message` | Bidirectional | Encrypted text message |
 | `image` | Bidirectional | Encrypted image |
 | `join` | S -> C | Participant joined |
@@ -554,19 +588,26 @@ If receivedCounter > expectedCounter:
 
 ## SAS Verification Protocol
 
-### SAS Generation (v3, current)
+### SAS Generation (v4, current)
 
 ```
 1. IKM        = sorted(IK_A_raw || IK_B_raw)
                 (identity public keys, lexicographically sorted)
-2. transcript = SHA-256( sorted(EPH_A_raw || EPH_B_raw) )
-                (live ECDH ephemeral public keys of this handshake)
-3. salt       = roomId || "pinchat-sas-v3"
-4. info       = "SAS-display-v3" || transcript
-5. sas        = HKDF-SHA256(IKM, salt, info, 96 bits)
-6. Encode as 16 emoji (64-emoji alphabet, 6 bits each)
+2. BLOCK_x    = handshakePub_x || ratchetPub_x
+                (both live ECDH ephemeral keys of side x)
+3. transcript = SHA-256( sorted(BLOCK_A, BLOCK_B) )
+4. salt       = roomId || "pinchat-sas-v4"
+5. info       = "SAS-display-v4" || transcript
+6. sas        = HKDF-SHA256(IKM, salt, info, 96 bits)
+7. Encode as 16 emoji (64-emoji alphabet, 6 bits each)
    Also display as 24 hex characters (12 dash-separated byte pairs)
 ```
+
+v4 (handshake v2 key separation) folds BOTH ephemeral public keys per side into
+the transcript, so the out-of-band code authenticates the full v2 handshake -
+substituting or corrupting either the handshake key or the ratchet key changes
+the SAS. v4 is wire-incompatible with v3; both endpoints must run it (a mismatch
+surfaces as a non-matching SAS, the correct fail-closed behaviour).
 
 The transcript binding makes the SAS authenticate the live session (the
 ephemeral keys that derive the root key), not merely the identity pair,

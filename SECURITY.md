@@ -248,10 +248,9 @@ IVs are generated using CSPRNG and never reused within a key's lifetime.
 
 **Domain Separation Labels**:
 ```
-"DoubleRatchet-RootKey"     - Root key derivation
-"InitiatorToResponder"      - Initiator's sending chain
-"ResponderToInitiator"      - Responder's sending chain
-"ChainKey"                  - Chain ratchet progression
+"DoubleRatchet-Init-v1"      - Independent initial root + two chain keys
+"DoubleRatchet-RootKey"      - Subsequent DH-ratchet root/chain derivation
+"ChainRatchet"              - Chain ratchet progression
 "MessageKey-{N}"            - Per-message key derivation
 ```
 
@@ -283,10 +282,18 @@ CK_{n+1} = HMAC-SHA256(CK_n, "ChainRatchet")
 **Input binding**:
 ```
 IKM        = sorted(Identity_PubKey_A_raw || Identity_PubKey_B_raw)   // 130 bytes for P-256
-transcript = SHA-256( sorted(Ephemeral_PubKey_A_raw || Ephemeral_PubKey_B_raw) )
-salt       = roomId || "pinchat-sas-v3"                               // fixed for the room
-info       = "SAS-display-v3" || transcript                           // session binding
+BLOCK_x    = Handshake_PubKey_x_raw || Ratchet_PubKey_x_raw           // both live ECDH keys, side x
+transcript = SHA-256( sorted(BLOCK_A, BLOCK_B) )
+salt       = roomId || "pinchat-sas-v4"                               // fixed for the room
+info       = "SAS-display-v4" || transcript                           // session binding
 ```
+
+**What changed vs v3 (handshake v2 key separation)**: v3 bound a single
+ephemeral ECDH key per side. Handshake v2 uses two ephemeral keys per side
+(a handshake key that derives S and is destroyed, and a ratchet key that
+becomes the Double Ratchet DHs), so v4 folds BOTH into the transcript. The
+out-of-band code now authenticates the entire v2 handshake: any substitution
+or corruption of either key on either side changes the SAS.
 
 **What changed vs v2 (audit H1)**: v2 derived the SAS from the identity
 keys and roomId only. Both inputs are known to the relay BEFORE the
@@ -313,8 +320,8 @@ this in two ways:
   peer-identity-change detection: a stable identity pair keeps the
   verified flag set, and only an identity-key change forces
   re-verification.
-- *Domain-separated.* The `"pinchat-sas-v3"` salt tag and the
-  `"SAS-display-v3"` info prefix separate this derivation from any
+- *Domain-separated.* The `"pinchat-sas-v4"` salt tag and the
+  `"SAS-display-v4"` info prefix separate this derivation from any
   other use of the same key material.
 - *Symmetric.* Identity keys and ephemeral keys are each sorted
   lexicographically before concatenation/hashing, so both peers derive

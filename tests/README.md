@@ -36,6 +36,21 @@ Tests the full Double Ratchet algorithm (DH + Symmetric) which provides both **P
 | Long Conversation | 20-message stress test |
 | State Destruction | All state cleared on destroy |
 
+### PFS handshake separation (`test-pfs-key-separation.js`)
+
+Drives the production handshake-v2 implementation and Double Ratchet handoff.
+It proves the initial secret and captured initial-chain ciphertext are not
+recoverable after cleanup for either role, using recorded handshake public
+keys. It also covers atomic peer-state commit, signed off-curve points,
+downgrade rejection, strict envelope schema, transcript tampering, and cleanup
+of all ECDH-manager key references.
+
+### Known-answer tests (`test-kat.js`)
+
+Pins the ratchet KDF schedule, chain progression, authenticated DH-header
+encoding, canonical handshake-v2 transcript, and SAS v4. SAS uses fixed valid
+P-256 public inputs with expected output `ddecf96d49efde6010c14fca`.
+
 ## Running Tests
 
 ```bash
@@ -47,6 +62,9 @@ node tests/run-all-tests.js chain
 
 # Run only double ratchet tests
 node tests/run-all-tests.js double
+
+# Run only the handshake-v2/PFS regression suite
+node tests/run-all-tests.js pfs
 ```
 
 ## Test Vectors

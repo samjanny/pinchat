@@ -13,6 +13,8 @@
 
 const { webcrypto } = require('crypto');
 const { subtle } = webcrypto;
+const fs = require('fs');
+const path = require('path');
 
 // Required globals for production modules under Node.
 global.debugLog = () => {};
@@ -212,6 +214,7 @@ async function runTests() {
 
         // Sign+verify roundtrip exercises the actual usages array on the keypair.
         let signVerifyOk = false;
+        let failedImportWasAtomic = false;
         try {
             const data = new TextEncoder().encode('F-02 regression payload');
             const sig = await mgr.sign(data);
@@ -219,17 +222,81 @@ async function runTests() {
             await mgr.verify(data, sig);
             signVerifyOk = true;
             console.log('  sign+verify roundtrip OK');
+
+            const previousKey = mgr.peerIdentityPublicKey;
+            const previousRaw = new Uint8Array(mgr.peerIdentityPublicKeyRaw);
+            const offCurve = new Uint8Array(65);
+            offCurve[0] = 0x04;
+            let rejected = false;
+            try {
+                await mgr.importPeerIdentityPublicKey(offCurve);
+            } catch (_) {
+                rejected = true;
+            }
+            failedImportWasAtomic = rejected
+                && mgr.peerIdentityPublicKey === previousKey
+                && Buffer.from(mgr.peerIdentityPublicKeyRaw).equals(Buffer.from(previousRaw));
+            console.log(`  failed peer-key import left prior state unchanged: ${failedImportWasAtomic}`);
         } catch (e) {
             console.log(`  sign+verify failed (unexpected): ${e.message}`);
         }
 
-        if (privateExportFailed && publicExportSucceeded && signVerifyOk) {
-            console.log('PASSED: F-02 — IdentityKeyManager generates non-extractable private with working public');
+        if (privateExportFailed && publicExportSucceeded && signVerifyOk && failedImportWasAtomic) {
+            console.log('PASSED: F-02 — non-extractable identity + transactional peer import');
             passed++;
         } else {
-            console.log(`FAILED: privateExportFailed=${privateExportFailed}, publicExportSucceeded=${publicExportSucceeded}, signVerifyOk=${signVerifyOk}`);
+            console.log(`FAILED: privateExportFailed=${privateExportFailed}, publicExportSucceeded=${publicExportSucceeded}, signVerifyOk=${signVerifyOk}, failedImportWasAtomic=${failedImportWasAtomic}`);
             failed++;
         }
+    } catch (e) {
+        console.log('FAILED:', e.message);
+        failed++;
+    }
+    console.log('');
+
+    // -------------------------------------------------------------------------
+    // Test 6: Extension release pins match the signed manifest generation
+    // -------------------------------------------------------------------------
+    console.log('--- Test 6: Extension release pins match signed manifest ---');
+    try {
+        const root = path.join(__dirname, '..');
+        const signed = JSON.parse(fs.readFileSync(path.join(root, 'hashes.json.signed'), 'utf8'));
+        const chromeBackground = fs.readFileSync(path.join(root, 'extensions/chrome/background.js'), 'utf8');
+        const firefoxBackground = fs.readFileSync(path.join(root, 'extensions/firefox/background.js'), 'utf8');
+        const chromeManifest = JSON.parse(fs.readFileSync(path.join(root, 'extensions/chrome/manifest.json'), 'utf8'));
+        const firefoxManifest = JSON.parse(fs.readFileSync(path.join(root, 'extensions/firefox/manifest.json'), 'utf8'));
+        const readPin = (source, name) => {
+            const match = source.match(new RegExp(`const ${name} = (?:'([^']+)'|([0-9]+));`));
+            if (!match) throw new Error(`${name} not found`);
+            return match[1] === undefined ? Number(match[2]) : match[1];
+        };
+        const chromeTag = readPin(chromeBackground, 'GITHUB_TAG');
+        const firefoxTag = readPin(firefoxBackground, 'GITHUB_TAG');
+        const chromeFloor = readPin(chromeBackground, 'MIN_KNOWN_SEQUENCE');
+        const firefoxFloor = readPin(firefoxBackground, 'MIN_KNOWN_SEQUENCE');
+        const readPublicKey = (source) => {
+            const match = source.match(/const PINCHAT_PUBLIC_KEY = `([\s\S]*?)`;/);
+            if (!match) throw new Error('PINCHAT_PUBLIC_KEY not found');
+            return match[1];
+        };
+
+        const pinsOk = chromeTag === 'v0.6.0'
+            && firefoxTag === chromeTag
+            && chromeFloor === signed.data.sequence
+            && firefoxFloor === chromeFloor
+            && chromeManifest.version === '1.1.0'
+            && firefoxManifest.version === chromeManifest.version
+            && readPublicKey(chromeBackground) === readPublicKey(firefoxBackground);
+        if (!pinsOk) {
+            throw new Error(
+                `tag chrome/firefox=${chromeTag}/${firefoxTag}, `
+                + `floor=${chromeFloor}/${firefoxFloor}, signed=${signed.data.sequence}, `
+                + `extension=${chromeManifest.version}/${firefoxManifest.version}`,
+            );
+        }
+        console.log(`  Release ${chromeTag}, sequence floor ${chromeFloor}, extension ${chromeManifest.version}`);
+        console.log('PASSED: Chrome and Firefox release pins are aligned');
+        passed++;
     } catch (e) {
         console.log('FAILED:', e.message);
         failed++;

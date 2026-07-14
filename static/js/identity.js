@@ -285,17 +285,13 @@ class IdentityKeyManager {
     async importPeerIdentityPublicKey(publicKeyRaw) {
         debugLog('[Identity] Importing peer identity public key...');
 
-        // Cache the raw bytes once at import-time so SAS generation and
-        // identity-change detection do not need to call exportKey() later.
-        // The CryptoKey itself is then imported as non-extractable: even
-        // with a hostile script in the page, the key cannot be re-exported
-        // from the WebCrypto opaque handle.
+        // Complete the fallible import before mutating peer state. This keeps
+        // standalone callers transactional too (the handshake-v2 path imports
+        // into a temporary key and calls commitPeerIdentityPublicKey directly).
         const rawBytes = (publicKeyRaw instanceof Uint8Array)
             ? new Uint8Array(publicKeyRaw)
             : new Uint8Array(publicKeyRaw);
-        this.peerIdentityPublicKeyRaw = rawBytes;
-
-        this.peerIdentityPublicKey = await crypto.subtle.importKey(
+        const importedPublicKey = await crypto.subtle.importKey(
             'raw',
             rawBytes,
             {
@@ -306,8 +302,34 @@ class IdentityKeyManager {
             ['verify']
         );
 
+        this.commitPeerIdentityPublicKey(rawBytes, importedPublicKey);
+
         debugLog('[Identity] ✅ Peer identity public key imported (non-extractable)');
         return this.peerIdentityPublicKey;
+    }
+
+    /**
+     * Atomically publish a peer identity key that has already been imported
+     * and validated. No await occurs here, so raw bytes and CryptoKey become
+     * visible together in one event-loop turn.
+     *
+     * @param {ArrayBuffer|Uint8Array} publicKeyRaw - 65-byte raw P-256 point
+     * @param {CryptoKey} importedPublicKey - Non-extractable ECDSA verify key
+     * @returns {CryptoKey}
+     */
+    commitPeerIdentityPublicKey(publicKeyRaw, importedPublicKey) {
+        const rawBytes = new Uint8Array(publicKeyRaw);
+        const algorithm = importedPublicKey && importedPublicKey.algorithm;
+        if (rawBytes.length !== 65 || rawBytes[0] !== 0x04
+            || !importedPublicKey || importedPublicKey.type !== 'public'
+            || !algorithm || algorithm.name !== 'ECDSA' || algorithm.namedCurve !== this.CURVE
+            || !importedPublicKey.usages.includes('verify')) {
+            throw new Error('invalid pre-imported peer identity key');
+        }
+
+        this.peerIdentityPublicKeyRaw = rawBytes;
+        this.peerIdentityPublicKey = importedPublicKey;
+        return importedPublicKey;
     }
 
     /**

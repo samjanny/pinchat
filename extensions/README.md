@@ -74,8 +74,14 @@ git commit -m "Update SRI attributes and signed hash list"
 git push
 ```
 
-The extensions will fetch the manifest from:
-`https://raw.githubusercontent.com/samjanny/pinchat/main/hashes.json.signed`
+The extensions fetch the manifest from the immutable release tag configured by
+`GITHUB_TAG` in both background scripts. For the handshake-v2 release this is:
+`https://raw.githubusercontent.com/samjanny/pinchat/v0.6.0/hashes.json.signed`.
+
+On every extension release, update both background scripts to the new tag,
+raise `MIN_KNOWN_SEQUENCE` to the signed manifest sequence, and bump both
+extension manifest versions. The release tag must contain the exact signed
+manifest before the extensions are published.
 
 ### 5. Generate Icon PNGs
 
