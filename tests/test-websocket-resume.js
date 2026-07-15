@@ -201,6 +201,75 @@ async function main() {
     check(delivered === deliveredBeforeInvalid,
         'invalid Connected frame is never dispatched to application state');
 
+    queuedResponses = [
+        response(200, { csrf_token: csrfToken }),
+        successToken('protocol-gate-token'),
+    ];
+    const protocolManager = new WebSocketManager('group-protocol-room');
+    let protocolError = null;
+    let protocolDispatches = 0;
+    protocolManager.onError = (error) => { protocolError = error.message; };
+    protocolManager.onMessage = async () => { protocolDispatches += 1; };
+    await protocolManager.connect();
+    const protocolSocket = FakeWebSocket.instances.at(-1);
+    protocolSocket.onopen();
+    protocolSocket.onmessage({
+        data: JSON.stringify({
+            type: 'connected',
+            user_id: 'group-relay-id',
+            room_type: 'group',
+            resumed: false,
+            resume_token: resumeToken,
+        }),
+    });
+    await protocolManager._inboundQueue;
+    protocolSocket.onmessage({
+        data: JSON.stringify({
+            type: 'message',
+            payload: 'legacy-1-to-1-frame',
+        }),
+    });
+    check(protocolSocket.closedWith && protocolSocket.closedWith.code === 1008
+        && protocolError === 'ROOM_PROTOCOL_VIOLATION',
+    'group client closes on a relay-delivered 1:1 protocol frame');
+    check(protocolDispatches === 1,
+        'cross-protocol frame is rejected before application dispatch');
+
+    queuedResponses = [
+        response(200, { csrf_token: csrfToken }),
+        successToken('one-to-one-protocol-gate-token'),
+    ];
+    const directManager = new WebSocketManager('one-to-one-protocol-room');
+    let directError = null;
+    let directDispatches = 0;
+    directManager.onError = (error) => { directError = error.message; };
+    directManager.onMessage = async () => { directDispatches += 1; };
+    await directManager.connect();
+    const directSocket = FakeWebSocket.instances.at(-1);
+    directSocket.onopen();
+    directSocket.onmessage({
+        data: JSON.stringify({
+            type: 'connected',
+            user_id: 'direct-relay-id',
+            room_type: 'onetoone',
+            resumed: false,
+            resume_token: resumeToken,
+        }),
+    });
+    await directManager._inboundQueue;
+    directSocket.onmessage({
+        data: JSON.stringify({
+            type: 'mls',
+            payload: 'group-frame',
+            wire_format: 2,
+        }),
+    });
+    check(directSocket.closedWith && directSocket.closedWith.code === 1008
+        && directError === 'ROOM_PROTOCOL_VIOLATION',
+    '1:1 client closes on a relay-delivered MLS frame');
+    check(directDispatches === 1,
+        'MLS frame in a 1:1 room is rejected before application dispatch');
+
     console.log(`\n${passed} assertions passed`);
 }
 

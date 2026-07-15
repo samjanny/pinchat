@@ -132,9 +132,12 @@ The browser-facing flow runs entirely over MLS for group rooms:
   not hold, so post-rotation traffic is unrecoverable to the attacker.
   Single-committer is preserved (only the creator commits), so there
   are no concurrent-commit forks.
-- The Rust server stays a blind relay: it forwards a single `mls`
-  envelope kind with `wire_format` and an optional `ratchet_tree`
-  side-channel, never inspecting the body.
+- The Rust server stays cryptographically blind: it allowlists MLS wire
+  formats, enforces canonical bounded Base64url transport fields, restricts
+  the `ratchet_tree` side-channel to Welcome, and shallowly reads the signed
+  PublicMessage framing only to distinguish Proposal from Commit for rate
+  limiting. Signature, membership, tree, and key-schedule validation remains
+  entirely client-side.
 
 Verified by `tests/test-mls-group-add-3leaf.js` (N-leaf Add),
 `tests/test-mls-group-remove.js` (Remove + post-remove Add), and

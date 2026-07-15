@@ -25,6 +25,21 @@ function _isValidWsResumeToken(value) {
         && /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(value);
 }
 
+const _COMMON_RELAY_MESSAGE_TYPES = new Set([
+    'connected', 'userjoined', 'userleft', 'error',
+]);
+
+function _isMessageAllowedForRoom(roomType, messageType) {
+    if (_COMMON_RELAY_MESSAGE_TYPES.has(messageType)) return true;
+    if (roomType === 'group') return messageType === 'mls';
+    if (roomType === 'onetoone') {
+        return messageType === 'ecdh_public_key'
+            || messageType === 'message'
+            || messageType === 'image';
+    }
+    return false;
+}
+
 class WebSocketManager {
     constructor(roomId) {
         this.roomId = roomId;
@@ -57,6 +72,10 @@ class WebSocketManager {
         // in page memory only: persisting it across a reload would preserve a
         // relay identity while the corresponding in-memory MLS state is gone.
         this.resumeToken = null;
+        // Set from the first server-authenticated Connected frame and pinned
+        // for the lifetime of this page. It gates every subsequent relay
+        // message before application dispatch.
+        this.roomType = null;
 
         // Callbacks
         this.onConnected = null;
@@ -83,6 +102,24 @@ class WebSocketManager {
         if (this.ws && this.ws.readyState === WebSocket.OPEN) {
             // Use code 1000 (normal closure) to signal intentional disconnect
             this.ws.close(1000, 'Page unload');
+        }
+    }
+
+    _failRoomProtocol(reason) {
+        console.error('[WS] Room protocol violation:', reason);
+        this._fatalAuthFailure = true;
+        this.resumeToken = null;
+        try {
+            if (this.ws) this.ws.close(1008, 'Room protocol violation');
+        } catch (_) { /* ignore close races */ }
+        if (this.onError) {
+            try {
+                this.onError(new Error('ROOM_PROTOCOL_VIOLATION'));
+            } catch (error) {
+                // A UI callback must not re-enter this failure path through
+                // the outer WebSocket message parser's catch block.
+                console.error('[WS] onError failed during protocol shutdown:', error);
+            }
         }
     }
 
@@ -461,6 +498,10 @@ class WebSocketManager {
             this.ws.onmessage = (event) => {
                 try {
                     const message = JSON.parse(event.data);
+                    if (!message || typeof message !== 'object'
+                        || typeof message.type !== 'string') {
+                        throw new Error('Relay message is not a typed object');
+                    }
                     console.log('WebSocket message received:', message.type);
 
                     // The resume credential is sent only in our direct
@@ -468,6 +509,18 @@ class WebSocketManager {
                     // and remove it from the message object so UI/debug code
                     // cannot accidentally retain or render the bearer token.
                     if (message.type === 'connected') {
+                        if (message.room_type !== 'group'
+                            && message.room_type !== 'onetoone') {
+                            this._failRoomProtocol(
+                                'Connected carries an unsupported room_type',
+                            );
+                            return;
+                        }
+                        if (this.roomType !== null
+                            && this.roomType !== message.room_type) {
+                            this._failRoomProtocol('room_type changed across reconnect');
+                            return;
+                        }
                         if (!_isValidWsResumeToken(message.resume_token)) {
                             this._fatalAuthFailure = true;
                             this.resumeToken = null;
@@ -475,8 +528,14 @@ class WebSocketManager {
                             if (this.onError) this.onError(new Error('RESUME_TOKEN_INVALID'));
                             return;
                         }
+                        this.roomType = message.room_type;
                         this.resumeToken = message.resume_token;
                         delete message.resume_token;
+                    } else if (!_isMessageAllowedForRoom(this.roomType, message.type)) {
+                        this._failRoomProtocol(
+                            `message type ${message.type} is invalid for ${this.roomType || 'uninitialized'} room`,
+                        );
+                        return;
                     }
 
                     if (this.onMessage) {
@@ -493,6 +552,7 @@ class WebSocketManager {
                     }
                 } catch (error) {
                     console.error('Failed to parse WebSocket message:', error);
+                    this._failRoomProtocol('malformed relay message');
                 }
             };
 

@@ -106,11 +106,11 @@ pub enum Message {
 
     /// MLS (RFC 9420) envelope relayed as opaque bytes.
     ///
-    /// The server never parses the MLS wire format — it is a blind relay.
-    /// The client inspects `wire_format` (matching the `WireFormat`
-    /// discriminant inside the embedded MLSMessage) to route the payload
-    /// to its KeyPackage intake, Welcome processor, Commit handler, or
-    /// PrivateMessage decryptor.
+    /// The server remains blind to MLS cryptographic contents. It validates
+    /// the transport shape and, for PublicMessage, reads only enough canonical
+    /// framing to distinguish Proposal from Commit for rate limiting. The
+    /// client performs all signature, membership, tree, and key-schedule
+    /// processing.
     ///
     /// `ratchet_tree` is a narrow side-channel used by the MVP Add flow
     /// so a joiner can verify tree_hash without a dedicated extension in

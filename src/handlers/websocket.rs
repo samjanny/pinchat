@@ -6,6 +6,7 @@ use axum::{
     http::{HeaderMap, StatusCode, header, header::SEC_WEBSOCKET_PROTOCOL},
     response::{IntoResponse, Response},
 };
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
 use sha2::{Digest, Sha256};
@@ -14,13 +15,241 @@ use tokio::time::{Duration, Instant, interval};
 use uuid::Uuid;
 
 use crate::jwt::{WsResumeTokenClaims, sign_resume_token, verify_token};
-use crate::models::{IncomingMessage, Message};
+use crate::models::{IncomingMessage, Message, RoomType};
 use crate::state::{AppState, ConnectionAdmission};
 
 /// Maximum allowed size for ECDH public key payload (8KB)
 /// Typical ECDH payload with P-256: ~500 bytes (65-byte key + encryption overhead + AAD)
 /// 8KB limit prevents DoS attacks with oversized payloads
 const MAX_ECDH_PAYLOAD_SIZE: usize = 8192;
+
+const WIRE_PUBLIC_MESSAGE: u16 = 1;
+const WIRE_PRIVATE_MESSAGE: u16 = 2;
+const WIRE_WELCOME: u16 = 3;
+const WIRE_KEY_PACKAGE: u16 = 5;
+
+const CONTENT_TYPE_PROPOSAL: u8 = 2;
+const CONTENT_TYPE_COMMIT: u8 = 3;
+
+/// Decoded-byte ceilings for the MLS transport envelope. The WebSocket frame
+/// cap is necessarily larger because Base64url expands data by roughly 4/3.
+/// Keeping format-specific limits here prevents a small KeyPackage or Commit
+/// parser from receiving an image-sized allocation.
+const MAX_MLS_CONTROL_BYTES: usize = 128 * 1024;
+const MAX_MLS_KEY_PACKAGE_BYTES: usize = 16 * 1024;
+const MAX_RATCHET_TREE_BYTES: usize = 64 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PublicMessageKind {
+    Proposal,
+    Commit,
+}
+
+#[derive(Debug)]
+struct ValidatedMlsEnvelope {
+    payload_bytes: Vec<u8>,
+    ratchet_tree_bytes: Option<Vec<u8>>,
+    public_kind: Option<PublicMessageKind>,
+}
+
+/// Decode unpadded Base64url and reject alternate/non-canonical spellings.
+/// The encoded-length check happens before allocation; the decoded check is
+/// retained as defense in depth around integer rounding.
+fn decode_bounded_base64url(
+    value: &str,
+    max_decoded_bytes: usize,
+) -> Result<Vec<u8>, &'static str> {
+    if value.is_empty() {
+        return Err("empty Base64url value");
+    }
+    let max_encoded_bytes = max_decoded_bytes.saturating_mul(4).saturating_add(2) / 3;
+    if value.len() > max_encoded_bytes {
+        return Err("Base64url value exceeds decoded-byte limit");
+    }
+    let decoded = URL_SAFE_NO_PAD
+        .decode(value)
+        .map_err(|_| "invalid Base64url value")?;
+    if decoded.len() > max_decoded_bytes {
+        return Err("decoded value exceeds byte limit");
+    }
+    if URL_SAFE_NO_PAD.encode(&decoded) != value {
+        return Err("non-canonical Base64url value");
+    }
+    Ok(decoded)
+}
+
+/// Read the MLS vector-length varint used by the shallow PublicMessage
+/// classifier. MLS permits canonical 1/2/4-byte encodings only. This parser
+/// deliberately stops before the Proposal/Commit body: the relay remains
+/// cryptographically blind and only needs the signed content_type byte to
+/// select the correct rate-limit bucket.
+fn read_mls_varint(bytes: &[u8], pos: &mut usize) -> Option<usize> {
+    let first = *bytes.get(*pos)?;
+    let encoded_len = 1usize << (first >> 6);
+    if encoded_len == 8 || bytes.len().saturating_sub(*pos) < encoded_len {
+        return None;
+    }
+    let mut value = usize::from(first & 0x3f);
+    for offset in 1..encoded_len {
+        value = value.checked_shl(8)? | usize::from(bytes[*pos + offset]);
+    }
+    if (encoded_len == 2 && value < 64) || (encoded_len == 4 && value < 16_384) {
+        return None;
+    }
+    *pos += encoded_len;
+    Some(value)
+}
+
+fn skip_mls_opaque(bytes: &[u8], pos: &mut usize) -> Option<()> {
+    let len = read_mls_varint(bytes, pos)?;
+    let end = pos.checked_add(len)?;
+    if end > bytes.len() {
+        return None;
+    }
+    *pos = end;
+    Some(())
+}
+
+fn classify_public_message(bytes: &[u8]) -> Result<PublicMessageKind, &'static str> {
+    let mut pos = 0usize;
+    skip_mls_opaque(bytes, &mut pos).ok_or("malformed PublicMessage group_id")?;
+    pos = pos.checked_add(8).ok_or("malformed PublicMessage epoch")?;
+    if pos > bytes.len() {
+        return Err("truncated PublicMessage epoch");
+    }
+
+    let sender_type = *bytes.get(pos).ok_or("missing PublicMessage sender")?;
+    pos += 1;
+    if sender_type != 1 {
+        return Err("unsupported PublicMessage sender type");
+    }
+    pos = pos.checked_add(4).ok_or("malformed PublicMessage sender")?;
+    if pos > bytes.len() {
+        return Err("truncated PublicMessage sender");
+    }
+
+    skip_mls_opaque(bytes, &mut pos).ok_or("malformed PublicMessage authenticated_data")?;
+    let content_type = *bytes.get(pos).ok_or("missing PublicMessage content type")?;
+    pos += 1;
+    if pos >= bytes.len() {
+        return Err("truncated PublicMessage body");
+    }
+    match content_type {
+        CONTENT_TYPE_PROPOSAL => Ok(PublicMessageKind::Proposal),
+        CONTENT_TYPE_COMMIT => Ok(PublicMessageKind::Commit),
+        _ => Err("unsupported PublicMessage content type"),
+    }
+}
+
+fn validate_mls_envelope(
+    payload: &str,
+    wire_format: u16,
+    ratchet_tree: Option<&str>,
+    key_package_ref: Option<&str>,
+    commit_ref: Option<&str>,
+    max_image_size: usize,
+) -> Result<ValidatedMlsEnvelope, &'static str> {
+    let max_payload_bytes = match wire_format {
+        WIRE_PUBLIC_MESSAGE | WIRE_WELCOME => MAX_MLS_CONTROL_BYTES,
+        WIRE_PRIVATE_MESSAGE => max_image_size.saturating_add(64 * 1024),
+        WIRE_KEY_PACKAGE => MAX_MLS_KEY_PACKAGE_BYTES,
+        _ => return Err("unsupported MLS wire format"),
+    };
+    let payload_bytes = decode_bounded_base64url(payload, max_payload_bytes)?;
+
+    let malformed_ref = key_package_ref
+        .map(|value| !valid_mls_correlation_ref(value))
+        .unwrap_or(false)
+        || commit_ref
+            .map(|value| !valid_mls_correlation_ref(value))
+            .unwrap_or(false);
+    if malformed_ref {
+        return Err("malformed MLS correlation reference");
+    }
+
+    let (public_kind, ratchet_tree_bytes) = match wire_format {
+        WIRE_PUBLIC_MESSAGE => {
+            if ratchet_tree.is_some() {
+                return Err("ratchet_tree is only valid on Welcome");
+            }
+            let kind = classify_public_message(&payload_bytes)?;
+            match kind {
+                PublicMessageKind::Proposal => {
+                    if key_package_ref.is_some() || commit_ref.is_some() {
+                        return Err("Proposal cannot carry Commit correlation metadata");
+                    }
+                }
+                PublicMessageKind::Commit => {
+                    let supplied = commit_ref.ok_or("Commit requires commit_ref")?;
+                    let expected = URL_SAFE_NO_PAD.encode(Sha256::digest(&payload_bytes));
+                    if supplied != expected {
+                        return Err("commit_ref does not match Commit payload");
+                    }
+                }
+            }
+            (Some(kind), None)
+        }
+        WIRE_WELCOME => {
+            if key_package_ref.is_none() || commit_ref.is_none() {
+                return Err("Welcome requires KeyPackageRef and CommitRef");
+            }
+            let tree = ratchet_tree.ok_or("Welcome requires ratchet_tree")?;
+            (
+                None,
+                Some(decode_bounded_base64url(tree, MAX_RATCHET_TREE_BYTES)?),
+            )
+        }
+        WIRE_PRIVATE_MESSAGE | WIRE_KEY_PACKAGE => {
+            if ratchet_tree.is_some() || key_package_ref.is_some() || commit_ref.is_some() {
+                return Err("MLS metadata is invalid for this wire format");
+            }
+            (None, None)
+        }
+        _ => unreachable!("wire format allowlisted above"),
+    };
+
+    Ok(ValidatedMlsEnvelope {
+        payload_bytes,
+        ratchet_tree_bytes,
+        public_kind,
+    })
+}
+
+fn hash_replay_field(hasher: &mut Sha256, value: &[u8]) {
+    hasher.update((value.len() as u64).to_be_bytes());
+    hasher.update(value);
+}
+
+/// Hash every security-relevant transport field, not just the MLS payload.
+/// This means an attacker who races a bad tree/reference cannot cause the
+/// later authentic envelope with the same payload to be discarded as a
+/// duplicate. Sender ID is intentionally excluded so cross-sender replay of
+/// an otherwise identical envelope remains suppressed.
+fn mls_envelope_replay_hash(
+    wire_format: u16,
+    validated: &ValidatedMlsEnvelope,
+    key_package_ref: Option<&str>,
+    commit_ref: Option<&str>,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"pinchat-mls-relay-envelope-v1");
+    hasher.update(wire_format.to_be_bytes());
+    hash_replay_field(&mut hasher, &validated.payload_bytes);
+    hash_replay_field(
+        &mut hasher,
+        validated.ratchet_tree_bytes.as_deref().unwrap_or_default(),
+    );
+    hash_replay_field(&mut hasher, key_package_ref.unwrap_or_default().as_bytes());
+    hash_replay_field(&mut hasher, commit_ref.unwrap_or_default().as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+fn room_accepts_client_message(room_type: RoomType, msg_type: &str) -> bool {
+    match room_type {
+        RoomType::Group => msg_type == "mls",
+        RoomType::OneToOne => matches!(msg_type, "ecdh_public_key" | "message" | "image"),
+    }
+}
 
 /// Minimum WebSocket message/frame size (512KB)
 /// Used as floor even for small image configs to support text messages and handshakes
@@ -525,6 +754,22 @@ async fn handle_socket(
                 // Parse the incoming message
                 match serde_json::from_str::<IncomingMessage>(&text) {
                     Ok(incoming) => {
+                        // Room types are cryptographic protocol boundaries,
+                        // not a UI preference. A group room accepts only MLS;
+                        // a 1:1 room accepts only the Double-Ratchet transport.
+                        if !room_accepts_client_message(room_type, &incoming.msg_type) {
+                            tracing::warn!(
+                                "message type '{}' is invalid for room type {:?} (connection_id={})",
+                                incoming.msg_type,
+                                room_type,
+                                connection_id
+                            );
+                            if bump_protocol_error(&state_clone, connection_id) {
+                                break;
+                            }
+                            continue;
+                        }
+
                         // Handle ECDH public key exchange (blind relay, no crypto server-side)
                         if incoming.msg_type == "ecdh_public_key" {
                             // Per-connection ECDH burst limiter. The looser
@@ -633,9 +878,10 @@ async fn handle_socket(
                                 );
                             }
                         }
-                        // MLS envelope (RFC 9420). Blind relay: the server never
-                        // parses the wire format. DoS caps + anti-replay + rate
-                        // limit apply identically to "message" / "image".
+                        // MLS envelope (RFC 9420). The relay remains blind to
+                        // cryptographic contents, but validates the supported
+                        // transport shape and shallow PublicMessage content
+                        // type before allocating or rebroadcasting it.
                         else if incoming.msg_type == "mls" {
                             let payload = match incoming.payload {
                                 Some(p) => p,
@@ -663,118 +909,42 @@ async fn handle_socket(
                                     continue;
                                 }
                             };
-
-                            // Upper bound on the MLS payload itself: Welcome
-                            // and Commit messages stay well under the image
-                            // ceiling, which is also the AEAD-framed budget.
-                            let max_size =
-                                max_image_payload_size(state_clone.config.max_image_size);
-                            if payload.len() > max_size {
-                                tracing::warn!(
-                                    "mls payload too large from connection_id={} ({} > {})",
-                                    connection_id,
-                                    payload.len(),
-                                    max_size
-                                );
-                                if bump_protocol_error(&state_clone, connection_id) {
-                                    break;
-                                }
-                                continue;
-                            }
-                            // Tighter cap on ratchet_tree side-channel: a
-                            // 64 KB tree comfortably fits ≥ 32-leaf groups
-                            // at ciphersuite 0x0002 (~2 KB/leaf in the
-                            // worst case), well above our ≤ 20-member
-                            // room cap. Larger blobs are bandwidth +
-                            // CPU amplification (every joiner has to
-                            // tree-hash whatever they receive) — drop
-                            // them rather than forward.
-                            const RATCHET_TREE_MAX_BYTES: usize = 64 * 1024;
-                            let rt_len =
-                                incoming.ratchet_tree.as_ref().map(|s| s.len()).unwrap_or(0);
-                            if rt_len > RATCHET_TREE_MAX_BYTES {
-                                tracing::warn!(
-                                    "mls ratchet_tree too large from connection_id={} ({} > {})",
-                                    connection_id,
-                                    rt_len,
-                                    RATCHET_TREE_MAX_BYTES
-                                );
-                                if bump_protocol_error(&state_clone, connection_id) {
-                                    break;
-                                }
-                                continue;
-                            }
-
-                            // Add/Welcome correlation metadata. These values
-                            // are opaque to the relay, but their canonical,
-                            // fixed-size framing is cheap to enforce and
-                            // prevents unbounded/arbitrary strings from being
-                            // reflected to every room participant.
+                            let ratchet_tree = incoming.ratchet_tree;
                             let key_package_ref = incoming.key_package_ref;
                             let commit_ref = incoming.commit_ref;
-                            let malformed_ref = key_package_ref
-                                .as_deref()
-                                .map(|value| !valid_mls_correlation_ref(value))
-                                .unwrap_or(false)
-                                || commit_ref
-                                    .as_deref()
-                                    .map(|value| !valid_mls_correlation_ref(value))
-                                    .unwrap_or(false);
-                            const WIRE_PUBLIC_MESSAGE: u16 = 1;
-                            const WIRE_WELCOME: u16 = 3;
-                            let invalid_ref_placement = match wire_format {
-                                WIRE_WELCOME => key_package_ref.is_none() || commit_ref.is_none(),
-                                WIRE_PUBLIC_MESSAGE => {
-                                    key_package_ref.is_some() && commit_ref.is_none()
+                            let validated = match validate_mls_envelope(
+                                &payload,
+                                wire_format,
+                                ratchet_tree.as_deref(),
+                                key_package_ref.as_deref(),
+                                commit_ref.as_deref(),
+                                state_clone.config.max_image_size,
+                            ) {
+                                Ok(validated) => validated,
+                                Err(reason) => {
+                                    tracing::warn!(
+                                        "invalid MLS envelope from connection_id={}: {}",
+                                        connection_id,
+                                        reason
+                                    );
+                                    if bump_protocol_error(&state_clone, connection_id) {
+                                        break;
+                                    }
+                                    continue;
                                 }
-                                _ => key_package_ref.is_some() || commit_ref.is_some(),
                             };
-                            if malformed_ref || invalid_ref_placement {
-                                tracing::warn!(
-                                    "invalid MLS correlation metadata from connection_id={}",
-                                    connection_id
-                                );
-                                if bump_protocol_error(&state_clone, connection_id) {
-                                    break;
-                                }
-                                continue;
-                            }
 
-                            // Anti-replay by payload hash, same pattern as the
-                            // 1:1 relay — a retransmitted MLS envelope is
-                            // silently discarded rather than broadcast twice.
-                            let payload_hash = {
-                                let mut hasher = Sha256::new();
-                                hasher.update(payload.as_bytes());
-                                format!("{:x}", hasher.finalize())
-                            };
-                            let mut seen_hashes = state_clone
-                                .seen_message_hashes
-                                .entry(room_id)
-                                .or_insert_with(HashSet::new);
-                            let room_ttl_minutes = state_clone
-                                .rooms
-                                .get(&room_id)
-                                .map(|r| r.ttl_minutes)
-                                .unwrap_or(60);
-                            let cutoff =
-                                Utc::now() - chrono::Duration::minutes(room_ttl_minutes as i64);
-                            seen_hashes.retain(|(_, ts)| *ts > cutoff);
+                            // Anti-replay covers the complete canonical relay
+                            // envelope. Hashing only payload lets an attacker
+                            // race altered correlation/tree metadata and cause
+                            // the authentic envelope to be discarded later.
+                            let payload_hash = mls_envelope_replay_hash(
+                                wire_format,
+                                &validated,
+                                key_package_ref.as_deref(),
+                                commit_ref.as_deref(),
+                            );
                             let now = Utc::now();
-                            if seen_hashes.iter().any(|(h, _)| h == &payload_hash) {
-                                continue;
-                            }
-                            let max_entries = state_clone.config.replay_cache_max_per_room;
-                            if seen_hashes.len() >= max_entries {
-                                let mut entries: Vec<_> = seen_hashes.iter().cloned().collect();
-                                entries.sort_by(|a, b| b.1.cmp(&a.1));
-                                entries.truncate(max_entries - 1);
-                                seen_hashes.clear();
-                                for entry in entries {
-                                    seen_hashes.insert(entry);
-                                }
-                            }
-                            seen_hashes.insert((payload_hash, now));
 
                             // Per-connection rate limit (same cadence).
                             let max_messages = state_clone.config.msg_rate_limit;
@@ -798,14 +968,11 @@ async fn handle_socket(
                             // DashMap shards across an await point.
                             drop(timestamps);
 
-                            // Tighter per-connection commit rate limit.
-                            // wire_format = 1 (MLS_PUBLIC_MESSAGE) is the
-                            // Commit channel — every other room member has
-                            // to verify TreeKEM + signatures + transcripts
-                            // on receipt, so the cost scales with member
-                            // count. A handful of commits per minute is
-                            // far below any legitimate add/remove cadence.
-                            if wire_format == WIRE_PUBLIC_MESSAGE {
+                            // Tighter per-connection Commit rate limit. A
+                            // PublicMessage Proposal is authenticated but does
+                            // not run TreeKEM/key schedule and must not consume
+                            // the creator's Commit budget.
+                            if validated.public_kind == Some(PublicMessageKind::Commit) {
                                 let max_commits = state_clone.config.commit_rate_limit;
                                 let commit_window = state_clone.config.commit_rate_window_secs;
                                 let mut commit_ts = state_clone
@@ -829,10 +996,41 @@ async fn handle_socket(
                                 commit_ts.push_back(now);
                             }
 
+                            // Record replay identity only after every quota
+                            // gate accepts the envelope. A rate-limited Commit
+                            // must remain retryable after the window instead of
+                            // poisoning the replay cache despite never having
+                            // been broadcast.
+                            let mut seen_hashes = state_clone
+                                .seen_message_hashes
+                                .entry(room_id)
+                                .or_insert_with(HashSet::new);
+                            let room_ttl_minutes = state_clone
+                                .rooms
+                                .get(&room_id)
+                                .map(|r| r.ttl_minutes)
+                                .unwrap_or(60);
+                            let cutoff = now - chrono::Duration::minutes(room_ttl_minutes as i64);
+                            seen_hashes.retain(|(_, ts)| *ts > cutoff);
+                            if seen_hashes.iter().any(|(h, _)| h == &payload_hash) {
+                                continue;
+                            }
+                            let max_entries = state_clone.config.replay_cache_max_per_room;
+                            if seen_hashes.len() >= max_entries {
+                                let mut entries: Vec<_> = seen_hashes.iter().cloned().collect();
+                                entries.sort_by(|a, b| b.1.cmp(&a.1));
+                                entries.truncate(max_entries - 1);
+                                seen_hashes.clear();
+                                for entry in entries {
+                                    seen_hashes.insert(entry);
+                                }
+                            }
+                            seen_hashes.insert((payload_hash, now));
+
                             let broadcast_msg = Message::Mls {
                                 payload,
                                 wire_format,
-                                ratchet_tree: incoming.ratchet_tree,
+                                ratchet_tree,
                                 key_package_ref,
                                 commit_ref,
                                 sender_id: connection_id,
@@ -1112,6 +1310,215 @@ mod tests {
         assert!(!valid_mls_correlation_ref(&("A".repeat(42) + "=")));
         assert!(!valid_mls_correlation_ref(&("A".repeat(42) + "/")));
         assert!(!valid_mls_correlation_ref(&("A".repeat(42) + "B")));
+    }
+
+    fn synthetic_public_message(content_type: u8) -> Vec<u8> {
+        let mut body = vec![1, 0xAA]; // group_id opaque<V>, one byte
+        body.extend_from_slice(&0u64.to_be_bytes()); // epoch
+        body.push(1); // SenderType::member
+        body.extend_from_slice(&0u32.to_be_bytes()); // leaf_index
+        body.push(0); // empty authenticated_data opaque<V>
+        body.push(content_type);
+        body.push(0); // enough trailing body for shallow classification
+        body
+    }
+
+    #[test]
+    fn mls_transport_validation_is_canonical_and_format_specific() {
+        let commit_body = synthetic_public_message(CONTENT_TYPE_COMMIT);
+        let commit_payload = URL_SAFE_NO_PAD.encode(&commit_body);
+        let commit_ref = URL_SAFE_NO_PAD.encode(Sha256::digest(&commit_body));
+        let commit = validate_mls_envelope(
+            &commit_payload,
+            WIRE_PUBLIC_MESSAGE,
+            None,
+            None,
+            Some(&commit_ref),
+            300 * 1024,
+        )
+        .expect("valid Commit transport");
+        assert_eq!(commit.public_kind, Some(PublicMessageKind::Commit));
+
+        let proposal_body = synthetic_public_message(CONTENT_TYPE_PROPOSAL);
+        let proposal_payload = URL_SAFE_NO_PAD.encode(&proposal_body);
+        let proposal = validate_mls_envelope(
+            &proposal_payload,
+            WIRE_PUBLIC_MESSAGE,
+            None,
+            None,
+            None,
+            300 * 1024,
+        )
+        .expect("valid Proposal transport");
+        assert_eq!(proposal.public_kind, Some(PublicMessageKind::Proposal));
+
+        assert!(
+            validate_mls_envelope(
+                &proposal_payload,
+                WIRE_PUBLIC_MESSAGE,
+                None,
+                None,
+                Some(&commit_ref),
+                300 * 1024,
+            )
+            .is_err(),
+            "Proposal must not consume or spoof the Commit correlation/rate bucket"
+        );
+        assert!(
+            validate_mls_envelope(
+                &commit_payload,
+                WIRE_PUBLIC_MESSAGE,
+                None,
+                None,
+                Some(&"A".repeat(43)),
+                300 * 1024,
+            )
+            .is_err(),
+            "CommitRef must equal SHA-256 of the exact decoded Commit body"
+        );
+
+        let small = URL_SAFE_NO_PAD.encode([0u8]);
+        let reference = "A".repeat(43);
+        let welcome = validate_mls_envelope(
+            &small,
+            WIRE_WELCOME,
+            Some(&small),
+            Some(&reference),
+            Some(&reference),
+            300 * 1024,
+        )
+        .expect("valid Welcome transport shape");
+        assert_eq!(welcome.ratchet_tree_bytes.as_deref(), Some(&[0u8][..]));
+        assert!(
+            validate_mls_envelope(
+                &small,
+                WIRE_WELCOME,
+                None,
+                Some(&reference),
+                Some(&reference),
+                300 * 1024,
+            )
+            .is_err(),
+            "Welcome must carry its bounded ratchet tree"
+        );
+        assert!(
+            validate_mls_envelope(
+                &small,
+                WIRE_PRIVATE_MESSAGE,
+                Some(&small),
+                None,
+                None,
+                300 * 1024,
+            )
+            .is_err(),
+            "ratchet_tree must be rejected outside Welcome"
+        );
+        assert!(
+            validate_mls_envelope(
+                &small,
+                4, // standalone GroupInfo is unsupported by this transport
+                None,
+                None,
+                None,
+                300 * 1024,
+            )
+            .is_err(),
+            "unsupported MLS wire formats must be rejected"
+        );
+
+        let oversized_key_package = URL_SAFE_NO_PAD.encode(vec![0u8; 16 * 1024 + 1]);
+        assert!(
+            validate_mls_envelope(
+                &oversized_key_package,
+                WIRE_KEY_PACKAGE,
+                None,
+                None,
+                None,
+                300 * 1024,
+            )
+            .is_err(),
+            "limits apply to decoded bytes for each wire format"
+        );
+        assert!(decode_bounded_base64url("AA==", 16).is_err());
+        assert!(decode_bounded_base64url("AB", 16).is_err());
+
+        let mut non_minimal = vec![0x40, 0x01]; // length 1 encoded in two bytes
+        non_minimal.extend_from_slice(&commit_body[1..]);
+        assert!(
+            classify_public_message(&non_minimal).is_err(),
+            "shallow classifier rejects non-minimal MLS varints"
+        );
+    }
+
+    #[test]
+    fn mls_shallow_classifier_matches_ietf_public_messages() {
+        let vectors: Vec<serde_json::Value> = serde_json::from_str(include_str!(
+            "../../tests/vectors/mls/message-protection.json"
+        ))
+        .expect("parse vendored IETF message-protection vectors");
+        let vector = vectors
+            .iter()
+            .find(|entry| entry["cipher_suite"].as_u64() == Some(2))
+            .expect("ciphersuite 0x0002 vector");
+
+        for (field, expected) in [
+            ("proposal_pub", PublicMessageKind::Proposal),
+            ("commit_pub", PublicMessageKind::Commit),
+        ] {
+            let framed = hex::decode(vector[field].as_str().expect("hex PublicMessage"))
+                .expect("decode PublicMessage vector");
+            assert_eq!(&framed[..4], &[0, 1, 0, 1]);
+            assert_eq!(
+                classify_public_message(&framed[4..]),
+                Ok(expected),
+                "relay classifier must match the RFC vector's signed content_type"
+            );
+        }
+    }
+
+    #[test]
+    fn mls_replay_hash_binds_metadata_and_room_protocols_are_disjoint() {
+        let payload = URL_SAFE_NO_PAD.encode([7u8]);
+        let first_ref = "A".repeat(43);
+        let second_ref = format!("{}E", "B".repeat(42));
+        let first = validate_mls_envelope(
+            &payload,
+            WIRE_WELCOME,
+            Some(&payload),
+            Some(&first_ref),
+            Some(&first_ref),
+            300 * 1024,
+        )
+        .unwrap();
+        let second = validate_mls_envelope(
+            &payload,
+            WIRE_WELCOME,
+            Some(&payload),
+            Some(&second_ref),
+            Some(&first_ref),
+            300 * 1024,
+        )
+        .unwrap();
+        assert_ne!(
+            mls_envelope_replay_hash(WIRE_WELCOME, &first, Some(&first_ref), Some(&first_ref),),
+            mls_envelope_replay_hash(WIRE_WELCOME, &second, Some(&second_ref), Some(&first_ref),),
+            "tree/correlation metadata participates in anti-replay identity"
+        );
+
+        assert!(room_accepts_client_message(RoomType::Group, "mls"));
+        assert!(!room_accepts_client_message(RoomType::Group, "message"));
+        assert!(!room_accepts_client_message(RoomType::Group, "image"));
+        assert!(!room_accepts_client_message(
+            RoomType::Group,
+            "ecdh_public_key"
+        ));
+        assert!(room_accepts_client_message(
+            RoomType::OneToOne,
+            "ecdh_public_key"
+        ));
+        assert!(room_accepts_client_message(RoomType::OneToOne, "message"));
+        assert!(room_accepts_client_message(RoomType::OneToOne, "image"));
+        assert!(!room_accepts_client_message(RoomType::OneToOne, "mls"));
     }
 
     fn test_config() -> Config {

@@ -58,7 +58,8 @@ pub struct AppState {
     /// hash + key schedule), so the global msg_rate_limit is too generous
     /// when applied to broadcast Commits. Capped at a few per minute
     /// (see `commit_rate_limit` in the config) to bound the CPU cost a
-    /// single peer can inflict on every other room member.
+    /// single peer can inflict on every other room member. Only structurally
+    /// classified Commits consume this budget; Proposals do not.
     pub connection_commit_timestamps: Arc<DashMap<Uuid, VecDeque<DateTime<Utc>>>>,
 
     /// Per-connection global frame timestamps.

@@ -527,6 +527,8 @@ These settings control application behavior only. They do not automatically conf
 | `ROOM_TOKEN_PERIOD_SECS` | `600` | Window for room/token rate limiting |
 | `MSG_RATE_LIMIT` | `30` | Messages per connection per window |
 | `MSG_RATE_WINDOW_SECS` | `1` | Window length for per-connection message rate limiting |
+| `COMMIT_RATE_LIMIT` | `24` | MLS Commits allowed per connection per Commit window; sized for a full 20-member Add burst |
+| `COMMIT_RATE_WINDOW_SECS` | `60` | Window length for the MLS Commit limiter |
 | `POW_MIN_DIFFICULTY` | `12` | Minimum proof-of-work difficulty, in bits |
 | `POW_MAX_DIFFICULTY` | `18` | Maximum proof-of-work difficulty, in bits |
 | `CHALLENGE_TTL_SECS` | `300` | Proof-of-work challenge TTL |

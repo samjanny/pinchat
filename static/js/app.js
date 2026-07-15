@@ -216,6 +216,11 @@ document.addEventListener('alpine:init', () => {
                     this.error = '⚠️ Server returned an invalid reconnect credential. Connection stopped.';
                     return;
                 }
+                if (msg === 'ROOM_PROTOCOL_VIOLATION') {
+                    this.mlsReady = false;
+                    this.error = '⚠️ The relay sent a message for the wrong room protocol. Connection stopped.';
+                    return;
+                }
                 this.error = '⚠️ Connection error. Retrying automatically...';
             };
 

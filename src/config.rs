@@ -55,9 +55,9 @@ pub struct Config {
     // Per-connection MLS Commit rate limit. Commits are broadcast to every
     // member and trigger TreeKEM verification + transcript hash + signature
     // checks on each receiver, so they're far more expensive than regular
-    // application messages. Defaults: 12 commits / 60 seconds (one every
-    // 5 s on average) — a peer can still bring in members at a steady
-    // cadence but cannot CPU-pin the room.
+    // application messages. Defaults: 24 commits / 60 seconds. This permits
+    // the creator to fill every slot in a 20-member room in one legitimate
+    // admission burst while still bounding sustained TreeKEM work.
     pub commit_rate_limit: usize,
     pub commit_rate_window_secs: i64,
 
@@ -207,11 +207,13 @@ impl Config {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(1),
 
-            // MLS Commit rate limit (default: 12 commits per 60 seconds).
+            // MLS Commit rate limit (default: 24 commits per 60 seconds).
+            // A fresh 20-member room requires 19 Add commits, so the former
+            // default of 12 rejected a valid full-room admission burst.
             commit_rate_limit: env::var("COMMIT_RATE_LIMIT")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(12),
+                .unwrap_or(24),
             commit_rate_window_secs: env::var("COMMIT_RATE_WINDOW_SECS")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -452,6 +454,9 @@ impl Config {
         if self.msg_rate_limit == 0 {
             panic!("MSG_RATE_LIMIT must be greater than 0");
         }
+        if self.commit_rate_limit == 0 {
+            panic!("COMMIT_RATE_LIMIT must be greater than 0");
+        }
         if self.frame_rate_limit == 0 {
             panic!("FRAME_RATE_LIMIT must be greater than 0");
         }
@@ -474,6 +479,9 @@ impl Config {
         }
         if self.msg_rate_window_secs <= 0 {
             panic!("MSG_RATE_WINDOW_SECS must be greater than 0");
+        }
+        if self.commit_rate_window_secs <= 0 {
+            panic!("COMMIT_RATE_WINDOW_SECS must be greater than 0");
         }
 
         // Validate TTLs are non-zero
