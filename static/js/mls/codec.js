@@ -2,17 +2,18 @@
  * PinChat MLS — wire-format codec (RFC 9420 §2 + §B).
  *
  * MLS adopts the TLS 1.3 presentation language (RFC 8446) with a twist:
- * variable-length vectors carry a *QUIC variable-length integer* length
- * prefix (RFC 9000 §16) instead of a fixed-width TLS length. Fixed-width
- * primitives are still big-endian.
+ * variable-length vectors carry an MLS variable-length integer prefix based
+ * on QUIC (RFC 9000 §16), but with two security-relevant restrictions from
+ * RFC 9420 §2.1.2: encodings MUST be minimal and the 8-byte form is invalid.
+ * Fixed-width primitives are still big-endian.
  *
- * QUIC varint layout:
+ * MLS varint layout:
  *   Two top bits of first byte  | total bytes | value range
  *   ─────────────────────────── | ─────────── | ──────────────────────
  *   00                          | 1           | 0 .. 2^6  - 1
- *   01                          | 2           | 0 .. 2^14 - 1
- *   10                          | 4           | 0 .. 2^30 - 1
- *   11                          | 8           | 0 .. 2^62 - 1
+ *   01                          | 2           | 2^6  .. 2^14 - 1
+ *   10                          | 4           | 2^14 .. 2^30 - 1
+ *   11                          | invalid     | —
  *
  * All encode functions produce a Uint8Array; all decode functions accept a
  * `Decoder` cursor and advance it on success, throwing on truncation.
@@ -253,8 +254,8 @@
     // ----- Stand-alone varint helpers ---------------------------------------
 
     /**
-     * Encode a QUIC-style variable-length integer. Accepts Number up to
-     * Number.MAX_SAFE_INTEGER or BigInt up to 2^62-1.
+     * Encode a canonical MLS variable-length integer. RFC 9420 §2.1.2
+     * permits only the minimal 1-, 2-, or 4-byte form, up to 2^30-1.
      */
     function encodeVarint(v) {
         let big;
@@ -283,37 +284,39 @@
                 Number(big & 0xffn),
             ]);
         }
-        if (big <= 0x3fffffffffffffffn) {
-            const out = new Uint8Array(8);
-            let n = big;
-            for (let i = 7; i >= 0; i -= 1) {
-                out[i] = Number(n & 0xffn);
-                n >>= 8n;
-            }
-            out[0] = 0xc0 | (out[0] & 0x3f);
-            return out;
-        }
-        throw new RangeError('varint: value exceeds 2^62-1');
+        throw new RangeError('varint: value exceeds MLS maximum 2^30-1');
     }
 
     /**
-     * Decode a QUIC-style variable-length integer from `buf` at `offset`.
-     * Returns {value, bytes} where `bytes` is the encoded length (1/2/4/8).
-     * `value` is a Number when it fits in Number.MAX_SAFE_INTEGER, else a BigInt.
+     * Decode a canonical MLS variable-length integer from `buf` at `offset`.
+     * Returns {value, bytes}, with a Number value and a 1/2/4-byte length.
+     * Prefix 0b11 and non-minimal encodings are malformed in MLS.
      */
     function decodeVarintAt(buf, offset) {
+        if (!(buf instanceof Uint8Array)) {
+            throw new TypeError('varint: Uint8Array required');
+        }
+        if (!Number.isInteger(offset) || offset < 0) {
+            throw new RangeError('varint: offset must be a non-negative integer');
+        }
         if (offset >= buf.length) throw new Error('varint: truncated');
         const first = buf[offset];
         const prefix = first >> 6;
-        const length = 1 << prefix; // 1, 2, 4, 8
+        if (prefix === 3) {
+            throw new Error('varint: invalid MLS prefix 0b11');
+        }
+        const length = 1 << prefix; // MLS permits only 1, 2, or 4.
         if (offset + length > buf.length) throw new Error('varint: truncated');
 
-        let big = BigInt(first & 0x3f);
+        let value = first & 0x3f;
         for (let i = 1; i < length; i += 1) {
-            big = (big << 8n) | BigInt(buf[offset + i]);
+            value = (value * 256) + buf[offset + i];
         }
-        const asNumber = big <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(big) : big;
-        return { value: asNumber, bytes: length };
+        const minimum = length === 2 ? 0x40 : (length === 4 ? 0x4000 : 0);
+        if (value < minimum) {
+            throw new Error('varint: non-minimal MLS encoding');
+        }
+        return { value, bytes: length };
     }
 
     // ----- base64url helpers (used for JSON envelopes on the wire) ----------

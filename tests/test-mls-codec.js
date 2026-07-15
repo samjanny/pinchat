@@ -5,7 +5,7 @@
  *
  * Covers:
  *   - Fixed-width big-endian integers (u8/u16/u32/u64).
- *   - QUIC variable-length integers (RFC 9000 §16 test vectors).
+ *   - Canonical MLS variable-length integers (RFC 9420 §2.1.2).
  *   - Opaque<V> and variable-length vector T<V> round-trips.
  *   - Truncation / out-of-range error handling.
  */
@@ -81,28 +81,22 @@ console.log('# fixed-width integers');
 })();
 
 // ---------------------------------------------------------------------------
-// QUIC varint — RFC 9000 Appendix A.1 test vectors
+// MLS varint — RFC 9420 §2.1.2 reference vectors and canonicality
 // ---------------------------------------------------------------------------
-console.log('# QUIC varint reference vectors');
+console.log('# canonical MLS varint reference vectors');
 (function () {
-    // RFC 9000 §A.1 test vectors
+    // These three examples are listed directly in RFC 9420 §2.1.2.
     const cases = [
-        { hex: '25', value: 37 },                              // 1-byte
-        { hex: '7bbd', value: 15293 },                         // 2-byte
-        { hex: '9d7f3e7d', value: 494878333 },                 // 4-byte
-        { hex: 'c2197c5eff14e88c', value: 151288809941952652n }, // 8-byte
+        { hex: '25', value: 37 },              // 1-byte
+        { hex: '7bbd', value: 15293 },         // 2-byte
+        { hex: '9d7f3e7d', value: 494878333 }, // 4-byte
     ];
     for (const c of cases) {
         const encoded = Codec.encodeVarint(c.value);
         eqHex(encoded, bytes(c.hex), `encode varint ${c.value}`);
         const { value, bytes: consumed } = Codec.decodeVarintAt(bytes(c.hex), 0);
         eq(consumed, bytes(c.hex).length, `varint ${c.value} length`);
-        const expected = typeof c.value === 'bigint' ? c.value : c.value;
-        const gotMatches =
-            typeof expected === 'bigint'
-                ? (typeof value === 'bigint' && value === expected) || value === Number(expected)
-                : value === expected;
-        assert(gotMatches, `decode varint ${c.value}`, `got ${value}`);
+        assert(value === c.value, `decode varint ${c.value}`, `got ${value}`);
     }
 
     // Boundary values
@@ -111,8 +105,39 @@ console.log('# QUIC varint reference vectors');
     eqHex(Codec.encodeVarint(64), bytes('4040'), 'encode varint 64 (min 2-byte)');
     eqHex(Codec.encodeVarint(16383), bytes('7fff'), 'encode varint 16383 (max 2-byte)');
     eqHex(Codec.encodeVarint(16384), bytes('80004000'), 'encode varint 16384 (min 4-byte)');
+    eqHex(Codec.encodeVarint(0x3fffffff), bytes('bfffffff'),
+        'encode varint 2^30-1 (MLS maximum)');
+    eq(Codec.decodeVarintAt(bytes('4040'), 0).value, 64,
+        'decode canonical 2-byte minimum');
+    eq(Codec.decodeVarintAt(bytes('80004000'), 0).value, 16384,
+        'decode canonical 4-byte minimum');
+    eq(Codec.decodeVarintAt(bytes('bfffffff'), 0).value, 0x3fffffff,
+        'decode canonical MLS maximum');
 
     throws(() => Codec.encodeVarint(-1), 'varint encode rejects negative');
+    throws(() => Codec.encodeVarint(0x40000000),
+        'varint encode rejects value above MLS maximum');
+    throws(() => Codec.encodeVarint(0x3fffffffffffffffn),
+        'varint encode rejects QUIC-only 8-byte value');
+
+    // MLS requires the shortest possible encoding for each value.
+    throws(() => Codec.decodeVarintAt(bytes('4025'), 0),
+        'decode rejects 2-byte encoding of 1-byte value');
+    throws(() => Codec.decodeVarintAt(bytes('80000025'), 0),
+        'decode rejects 4-byte encoding of 1-byte value');
+    throws(() => Codec.decodeVarintAt(bytes('80003fff'), 0),
+        'decode rejects 4-byte encoding of 2-byte value');
+    throws(() => Codec.decodeVarintAt(bytes('c2197c5eff14e88c'), 0),
+        'decode rejects invalid MLS prefix 0b11 / QUIC 8-byte form');
+    throws(() => Codec.decodeVarintAt(bytes('40'), 0),
+        'decode rejects truncated 2-byte varint');
+    throws(() => Codec.decodeVarintAt(bytes('800040'), 0),
+        'decode rejects truncated 4-byte varint');
+
+    const rejected = new Codec.Decoder(bytes('4025aa'));
+    throws(() => rejected.readVarint(),
+        'Decoder.readVarint rejects non-minimal encoding');
+    eq(rejected.pos, 0, 'rejected varint leaves Decoder cursor unchanged');
 })();
 
 // ---------------------------------------------------------------------------

@@ -72,7 +72,7 @@ const TEST_SUITES = {
     'mls-codec': {
         name: 'MLS wire-format codec',
         file: 'test-mls-codec.js',
-        description: 'QUIC varint + opaque/vector round-trip (RFC 9420 §2)'
+        description: 'Canonical MLS varint + opaque/vector round-trip (RFC 9420 §2)'
     },
     'mls-hpke': {
         name: 'MLS HPKE',
