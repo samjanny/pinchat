@@ -47,6 +47,15 @@ async function freshIdentity() {
     return { signaturePrivateKey: kp.privateKey, signaturePublicKeyBytes: kp.publicKeyBytes };
 }
 
+async function bootstrapPins(group) {
+    return {
+        expectedGroupId: Uint8Array.from(group.groupId),
+        expectedCreatorKeyHash: await Labeled.sha256(
+            group.ratchetTree[0].leaf.signatureKey,
+        ),
+    };
+}
+
 async function buildKeyPackage() {
     const identity = await freshIdentity();
     const initKp = await HPKE.generateKeyPair();
@@ -83,6 +92,7 @@ async function addMember(committer, others) {
         leafEncKeyPair: joiner.initKp,
         ratchetTreeBytes,
         expectedSignerLeafIndex: committer.myLeafIndex,
+        ...await bootstrapPins(committer),
     });
     for (const o of others) await o.processCommit(commitMessage);
     return { joined, commitMessage };

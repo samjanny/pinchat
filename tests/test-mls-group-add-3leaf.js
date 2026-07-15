@@ -50,6 +50,15 @@ async function freshIdentity() {
     };
 }
 
+async function bootstrapPins(group) {
+    return {
+        expectedGroupId: Uint8Array.from(group.groupId),
+        expectedCreatorKeyHash: await Labeled.sha256(
+            group.ratchetTree[0].leaf.signatureKey,
+        ),
+    };
+}
+
 async function buildKeyPackage() {
     const identity = await freshIdentity();
     // RFC §7.2.1: init_key (Welcome HPKE recipient) and encryption_key
@@ -100,6 +109,7 @@ async function main() {
         leafEncKeyPair: bob.leafEncKp,
         ratchetTreeBytes: tree1Bytes,
         expectedSignerLeafIndex: 0,
+        ...await bootstrapPins(alice),
     });
     assert(alice.epoch === 1n && bobGroup.epoch === 1n,
         'Alice and Bob at epoch 1 after first Add');
@@ -128,6 +138,7 @@ async function main() {
         leafEncKeyPair: carol.leafEncKp,
         ratchetTreeBytes: tree2Bytes,
         expectedSignerLeafIndex: 0,
+        ...await bootstrapPins(alice),
     });
     assert(carolGroup.epoch === 2n && carolGroup.nLeaves === 3,
         'Carol joined into 3-leaf tree at epoch 2');
@@ -185,6 +196,7 @@ async function main() {
         leafEncKeyPair: dave.leafEncKp,
         ratchetTreeBytes: tree3Bytes,
         expectedSignerLeafIndex: 0,
+        ...await bootstrapPins(alice),
     });
     assert(daveGroup.myLeafIndex === 3, 'Dave is leaf 3');
     assert(daveGroup.epoch === 3n && daveGroup.nLeaves === 4,
@@ -385,6 +397,7 @@ async function main() {
             ratchetTreeBytes: tx,
             pskSecret: psk,
             expectedSignerLeafIndex: 0,
+            ...await bootstrapPins(aliceX),
         });
         assert(bobOk.epoch === 1n, 'matching PSK joins (sanity)');
 
@@ -400,6 +413,7 @@ async function main() {
                 ratchetTreeBytes: tx,
                 pskSecret: wrongPsk,
                 expectedSignerLeafIndex: 0,
+                ...await bootstrapPins(aliceX),
             });
         } catch (_) { threwPsk = true; }
         assert(threwPsk, 'wrong PSK rejected by Welcome decryption');
@@ -415,6 +429,7 @@ async function main() {
                 leafEncKeyPair: bobKp.leafEncKp,
                 ratchetTreeBytes: tx,
                 expectedSignerLeafIndex: 0,
+                ...await bootstrapPins(aliceX),
                 // pskSecret omitted → defaults to zeros, which mismatches `psk`
             });
         } catch (_) { threwNoPsk = true; }
@@ -438,6 +453,7 @@ async function main() {
             leafEncKeyPair: bobM1.leafEncKp,
             ratchetTreeBytes: treeM1,
             expectedSignerLeafIndex: 0,
+            ...await bootstrapPins(aliceM1),
         });
         assert(okGroup.epoch === 1n, 'matching expectedSignerLeafIndex accepted');
 
@@ -453,6 +469,7 @@ async function main() {
                 leafEncKeyPair: bobM1.leafEncKp,
                 ratchetTreeBytes: treeM1,
                 expectedSignerLeafIndex: 99,
+                ...await bootstrapPins(aliceM1),
             });
         } catch (err) { mismatchThrew = true; mismatchErr = err.message; }
         assert(mismatchThrew && mismatchErr.includes('GroupInfo.signer'),
@@ -496,6 +513,7 @@ async function main() {
             leafEncKeyPair: otherBob.leafEncKp,
             ratchetTreeBytes: otherTreeBytes,
             expectedSignerLeafIndex: 0,
+            ...await bootstrapPins(otherAlice),
         });
         const foreignWire = await otherAlice.encryptApplicationMessage('foreign');
         let threwGid = false;

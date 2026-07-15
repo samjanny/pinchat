@@ -53,6 +53,15 @@ async function freshIdentity() {
     };
 }
 
+async function bootstrapPins(group) {
+    return {
+        expectedGroupId: Uint8Array.from(group.groupId),
+        expectedCreatorKeyHash: await Labeled.sha256(
+            group.ratchetTree[0].leaf.signatureKey,
+        ),
+    };
+}
+
 async function buildBobKeyPackage() {
     const identity = await freshIdentity();
     const initKp = await HPKE.generateKeyPair();
@@ -117,6 +126,7 @@ async function main() {
         leafEncKeyPair: bob.initKp,
         ratchetTreeBytes,
         expectedSignerLeafIndex: 0,
+        ...await bootstrapPins(alice),
     });
     assert(bobGroup.nLeaves === 2, 'Bob sees 2-leaf tree');
     assert(bobGroup.epoch === 1n, 'Bob at epoch 1');

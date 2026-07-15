@@ -48,6 +48,15 @@ async function freshIdentity() {
     };
 }
 
+async function bootstrapPins(group) {
+    return {
+        expectedGroupId: Uint8Array.from(group.groupId),
+        expectedCreatorKeyHash: await Labeled.sha256(
+            group.ratchetTree[0].leaf.signatureKey,
+        ),
+    };
+}
+
 async function buildKeyPackage() {
     const identity = await freshIdentity();
     const initKp = await HPKE.generateKeyPair();
@@ -97,6 +106,7 @@ async function addAndJoin(creator, joiner, existingMembers = []) {
         leafEncKeyPair: joiner.leafEncKp,
         ratchetTreeBytes: Nodes.ratchetTreeBytes(creator.ratchetTree),
         expectedSignerLeafIndex: 0,
+        ...await bootstrapPins(creator),
     });
 }
 
@@ -134,6 +144,7 @@ async function main() {
                     nonCreatorGroup.ratchetTree,
                 ),
                 expectedSignerLeafIndex: 1,
+                ...await bootstrapPins(nonCreatorGroup),
             }),
             'only creator leaf 0 may sign GroupInfo',
             'Welcome signed by authenticated non-creator leaf is rejected',

@@ -20,10 +20,14 @@ global.debugError = () => {};
 global.debugWarn = () => {};
 
 // crypto.js must be required first so it promotes the AAD globals before
-// downstream modules evaluate. We don't use CryptoManager directly here
-// but loading identity.js as the real production module is the point of
-// the F-02 regression test below.
-require('../static/js/crypto.js');
+// downstream modules evaluate. Loading identity.js as the real production
+// module is the point of the F-02 regression test below; the pure fragment
+// helpers additionally exercise canonical MLS bootstrap pin parsing.
+const {
+    CryptoManager,
+    encodeMlsBootstrapPin,
+    parseMlsBootstrapPins,
+} = require('../static/js/crypto.js');
 const { IdentityKeyManager } = require('../static/js/identity.js');
 
 async function runTests() {
@@ -228,6 +232,81 @@ async function runTests() {
             passed++;
         } else {
             console.log(`FAILED: privateExportFailed=${privateExportFailed}, publicExportSucceeded=${publicExportSucceeded}, signVerifyOk=${signVerifyOk}`);
+            failed++;
+        }
+    } catch (e) {
+        console.log('FAILED:', e.message);
+        failed++;
+    }
+    console.log('');
+
+    // -------------------------------------------------------------------------
+    // Test 6: MLS invite identity pins are paired and canonically encoded
+    // -------------------------------------------------------------------------
+    console.log('--- Test 6: MLS Bootstrap Pin Fragment Canonicality ---');
+    try {
+        const groupId = webcrypto.getRandomValues(new Uint8Array(32));
+        const creatorKeyHash = webcrypto.getRandomValues(new Uint8Array(32));
+        const gid = encodeMlsBootstrapPin(groupId);
+        const creator = encodeMlsBootstrapPin(creatorKeyHash);
+        const parsed = parseMlsBootstrapPins(
+            `key=ignored&mls_gid=${gid}&mls_creator=${creator}`,
+        );
+        const roundTrip = Buffer.from(parsed.groupId).equals(Buffer.from(groupId))
+            && Buffer.from(parsed.creatorKeyHash).equals(Buffer.from(creatorKeyHash));
+
+        let missingPairRejected = false;
+        let duplicateRejected = false;
+        let nonCanonicalRejected = false;
+        try {
+            parseMlsBootstrapPins(`mls_gid=${gid}`);
+        } catch (_) { missingPairRejected = true; }
+        try {
+            parseMlsBootstrapPins(
+                `mls_gid=${gid}&mls_gid=${gid}&mls_creator=${creator}`,
+            );
+        } catch (_) { duplicateRejected = true; }
+        try {
+            parseMlsBootstrapPins(
+                `mls_gid=${gid}%3D&mls_creator=${creator}`,
+            );
+        } catch (_) { nonCanonicalRejected = true; }
+
+        // Production reconstruction path: the creator starts from a stashed
+        // PSK-only fragment, installs its freshly generated pins, and later
+        // copyLink() obtains the complete fragment without restoring it to the
+        // URL bar.
+        const savedWindow = global.window;
+        const savedSessionStorage = global.sessionStorage;
+        const storage = new Map([
+            ['pinchat_hash:/static/chat.html', '#key=bootstrap-secret'],
+        ]);
+        global.window = {
+            location: {
+                hash: '', pathname: '/static/chat.html', search: '?room=test',
+            },
+        };
+        global.sessionStorage = {
+            getItem: (key) => storage.get(key) || null,
+            setItem: (key, value) => storage.set(key, value),
+        };
+        const mgr = new CryptoManager();
+        mgr.setMlsBootstrapPins(groupId, creatorKeyHash);
+        const shareable = mgr.getInviteFragment({ requireMlsPins: true });
+        const reconstructed = parseMlsBootstrapPins(shareable);
+        const reconstructionOk = shareable.startsWith('#key=bootstrap-secret&')
+            && Buffer.from(reconstructed.groupId).equals(Buffer.from(groupId))
+            && Buffer.from(reconstructed.creatorKeyHash)
+                .equals(Buffer.from(creatorKeyHash));
+        global.window = savedWindow;
+        global.sessionStorage = savedSessionStorage;
+
+        if (roundTrip && missingPairRejected && duplicateRejected
+            && nonCanonicalRejected && reconstructionOk) {
+            console.log('PASSED: MLS pins round-trip canonically; malformed pairs rejected');
+            passed++;
+        } else {
+            console.log('FAILED: MLS bootstrap pin parser accepted ambiguity');
             failed++;
         }
     } catch (e) {

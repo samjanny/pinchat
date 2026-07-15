@@ -76,13 +76,16 @@ async function createExchange() {
         send: (envelope) => creatorOut.push(envelope),
         onEvent: (event) => creatorEvents.push(event),
     });
+    await creator.start();
+    const pins = creator.bootstrapPins;
     const joiner = new MLSSession({
         role: 'joiner',
         send: (envelope) => joinerOut.push(envelope),
         onEvent: (event) => joinerEvents.push(event),
+        expectedGroupId: pins.groupId,
+        expectedCreatorKeyHash: pins.creatorKeyHash,
     });
 
-    await creator.start();
     await joiner.start();
     const keyPackage = joinerOut.find(
         (envelope) => envelope.wire_format === WireFormat.MLS_KEY_PACKAGE,
@@ -232,6 +235,9 @@ async function main() {
         role: 'joiner',
         send: (envelope) => targetOut.push(envelope),
         onEvent: (event) => targetEvents.push(event),
+        expectedGroupId: unauthorizedExchange.creator.bootstrapPins.groupId,
+        expectedCreatorKeyHash:
+            unauthorizedExchange.creator.bootstrapPins.creatorKeyHash,
     });
     await target.start();
     const unauthorized = await unauthorizedExchange.joiner.group.commitAddMember({
@@ -274,6 +280,80 @@ async function main() {
         'non-creator Welcome leaves target unjoined');
     assert(target._pendingCommitBytes === null,
         'rejected non-creator Welcome clears buffered Commit');
+
+    // A PSK alone is insufficient to identify the intended MLS group. A
+    // joiner with an old/bare link must fail before publishing a KeyPackage.
+    const unpinnedOut = [];
+    const unpinned = new MLSSession({
+        role: 'joiner',
+        send: (envelope) => unpinnedOut.push(envelope),
+        onEvent: () => {},
+    });
+    let missingPinsError = '';
+    try {
+        await unpinned.start();
+    } catch (err) {
+        missingPinsError = err.message;
+    }
+    assert(missingPinsError.includes('missing authenticated group_id / creator-key pins'),
+        'joiner without bootstrap pins fails closed before handshake', missingPinsError);
+    assert(unpinned.state === 'idle' && unpinnedOut.length === 0,
+        'unpinned joiner does not publish a KeyPackage');
+
+    // Model a party that knows the same PSK but starts a fresh MLS group with
+    // itself as leaf 0. The Commit and Welcome are internally valid and pass
+    // the creator-only index rule, but the trusted creator's group_id pin must
+    // keep the victim out of the alternative group.
+    const trustedCreator = new MLSSession({
+        role: 'creator', send: () => {}, onEvent: () => {},
+    });
+    await trustedCreator.start();
+    const attackerOut = [];
+    const alternateCreator = new MLSSession({
+        role: 'creator',
+        send: (envelope) => attackerOut.push(envelope),
+        onEvent: () => {},
+    });
+    await alternateCreator.start();
+    const victimOut = [];
+    const victim = new MLSSession({
+        role: 'joiner',
+        send: (envelope) => victimOut.push(envelope),
+        onEvent: () => {},
+        expectedGroupId: trustedCreator.bootstrapPins.groupId,
+        expectedCreatorKeyHash: trustedCreator.bootstrapPins.creatorKeyHash,
+    });
+    await victim.start();
+    const victimKeyPackage = victimOut.find(
+        (envelope) => envelope.wire_format === WireFormat.MLS_KEY_PACKAGE,
+    );
+    await alternateCreator.onRelayEnvelope({
+        ...victimKeyPackage,
+        sender_id: 'alternate-creator',
+    });
+    const alternateCommit = attackerOut.find(
+        (envelope) => envelope.wire_format === WireFormat.MLS_PUBLIC_MESSAGE,
+    );
+    const alternateWelcome = attackerOut.find(
+        (envelope) => envelope.wire_format === WireFormat.MLS_WELCOME,
+    );
+    await victim.onRelayEnvelope({
+        ...alternateCommit,
+        sender_id: 'alternate-creator',
+    });
+    let alternateGroupError = '';
+    try {
+        await victim.onRelayEnvelope({
+            ...alternateWelcome,
+            sender_id: 'alternate-creator',
+        });
+    } catch (err) {
+        alternateGroupError = err.message;
+    }
+    assert(alternateGroupError.includes('group_id does not match invite bootstrap pin'),
+        'same-PSK alternative group is rejected by group_id pin', alternateGroupError);
+    assert(victim.state === 'awaiting-welcome' && victim.group === null,
+        'alternative-group Welcome leaves victim unjoined');
 
     console.log('');
     console.log(`mls-session-join: ${passed} passed, ${failed} failed`);

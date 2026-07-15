@@ -47,6 +47,15 @@ async function freshIdentity() {
     };
 }
 
+async function bootstrapPins(group) {
+    return {
+        expectedGroupId: Uint8Array.from(group.groupId),
+        expectedCreatorKeyHash: await Labeled.sha256(
+            group.ratchetTree[0].leaf.signatureKey,
+        ),
+    };
+}
+
 async function buildKeyPackage() {
     const identity = await freshIdentity();
     const initKp = await HPKE.generateKeyPair();
@@ -96,6 +105,7 @@ async function main() {
         leafEncKeyPair: bob.leafEncKp,
         ratchetTreeBytes: tree1,
         expectedSignerLeafIndex: 0,
+        ...await bootstrapPins(alice),
     });
 
     // Add Carol → epoch 2.
@@ -111,6 +121,7 @@ async function main() {
         leafEncKeyPair: carol.leafEncKp,
         ratchetTreeBytes: tree2,
         expectedSignerLeafIndex: 0,
+        ...await bootstrapPins(alice),
     });
     assert(alice.epoch === 2n && bobGroup.epoch === 2n && carolGroup.epoch === 2n,
         'A/B/C all at epoch 2 after second Add');
@@ -196,6 +207,7 @@ async function main() {
         leafEncKeyPair: dave.leafEncKp,
         ratchetTreeBytes: tree4,
         expectedSignerLeafIndex: 0,
+        ...await bootstrapPins(alice),
     });
     assert(daveGroup.myLeafIndex === 3, 'Dave joined at leaf 3 (after blank Bob slot)');
 

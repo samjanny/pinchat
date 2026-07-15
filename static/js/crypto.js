@@ -45,6 +45,57 @@ function base64urlToBase64(base64url) {
     return base64;
 }
 
+const MLS_GROUP_ID_FRAGMENT_PARAM = 'mls_gid';
+const MLS_CREATOR_KEY_FRAGMENT_PARAM = 'mls_creator';
+const MLS_BOOTSTRAP_PIN_BYTES = 32;
+
+function encodeMlsBootstrapPin(bytes, label = 'MLS bootstrap pin') {
+    if (!(bytes instanceof Uint8Array) || bytes.length !== MLS_BOOTSTRAP_PIN_BYTES) {
+        throw new Error(`${label} must be ${MLS_BOOTSTRAP_PIN_BYTES} bytes`);
+    }
+    let binary = '';
+    for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+    return base64ToBase64url(btoa(binary));
+}
+
+function decodeMlsBootstrapPin(value, label) {
+    // A 32-byte value has exactly 43 unpadded base64url characters. Requiring
+    // the canonical alphabet/length prevents duplicate textual encodings of
+    // the same pin inside copied invite links.
+    if (typeof value !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(value)) {
+        throw new Error(`${label} must be canonical base64url for 32 bytes`);
+    }
+    const binary = atob(base64urlToBase64(value));
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    if (bytes.length !== MLS_BOOTSTRAP_PIN_BYTES
+        || encodeMlsBootstrapPin(bytes, label) !== value) {
+        throw new Error(`${label} is not canonical`);
+    }
+    return bytes;
+}
+
+function parseMlsBootstrapPins(paramsOrFragment) {
+    const params = typeof paramsOrFragment === 'string'
+        ? new URLSearchParams(paramsOrFragment.replace(/^#/, ''))
+        : paramsOrFragment;
+    if (!params || typeof params.getAll !== 'function') {
+        throw new Error('MLS bootstrap pins require URLSearchParams');
+    }
+    const groupIds = params.getAll(MLS_GROUP_ID_FRAGMENT_PARAM);
+    const creatorKeys = params.getAll(MLS_CREATOR_KEY_FRAGMENT_PARAM);
+    if (groupIds.length === 0 && creatorKeys.length === 0) return null;
+    if (groupIds.length !== 1 || creatorKeys.length !== 1) {
+        throw new Error('MLS bootstrap fragment must contain exactly one group and creator pin');
+    }
+    return {
+        groupId: decodeMlsBootstrapPin(groupIds[0], 'MLS group_id pin'),
+        creatorKeyHash: decodeMlsBootstrapPin(
+            creatorKeys[0], 'MLS creator-key pin',
+        ),
+    };
+}
+
 /**
  * AAD Field Types for TLV (Type-Length-Value) encoding
  * Prevents parsing ambiguity when concatenating variable-length fields
@@ -367,6 +418,8 @@ class CryptoManager {
     constructor() {
         this.key = null;                  // Bootstrap key (from URL)
         this.mlsPskSecret = null;         // 32-byte PSK derived from URL key for MLS
+        this.mlsExpectedGroupId = null;    // 32-byte group_id from invite fragment
+        this.mlsExpectedCreatorKeyHash = null; // SHA-256(leaf-0 signature_key)
         this.algorithm = {
             name: 'AES-GCM',
             length: 256
@@ -431,12 +484,23 @@ class CryptoManager {
         const params = new URLSearchParams(fragment);
         let keyBase64 = params.get('key');
 
+        // Never retain pins from an earlier parse attempt if this fragment is
+        // absent or malformed during a reset/reconnect path.
+        this.mlsExpectedGroupId = null;
+        this.mlsExpectedCreatorKeyHash = null;
+
         if (!keyBase64) {
             debugError('No encryption key found in URL or sessionStorage');
             return null;
         }
 
         try {
+            const mlsPins = parseMlsBootstrapPins(params);
+            if (mlsPins) {
+                this.mlsExpectedGroupId = mlsPins.groupId;
+                this.mlsExpectedCreatorKeyHash = mlsPins.creatorKeyHash;
+            }
+
             // Convert Base64url to standard Base64 if needed
             // Detect Base64url format (contains '-' or '_' instead of '+' or '/')
             if (keyBase64.includes('-') || keyBase64.includes('_')) {
@@ -503,6 +567,73 @@ class CryptoManager {
             debugError('Failed to load encryption key:', error);
             return null;
         }
+    }
+
+    /**
+     * Attach the creator-generated MLS identity pins to the tab-scoped invite
+     * fragment. The URL bar stays scrubbed; copyLink() asks getInviteFragment()
+     * for the reconstructed, shareable form.
+     */
+    setMlsBootstrapPins(groupId, creatorKeyHash) {
+        // Encode first for strict type/length validation, then retain copies so
+        // callers cannot mutate the trusted values after installation.
+        encodeMlsBootstrapPin(groupId, 'MLS group_id pin');
+        encodeMlsBootstrapPin(creatorKeyHash, 'MLS creator-key pin');
+        this.mlsExpectedGroupId = Uint8Array.from(groupId);
+        this.mlsExpectedCreatorKeyHash = Uint8Array.from(creatorKeyHash);
+
+        const fragment = this.getInviteFragment({ requireMlsPins: true });
+        if (!fragment) {
+            throw new Error('Cannot attach MLS pins: bootstrap key fragment is unavailable');
+        }
+        const stashKey = `pinchat_hash:${window.location.pathname}`;
+        try {
+            sessionStorage.setItem(stashKey, fragment);
+        } catch (_) {
+            // If storage is disabled, extractKeyFromURL intentionally leaves
+            // the original fragment in the URL. getInviteFragment() can still
+            // reconstruct the pinned link from in-memory pins for this tab.
+        }
+        return fragment;
+    }
+
+    /**
+     * Reconstruct the complete invite fragment from the URL/stash and the
+     * validated in-memory MLS pins. Returns null rather than a bare group link
+     * when requireMlsPins is true and either pin is unavailable.
+     */
+    getInviteFragment({ requireMlsPins = false } = {}) {
+        const stashKey = `pinchat_hash:${window.location.pathname}`;
+        let fragment = window.location.hash
+            ? window.location.hash.substring(1)
+            : '';
+        if (!fragment) {
+            try {
+                const saved = sessionStorage.getItem(stashKey);
+                if (saved) fragment = saved.startsWith('#') ? saved.substring(1) : saved;
+            } catch (_) {
+                /* sessionStorage unavailable */
+            }
+        }
+        if (!fragment) return null;
+
+        const params = new URLSearchParams(fragment);
+        if (!params.get('key')) return null;
+        if (this.mlsExpectedGroupId && this.mlsExpectedCreatorKeyHash) {
+            params.set(
+                MLS_GROUP_ID_FRAGMENT_PARAM,
+                encodeMlsBootstrapPin(this.mlsExpectedGroupId, 'MLS group_id pin'),
+            );
+            params.set(
+                MLS_CREATOR_KEY_FRAGMENT_PARAM,
+                encodeMlsBootstrapPin(
+                    this.mlsExpectedCreatorKeyHash, 'MLS creator-key pin',
+                ),
+            );
+        } else if (requireMlsPins) {
+            return null;
+        }
+        return '#' + params.toString();
     }
 
     /**
@@ -868,6 +999,10 @@ if (typeof module !== 'undefined' && module.exports) {
         encodeAADWithLengthPrefix,
         base64ToBase64url,
         base64urlToBase64,
+        encodeMlsBootstrapPin,
+        parseMlsBootstrapPins,
+        MLS_GROUP_ID_FRAGMENT_PARAM,
+        MLS_CREATOR_KEY_FRAGMENT_PARAM,
     };
 } else {
     window.cryptoManager = new CryptoManager();

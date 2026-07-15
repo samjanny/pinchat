@@ -606,15 +606,39 @@ document.addEventListener('alpine:init', () => {
                 return;
             }
 
+            const expectedGroupId = window.cryptoManager
+                ? window.cryptoManager.mlsExpectedGroupId
+                : null;
+            const expectedCreatorKeyHash = window.cryptoManager
+                ? window.cryptoManager.mlsExpectedCreatorKeyHash
+                : null;
+            if (role === 'joiner' && (!expectedGroupId || !expectedCreatorKeyHash)) {
+                this.error = '⚠️ Group invite is missing its authenticated creator pins. '
+                    + 'Ask the creator to copy and resend the complete link.';
+                return;
+            }
+
             const self = this;
-            this.mlsSession = new window.MLSSession({
+            const session = new window.MLSSession({
                 role,
                 send: (envelope) => self.wsManager.send(envelope),
                 onEvent: (event) => self._handleMlsEvent(event),
                 pskSecret,
+                expectedGroupId,
+                expectedCreatorKeyHash,
             });
             try {
-                await this.mlsSession.start();
+                await session.start();
+                if (role === 'creator') {
+                    const pins = session.bootstrapPins;
+                    if (!pins) {
+                        throw new Error('creator failed to produce MLS bootstrap pins');
+                    }
+                    window.cryptoManager.setMlsBootstrapPins(
+                        pins.groupId, pins.creatorKeyHash,
+                    );
+                }
+                this.mlsSession = session;
                 debugLog('[MLS] Session started, role=', role);
             } catch (err) {
                 console.error('[MLS] Failed to start session:', err);
@@ -1007,9 +1031,24 @@ document.addEventListener('alpine:init', () => {
             // C-06: the bootstrap secret was moved from window.location.hash
             // to sessionStorage on page load. window.location.href therefore
             // no longer carries the #key=... fragment that recipients need.
-            // Reconstruct it from the stash.
+            // Reconstruct it from the stash. Group links additionally require
+            // the creator-generated group_id + creator-key pins; never copy a
+            // PSK-only group link because it permits alternative-group joins.
             let link = window.location.href;
-            if (!window.location.hash) {
+            if (window.cryptoManager
+                && typeof window.cryptoManager.getInviteFragment === 'function') {
+                const fragment = window.cryptoManager.getInviteFragment({
+                    requireMlsPins: this.roomType === 'group',
+                });
+                if (!fragment && this.roomType === 'group') {
+                    this.error = '⚠️ Secure group invite is not ready yet. Please wait.';
+                    return;
+                }
+                if (fragment) {
+                    link = window.location.origin + window.location.pathname
+                        + window.location.search + fragment;
+                }
+            } else if (!window.location.hash) {
                 try {
                     const stash = sessionStorage.getItem(`pinchat_hash:${window.location.pathname}`);
                     if (stash) {

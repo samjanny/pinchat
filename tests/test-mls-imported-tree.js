@@ -47,6 +47,15 @@ async function freshIdentity() {
     };
 }
 
+async function bootstrapPins(group) {
+    return {
+        expectedGroupId: Uint8Array.from(group.groupId),
+        expectedCreatorKeyHash: await Labeled.sha256(
+            group.ratchetTree[0].leaf.signatureKey,
+        ),
+    };
+}
+
 async function buildKeyPackage() {
     const identity = await freshIdentity();
     const initKp = await HPKE.generateKeyPair();
@@ -96,7 +105,10 @@ async function replaceKeyPackageLeafEncryptionKey(bundle, encryptionKey) {
     bundle.keyPackageBytes = KeyPackage.keyPackageBytes(bundle.keyPackage);
 }
 
-function joinFrom(committer, result, joiner, expectedSignerLeafIndex = committer.myLeafIndex) {
+async function joinFrom(
+    committer, result, joiner,
+    expectedSignerLeafIndex = committer.myLeafIndex,
+) {
     return Group.Group.joinFromWelcomeWithTree({
         welcomeMessage: result.welcomeMessage,
         keyPackageBytes: joiner.keyPackageBytes,
@@ -105,6 +117,7 @@ function joinFrom(committer, result, joiner, expectedSignerLeafIndex = committer
         leafEncKeyPair: joiner.leafEncKp,
         ratchetTreeBytes: Nodes.ratchetTreeBytes(committer.ratchetTree),
         expectedSignerLeafIndex,
+        ...await bootstrapPins(committer),
     });
 }
 
@@ -127,7 +140,7 @@ async function main() {
         const alice = await Group.Group.create({ identity: await freshIdentity() });
         const bob = await buildKeyPackage();
         const result = await alice.commitAddMember({ keyPackageBytes: bob.keyPackageBytes });
-        const args = {
+        const baseArgs = {
             welcomeMessage: result.welcomeMessage,
             keyPackageBytes: bob.keyPackageBytes,
             initPrivateKey: bob.initKp.privateKey,
@@ -135,6 +148,7 @@ async function main() {
             leafEncKeyPair: bob.leafEncKp,
             ratchetTreeBytes: Nodes.ratchetTreeBytes(alice.ratchetTree),
         };
+        const args = { ...baseArgs, ...await bootstrapPins(alice) };
         await expectReject(
             Group.Group.joinFromWelcomeWithTree(args),
             'missing Commit sender',
@@ -144,6 +158,54 @@ async function main() {
             ...args, expectedSignerLeafIndex: 0,
         });
         assert(joined.epoch === 1n, 'same Welcome joins when Commit sender is bound');
+
+        await expectReject(
+            Group.Group.joinFromWelcomeWithTree({
+                ...baseArgs, expectedSignerLeafIndex: 0,
+            }),
+            'group_id bootstrap pin',
+            'Welcome without invite identity pins is rejected fail-closed',
+        );
+
+        const wrongGroupId = Uint8Array.from(alice.groupId);
+        wrongGroupId[0] ^= 0x01;
+        await expectReject(
+            Group.Group.joinFromWelcomeWithTree({
+                ...baseArgs,
+                expectedSignerLeafIndex: 0,
+                expectedGroupId: wrongGroupId,
+                expectedCreatorKeyHash: (await bootstrapPins(alice))
+                    .expectedCreatorKeyHash,
+            }),
+            'group_id does not match invite bootstrap pin',
+            'Welcome for a different group_id is rejected by invite pin',
+        );
+
+        // Even if an alternative leaf-0 group deliberately reuses the pinned
+        // group_id and the same PSK, it cannot reproduce the creator's signing
+        // key fingerprint from the invite.
+        const imposter = await Group.Group.create({
+            identity: await freshIdentity(),
+            groupId: Uint8Array.from(alice.groupId),
+        });
+        const target = await buildKeyPackage();
+        const imposterWelcome = await imposter.commitAddMember({
+            keyPackageBytes: target.keyPackageBytes,
+        });
+        await expectReject(
+            Group.Group.joinFromWelcomeWithTree({
+                welcomeMessage: imposterWelcome.welcomeMessage,
+                keyPackageBytes: target.keyPackageBytes,
+                initPrivateKey: target.initKp.privateKey,
+                identity: target.identity,
+                leafEncKeyPair: target.leafEncKp,
+                ratchetTreeBytes: Nodes.ratchetTreeBytes(imposter.ratchetTree),
+                expectedSignerLeafIndex: 0,
+                ...await bootstrapPins(alice),
+            }),
+            'creator signature_key does not match invite bootstrap pin',
+            'same-group-id alternative creator is rejected by key pin',
+        );
     }
 
     // ---- G-1(a): every non-blank leaf signature is checked --------------

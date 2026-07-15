@@ -100,6 +100,7 @@
     const PROTOCOL_VERSION = 0x0001;
     const CIPHERSUITE = 0x0002;
     const CREATOR_LEAF_INDEX = 0;
+    const BOOTSTRAP_PIN_BYTES = 32;
 
     function getCrypto() {
         if (typeof globalThis !== 'undefined' && globalThis.crypto) return globalThis.crypto;
@@ -2006,15 +2007,30 @@
      *   ratchetTreeBytes  : serialised tree (out-of-band from Welcome)
      *   expectedSignerLeafIndex : member sender_leaf_index parsed from the
      *                       Commit paired with this Welcome (required)
+     *   expectedGroupId   : 32-byte group_id pinned in the invite fragment
+     *   expectedCreatorKeyHash : SHA-256(signature_key of leaf 0), also
+     *                       pinned in the invite fragment
      */
     Group.joinFromWelcomeWithTree = async function joinFromWelcomeWithTree({
         welcomeMessage, keyPackageBytes, initPrivateKey, identity,
         leafEncKeyPair, ratchetTreeBytes, pskSecret,
-        expectedSignerLeafIndex,
+        expectedSignerLeafIndex, expectedGroupId, expectedCreatorKeyHash,
     }) {
         const psk = pskSecret || new Uint8Array(HPKE.Nh);
         if (psk.length !== HPKE.Nh) {
             throw new Error(`group.join: pskSecret must be ${HPKE.Nh} bytes (got ${psk.length})`);
+        }
+        if (!(expectedGroupId instanceof Uint8Array)
+            || expectedGroupId.length !== BOOTSTRAP_PIN_BYTES) {
+            throw new Error(
+                'group.join: missing or invalid 32-byte group_id bootstrap pin',
+            );
+        }
+        if (!(expectedCreatorKeyHash instanceof Uint8Array)
+            || expectedCreatorKeyHash.length !== BOOTSTRAP_PIN_BYTES) {
+            throw new Error(
+                'group.join: missing or invalid 32-byte creator-key bootstrap pin',
+            );
         }
 
         const frame = MLSMessage.parseMLSMessage(welcomeMessage);
@@ -2040,6 +2056,9 @@
         const { key: wKey, nonce: wNonce } = await Welcome.welcomeKeyNonce(welcomeSecret);
         const giBytes = await Welcome.openEncryptedGroupInfo(wKey, wNonce, welcome.encryptedGroupInfo);
         const groupInfo = GroupInfo.parseGroupInfo(giBytes);
+        if (!equalBytes(groupInfo.groupContext.groupId, expectedGroupId)) {
+            throw new Error('group.join: group_id does not match invite bootstrap pin');
+        }
 
         // Parse the ratchet tree. The committer always serialises with
         // node_width(nLeaves) entries (no trailing-blank truncation), so
@@ -2090,6 +2109,12 @@
         }
         const signerLeaf = RatchetTree.leafFor(tree, signerLeafIndex);
         if (!signerLeaf) throw new Error('group.join: signer leaf not present');
+        const creatorKeyHash = await Labeled.sha256(signerLeaf.signatureKey);
+        if (!equalBytes(creatorKeyHash, expectedCreatorKeyHash)) {
+            throw new Error(
+                'group.join: creator signature_key does not match invite bootstrap pin',
+            );
+        }
         const signerSigPub = await Signature.importPublicKey(signerLeaf.signatureKey);
         const sigOk = await Labeled.verifyWithLabel(
             signerSigPub, 'GroupInfoTBS',

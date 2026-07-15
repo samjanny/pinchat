@@ -54,6 +54,17 @@
     const PAYLOAD_TEXT = 0x01;
     const PAYLOAD_IMAGE = 0x02;
     const CREATOR_LEAF_INDEX = 0;
+    const BOOTSTRAP_PIN_BYTES = 32;
+
+    function copyBootstrapPin(value, name) {
+        if (value === null || value === undefined) return null;
+        if (!(value instanceof Uint8Array) || value.length !== BOOTSTRAP_PIN_BYTES) {
+            throw new Error(
+                `mls-session: ${name} must be ${BOOTSTRAP_PIN_BYTES} bytes`,
+            );
+        }
+        return Uint8Array.from(value);
+    }
 
     function encodeTextPayload(text) {
         const utf8 = new TextEncoder().encode(String(text));
@@ -148,8 +159,13 @@
          * @param {'creator' | 'joiner'} opts.role
          * @param {(envelope: object) => void} opts.send
          * @param {(event: object) => void} opts.onEvent
+         * @param {Uint8Array} opts.expectedGroupId
+         * @param {Uint8Array} opts.expectedCreatorKeyHash
          */
-        constructor({ role, send, onEvent, pskSecret }) {
+        constructor({
+            role, send, onEvent, pskSecret,
+            expectedGroupId, expectedCreatorKeyHash,
+        }) {
             if (role !== 'creator' && role !== 'joiner') {
                 throw new Error(`mls-session: invalid role "${role}"`);
             }
@@ -166,6 +182,17 @@
             // key can neither construct nor consume valid Welcomes/Commits
             // even if they reach the relay first.
             this.pskSecret = pskSecret || null;
+            // End-to-end bootstrap pins carried in the URL fragment. The PSK
+            // proves possession of the invite secret; these pins additionally
+            // identify the exact group and its permanent creator at leaf 0.
+            // Creators populate them after Group.create; joiners must receive
+            // both before publishing a KeyPackage.
+            this.expectedGroupId = copyBootstrapPin(
+                expectedGroupId, 'expectedGroupId',
+            );
+            this.expectedCreatorKeyHash = copyBootstrapPin(
+                expectedCreatorKeyHash, 'expectedCreatorKeyHash',
+            );
             // Buffered Commit envelope while we're in 'awaiting-welcome'.
             // The committer broadcasts Commit + Welcome atomically; we
             // ignore the Commit while we don't yet have a group state,
@@ -217,8 +244,18 @@
                     identity: id,
                     pskSecret: this.pskSecret,
                 });
+                this.expectedGroupId = Uint8Array.from(this.group.groupId);
+                this.expectedCreatorKeyHash = await MLS.Labeled.sha256(
+                    id.signaturePublicKeyBytes,
+                );
                 this._state = 'awaiting-keypackage';
             } else {
+                if (!this.expectedGroupId || !this.expectedCreatorKeyHash) {
+                    throw new Error(
+                        'mls-session: group invite is missing authenticated '
+                        + 'group_id / creator-key pins',
+                    );
+                }
                 const bundle = await buildKeyPackage();
                 this.identity = bundle.identity;
                 this.keyPackageBundle = bundle;
@@ -418,6 +455,8 @@
                 ratchetTreeBytes,
                 pskSecret: this.pskSecret,
                 expectedSignerLeafIndex,
+                expectedGroupId: this.expectedGroupId,
+                expectedCreatorKeyHash: this.expectedCreatorKeyHash,
             });
             this._state = 'joined';
             this.onEvent({ kind: 'joined' });
@@ -738,6 +777,14 @@
         }
 
         get state() { return this._state; }
+
+        get bootstrapPins() {
+            if (!this.expectedGroupId || !this.expectedCreatorKeyHash) return null;
+            return {
+                groupId: Uint8Array.from(this.expectedGroupId),
+                creatorKeyHash: Uint8Array.from(this.expectedCreatorKeyHash),
+            };
+        }
     }
 
     // MLSMessage bytes wrap = version(u16) || wire_format(u16) || body.
