@@ -170,6 +170,13 @@ async function main() {
         );
         assert(member._chainStates.size === 4,
             `leaf ${member.myLeafIndex} retains only two chains per live leaf`);
+        assert(member.identity.signaturePrivateKey.extractable === false
+            && member.leafKeyPair.privateKey.extractable === false,
+        `leaf ${member.myLeafIndex} stores only non-extractable member private keys`);
+        assert([...member.parentKeyPairs.values()].every((keyPair) =>
+            keyPair.privateKey.extractable === false
+            && !Object.prototype.hasOwnProperty.call(keyPair, 'scalar')),
+        `leaf ${member.myLeafIndex} stores no extractable/raw TreeKEM private keys`);
     }
 
     // 5. Exchange application messages at epoch 1.

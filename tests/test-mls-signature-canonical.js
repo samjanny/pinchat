@@ -194,6 +194,20 @@ function parseCommitMessage(commitMessage) {
 async function main() {
     console.log('# MLS canonical low-S signature enforcement');
 
+    const lifecycleKeyPair = await Signature.generateKeyPair();
+    assert(lifecycleKeyPair.privateKey.extractable === false,
+        'generated signature private key is non-extractable');
+    assert(lifecycleKeyPair.publicKey.extractable === true,
+        'generated signature public key remains exportable');
+    let privateExportRejected = false;
+    try {
+        await webcrypto.subtle.exportKey('jwk', lifecycleKeyPair.privateKey);
+    } catch (_err) {
+        privateExportRejected = true;
+    }
+    assert(privateExportRejected,
+        'WebCrypto rejects export of generated signature private key');
+
     const alice = await Group.Group.create({ identity: await freshIdentity() });
     const bob = await addAndJoin(alice, await buildKeyPackage());
     const { commitMessage } = await alice.commitUpdate();

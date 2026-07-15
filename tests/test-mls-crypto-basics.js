@@ -161,6 +161,8 @@ async function main() {
 
         // Round-trip with the vector's private scalar.
         const priv = await Signature.importPrivateKey(privBytes, pubBytes);
+        assert(priv.extractable === false,
+            'imported signature private key is non-extractable');
         const mySig = await Labeled.signWithLabel(priv, label, content);
         const verifiedMine = await Labeled.verifyWithLabel(pub, label, content, mySig);
         assert(verifiedMine === true,
@@ -247,6 +249,8 @@ async function main() {
         const label = v.encrypt_with_label.label;
 
         const priv = await HPKE.importPrivateKey(privBytes, pubBytes);
+        assert(priv.extractable === false,
+            'imported HPKE private key is non-extractable');
         const recovered = await Labeled.decryptWithLabel(
             priv, pubBytes, label, context, kemOutput, ciphertext);
         assert(hex(recovered) === hex(plaintext),

@@ -1156,6 +1156,14 @@
             }
             this.group = joinedGroup;
             this._state = 'joined';
+            // The KeyPackage init key is a one-shot Welcome decryption key.
+            // The joined Group now owns the long-lived identity and leaf
+            // key handles, so release the bootstrap bundle and its lookup
+            // reference immediately after the authenticated join succeeds.
+            this.keyPackageBundle = null;
+            wipeBytes(this._keyPackageRefBytes);
+            this._keyPackageRefBytes = null;
+            this._keyPackageRef = null;
             // Correlating the route is useful for diagnostics, but the relay
             // controls this value. It is never included in roster identities.
             this._senderIdByLeaf.set(CREATOR_LEAF_INDEX, candidate.senderId);

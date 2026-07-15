@@ -551,6 +551,8 @@ async function main() {
     'Welcome with a non-successor epoch is rejected without consuming candidate');
     correlatedCandidate.epoch = correlatedEpoch;
 
+    const consumedBootstrapBundle = exchange.joiner.keyPackageBundle;
+    const consumedKeyPackageRefBytes = exchange.joiner._keyPackageRefBytes;
     await exchange.joiner.onRelayEnvelope({
         ...exchange.welcome,
         sender_id: 'creator-1',
@@ -559,6 +561,15 @@ async function main() {
     assert(exchange.joiner.state === 'joined', 'joiner reaches joined state');
     assert(exchange.joiner._pendingWelcomeCommits.size === 0,
         'successful join clears obsolete Welcome correlation state');
+    assert(exchange.joiner.keyPackageBundle === null
+        && exchange.joiner._keyPackageRefBytes === null
+        && exchange.joiner._keyPackageRef === null
+        && consumedKeyPackageRefBytes.every((byte) => byte === 0),
+    'successful join releases one-shot init-key bundle and wipes lookup reference');
+    assert(consumedBootstrapBundle.initKeyPair.privateKey.extractable === false
+        && exchange.joiner.group.identity.signaturePrivateKey.extractable === false
+        && exchange.joiner.group.leafKeyPair.privateKey.extractable === false,
+    'joined state retains only required non-extractable member key handles');
     assert(exchange.joiner.group.epoch === exchange.creator.group.epoch,
         'creator and joiner are in the same epoch');
     assert(equalBytes(

@@ -75,8 +75,12 @@ async function main() {
         const ikm = new TextEncoder().encode('pinchat-mls-treekem-derivekp');
         const a = await HPKE.deriveKeyPair(ikm);
         const b = await HPKE.deriveKeyPair(ikm);
-        assert(hex(a.scalar) === hex(b.scalar), 'deriveKeyPair deterministic');
         assert(hex(a.publicKeyBytes) === hex(b.publicKeyBytes), 'deriveKeyPair pub deterministic');
+        assert(!Object.prototype.hasOwnProperty.call(a, 'scalar')
+            && !Object.prototype.hasOwnProperty.call(b, 'scalar'),
+        'deriveKeyPair does not retain a raw private scalar');
+        assert(a.privateKey.extractable === false && b.privateKey.extractable === false,
+            'deriveKeyPair returns non-extractable private keys');
 
         const { sharedSecret: ss1, enc } = await HPKE.encap(a.publicKeyBytes);
         const ss2 = await HPKE.decap(enc, a.privateKey, a.publicKeyBytes);

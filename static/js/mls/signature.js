@@ -50,7 +50,7 @@
 
     async function generateKeyPair() {
         const kp = await getSubtle().generateKey(
-            { name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify']
+            { name: 'ECDSA', namedCurve: 'P-256' }, false, ['sign', 'verify']
         );
         const rawPub = new Uint8Array(await getSubtle().exportKey('raw', kp.publicKey));
         return { privateKey: kp.privateKey, publicKey: kp.publicKey, publicKeyBytes: rawPub };
@@ -88,11 +88,17 @@
             d: Codec.bytesToBase64Url(rawScalarBytes),
             x: Codec.bytesToBase64Url(x),
             y: Codec.bytesToBase64Url(y),
-            ext: true,
+            ext: false,
         };
-        return getSubtle().importKey(
-            'jwk', jwk, { name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign']
-        );
+        try {
+            return await getSubtle().importKey(
+                'jwk', jwk, { name: 'ECDSA', namedCurve: 'P-256' }, false, ['sign']
+            );
+        } finally {
+            // Strings cannot be zeroized, but do not keep the base64url
+            // representation reachable beyond the WebCrypto import.
+            jwk.d = '';
+        }
     }
 
     // --- DER <-> raw r||s conversion ---------------------------------------

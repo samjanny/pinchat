@@ -21,6 +21,7 @@
  */
 
 const path = require('path');
+const { webcrypto } = require('crypto');
 const HPKE = require(path.join(__dirname, '..', 'static', 'js', 'mls', 'hpke.js'));
 
 let passed = 0;
@@ -78,7 +79,32 @@ async function main() {
     }
 
     // ---------------------------------------------------------------------
-    // 2. DHKEM Encap/Decap symmetry
+    // 2. WebCrypto key lifecycle
+    // ---------------------------------------------------------------------
+    console.log('# WebCrypto HPKE key lifecycle');
+    {
+        const keyPair = await HPKE.generateKeyPair();
+        assert(keyPair.privateKey.extractable === false,
+            'generated HPKE private key is non-extractable');
+        assert(keyPair.publicKey.extractable === true,
+            'generated HPKE public key remains exportable');
+        const exportedPublic = new Uint8Array(
+            await webcrypto.subtle.exportKey('raw', keyPair.publicKey),
+        );
+        eqBytes(exportedPublic, keyPair.publicKeyBytes,
+            'generated HPKE public key still serializes');
+        let privateExportRejected = false;
+        try {
+            await webcrypto.subtle.exportKey('jwk', keyPair.privateKey);
+        } catch (_err) {
+            privateExportRejected = true;
+        }
+        assert(privateExportRejected,
+            'WebCrypto rejects export of generated HPKE private key');
+    }
+
+    // ---------------------------------------------------------------------
+    // 3. DHKEM Encap/Decap symmetry
     // ---------------------------------------------------------------------
     console.log('# DHKEM(P-256) Encap/Decap');
     {
@@ -90,7 +116,7 @@ async function main() {
     }
 
     // ---------------------------------------------------------------------
-    // 3. HPKE Seal/Open single-shot round-trip
+    // 4. HPKE Seal/Open single-shot round-trip
     // ---------------------------------------------------------------------
     console.log('# HPKE Seal / Open');
     {
