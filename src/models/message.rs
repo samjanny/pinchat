@@ -124,6 +124,14 @@ pub enum Message {
         /// Optional ratchet-tree side-channel for `mls_welcome` only.
         #[serde(skip_serializing_if = "Option::is_none", default)]
         ratchet_tree: Option<String>,
+        /// Standard MLS KeyPackageRef identifying the Add/Welcome recipient.
+        /// Present on Add Commits and their corresponding Welcome only.
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        key_package_ref: Option<String>,
+        /// PinChat transport correlation digest: base64url SHA-256 over the
+        /// exact mls_public_message body paired with this envelope.
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        commit_ref: Option<String>,
         /// Connection ID of the sender (same framing as ecdh_public_key).
         sender_id: Uuid,
     },
@@ -146,6 +154,12 @@ pub struct IncomingMessage {
     /// MLS ratchet-tree side-channel for `mls` welcome envelopes only.
     #[serde(default)]
     pub ratchet_tree: Option<String>,
+    /// Optional Add/Welcome recipient KeyPackageRef correlation metadata.
+    #[serde(default)]
+    pub key_package_ref: Option<String>,
+    /// Optional SHA-256 Commit correlation metadata.
+    #[serde(default)]
+    pub commit_ref: Option<String>,
 }
 
 #[cfg(test)]
@@ -183,5 +197,36 @@ mod tests {
         assert_eq!(parsed.v, 1);
         assert_eq!(parsed.dh, "AA");
         assert_eq!(parsed.sig, "BB");
+    }
+
+    #[test]
+    fn mls_correlation_metadata_roundtrips() {
+        let reference = "A".repeat(43);
+        let incoming: IncomingMessage = serde_json::from_value(serde_json::json!({
+            "type": "mls",
+            "payload": "AA",
+            "wire_format": 3,
+            "ratchet_tree": "AA",
+            "key_package_ref": reference,
+            "commit_ref": reference,
+        }))
+        .unwrap();
+        assert_eq!(
+            incoming.key_package_ref.as_deref(),
+            Some(reference.as_str())
+        );
+        assert_eq!(incoming.commit_ref.as_deref(), Some(reference.as_str()));
+
+        let outgoing = Message::Mls {
+            payload: "AA".to_string(),
+            wire_format: 3,
+            ratchet_tree: Some("AA".to_string()),
+            key_package_ref: Some(reference.clone()),
+            commit_ref: Some(reference.clone()),
+            sender_id: Uuid::nil(),
+        };
+        let encoded = serde_json::to_value(outgoing).unwrap();
+        assert_eq!(encoded["key_package_ref"], reference);
+        assert_eq!(encoded["commit_ref"], reference);
     }
 }

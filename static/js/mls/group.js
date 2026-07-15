@@ -2582,6 +2582,9 @@
      *   ratchetTreeBytes  : serialised tree (out-of-band from Welcome)
      *   expectedSignerLeafIndex : member sender_leaf_index parsed from the
      *                       Commit paired with this Welcome (required)
+     *   expectedCommitEpoch : epoch carried by that correlated Commit;
+     *                       when supplied, GroupInfo must describe exactly
+     *                       the following epoch
      *   expectedGroupId   : 32-byte group_id pinned in the invite fragment
      *   expectedCreatorKeyHash : SHA-256(signature_key of leaf 0), also
      *                       pinned in the invite fragment
@@ -2589,7 +2592,8 @@
     Group.joinFromWelcomeWithTree = async function joinFromWelcomeWithTree({
         welcomeMessage, keyPackageBytes, initPrivateKey, identity,
         leafEncKeyPair, ratchetTreeBytes, pskSecret,
-        expectedSignerLeafIndex, expectedGroupId, expectedCreatorKeyHash,
+        expectedSignerLeafIndex, expectedCommitEpoch,
+        expectedGroupId, expectedCreatorKeyHash,
     }) {
         // The joined Group owns and eventually erases this copy.
         const psk = pskSecret
@@ -2645,6 +2649,16 @@
         const groupInfo = GroupInfo.parseGroupInfo(giBytes);
         if (!equalBytes(groupInfo.groupContext.groupId, expectedGroupId)) {
             throw new Error('group.join: group_id does not match invite bootstrap pin');
+        }
+        if (expectedCommitEpoch !== undefined && expectedCommitEpoch !== null) {
+            if (typeof expectedCommitEpoch !== 'bigint') {
+                throw new Error('group.join: expectedCommitEpoch must be a uint64 BigInt');
+            }
+            if (groupInfo.groupContext.epoch !== expectedCommitEpoch + 1n) {
+                throw new Error(
+                    'group.join: Welcome epoch does not immediately follow correlated Commit epoch',
+                );
+            }
         }
 
         // Parse the ratchet tree. The committer always serialises with

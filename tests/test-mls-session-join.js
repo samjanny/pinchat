@@ -279,6 +279,13 @@ async function main() {
         (envelope) => envelope.wire_format === WireFormat.MLS_WELCOME,
     );
     assert(Boolean(exchange.welcome), 'creator emitted a Welcome');
+    assert(typeof exchange.commit.key_package_ref === 'string'
+        && exchange.commit.key_package_ref === exchange.welcome.key_package_ref
+        && exchange.commit.key_package_ref === exchange.joiner._keyPackageRef,
+    'Add Commit and Welcome carry the joiner KeyPackageRef');
+    assert(typeof exchange.commit.commit_ref === 'string'
+        && exchange.commit.commit_ref === exchange.welcome.commit_ref,
+    'Add Commit and Welcome carry the same payload-derived commit_ref');
     assert(exchange.creator._pendingCommit === null,
         'Commit echo atomically clears PendingCommit');
     assert(exchange.creator.group.epoch === exchange.beforeAdd.epoch + 1n,
@@ -359,16 +366,92 @@ async function main() {
     assert(!removalRace.creator._leafBySenderId.has('joiner-1'),
         'deferred Remove applies after its own relay echo');
 
+    const unrelatedRef = global.MLS.Codec.bytesToBase64Url(
+        new Uint8Array(32).fill(0x5a),
+    );
+    await exchange.joiner.onRelayEnvelope({
+        ...exchange.commit,
+        key_package_ref: unrelatedRef,
+        sender_id: 'creator-1',
+    });
+    assert(exchange.joiner._pendingWelcomeCommits.size === 0,
+        'Add Commit for another KeyPackage does not occupy the join buffer');
+
+    let badCommitRefError = '';
+    try {
+        await exchange.joiner.onRelayEnvelope({
+            ...exchange.commit,
+            commit_ref: unrelatedRef,
+            sender_id: 'creator-1',
+        });
+    } catch (err) {
+        badCommitRefError = err.message;
+    }
+    assert(badCommitRefError.includes('does not match PublicMessage payload')
+        && exchange.joiner._pendingWelcomeCommits.size === 0,
+    'mismatched commit_ref is rejected before buffering');
+
     await exchange.joiner.onRelayEnvelope({
         ...exchange.commit,
         sender_id: 'creator-1',
     });
+    assert(exchange.joiner._pendingWelcomeCommits.size === 1,
+        'matching Add Commit is buffered by commit_ref');
+    await exchange.joiner.onRelayEnvelope({
+        ...exchange.welcome,
+        key_package_ref: unrelatedRef,
+        sender_id: 'creator-1',
+    });
+    assert(exchange.joiner.state === 'awaiting-welcome'
+        && exchange.joiner._pendingWelcomeCommits.size === 1,
+    'unrelated Welcome neither joins nor consumes matching Commit');
+
+    let wrongWelcomeRefError = '';
+    try {
+        await exchange.joiner.onRelayEnvelope({
+            ...exchange.welcome,
+            commit_ref: unrelatedRef,
+            sender_id: 'creator-1',
+        });
+    } catch (err) {
+        wrongWelcomeRefError = err.message;
+    }
+    assert(wrongWelcomeRefError.includes('without its matching buffered Commit')
+        && exchange.joiner._pendingWelcomeCommits.size === 1,
+    'Welcome with wrong commit_ref is rejected without consuming candidate');
+
+    // The GroupInfo epoch must be the direct successor of the exact buffered
+    // Commit epoch. Exercise the fail-closed join boundary and then restore
+    // the test fixture to prove that a rejected attempt did not consume it.
+    const correlatedCandidate = exchange.joiner._pendingWelcomeCommits
+        .get(exchange.commit.commit_ref);
+    const correlatedEpoch = correlatedCandidate.epoch;
+    correlatedCandidate.epoch += 1n;
+    let skippedEpochError = '';
+    try {
+        await exchange.joiner.onRelayEnvelope({
+            ...exchange.welcome,
+            sender_id: 'creator-1',
+        });
+    } catch (err) {
+        skippedEpochError = err.message;
+    }
+    assert(skippedEpochError.includes(
+        'Welcome epoch does not immediately follow correlated Commit epoch',
+    ) && exchange.joiner.state === 'awaiting-welcome'
+        && exchange.joiner.group === null
+        && exchange.joiner._pendingWelcomeCommits.size === 1,
+    'Welcome with a non-successor epoch is rejected without consuming candidate');
+    correlatedCandidate.epoch = correlatedEpoch;
+
     await exchange.joiner.onRelayEnvelope({
         ...exchange.welcome,
         sender_id: 'creator-1',
     });
 
     assert(exchange.joiner.state === 'joined', 'joiner reaches joined state');
+    assert(exchange.joiner._pendingWelcomeCommits.size === 0,
+        'successful join clears obsolete Welcome correlation state');
     assert(exchange.joiner.group.epoch === exchange.creator.group.epoch,
         'creator and joiner are in the same epoch');
     assert(equalBytes(
@@ -672,6 +755,110 @@ async function main() {
     assert(queuedExchange.creator._pendingUpdateProposals.size === 0,
         'stale authenticated Update is removed from the queue');
 
+    // Two joiners may publish KeyPackages before the first Add is accepted.
+    // The creator serializes the Commits, while each awaiting joiner must
+    // retain only the Commit/Welcome pair addressed to its own KeyPackageRef.
+    const multiCreatorOut = [];
+    const multiCreator = new MLSSession({
+        role: 'creator',
+        send: (envelope) => multiCreatorOut.push(envelope),
+        onEvent: () => {},
+    });
+    await multiCreator.start();
+    const multiPins = multiCreator.bootstrapPins;
+    const multiAOut = [];
+    const multiBOut = [];
+    const multiA = new MLSSession({
+        role: 'joiner',
+        send: (envelope) => multiAOut.push(envelope),
+        onEvent: () => {},
+        expectedGroupId: multiPins.groupId,
+        expectedCreatorKeyHash: multiPins.creatorKeyHash,
+    });
+    const multiB = new MLSSession({
+        role: 'joiner',
+        send: (envelope) => multiBOut.push(envelope),
+        onEvent: () => {},
+        expectedGroupId: multiPins.groupId,
+        expectedCreatorKeyHash: multiPins.creatorKeyHash,
+    });
+    await multiA.start();
+    await multiB.start();
+    const multiAKp = multiAOut.find(
+        (envelope) => envelope.wire_format === WireFormat.MLS_KEY_PACKAGE,
+    );
+    const multiBKp = multiBOut.find(
+        (envelope) => envelope.wire_format === WireFormat.MLS_KEY_PACKAGE,
+    );
+    await multiCreator.onRelayEnvelope({ ...multiAKp, sender_id: 'multi-a' });
+    await multiCreator.onRelayEnvelope({ ...multiBKp, sender_id: 'multi-b' });
+    const multiCommitA = multiCreatorOut.find(
+        (envelope) => envelope.wire_format === WireFormat.MLS_PUBLIC_MESSAGE,
+    );
+    await multiA.onRelayEnvelope({ ...multiCommitA, sender_id: 'multi-creator' });
+    await multiB.onRelayEnvelope({ ...multiCommitA, sender_id: 'multi-creator' });
+    assert(multiA._pendingWelcomeCommits.size === 1
+        && multiB._pendingWelcomeCommits.size === 0,
+    'first simultaneous Add is buffered only by its intended joiner');
+
+    await echoPendingCommit(multiCreator, multiCommitA, 'multi-creator');
+    const multiWelcomeA = multiCreatorOut.find(
+        (envelope) => envelope.wire_format === WireFormat.MLS_WELCOME,
+    );
+    const multiCommits = multiCreatorOut.filter(
+        (envelope) => envelope.wire_format === WireFormat.MLS_PUBLIC_MESSAGE,
+    );
+    const multiCommitB = multiCommits[1];
+    assert(Boolean(multiWelcomeA) && Boolean(multiCommitB),
+        'creator serializes second simultaneous Add after first acceptance');
+    await multiA.onRelayEnvelope({ ...multiWelcomeA, sender_id: 'multi-creator' });
+    await multiB.onRelayEnvelope({ ...multiWelcomeA, sender_id: 'multi-creator' });
+    assert(multiA.state === 'joined' && multiB.state === 'awaiting-welcome',
+        'first Welcome joins only its KeyPackage owner');
+
+    await multiA.onRelayEnvelope({ ...multiCommitB, sender_id: 'multi-creator' });
+    await multiB.onRelayEnvelope({ ...multiCommitB, sender_id: 'multi-creator' });
+    assert(multiB._pendingWelcomeCommits.size === 1,
+        'second joiner buffers its own correlated Add after ignoring first');
+
+    // Transport metadata is only a routing hint. Even if it is rewritten to
+    // target B and name B's buffered Commit, the actual Welcome must contain
+    // B's standard MLS KeyPackageRef before any join secrets are processed.
+    let crossTargetWelcomeError = '';
+    try {
+        await multiB.onRelayEnvelope({
+            ...multiWelcomeA,
+            key_package_ref: multiB._keyPackageRef,
+            commit_ref: multiCommitB.commit_ref,
+            sender_id: 'multi-creator',
+        });
+    } catch (err) {
+        crossTargetWelcomeError = err.message;
+    }
+    assert(crossTargetWelcomeError.includes(
+        'targeted Welcome does not contain our KeyPackageRef',
+    ) && multiB.state === 'awaiting-welcome'
+        && multiB._pendingWelcomeCommits.size === 1,
+    'rewritten Welcome metadata cannot retarget another joiner or consume state');
+
+    await echoPendingCommit(multiCreator, multiCommitB, 'multi-creator');
+    const multiWelcomes = multiCreatorOut.filter(
+        (envelope) => envelope.wire_format === WireFormat.MLS_WELCOME,
+    );
+    const multiWelcomeB = multiWelcomes[1];
+    await multiB.onRelayEnvelope({ ...multiWelcomeB, sender_id: 'multi-creator' });
+    assert(multiA.state === 'joined' && multiB.state === 'joined'
+        && multiCreator.group.epoch === multiA.group.epoch
+        && multiA.group.epoch === multiB.group.epoch,
+    'both simultaneous joiners converge after independently correlated Welcomes');
+    assert(equalBytes(
+        multiCreator.group.epochSecrets.epochAuthenticator,
+        multiA.group.epochSecrets.epochAuthenticator,
+    ) && equalBytes(
+        multiA.group.epochSecrets.epochAuthenticator,
+        multiB.group.epochSecrets.epochAuthenticator,
+    ), 'three-member simultaneous-join flow converges cryptographically');
+
     const noCommitExchange = await createExchange();
     let noCommitError = '';
     try {
@@ -683,7 +870,7 @@ async function main() {
         noCommitError = err.message;
     }
     assert(
-        noCommitError.includes('without a buffered Commit'),
+        noCommitError.includes('without its matching buffered Commit'),
         'Welcome without buffered Commit is rejected fail-closed',
         noCommitError,
     );
@@ -720,25 +907,15 @@ async function main() {
     const unauthorizedCommitBody = global.MLS.MLSMessage.parseMLSMessage(
         unauthorized.commitMessage,
     ).body;
-    const unauthorizedWelcomeBody = global.MLS.MLSMessage.parseMLSMessage(
-        unauthorized.welcomeMessage,
-    ).body;
-    await target.onRelayEnvelope({
-        type: 'mls',
-        payload: global.MLS.Codec.bytesToBase64Url(unauthorizedCommitBody),
-        wire_format: WireFormat.MLS_PUBLIC_MESSAGE,
-        sender_id: 'non-creator-1',
-    });
     let nonCreatorError = '';
     try {
         await target.onRelayEnvelope({
             type: 'mls',
-            payload: global.MLS.Codec.bytesToBase64Url(unauthorizedWelcomeBody),
-            wire_format: WireFormat.MLS_WELCOME,
-            ratchet_tree: global.MLS.Codec.bytesToBase64Url(
-                global.MLS.Nodes.ratchetTreeBytes(
-                    unauthorizedExchange.joiner.group.ratchetTree,
-                ),
+            payload: global.MLS.Codec.bytesToBase64Url(unauthorizedCommitBody),
+            wire_format: WireFormat.MLS_PUBLIC_MESSAGE,
+            key_package_ref: target._keyPackageRef,
+            commit_ref: global.MLS.Codec.bytesToBase64Url(
+                await global.MLS.Labeled.sha256(unauthorizedCommitBody),
             ),
             sender_id: 'non-creator-1',
         });
@@ -746,14 +923,14 @@ async function main() {
         nonCreatorError = err.message;
     }
     assert(
-        nonCreatorError.includes('only creator leaf 0 may commit a Welcome epoch'),
-        'MLSSession rejects Welcome paired with non-creator Commit',
+        nonCreatorError.includes('was not sent by creator leaf 0'),
+        'MLSSession rejects correlated Add Commit from non-creator leaf',
         nonCreatorError,
     );
     assert(target.state === 'awaiting-welcome' && target.group === null,
-        'non-creator Welcome leaves target unjoined');
-    assert(target._pendingCommitBytes === null,
-        'rejected non-creator Welcome clears buffered Commit');
+        'non-creator Add leaves target unjoined');
+    assert(target._pendingWelcomeCommits.size === 0,
+        'rejected non-creator Add is never buffered');
 
     // A PSK alone is insufficient to identify the intended MLS group. A
     // joiner with an old/bare link must fail before publishing a KeyPackage.
@@ -811,26 +988,19 @@ async function main() {
     await echoPendingCommit(
         alternateCreator, alternateCommit, 'alternate-creator-self',
     );
-    const alternateWelcome = attackerOut.find(
-        (envelope) => envelope.wire_format === WireFormat.MLS_WELCOME,
-    );
-    await victim.onRelayEnvelope({
-        ...alternateCommit,
-        sender_id: 'alternate-creator',
-    });
     let alternateGroupError = '';
     try {
         await victim.onRelayEnvelope({
-            ...alternateWelcome,
+            ...alternateCommit,
             sender_id: 'alternate-creator',
         });
     } catch (err) {
         alternateGroupError = err.message;
     }
-    assert(alternateGroupError.includes('group_id does not match invite bootstrap pin'),
-        'same-PSK alternative group is rejected by group_id pin', alternateGroupError);
+    assert(alternateGroupError.includes('unexpected group_id'),
+        'same-PSK alternative Add is rejected by group_id pin', alternateGroupError);
     assert(victim.state === 'awaiting-welcome' && victim.group === null,
-        'alternative-group Welcome leaves victim unjoined');
+        'alternative-group Add leaves victim unjoined');
 
     console.log('');
     console.log(`mls-session-join: ${passed} passed, ${failed} failed`);

@@ -42,6 +42,25 @@ fn max_ws_size(max_image_size: usize) -> usize {
     std::cmp::max(MIN_WS_SIZE, (image_payload as f64 * 1.5) as usize)
 }
 
+/// Transport-level MLS references are SHA-256 values encoded as unpadded
+/// base64url (32 bytes -> exactly 43 ASCII characters). Cryptographic
+/// equality is checked by the browser; the relay only rejects malformed
+/// framing before rebroadcasting it.
+fn valid_mls_correlation_ref(value: &str) -> bool {
+    value.len() == 43
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        // A 32-byte input leaves two bytes in the final Base64 quantum.
+        // The low two bits of the last sextet must therefore be zero; this
+        // rejects alternate, non-canonical spellings of the same digest.
+        && matches!(
+            value.as_bytes()[42],
+            b'A' | b'E' | b'I' | b'M' | b'Q' | b'U' | b'Y' | b'c'
+                | b'g' | b'k' | b'o' | b's' | b'w' | b'0' | b'4' | b'8'
+        )
+}
+
 /// Handler for upgrading the WebSocket connection (protocol v1).
 ///
 /// JWT is carried in the `Sec-WebSocket-Protocol` header rather than a query
@@ -645,6 +664,41 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: Uuid, connec
                                 continue;
                             }
 
+                            // Add/Welcome correlation metadata. These values
+                            // are opaque to the relay, but their canonical,
+                            // fixed-size framing is cheap to enforce and
+                            // prevents unbounded/arbitrary strings from being
+                            // reflected to every room participant.
+                            let key_package_ref = incoming.key_package_ref;
+                            let commit_ref = incoming.commit_ref;
+                            let malformed_ref = key_package_ref
+                                .as_deref()
+                                .map(|value| !valid_mls_correlation_ref(value))
+                                .unwrap_or(false)
+                                || commit_ref
+                                    .as_deref()
+                                    .map(|value| !valid_mls_correlation_ref(value))
+                                    .unwrap_or(false);
+                            const WIRE_PUBLIC_MESSAGE: u16 = 1;
+                            const WIRE_WELCOME: u16 = 3;
+                            let invalid_ref_placement = match wire_format {
+                                WIRE_WELCOME => key_package_ref.is_none() || commit_ref.is_none(),
+                                WIRE_PUBLIC_MESSAGE => {
+                                    key_package_ref.is_some() && commit_ref.is_none()
+                                }
+                                _ => key_package_ref.is_some() || commit_ref.is_some(),
+                            };
+                            if malformed_ref || invalid_ref_placement {
+                                tracing::warn!(
+                                    "invalid MLS correlation metadata from connection_id={}",
+                                    connection_id
+                                );
+                                if bump_protocol_error(&state_clone, connection_id) {
+                                    break;
+                                }
+                                continue;
+                            }
+
                             // Anti-replay by payload hash, same pattern as the
                             // 1:1 relay — a retransmitted MLS envelope is
                             // silently discarded rather than broadcast twice.
@@ -710,7 +764,6 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: Uuid, connec
                             // on receipt, so the cost scales with member
                             // count. A handful of commits per minute is
                             // far below any legitimate add/remove cadence.
-                            const WIRE_PUBLIC_MESSAGE: u16 = 1;
                             if wire_format == WIRE_PUBLIC_MESSAGE {
                                 let max_commits = state_clone.config.commit_rate_limit;
                                 let commit_window = state_clone.config.commit_rate_window_secs;
@@ -739,6 +792,8 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: Uuid, connec
                                 payload,
                                 wire_format,
                                 ratchet_tree: incoming.ratchet_tree,
+                                key_package_ref,
+                                commit_ref,
                                 sender_id: connection_id,
                             };
                             if let Ok(json) = serde_json::to_string(&broadcast_msg) {
@@ -994,6 +1049,18 @@ mod tests {
     use axum::{Router, routing::get};
     use std::net::SocketAddr;
     use uuid::Uuid;
+
+    #[test]
+    fn mls_correlation_ref_shape_is_bounded() {
+        let mixed = "_-".repeat(21) + "A";
+        assert!(valid_mls_correlation_ref(&"A".repeat(43)));
+        assert!(valid_mls_correlation_ref(&mixed));
+        assert!(!valid_mls_correlation_ref(&"A".repeat(42)));
+        assert!(!valid_mls_correlation_ref(&"A".repeat(44)));
+        assert!(!valid_mls_correlation_ref(&("A".repeat(42) + "=")));
+        assert!(!valid_mls_correlation_ref(&("A".repeat(42) + "/")));
+        assert!(!valid_mls_correlation_ref(&("A".repeat(42) + "B")));
+    }
 
     fn test_config() -> Config {
         Config {

@@ -23,8 +23,10 @@
  * ------------------
  * The `send(envelope)` callback must broadcast to the room relay and may
  * return `false` to report a synchronous transport rejection; the
- * envelope is `{ type: 'mls', payload, wire_format, ratchet_tree? }`
- * (same shape the Rust server's Message::Mls expects). `onEvent` fires
+ * envelope is `{ type: 'mls', payload, wire_format, ratchet_tree?,
+ * key_package_ref?, commit_ref? }` (the optional references correlate an
+ * Add Commit with its Welcome). This is the same shape the Rust server's
+ * Message::Mls expects. `onEvent` fires
  * with `{ kind, ... }` for UI updates. `kind` values:
  *   'keypackage-published'   — our KeyPackage has been emitted
  *   'welcome-sent'            — Alice sent a Welcome to the new member
@@ -56,6 +58,36 @@
     const PAYLOAD_IMAGE = 0x02;
     const CREATOR_LEAF_INDEX = 0;
     const BOOTSTRAP_PIN_BYTES = 32;
+    const CORRELATION_REF_BYTES = 32;
+    const MAX_PENDING_WELCOME_COMMITS = 8;
+
+    function equalBytes(a, b) {
+        if (!(a instanceof Uint8Array) || !(b instanceof Uint8Array)
+            || a.length !== b.length) return false;
+        let diff = 0;
+        for (let i = 0; i < a.length; i += 1) diff |= a[i] ^ b[i];
+        return diff === 0;
+    }
+
+    function decodeCorrelationRef(value, name) {
+        if (typeof value !== 'string' || value.length === 0) {
+            throw new Error(`mls-session: ${name} is missing`);
+        }
+        let decoded;
+        try {
+            decoded = base64UrlDecode(value);
+        } catch (_err) {
+            throw new Error(`mls-session: ${name} is not valid base64url`);
+        }
+        if (decoded.length !== CORRELATION_REF_BYTES
+            || base64UrlEncode(decoded) !== value) {
+            throw new Error(
+                `mls-session: ${name} must be a canonical `
+                + `${CORRELATION_REF_BYTES}-byte base64url value`,
+            );
+        }
+        return decoded;
+    }
 
     function copyBootstrapPin(value, name) {
         if (value === null || value === undefined) return null;
@@ -194,15 +226,15 @@
             this.expectedCreatorKeyHash = copyBootstrapPin(
                 expectedCreatorKeyHash, 'expectedCreatorKeyHash',
             );
-            // Buffered Commit envelope while we're in 'awaiting-welcome'.
-            // The committer broadcasts Commit + Welcome atomically; we
-            // ignore the Commit while we don't yet have a group state,
-            // but capturing it lets us bind groupInfo.signer to the
-            // Commit's FramedContent sender_leaf_index when the Welcome
-            // arrives (RFC §12.4.3.1). Without this binding, a creator
-            // who commits and signs a forged GroupInfo claiming a
-            // different leaf "minted" the epoch would go undetected.
-            this._pendingCommitBytes = null;
+            // Join correlation state. KeyPackageRef identifies which
+            // broadcast Add/Welcome is addressed to this joiner; commit_ref
+            // is PinChat transport metadata equal to SHA-256 over the exact
+            // PublicMessage body. A bounded map replaces the old single
+            // `_pendingCommitBytes` slot, so unrelated PublicMessages and
+            // Welcomes cannot overwrite or consume the candidate we need.
+            this._keyPackageRefBytes = null;
+            this._keyPackageRef = null;
+            this._pendingWelcomeCommits = new Map();
             // Per-sender_id → leafIndex map maintained by the creator.
             // We commit at most one KeyPackage per WebSocket sender_id;
             // a second KeyPackage from the same sender (or a sender
@@ -273,6 +305,10 @@
                 const bundle = await buildKeyPackage();
                 this.identity = bundle.identity;
                 this.keyPackageBundle = bundle;
+                this._keyPackageRefBytes = await MLS.KeyPackage.keyPackageRef(
+                    bundle.keyPackageBytes,
+                );
+                this._keyPackageRef = base64UrlEncode(this._keyPackageRefBytes);
                 this.send(envelopeFromMlsMessage(
                     MLS.MLSMessage.WireFormat.MLS_KEY_PACKAGE,
                     bundle.keyPackageBytes,
@@ -320,16 +356,47 @@
             );
         }
 
-        async _stagePendingCommit({ candidateGroup, commitMessage, kind, ...metadata }) {
+        async _stagePendingCommit({
+            candidateGroup, commitMessage, kind,
+            commitRef = null, keyPackageRef = null,
+            ...metadata
+        }) {
             if (this._pendingCommit) {
                 throw new Error('mls-session: another Commit is already awaiting relay acceptance');
             }
+            const commitBody = stripMlsWrapper(commitMessage);
+            const computedCommitRefBytes = await MLS.Labeled.sha256(commitBody);
+            const computedCommitRef = base64UrlEncode(computedCommitRefBytes);
+            if (commitRef !== null) {
+                const suppliedCommitRef = decodeCorrelationRef(
+                    commitRef, 'commit_ref',
+                );
+                if (!equalBytes(suppliedCommitRef, computedCommitRefBytes)) {
+                    throw new Error(
+                        'mls-session: supplied commit_ref does not match Commit payload',
+                    );
+                }
+            }
+            if (keyPackageRef !== null) {
+                decodeCorrelationRef(keyPackageRef, 'key_package_ref');
+            }
             const commitEnvelope = {
                 type: 'mls',
-                payload: base64UrlEncode(stripMlsWrapper(commitMessage)),
+                payload: base64UrlEncode(commitBody),
                 wire_format: MLS.MLSMessage.WireFormat.MLS_PUBLIC_MESSAGE,
+                commit_ref: computedCommitRef,
             };
-            const pending = { candidateGroup, commitEnvelope, kind, ...metadata };
+            if (keyPackageRef !== null) {
+                commitEnvelope.key_package_ref = keyPackageRef;
+            }
+            const pending = {
+                candidateGroup,
+                commitEnvelope,
+                kind,
+                commitRef: computedCommitRef,
+                keyPackageRef,
+                ...metadata,
+            };
             // Install the pending marker BEFORE calling the transport so a
             // synchronous/in-memory relay cannot race its echo ahead of us.
             this._pendingCommit = pending;
@@ -498,12 +565,24 @@
 
             if (wireFormat === MLS.MLSMessage.WireFormat.MLS_WELCOME
                 && this.role === 'joiner' && this._state === 'awaiting-welcome') {
+                const candidate = await this._matchingWelcomeCommit(
+                    payload, envelope,
+                );
+                // Welcomes are room broadcasts. A Welcome for another
+                // KeyPackage is expected during simultaneous joins and must
+                // not consume any of our buffered Commit candidates.
+                if (!candidate) return;
                 if (!envelope.ratchet_tree) {
                     this.onEvent({ kind: 'error',
                         reason: 'Welcome envelope missing ratchet_tree side-channel' });
                     return;
                 }
-                await this._handleWelcome(payload, base64UrlDecode(envelope.ratchet_tree));
+                await this._handleWelcome(
+                    payload,
+                    base64UrlDecode(envelope.ratchet_tree),
+                    candidate,
+                );
+                this._pendingWelcomeCommits.clear();
                 return;
             }
 
@@ -521,7 +600,7 @@
             }
             if (wireFormat === MLS.MLSMessage.WireFormat.MLS_PUBLIC_MESSAGE
                 && this.role === 'joiner' && this._state === 'awaiting-welcome') {
-                this._pendingCommitBytes = payload;
+                await this._bufferWelcomeCommit(payload, envelope);
                 return;
             }
 
@@ -533,6 +612,189 @@
 
             // Anything else (commit while still awaiting-welcome, etc.)
             // is silently dropped — Welcome is the catch-up path.
+        }
+
+        /**
+         * Validate and retain an Add Commit addressed to our exact
+         * KeyPackage. The outer Commit is not yet cryptographically
+         * verifiable because a pre-Welcome joiner has no membership_key or
+         * ratchet tree; GroupInfo/tree validation supplies that trust at
+         * join. Here we enforce structural correlation, creator leaf 0,
+         * pinned group_id, exact KeyPackage bytes, and a payload-derived
+         * commit_ref so unrelated room traffic cannot replace the candidate.
+         */
+        async _bufferWelcomeCommit(mlsMessageBytes, envelope) {
+            let pm;
+            try {
+                const wrapped = MLS.MLSMessage.serializeMLSMessage(
+                    MLS.MLSMessage.WireFormat.MLS_PUBLIC_MESSAGE,
+                    mlsMessageBytes,
+                );
+                const frame = MLS.MLSMessage.parseMLSMessage(wrapped);
+                pm = MLS.PublicMessage.parsePublicMessage(
+                    frame.body,
+                    (decoder, contentType) => {
+                        if (contentType === MLS.Framing.ContentType.PROPOSAL) {
+                            return MLS.Proposal.readProposal(decoder);
+                        }
+                        if (contentType === MLS.Framing.ContentType.COMMIT) {
+                            return MLS.Commit.readCommit(decoder);
+                        }
+                        throw new Error(
+                            `unsupported PublicMessage content_type ${contentType}`,
+                        );
+                    },
+                );
+            } catch (err) {
+                throw new Error(
+                    `mls-session: malformed pre-Welcome PublicMessage: ${err.message}`,
+                );
+            }
+
+            // Standalone proposals and ordinary membership/path commits do
+            // not carry a KeyPackageRef for this joiner; ignore them while
+            // waiting for the Add that actually addresses us.
+            if (pm.content.contentType !== MLS.Framing.ContentType.COMMIT
+                || !envelope.key_package_ref) return false;
+
+            if (!this._keyPackageRefBytes || !this._keyPackageRef) {
+                throw new Error('mls-session: local KeyPackageRef is unavailable');
+            }
+            const envelopeKeyPackageRef = decodeCorrelationRef(
+                envelope.key_package_ref, 'key_package_ref',
+            );
+            if (!equalBytes(envelopeKeyPackageRef, this._keyPackageRefBytes)) {
+                return false;
+            }
+            if (!equalBytes(pm.content.groupId, this.expectedGroupId)) {
+                throw new Error(
+                    'mls-session: correlated Add Commit has unexpected group_id',
+                );
+            }
+            if (!pm.content.sender
+                || pm.content.sender.senderType !== MLS.Framing.SenderType.MEMBER
+                || pm.content.sender.leafIndex !== CREATOR_LEAF_INDEX) {
+                throw new Error(
+                    'mls-session: correlated Add Commit was not sent by creator leaf 0',
+                );
+            }
+
+            let containsOurKeyPackage = false;
+            for (const item of pm.content.parsed.proposals) {
+                if (item.type !== MLS.Proposal.ProposalOrRefType.PROPOSAL
+                    || !item.proposal
+                    || item.proposal.proposalType !== MLS.Proposal.ProposalType.ADD) {
+                    continue;
+                }
+                const addedKeyPackageBytes = MLS.KeyPackage.keyPackageBytes(
+                    item.proposal.keyPackage,
+                );
+                if (equalBytes(
+                    addedKeyPackageBytes,
+                    this.keyPackageBundle.keyPackageBytes,
+                )) {
+                    containsOurKeyPackage = true;
+                    break;
+                }
+            }
+            if (!containsOurKeyPackage) {
+                throw new Error(
+                    'mls-session: correlated Add Commit does not contain our KeyPackage',
+                );
+            }
+
+            const commitRefBytes = decodeCorrelationRef(
+                envelope.commit_ref, 'commit_ref',
+            );
+            const computedCommitRef = await MLS.Labeled.sha256(mlsMessageBytes);
+            if (!equalBytes(commitRefBytes, computedCommitRef)) {
+                throw new Error(
+                    'mls-session: commit_ref does not match PublicMessage payload',
+                );
+            }
+            const commitRef = base64UrlEncode(commitRefBytes);
+            const existing = this._pendingWelcomeCommits.get(commitRef);
+            if (existing) {
+                if (existing.senderId !== envelope.sender_id) {
+                    throw new Error(
+                        'mls-session: duplicate commit_ref arrived from a different relay sender',
+                    );
+                }
+                return true;
+            }
+            if (this._pendingWelcomeCommits.size >= MAX_PENDING_WELCOME_COMMITS) {
+                throw new Error(
+                    'mls-session: too many correlated Add Commits while awaiting Welcome',
+                );
+            }
+            if (!envelope.sender_id) {
+                throw new Error(
+                    'mls-session: correlated Add Commit envelope missing sender_id',
+                );
+            }
+            this._pendingWelcomeCommits.set(commitRef, {
+                bytes: Uint8Array.from(mlsMessageBytes),
+                commitRef,
+                keyPackageRef: this._keyPackageRef,
+                senderId: envelope.sender_id,
+                senderLeafIndex: CREATOR_LEAF_INDEX,
+                epoch: pm.content.epoch,
+            });
+            return true;
+        }
+
+        /**
+         * Return the exact buffered Commit named by an incoming Welcome, or
+         * null when the Welcome is addressed to another KeyPackage. Invalid
+         * targeted Welcomes fail closed without deleting any candidate, so a
+         * later authentic retransmission can still complete the join.
+         */
+        async _matchingWelcomeCommit(mlsMessageBytes, envelope) {
+            if (!this._keyPackageRefBytes || !this._keyPackageRef) {
+                throw new Error('mls-session: local KeyPackageRef is unavailable');
+            }
+            const envelopeKeyPackageRef = decodeCorrelationRef(
+                envelope.key_package_ref, 'key_package_ref',
+            );
+            if (!equalBytes(envelopeKeyPackageRef, this._keyPackageRefBytes)) {
+                return null;
+            }
+
+            let welcome;
+            try {
+                welcome = MLS.Welcome.parseWelcome(mlsMessageBytes);
+            } catch (err) {
+                throw new Error(`mls-session: malformed targeted Welcome: ${err.message}`);
+            }
+            const containsOurKeyPackageRef = welcome.secrets.some((entry) =>
+                equalBytes(entry.newMember, this._keyPackageRefBytes));
+            if (!containsOurKeyPackageRef) {
+                throw new Error(
+                    'mls-session: targeted Welcome does not contain our KeyPackageRef',
+                );
+            }
+
+            const commitRefBytes = decodeCorrelationRef(
+                envelope.commit_ref, 'commit_ref',
+            );
+            const commitRef = base64UrlEncode(commitRefBytes);
+            const candidate = this._pendingWelcomeCommits.get(commitRef);
+            if (!candidate) {
+                throw new Error(
+                    'mls-session: Welcome received without its matching buffered Commit',
+                );
+            }
+            if (candidate.keyPackageRef !== this._keyPackageRef) {
+                throw new Error(
+                    'mls-session: Welcome/Commit KeyPackageRef correlation mismatch',
+                );
+            }
+            if (candidate.senderId !== envelope.sender_id) {
+                throw new Error(
+                    'mls-session: Welcome and Commit relay sender_id mismatch',
+                );
+            }
+            return candidate;
         }
 
         async _handleIncomingKeyPackage(kpBytes, senderId) {
@@ -550,7 +812,7 @@
                 candidateGroup = this.group.forkForPendingCommit();
                 const { commitMessage, welcomeMessage } =
                     await candidateGroup.commitAddMember({
-                    keyPackageBytes: kpBytes,
+                        keyPackageBytes: kpBytes,
                     });
                 // commitAddMember always inserts at `nLeaves` (pre-bump).
                 // Only the candidate has advanced at this point.
@@ -558,16 +820,26 @@
                 const ratchetTreeBytes = MLS.Nodes.ratchetTreeBytes(
                     candidateGroup.ratchetTree,
                 );
+                const keyPackageRef = base64UrlEncode(
+                    await MLS.KeyPackage.keyPackageRef(kpBytes),
+                );
+                const commitRef = base64UrlEncode(
+                    await MLS.Labeled.sha256(stripMlsWrapper(commitMessage)),
+                );
                 const welcomeEnvelope = {
                     type: 'mls',
                     payload: base64UrlEncode(stripMlsWrapper(welcomeMessage)),
                     wire_format: MLS.MLSMessage.WireFormat.MLS_WELCOME,
                     ratchet_tree: base64UrlEncode(ratchetTreeBytes),
+                    key_package_ref: keyPackageRef,
+                    commit_ref: commitRef,
                 };
                 staged = await this._stagePendingCommit({
                     candidateGroup,
                     commitMessage,
                     kind: 'add',
+                    keyPackageRef,
+                    commitRef,
                     senderId,
                     addedLeafIndex,
                     welcomeEnvelope,
@@ -582,60 +854,33 @@
             if (!staged) await this._drainDeferredEnvelopes();
         }
 
-        async _handleWelcome(mlsMessageBytes, ratchetTreeBytes) {
+        async _handleWelcome(mlsMessageBytes, ratchetTreeBytes, candidate) {
             // The envelope payload is the INNER MLSMessage body; wrap it
             // back so joinFromWelcomeWithTree can parse the full frame.
             const wrapped = MLS.MLSMessage.serializeMLSMessage(
                 MLS.MLSMessage.WireFormat.MLS_WELCOME, mlsMessageBytes,
             );
 
-            // M-1 (RFC §12.4.3.1): bind GroupInfo.signer to the
-            // FramedContent sender of the Commit that produced this
-            // epoch. Extract the Commit's sender_leaf_index from the
-            // buffered PublicMessage and pass it to the join routine.
-            // Fail closed if the Commit was absent, malformed, not actually
-            // a Commit, or not sent as a group member. A Welcome without
-            // this binding cannot establish who created the imported epoch.
-            if (!this._pendingCommitBytes) {
+            // M-1 (RFC §12.4.3.1): the correlated Commit was parsed and
+            // restricted to creator leaf 0 before buffering. Recheck its
+            // payload-derived reference here before passing both signer and
+            // old epoch into the cryptographic join routine.
+            if (!candidate
+                || this._pendingWelcomeCommits.get(candidate.commitRef) !== candidate) {
                 throw new Error(
-                    'mls-session: Welcome received without a buffered Commit',
+                    'mls-session: Welcome has no live correlated Commit candidate',
                 );
             }
-            let expectedSignerLeafIndex;
-            try {
-                const commitWrapped = MLS.MLSMessage.serializeMLSMessage(
-                    MLS.MLSMessage.WireFormat.MLS_PUBLIC_MESSAGE,
-                    this._pendingCommitBytes,
-                );
-                const frame = MLS.MLSMessage.parseMLSMessage(commitWrapped);
-                const pm = MLS.PublicMessage.parsePublicMessage(
-                    frame.body, (decoder) => MLS.Commit.readCommit(decoder),
-                );
-                if (!pm.content
-                    || pm.content.contentType !== MLS.Framing.ContentType.COMMIT) {
-                    throw new Error('buffered PublicMessage is not a Commit');
-                }
-                if (!pm.content.sender
-                    || pm.content.sender.senderType !== MLS.Framing.SenderType.MEMBER
-                    || !Number.isInteger(pm.content.sender.leafIndex)) {
-                    throw new Error('buffered Commit has no member sender_leaf_index');
-                }
-                if (pm.content.sender.leafIndex !== CREATOR_LEAF_INDEX) {
-                    throw new Error(
-                        'only creator leaf 0 may commit a Welcome epoch '
-                        + `(got leaf ${pm.content.sender.leafIndex})`,
-                    );
-                }
-                expectedSignerLeafIndex = pm.content.sender.leafIndex;
-            } catch (err) {
+            const computedCommitRef = base64UrlEncode(
+                await MLS.Labeled.sha256(candidate.bytes),
+            );
+            if (computedCommitRef !== candidate.commitRef) {
                 throw new Error(
-                    `mls-session: cannot bind Welcome to Commit: ${err.message}`,
+                    'mls-session: buffered Commit bytes no longer match commit_ref',
                 );
-            } finally {
-                this._pendingCommitBytes = null;
             }
 
-            this.group = await MLS.Group.Group.joinFromWelcomeWithTree({
+            const joinedGroup = await MLS.Group.Group.joinFromWelcomeWithTree({
                 welcomeMessage: wrapped,
                 keyPackageBytes: this.keyPackageBundle.keyPackageBytes,
                 initPrivateKey: this.keyPackageBundle.initKeyPair.privateKey,
@@ -643,10 +888,12 @@
                 leafEncKeyPair: this.keyPackageBundle.leafEncKeyPair,
                 ratchetTreeBytes,
                 pskSecret: this.pskSecret,
-                expectedSignerLeafIndex,
+                expectedSignerLeafIndex: candidate.senderLeafIndex,
+                expectedCommitEpoch: candidate.epoch,
                 expectedGroupId: this.expectedGroupId,
                 expectedCreatorKeyHash: this.expectedCreatorKeyHash,
             });
+            this.group = joinedGroup;
             this._state = 'joined';
             this.onEvent({ kind: 'joined' });
         }
