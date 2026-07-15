@@ -93,6 +93,7 @@ async function createExchange() {
         creator,
         joiner,
         creatorOut,
+        joinerOut,
         creatorEvents,
         joinerEvents,
         commit: creatorOut.find(
@@ -129,6 +130,70 @@ async function main() {
     ), 'creator and joiner share encryption_secret');
     assert(exchange.joinerEvents.some((event) => event.kind === 'joined'),
         'joiner emits authenticated joined event');
+
+    // Exercise the steady-state browser path after the Welcome.  This is
+    // intentionally routed through MLSSession.onRelayEnvelope: Group-level
+    // tests do not cover the PublicMessage body parser used for dispatch.
+    const epochBeforeCreatorUpdate = exchange.creator.group.epoch;
+    const creatorOutBeforeUpdate = exchange.creatorOut.length;
+    await exchange.creator.commitUpdate();
+    const creatorUpdateCommit = exchange.creatorOut
+        .slice(creatorOutBeforeUpdate)
+        .find((envelope) => envelope.wire_format === WireFormat.MLS_PUBLIC_MESSAGE);
+    assert(Boolean(creatorUpdateCommit),
+        'creator emits a steady-state Update Commit after join');
+    await exchange.joiner.onRelayEnvelope({
+        ...creatorUpdateCommit,
+        sender_id: 'creator-1',
+    });
+    assert(exchange.creator.group.epoch === epochBeforeCreatorUpdate + 1n,
+        'creator advances for steady-state Update Commit');
+    assert(exchange.joiner.group.epoch === exchange.creator.group.epoch,
+        'joiner applies steady-state Commit through MLSSession');
+    assert(equalBytes(
+        exchange.joiner.group.epochSecrets.encryptionSecret,
+        exchange.creator.group.epochSecrets.encryptionSecret,
+    ), 'steady-state Commit keeps creator and joiner secrets aligned');
+    assert(exchange.joinerEvents.some((event) => event.kind === 'commit-applied'),
+        'joiner emits commit-applied for post-join Commit');
+
+    // Exercise the Proposal branch of the same router.  The joiner publishes
+    // an Update proposal, the creator buffers it, and the next creator Commit
+    // folds it in.  Delivering that Commit also verifies that the pending
+    // self-update keypair is activated on the joiner.
+    const joinerOutBeforeProposal = exchange.joinerOut.length;
+    await exchange.joiner.proposeUpdate();
+    const updateProposal = exchange.joinerOut
+        .slice(joinerOutBeforeProposal)
+        .find((envelope) => envelope.wire_format === WireFormat.MLS_PUBLIC_MESSAGE);
+    assert(Boolean(updateProposal), 'joiner emits a standalone Update proposal');
+    await exchange.creator.onRelayEnvelope({
+        ...updateProposal,
+        sender_id: 'joiner-1',
+    });
+    assert(exchange.creatorEvents.some(
+        (event) => event.kind === 'update-proposal-received'
+            && event.senderLeafIndex === 1,
+    ), 'creator parses and buffers member Update proposal through MLSSession');
+
+    const creatorOutBeforeFold = exchange.creatorOut.length;
+    await exchange.creator.commitUpdate();
+    const foldedUpdateCommit = exchange.creatorOut
+        .slice(creatorOutBeforeFold)
+        .find((envelope) => envelope.wire_format === WireFormat.MLS_PUBLIC_MESSAGE);
+    assert(Boolean(foldedUpdateCommit), 'creator emits Commit containing member Update');
+    await exchange.joiner.onRelayEnvelope({
+        ...foldedUpdateCommit,
+        sender_id: 'creator-1',
+    });
+    assert(exchange.joiner.group.epoch === exchange.creator.group.epoch,
+        'joiner applies Commit containing its Update proposal');
+    assert(equalBytes(
+        exchange.joiner.group.epochSecrets.encryptionSecret,
+        exchange.creator.group.epochSecrets.encryptionSecret,
+    ), 'folded Update keeps creator and joiner secrets aligned');
+    assert(exchange.joiner._pendingSelfUpdate === null,
+        'joiner activates and clears pending self-update after Commit');
 
     const noCommitExchange = await createExchange();
     let noCommitError = '';

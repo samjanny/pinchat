@@ -492,28 +492,43 @@
 
         /**
          * Route an incoming PublicMessage: Commit vs standalone Proposal.
-         * We peek the FramedContent content_type without fully parsing the
-         * body (the parse callback returns null for both), then dispatch.
+         * PublicMessage has no length prefix around the Proposal/Commit body,
+         * so the parse callback MUST consume that body before auth_data and
+         * membership_tag can be decoded.  Parse it fully here, then dispatch;
+         * processCommit deliberately re-parses the original bytes while doing
+         * its cryptographic validation.
          */
         async _handlePublicMessage(mlsMessageBytes, senderId) {
             const wrapped = MLS.MLSMessage.serializeMLSMessage(
                 MLS.MLSMessage.WireFormat.MLS_PUBLIC_MESSAGE, mlsMessageBytes,
             );
-            let contentType;
+            let pm;
             try {
                 const frame = MLS.MLSMessage.parseMLSMessage(wrapped);
-                const pm = MLS.PublicMessage.parsePublicMessage(frame.body, () => null);
-                contentType = pm.content.contentType;
+                pm = MLS.PublicMessage.parsePublicMessage(frame.body, (decoder, contentType) => {
+                    if (contentType === MLS.Framing.ContentType.PROPOSAL) {
+                        return MLS.Proposal.readProposal(decoder);
+                    }
+                    if (contentType === MLS.Framing.ContentType.COMMIT) {
+                        return MLS.Commit.readCommit(decoder);
+                    }
+                    throw new Error(`unsupported PublicMessage content_type ${contentType}`);
+                });
             } catch (err) {
                 this.onEvent({ kind: 'error',
                     reason: `malformed PublicMessage: ${err.message}` });
                 return;
             }
-            if (contentType === MLS.Framing.ContentType.PROPOSAL) {
-                await this._handleIncomingProposal(wrapped, senderId);
+            if (pm.content.contentType === MLS.Framing.ContentType.PROPOSAL) {
+                await this._handleIncomingProposal(wrapped, senderId, pm);
                 return;
             }
-            await this._handleIncomingCommit(wrapped);
+            if (pm.content.contentType === MLS.Framing.ContentType.COMMIT) {
+                await this._handleIncomingCommit(wrapped);
+                return;
+            }
+            this.onEvent({ kind: 'error',
+                reason: `unsupported PublicMessage content_type ${pm.content.contentType}` });
         }
 
         /**
@@ -524,18 +539,21 @@
          * signature checks); here we only parse and stash it, keyed by
          * the proposer's leaf index so a re-proposal supersedes.
          */
-        async _handleIncomingProposal(wrappedBytes, senderId) {
+        async _handleIncomingProposal(wrappedBytes, senderId, parsedPublicMessage = null) {
             if (this.role !== 'creator') return;
             let proposal;
             let senderLeafIndex;
             try {
-                const frame = MLS.MLSMessage.parseMLSMessage(wrappedBytes);
-                const pm = MLS.PublicMessage.parsePublicMessage(frame.body, (decoder, ct) => {
-                    if (ct === MLS.Framing.ContentType.PROPOSAL) {
+                let pm = parsedPublicMessage;
+                if (!pm) {
+                    const frame = MLS.MLSMessage.parseMLSMessage(wrappedBytes);
+                    pm = MLS.PublicMessage.parsePublicMessage(frame.body, (decoder, ct) => {
+                        if (ct !== MLS.Framing.ContentType.PROPOSAL) {
+                            throw new Error(`expected Proposal, got content_type ${ct}`);
+                        }
                         return MLS.Proposal.readProposal(decoder);
-                    }
-                    return null;
-                });
+                    });
+                }
                 if (pm.content.sender.senderType !== MLS.Framing.SenderType.MEMBER) return;
                 senderLeafIndex = pm.content.sender.leafIndex;
                 proposal = pm.content.parsed;
