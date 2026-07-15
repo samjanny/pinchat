@@ -840,11 +840,12 @@
          * their LeafNode's signature_key, rejects wrong-epoch or
          * non-application messages.
          *
-         * Returns { plaintext, senderLeafIndex }: the leaf index is the
-         * CRYPTOGRAPHICALLY authenticated sender (signature verified
-         * against that leaf's signature_key in the tree), as opposed to
-         * the relay envelope's unauthenticated sender_id. Callers doing
-         * sender attribution MUST use this value.
+         * Returns { plaintext, senderLeafIndex, senderSignatureKey }: the
+         * leaf index and copied signature key identify the CRYPTOGRAPHICALLY
+         * authenticated sender (the signature was verified against that
+         * exact LeafNode), as opposed to the relay envelope's unauthenticated
+         * sender_id. Callers doing sender attribution MUST derive it from
+         * senderSignatureKey, not from transport metadata.
          */
         async decryptApplicationMessage(mlsMessageBytes) {
             const frame = MLSMessage.parseMLSMessage(mlsMessageBytes);
@@ -936,7 +937,11 @@
                 this._chainStates = acceptedChainStates;
                 this._markGenerationConsumed(senderLeafIndex, generation);
 
-                return { plaintext: out.content.payloadBytes, senderLeafIndex };
+                return {
+                    plaintext: out.content.payloadBytes,
+                    senderLeafIndex,
+                    senderSignatureKey: Uint8Array.from(senderLeaf.signatureKey),
+                };
             } catch (err) {
                 ratchetTx.rollback();
                 throw err;
@@ -1022,7 +1027,11 @@
                 }
                 consumedSet.add(generation);
 
-                return { plaintext: out.content.payloadBytes, senderLeafIndex };
+                return {
+                    plaintext: out.content.payloadBytes,
+                    senderLeafIndex,
+                    senderSignatureKey: Uint8Array.from(senderLeaf.signatureKey),
+                };
             } catch (err) {
                 ratchetTx.rollback();
                 throw err;

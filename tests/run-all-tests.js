@@ -179,6 +179,11 @@ const TEST_SUITES = {
         file: 'test-mls-session-join.js',
         description: 'Browser-level Commit buffering + fail-closed Welcome join'
     },
+    'mls-visual-identity': {
+        name: 'MLS authenticated visual identity',
+        file: 'test-mls-visual-identity.js',
+        description: 'Signature-key roster labels isolated from relay sender_id metadata'
+    },
     'mls-group-add': {
         name: 'MLS Group Add/Commit/Welcome flow',
         file: 'test-mls-group-add.js',

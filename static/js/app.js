@@ -32,9 +32,10 @@ document.addEventListener('alpine:init', () => {
         userId: null,
         peerUserId: null,       // UUID of the other participant in 1:1 rooms (null when alone)
         peerNickname: null,     // Derived display name from peerUserId via generateNickname()
-        // Group rooms: ordered list of currently connected peers ({ userId,
-        // nickname }). The sidebar iterates over this to render one row per
-        // peer. 1:1 rooms keep peerUserId/peerNickname above and ignore this.
+        // Group rooms: authenticated MLS roster excluding our own leaf.
+        // Entries come only from ratchet-tree signature keys ({ leafIndex,
+        // fingerprint, displayName }); relay connection IDs never populate or
+        // name this list. 1:1 rooms ignore it.
         groupPeers: [],
         myNickname: null,  // User's own nickname (generated from userId)
         initialized: false,
@@ -74,6 +75,10 @@ document.addEventListener('alpine:init', () => {
         // bundle and dispatches incoming `mls` envelopes.
         mlsSession: null,
         mlsReady: false,   // true once we've joined (creator after commit, joiner after welcome)
+        mlsRosterValid: false,
+        // Our own authenticated ratchet-tree identity. Null while a joiner is
+        // only connected to the relay but not yet admitted by a Welcome.
+        mlsSelfIdentity: null,
         // Captured at init() before wsManager.connect() consumes the creator
         // token from sessionStorage. 'creator' | 'joiner' | null.
         mlsRole: null,
@@ -345,18 +350,6 @@ document.addEventListener('alpine:init', () => {
                         const isPendingCommitAck = isOwnEnvelope
                             && this.mlsSession.shouldHandleOwnEnvelope(message);
                         if (isOwnEnvelope && !isPendingCommitAck) break;
-                        // Discover peers we never got a userjoined for —
-                        // a member who joins late never sees join events
-                        // for the existing participants, so we backfill
-                        // the sidebar from the envelope's sender_id.
-                        if (!isOwnEnvelope
-                            && this.roomType === 'group' && message.sender_id
-                            && !this.groupPeers.find((p) => p.userId === message.sender_id)) {
-                            this.groupPeers.push({
-                                userId: message.sender_id,
-                                nickname: generateNickname(message.sender_id).display,
-                            });
-                        }
                         try {
                             await this.mlsSession.onRelayEnvelope(message);
                         } catch (err) {
@@ -384,23 +377,18 @@ document.addEventListener('alpine:init', () => {
 
                 case 'userjoined':
                     this.participantCount = message.participant_count;
-                    this.addSystemMessage('👋 A participant joined the chat');
+                    this.addSystemMessage(this.roomType === 'group'
+                        ? '👋 A relay participant connected; waiting for MLS authentication'
+                        : '👋 A participant joined the chat');
 
-                    // Record peer identity up-front so the sidebar can show the
-                    // correct nickname before the peer's first message arrives.
-                    if (message.user_id && message.user_id !== this.userId) {
+                    // In 1:1 rooms the relay identifier is bound into the
+                    // authenticated handshake and remains the UI nickname
+                    // seed. Group identities come only from MLSSession roster
+                    // events after the ratchet tree has been authenticated.
+                    if (this.roomType === 'onetoone'
+                        && message.user_id && message.user_id !== this.userId) {
                         this.peerUserId = message.user_id;
                         this.peerNickname = generateNickname(message.user_id).display;
-
-                        // Group rooms maintain a list — append if not already
-                        // tracked. Idempotent so reconnects don't double-add.
-                        if (this.roomType === 'group'
-                            && !this.groupPeers.find((p) => p.userId === message.user_id)) {
-                            this.groupPeers.push({
-                                userId: message.user_id,
-                                nickname: generateNickname(message.user_id).display,
-                            });
-                        }
                     }
 
                     if (this.roomType === 'onetoone' && this.participantCount === 2) {
@@ -428,7 +416,9 @@ document.addEventListener('alpine:init', () => {
                 case 'userleft':
                     this.participantCount = message.participant_count;
                     if (message.user_id !== this.userId) {
-                        this.addSystemMessage('👋 A participant left the chat');
+                        this.addSystemMessage(this.roomType === 'group'
+                            ? '👋 A relay participant disconnected; MLS membership changes only after an authenticated Remove'
+                            : '👋 A participant left the chat');
                     }
 
                     // Clear peer identity when they actually leave
@@ -437,9 +427,6 @@ document.addEventListener('alpine:init', () => {
                         this.peerNickname = null;
                     }
                     if (this.roomType === 'group' && message.user_id) {
-                        this.groupPeers = this.groupPeers.filter(
-                            (p) => p.userId !== message.user_id,
-                        );
                         // Creator-only: emit an MLS Remove commit so the
                         // departing peer's epoch keys are invalidated.
                         // The session ignores the call when we never had
@@ -536,6 +523,7 @@ document.addEventListener('alpine:init', () => {
                     isOwn: isOwn,
                     nickname: nicknameData.display,        // "Cosmic Fox"
                     senderId: message.sender_id,           // Full UUID (for tooltip)
+                    senderTitle: message.sender_id,
                     outOfOrder: outOfOrder === true        // True if a later counter was already seen
                 });
 
@@ -568,6 +556,11 @@ document.addEventListener('alpine:init', () => {
                     this.error = '⚠️ Secure group not yet ready. Please wait.';
                     return;
                 }
+                const ownIdentity = this.mlsSelfIdentity;
+                if (!ownIdentity) {
+                    this.error = '⚠️ Authenticated MLS self identity is unavailable.';
+                    return;
+                }
                 try {
                     this.messages.push({
                         id: this.nextMessageId++,
@@ -575,8 +568,9 @@ document.addEventListener('alpine:init', () => {
                         text,
                         timestamp: new Date(),
                         isOwn: true,
-                        nickname: this.myNickname,
-                        senderId: this.userId,
+                        nickname: ownIdentity.displayName,
+                        senderFingerprint: ownIdentity.fingerprint,
+                        senderTitle: this.mlsIdentityTitle(ownIdentity),
                     });
                     this.messageInput = '';
                     requestAnimationFrame(() => this.scrollToBottom());
@@ -598,7 +592,8 @@ document.addEventListener('alpine:init', () => {
                     timestamp: new Date(),
                     isOwn: true,
                     nickname: this.myNickname,  // Add user's own nickname
-                    senderId: this.userId        // Add user's own UUID
+                    senderId: this.userId,       // Full UUID for 1:1 routing
+                    senderTitle: this.userId,
                 });
 
                 this.messageInput = '';
@@ -732,11 +727,56 @@ document.addEventListener('alpine:init', () => {
 
         _handleMlsEvent(event) {
             switch (event.kind) {
+                case 'roster': {
+                    const members = Array.isArray(event.members) ? event.members : [];
+                    const fingerprints = new Set();
+                    const leafIndices = new Set();
+                    const valid = Number.isInteger(event.myLeafIndex)
+                        && members.every((member) => {
+                            if (!this.isValidMlsIdentity(member, member?.leafIndex)
+                                || member.isSelf !== (member.leafIndex === event.myLeafIndex)
+                                || fingerprints.has(member.fingerprint)
+                                || leafIndices.has(member.leafIndex)) return false;
+                            fingerprints.add(member.fingerprint);
+                            leafIndices.add(member.leafIndex);
+                            return true;
+                        });
+                    const selfIdentity = members.find(
+                        (member) => member.leafIndex === event.myLeafIndex
+                            && member.isSelf === true,
+                    );
+                    if (!valid || !selfIdentity) {
+                        this.mlsReady = false;
+                        this.mlsRosterValid = false;
+                        this.mlsSelfIdentity = null;
+                        this.groupPeers = [];
+                        this.error = '⚠️ Authenticated MLS roster is malformed';
+                        break;
+                    }
+                    this.mlsRosterValid = true;
+                    this.mlsSelfIdentity = { ...selfIdentity };
+                    this.groupPeers = members
+                        .filter((member) => member.leafIndex !== event.myLeafIndex)
+                        .map((member) => ({
+                            leafIndex: member.leafIndex,
+                            fingerprint: member.fingerprint,
+                            shortFingerprint: member.shortFingerprint,
+                            displayName: member.displayName,
+                            nickname: member.displayName,
+                            isCreator: member.isCreator === true,
+                            identityTitle: this.mlsIdentityTitle(member),
+                        }));
+                    break;
+                }
                 case 'keypackage-published':
                     this.addSystemMessage('🔑 KeyPackage published; waiting for Welcome…');
                     break;
                 case 'welcome-sent':
-                    this.mlsReady = true;
+                    this.mlsReady = this.mlsRosterValid;
+                    if (!this.mlsReady) {
+                        this.error = '⚠️ Secure group established without an authenticated roster';
+                        break;
+                    }
                     this.addSystemMessage('✅ Secure group established');
                     this._startMlsUpdateTimer();
                     break;
@@ -746,7 +786,11 @@ document.addEventListener('alpine:init', () => {
                     debugLog('[MLS] Path re-keyed (Update commit), epoch', event.epoch);
                     break;
                 case 'joined':
-                    this.mlsReady = true;
+                    this.mlsReady = this.mlsRosterValid;
+                    if (!this.mlsReady) {
+                        this.error = '⚠️ Joined group without an authenticated roster';
+                        break;
+                    }
                     this.addSystemMessage('✅ Joined secure group');
                     this._startMlsUpdateTimer();
                     break;
@@ -757,35 +801,41 @@ document.addEventListener('alpine:init', () => {
                     debugLog('[MLS] Buffered member Update proposal, leaf', event.senderLeafIndex);
                     break;
                 case 'message': {
-                    // attributionWarning: the relay stamped a sender_id
-                    // that contradicts the MLS-authenticated sender leaf.
-                    // The session already attributes by the pinned value;
-                    // surface the anomaly so the user knows.
-                    if (event.attributionWarning) {
-                        this.addSystemMessage('🔐 Security warning: relay sender attribution mismatch; showing the cryptographically pinned sender');
+                    const identity = event.senderIdentity;
+                    if (!this.isValidMlsIdentity(
+                        identity, event.senderLeafIndex,
+                    )) {
+                        this.error = '⚠️ MLS message omitted its authenticated sender identity';
+                        break;
                     }
-                    const nickname = event.senderId
-                        ? generateNickname(event.senderId).display
-                        : 'Peer';
+                    if (event.attributionWarning) {
+                        this.addSystemMessage('🔐 Security warning: relay routing ID changed for an authenticated MLS member; the displayed key fingerprint is unchanged');
+                    }
                     this.messages.push({
                         id: this.nextMessageId++,
                         type: 'message',
                         text: event.text,
                         timestamp: new Date(),
                         isOwn: false,
-                        nickname,
-                        senderId: event.senderId || null,
+                        nickname: identity.displayName,
+                        senderFingerprint: identity.fingerprint,
+                        senderTitle: this.mlsIdentityTitle(identity),
+                        senderLeafIndex: event.senderLeafIndex,
                     });
                     requestAnimationFrame(() => this.scrollToBottom());
                     break;
                 }
                 case 'image': {
-                    if (event.attributionWarning) {
-                        this.addSystemMessage('🔐 Security warning: relay sender attribution mismatch; showing the cryptographically pinned sender');
+                    const identity = event.senderIdentity;
+                    if (!this.isValidMlsIdentity(
+                        identity, event.senderLeafIndex,
+                    )) {
+                        this.error = '⚠️ MLS image omitted its authenticated sender identity';
+                        break;
                     }
-                    const nicknameImg = event.senderId
-                        ? generateNickname(event.senderId).display
-                        : 'Peer';
+                    if (event.attributionWarning) {
+                        this.addSystemMessage('🔐 Security warning: relay routing ID changed for an authenticated MLS member; the displayed key fingerprint is unchanged');
+                    }
                     const blob = new Blob([event.data], { type: event.mimeType });
                     const imageUrl = URL.createObjectURL(blob);
                     this.messages.push({
@@ -794,8 +844,10 @@ document.addEventListener('alpine:init', () => {
                         imageUrl,
                         timestamp: new Date(),
                         isOwn: false,
-                        nickname: nicknameImg,
-                        senderId: event.senderId || null,
+                        nickname: identity.displayName,
+                        senderFingerprint: identity.fingerprint,
+                        senderTitle: this.mlsIdentityTitle(identity),
+                        senderLeafIndex: event.senderLeafIndex,
                     });
                     requestAnimationFrame(() => this.scrollToBottom());
                     break;
@@ -811,6 +863,12 @@ document.addEventListener('alpine:init', () => {
                     break;
                 case 'error':
                     console.error('[MLS]', event.reason);
+                    if (event.fatalIdentity === true) {
+                        this.mlsReady = false;
+                        this.mlsRosterValid = false;
+                        this.mlsSelfIdentity = null;
+                        this.groupPeers = [];
+                    }
                     this.error = '⚠️ ' + event.reason;
                     break;
             }
@@ -899,14 +957,26 @@ document.addEventListener('alpine:init', () => {
             // Blob is shared with the preview and freed on tab close or
             // next upload.
             const localImageUrl = this.pendingImage.previewUrl;
+            const ownMlsIdentity = this.roomType === 'group'
+                ? this.mlsSelfIdentity : null;
+            if (this.roomType === 'group' && !ownMlsIdentity) {
+                this.sendingImage = false;
+                this.error = '⚠️ Authenticated MLS self identity is unavailable.';
+                return;
+            }
             this.messages.push({
                 id: this.nextMessageId++,
                 type: 'image',
                 imageUrl: localImageUrl,
                 timestamp: new Date(),
                 isOwn: true,
-                nickname: this.myNickname,
-                senderId: this.userId
+                nickname: ownMlsIdentity
+                    ? ownMlsIdentity.displayName : this.myNickname,
+                senderId: ownMlsIdentity ? null : this.userId,
+                senderFingerprint: ownMlsIdentity
+                    ? ownMlsIdentity.fingerprint : null,
+                senderTitle: ownMlsIdentity
+                    ? this.mlsIdentityTitle(ownMlsIdentity) : this.userId,
             });
             requestAnimationFrame(() => this.scrollToBottom());
 
@@ -984,6 +1054,7 @@ document.addEventListener('alpine:init', () => {
                     isOwn: false,
                     nickname: nicknameData.display,
                     senderId: message.sender_id,
+                    senderTitle: message.sender_id,
                     outOfOrder: imageData.outOfOrder === true
                 });
 
@@ -1009,6 +1080,61 @@ document.addEventListener('alpine:init', () => {
             if (bytes < 1024) return bytes + ' B';
             if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
             return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+        },
+
+        isValidMlsIdentity(identity, leafIndex) {
+            if (!identity || !Number.isInteger(leafIndex)
+                || identity.leafIndex !== leafIndex
+                || typeof identity.fingerprint !== 'string'
+                || !/^[0-9a-f]{64}$/.test(identity.fingerprint)) return false;
+            const short = identity.fingerprint.slice(0, 20)
+                .match(/.{1,4}/g).join(' ');
+            const isCreator = leafIndex === 0;
+            return identity.shortFingerprint === short
+                && identity.isCreator === isCreator
+                && identity.displayName
+                    === `${isCreator ? 'Creator' : 'Member'} · ${short}`;
+        },
+
+        /** Full tooltip for an MLS identity; never includes relay metadata. */
+        mlsIdentityTitle(identity) {
+            if (!identity || !identity.fingerprint) return 'Authenticated MLS member';
+            return `Authenticated MLS signature key SHA-256: ${identity.fingerprint}`;
+        },
+
+        ownDisplayName() {
+            if (this.roomType === 'group') {
+                return this.mlsSelfIdentity
+                    ? this.mlsSelfIdentity.displayName : 'Authenticating…';
+            }
+            return this.myNickname || '…';
+        },
+
+        ownIdentityTitle() {
+            if (this.roomType === 'group') {
+                return this.mlsIdentityTitle(this.mlsSelfIdentity);
+            }
+            return this.userId || '';
+        },
+
+        ownAvatarLetter() {
+            const name = this.ownDisplayName();
+            return name && name !== 'Authenticating…'
+                ? name.charAt(0).toUpperCase() : '?';
+        },
+
+        securityStatusLabel() {
+            if (this.roomType === 'group') {
+                return this.mlsReady ? 'MLS · authenticated' : 'MLS · setup';
+            }
+            const status = this.sasVerificationStatus === 'verified'
+                ? 'verified' : (this.pfsActive ? 'encrypted' : 'setup');
+            return `protocol v1 · ${status}`;
+        },
+
+        authenticatedMemberCount() {
+            if (this.roomType !== 'group') return this.participantCount;
+            return this.groupPeers.length + (this.mlsSelfIdentity ? 1 : 0);
         },
 
         /**

@@ -20,12 +20,12 @@
                 <b>PinChat</b>
             </a>
 
-            <div class="sidebar-group">Participants <span class="sidebar-group-count" x-text="'(' + participantCount + '/' + (maxParticipants !== null ? maxParticipants : '-') + ')'">(0/-)</span></div>
+            <div class="sidebar-group"><span x-text="roomType === 'group' ? 'MLS members' : 'Participants'">Participants</span> <span class="sidebar-group-count" x-text="'(' + authenticatedMemberCount() + '/' + (maxParticipants !== null ? maxParticipants : '-') + ')'">(0/-)</span></div>
 
             <!-- You (current user) -->
-            <div class="sidebar-item active" :title="userId">
+            <div class="sidebar-item active" :title="ownIdentityTitle()">
                 <span class="dot" :class="connected ? 'on' : 'off'"></span>
-                <span class="sidebar-item-label"><span x-text="myNickname || '…'">…</span></span>
+                <span class="sidebar-item-label"><span x-text="ownDisplayName()">…</span></span>
                 <span class="sidebar-item-badge">you</span>
             </div>
 
@@ -41,15 +41,15 @@
                 </div>
             </template>
 
-            <!-- Group peers. Late-joiners discover existing participants
-                 lazily as MLS envelopes arrive (sender_id backfill in
-                 app.js); the creator and earlier joiners populate the
-                 list directly from userjoined events. -->
+            <!-- Group peers come only from the cryptographically validated
+                 MLS ratchet tree. Relay sender_id values are routing metadata
+                 and never create, rename, or key these entries. -->
             <template x-if="roomType === 'group'">
-                <template x-for="p in groupPeers" :key="p.userId">
-                    <div class="sidebar-item" :title="p.userId">
+                <template x-for="p in groupPeers" :key="p.fingerprint">
+                    <div class="sidebar-item" :title="p.identityTitle">
                         <span class="dot on"></span>
                         <span class="sidebar-item-label" x-text="p.nickname">Peer</span>
+                        <span class="sidebar-item-badge" x-show="p.isCreator">creator</span>
                     </div>
                 </template>
             </template>
@@ -78,16 +78,16 @@
             <div class="sidebar-info">
                 <div class="row"><span class="k">Room</span><b x-text="roomId ? roomId.substring(0,8) + '…' : '—'">—</b></div>
                 <div class="row"><span class="k">Time left</span><b x-text="timeRemaining ? formatTime(timeRemaining).replace('⏱️ ', '') : '—'">—</b></div>
-                <div class="row"><span class="k">Participants</span><b><span x-text="participantCount">0</span>/<span x-text="maxParticipants !== null ? maxParticipants : '-'">-</span></b></div>
+                <div class="row"><span class="k" x-text="roomType === 'group' ? 'MLS members' : 'Participants'">Participants</span><b><span x-text="authenticatedMemberCount()">0</span>/<span x-text="maxParticipants !== null ? maxParticipants : '-'">-</span></b></div>
                 <div class="row"><span class="k">Max image</span><b x-text="maxImageSize ? (Math.round(maxImageSize/1024) + ' KB') : '—'">—</b></div>
             </div>
 
             <div class="sidebar-foot">
-                <div class="you">
-                    <span class="avatar" x-text="myNickname ? myNickname.charAt(0).toUpperCase() : '?'">?</span>
+                <div class="you" :title="ownIdentityTitle()">
+                    <span class="avatar" x-text="ownAvatarLetter()">?</span>
                     <div class="meta">
-                        <b x-text="myNickname || 'You'">You</b>
-                        <small>protocol v1 · <span x-text="sasVerificationStatus === 'verified' ? 'verified' : (pfsActive ? 'encrypted' : 'setup')">setup</span></small>
+                        <b x-text="ownDisplayName()">You</b>
+                        <small x-text="securityStatusLabel()">setup</small>
                     </div>
                 </div>
                 <div class="sidebar-legal">
@@ -116,12 +116,12 @@
                 <div class="room-details">
                     <!-- Show loading state until server sends room config -->
                     <span class="badge" x-text="roomType ? (roomType === 'onetoone' ? '1:1' : 'Group') : 'Loading…'"></span>
-                    <span class="participants"><svg class="icon" aria-hidden="true"><use href="#i-users"/></svg><span x-text="participantCount"></span>/<span x-text="maxParticipants !== null ? maxParticipants : '-'"></span></span>
+                    <span class="participants"><svg class="icon" aria-hidden="true"><use href="#i-users"/></svg><span x-text="authenticatedMemberCount()"></span>/<span x-text="maxParticipants !== null ? maxParticipants : '-'"></span></span>
                     <span class="ttl-countdown" x-show="timeRemaining" x-text="formatTime(timeRemaining).replace('⏱️ ', '')"></span>
 
-                    <!-- User's nickname -->
-                    <span x-show="myNickname" class="badge badge-info" :title="'Your session identifier: ' + userId">
-                        <svg class="icon" aria-hidden="true"><use href="#i-user"/></svg><span x-text="myNickname"></span>
+                    <!-- 1:1 nickname or authenticated MLS key identity -->
+                    <span x-show="roomType === 'group' ? mlsSelfIdentity : myNickname" class="badge badge-info" :title="ownIdentityTitle()">
+                        <svg class="icon" aria-hidden="true"><use href="#i-user"/></svg><span x-text="ownDisplayName()"></span>
                     </span>
 
                     <!-- PFS & PCS Status Badges -->
@@ -157,7 +157,7 @@
             <span class="sep"></span>
             <span class="kv"><span class="k">TTL</span> <b x-text="ttlMinutes ? (ttlMinutes < 60 ? ttlMinutes + 'm' : (ttlMinutes % 60 === 0 ? (ttlMinutes/60) + 'h' : Math.floor(ttlMinutes/60) + 'h ' + (ttlMinutes%60) + 'm')) : '—'"></b></span>
             <span class="sep"></span>
-            <span class="kv"><span class="k">Participants</span> <b><span x-text="participantCount"></span>/<span x-text="maxParticipants !== null ? maxParticipants : '-'"></span></b></span>
+            <span class="kv"><span class="k" x-text="roomType === 'group' ? 'MLS members' : 'Participants'">Participants</span> <b><span x-text="authenticatedMemberCount()"></span>/<span x-text="maxParticipants !== null ? maxParticipants : '-'"></span></b></span>
             <span class="sep"></span>
             <span class="kv"><span class="k">Max image</span> <b x-text="maxImageSize ? (Math.round(maxImageSize/1024) + ' KB') : '—'"></b></span>
         </div>
@@ -189,7 +189,7 @@
                         <div x-show="msg.type === 'message'" class="message" :class="msg.isOwn ? 'message-own' : 'message-other'">
                             <div class="message-bubble">
                                 <!-- Show nickname for all messages -->
-                                <div x-show="msg.nickname" class="message-sender" :title="msg.senderId">
+                                <div x-show="msg.nickname" class="message-sender" :title="msg.senderTitle">
                                     <strong x-text="msg.nickname"></strong>
                                 </div>
                                 <p><span x-html="renderMessage(msg.text)"></span><span class="message-time" x-text="formatTimestamp(msg.timestamp)"></span><span x-show="msg.outOfOrder" class="message-late" title="Delivered out of order">late</span></p>
@@ -200,7 +200,7 @@
                         <div x-show="msg.type === 'image'" class="message" :class="msg.isOwn ? 'message-own' : 'message-other'">
                             <div class="message-bubble message-bubble-image">
                                 <!-- Show nickname for all messages -->
-                                <div x-show="msg.nickname" class="message-sender" :title="msg.senderId">
+                                <div x-show="msg.nickname" class="message-sender" :title="msg.senderTitle">
                                     <strong x-text="msg.nickname"></strong>
                                 </div>
                                 <div class="message-image-container">
@@ -491,12 +491,12 @@
     <script src="/static/js/mls/public-message.js" integrity="sha256-CImebucnV+k1eq/F/6EqVd0sRqT9qAzHP0OMBxoYUdg=" crossorigin="anonymous" ></script>
     <script src="/static/js/mls/secret-tree.js" integrity="sha256-XsYydGfvBZYpe+pw6/nB27UdZAKCU5x6HFV83YBJ+Xw=" crossorigin="anonymous" ></script>
     <script src="/static/js/mls/private-message.js" integrity="sha256-BsMGsOBzh8RPdfQmfau5mzBWgioY5jy7zPMmRhSZXoA=" crossorigin="anonymous" ></script>
-    <script src="/static/js/mls/group.js" integrity="sha256-99/QCRRkJwQfio3rE44J+5aCWzcGdlrXpJReCCQ8wX4=" crossorigin="anonymous" ></script>
-    <script src="/static/js/mls-session.js" integrity="sha256-SifHFYz+hUqnu1QYToJEBmYh2KoeE3jBwcRUwhQeLXI=" crossorigin="anonymous" ></script>
+    <script src="/static/js/mls/group.js" integrity="sha256-g/82klJnXJpeqSIpH/w0TvTQyrM+yn/o8MHnOCJF31E=" crossorigin="anonymous" ></script>
+    <script src="/static/js/mls-session.js" integrity="sha256-u46A6XkGfEPXq92sInvVLBSRM33id70h+dPLe57S6O4=" crossorigin="anonymous" ></script>
     <!-- end MLS -->
     <script src="/static/js/websocket.js" integrity="sha256-pL1GGaWtDu80oPIKPn+m/NQ6q4I1UY+aJe4+CAho+Oo=" crossorigin="anonymous" ></script>
     <script src="/static/js/emoji.js" integrity="sha256-w67zAeAVHFA9AB+RnbDbadBSg6LDd5RS+4mvZksLUv8=" crossorigin="anonymous" ></script>
-    <script src="/static/js/app.js" integrity="sha256-RBb10iKvqVC3YMI5Y2gbMVcBiMfVFobPQVlHajlbqvM=" crossorigin="anonymous" ></script>
+    <script src="/static/js/app.js" integrity="sha256-H3toJ2RgRq3eFuFYUAgLkeixlw6KAlIpofG2w8Tq1Rg=" crossorigin="anonymous" ></script>
     <script src="/static/js/alpine-csp.min.js" integrity="sha256-58hj2liWaS9dR44Q2uCJ5hZP7RxcG2offLv3qbCT8FU=" crossorigin="anonymous" defer></script>
 
     <!-- Lucide icon sprite (ISC license, https://lucide.dev) -->

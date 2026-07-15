@@ -97,13 +97,16 @@ The browser-facing flow runs entirely over MLS for group rooms:
   retained as defense-in-depth. Out-of-order tolerance: up to 256
   generations of forward jump per message. This also makes decryption
   O(1) per message instead of O(generation).
-- **E2E sender attribution.** `decryptApplicationMessage` returns the
-  signature-verified sender leaf index alongside the plaintext;
-  `mls-session.js` pins the first observed `leaf -> sender_id`
-  association (the creator seeds it from the KeyPackage envelope) and,
-  if the relay later re-stamps a different `sender_id` on that leaf's
-  traffic, keeps the pinned identity and raises a UI warning instead of
-  trusting the relay's field.
+- **E2E sender attribution and visual identity.**
+  `decryptApplicationMessage` returns both the signature-verified sender
+  leaf index and the exact LeafNode signature key that authenticated the
+  plaintext. `mls-session.js` derives a SHA-256 fingerprint from that key;
+  the visible `Creator` / `Member` label contains an 80-bit prefix and its
+  tooltip carries the full 256-bit fingerprint. The sidebar is rebuilt only
+  from non-blank leaves in the authenticated ratchet tree. Relay
+  `sender_id` values remain routing/presence metadata: they cannot create,
+  remove, or rename a roster entry or message author. A changed route still
+  raises a diagnostic warning without changing the displayed key identity.
 - **Previous-epoch grace window.** On every epoch transition the
   outgoing epoch's decrypt-only context (old tree, old secrets, old
   chains) is retained for 60 seconds, so application messages already
@@ -149,8 +152,9 @@ The browser-facing flow runs entirely over MLS for group rooms:
   entirely client-side.
 
 Verified by `tests/test-mls-group-add-3leaf.js` (N-leaf Add),
-`tests/test-mls-group-remove.js` (Remove + post-remove Add), and
-`tests/test-mls-imported-tree.js` (malicious-committer Welcome trees).
+`tests/test-mls-group-remove.js` (Remove + post-remove Add),
+`tests/test-mls-imported-tree.js` (malicious-committer Welcome trees), and
+`tests/test-mls-visual-identity.js` (relay/MLS identity separation).
 Together these exercise PSK rejection, replay rejection, group_id
 mismatch, KeyPackage and LeafNode tamper rejection, whole-tree
 parent-hash validation, key uniqueness, removal-blanks-leaf, and
@@ -164,15 +168,16 @@ removed-member loss-of-access.
   a page reload. If the creator leaves or reloads, remaining members
   can keep chatting in the current epoch but nobody can join or be
   removed any more; the group must be re-created from a fresh room.
-- **No out-of-band verification ceremony.** Group identities are
-  fresh per-session signature keys whose credential is the key
-  itself; there is no SAS equivalent or identity continuity across a
-  page reload. A live page can reclaim the same relay `sender_id`
-  during the short, server-authenticated reconnect grace period, while
-  an expired/missing resume credential is rejected fail-closed for MLS.
-  Peer authentication rests entirely on the URL fragment PSK (the link
-  is the capability) plus the TOFU `leaf -> sender_id` pinning described
-  above.
+- **No out-of-band verification ceremony.** Group identities are fresh
+  per-session signature keys whose credential is the key itself. Their key
+  fingerprints prevent the relay from substituting a visual nickname, but
+  they do not assert a human name and there is no SAS equivalent or identity
+  continuity across a page reload. A live page can reclaim the same relay
+  `sender_id` during the short, server-authenticated reconnect grace period,
+  while an expired/missing resume credential is rejected fail-closed for
+  MLS. Peer admission rests on the URL-fragment PSK (the link is the
+  capability), authenticated LeafNodes, and the creator's membership
+  decisions; users do not currently compare fingerprints out of band.
 - **Filtered direct path on the wire (§7.6).** `commitAddMember` emits
   the *full* direct path with empty `encrypted_path_secret` lists where
   the copath sibling resolution is empty, instead of dropping those

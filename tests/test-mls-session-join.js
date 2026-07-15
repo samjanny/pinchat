@@ -70,6 +70,18 @@ function bytesTag(bytes) {
     return Buffer.from(bytes || []).toString('base64url');
 }
 
+async function signatureKeyFingerprint(group, leafIndex) {
+    const leaf = global.MLS.RatchetTree.leafFor(
+        group.ratchetTree, leafIndex,
+    );
+    const digest = await global.MLS.Labeled.sha256(leaf.signatureKey);
+    return Buffer.from(digest).toString('hex');
+}
+
+function latestRoster(events) {
+    return events.filter((event) => event.kind === 'roster').at(-1);
+}
+
 function captureLiveGroup(session) {
     const group = session.group;
     return {
@@ -461,6 +473,63 @@ async function main() {
     assert(exchange.joinerEvents.some((event) => event.kind === 'joined'),
         'joiner emits authenticated joined event');
 
+    // Visual identity must come exclusively from each authenticated
+    // LeafNode.signature_key. Relay sender_id values are routing metadata and
+    // may neither name roster entries nor application messages.
+    const creatorFingerprint = await signatureKeyFingerprint(
+        exchange.joiner.group, 0,
+    );
+    const joinerFingerprint = await signatureKeyFingerprint(
+        exchange.joiner.group, 1,
+    );
+    const creatorRoster = latestRoster(exchange.creatorEvents);
+    const joinerRoster = latestRoster(exchange.joinerEvents);
+    assert(creatorRoster && joinerRoster
+        && creatorRoster.members.length === 2
+        && joinerRoster.members.length === 2,
+    'creator and joiner emit complete authenticated two-member rosters');
+    assert(creatorRoster.members.map((member) => member.fingerprint).join(',')
+        === joinerRoster.members.map((member) => member.fingerprint).join(',')
+        && creatorRoster.members[0].fingerprint === creatorFingerprint
+        && creatorRoster.members[1].fingerprint === joinerFingerprint,
+    'all members derive the same roster identities from MLS signature keys');
+    assert(creatorRoster.members.every((member) => member.senderId === undefined
+        && /^[0-9a-f]{64}$/.test(member.fingerprint)
+        && /^[0-9a-f]{4}( [0-9a-f]{4}){4}$/.test(member.shortFingerprint)
+        && member.displayName.includes(member.shortFingerprint)),
+    'authenticated roster contains full/80-bit fingerprints and no relay identity');
+    assert(creatorRoster.members.find((member) => member.isSelf).leafIndex === 0
+        && joinerRoster.members.find((member) => member.isSelf).leafIndex === 1,
+    'each roster marks its own authenticated leaf');
+
+    const creatorOutBeforeIdentityMessage = exchange.creatorOut.length;
+    const joinerEventsBeforeIdentityMessage = exchange.joinerEvents.length;
+    await exchange.creator.sendMessage('identity is the MLS key');
+    const identityMessage = exchange.creatorOut
+        .slice(creatorOutBeforeIdentityMessage)
+        .find((envelope) => envelope.wire_format === WireFormat.MLS_PRIVATE_MESSAGE);
+    await exchange.joiner.onRelayEnvelope({
+        ...identityMessage,
+        // Model a relay changing the route label after it supplied
+        // "creator-1" on the correlated Commit + Welcome.
+        sender_id: 'relay-chosen-fake-name',
+    });
+    const authenticatedMessage = exchange.joinerEvents
+        .slice(joinerEventsBeforeIdentityMessage)
+        .find((event) => event.kind === 'message');
+    assert(authenticatedMessage
+        && authenticatedMessage.senderIdentity.fingerprint === creatorFingerprint
+        && authenticatedMessage.senderIdentity.displayName
+            === joinerRoster.members[0].displayName,
+    'application event identity is derived from the signature-verified leaf key');
+    assert(authenticatedMessage.senderId === undefined
+        && !authenticatedMessage.senderIdentity.displayName.includes('creator-1')
+        && !authenticatedMessage.senderIdentity.displayName
+            .includes('relay-chosen-fake-name'),
+    'relay sender_id cannot enter the displayed application identity');
+    assert(authenticatedMessage.attributionWarning === true,
+        'relay route relabeling is surfaced without changing key identity');
+
     // Exercise the steady-state browser path after the Welcome.  This is
     // intentionally routed through MLSSession.onRelayEnvelope: Group-level
     // tests do not cover the PublicMessage body parser used for dispatch.
@@ -710,6 +779,10 @@ async function main() {
         && !exchange.creator._leafBySenderId.has('joiner-1')
         && !exchange.creator._senderIdByLeaf.has(1),
     'Remove applies atomically and clears routing only after Commit echo');
+    const rosterAfterRemove = latestRoster(exchange.creatorEvents);
+    assert(rosterAfterRemove.members.length === 1
+        && rosterAfterRemove.members[0].fingerprint === creatorFingerprint,
+    'authenticated roster removes a member only after accepted Remove');
 
     // Also cover a proposal that was valid when received but sat in the
     // queue while some other local Commit advanced the creator. Its outer

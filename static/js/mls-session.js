@@ -31,7 +31,8 @@
  *   'keypackage-published'   — our KeyPackage has been emitted
  *   'welcome-sent'            — Alice sent a Welcome to the new member
  *   'joined'                  — Bob completed join
- *   'message'                 — application payload decrypted
+ *   'roster'                  — live leaves identified by signature-key hash
+ *   'message'                 — payload + authenticated sender key identity
  *   'error'                   — unrecoverable error with { reason }
  */
 (function (root) {
@@ -60,6 +61,19 @@
     const BOOTSTRAP_PIN_BYTES = 32;
     const CORRELATION_REF_BYTES = 32;
     const MAX_PENDING_WELCOME_COMMITS = 8;
+    // The visible label carries 80 bits of the SHA-256 fingerprint. The full
+    // 256-bit value is always emitted alongside it for tooltips/comparison.
+    const VISIBLE_FINGERPRINT_HEX = 20;
+
+    function hexEncode(bytes) {
+        return Array.from(bytes, (byte) =>
+            byte.toString(16).padStart(2, '0')).join('');
+    }
+
+    function shortFingerprint(fullFingerprint) {
+        return fullFingerprint.slice(0, VISIBLE_FINGERPRINT_HEX)
+            .match(/.{1,4}/g).join(' ');
+    }
 
     function equalBytes(a, b) {
         if (!(a instanceof Uint8Array) || !(b instanceof Uint8Array)
@@ -242,15 +256,18 @@
             // a single peer can publish many KeyPackages, growing the
             // tree arbitrarily and exhausting committer resources.
             this._leafBySenderId = new Map();
-            // Reverse binding leafIndex → sender_id used for E2E message
-            // attribution. The MLS signature authenticates the sender's
-            // LEAF; the relay's sender_id is unauthenticated transport
-            // metadata. The creator seeds this map at commit time; every
-            // member pins the first observed association (TOFU). On a
-            // later mismatch we keep the pinned identity and flag the
-            // message: a mismatch means the relay re-stamped the
-            // envelope's sender_id.
+            // Reverse leafIndex → sender_id binding used ONLY for transport
+            // routing diagnostics. The MLS signature authenticates the leaf
+            // and its signature_key; sender_id is relay metadata and MUST
+            // never supply a displayed name or security identity. The
+            // creator seeds this map at Add time; other members remember the
+            // first observed route and warn if the relay later re-stamps it.
             this._senderIdByLeaf = new Map();
+            // Public identity cache keyed by the complete raw signature key.
+            // Entries contain only SHA-256 fingerprints, never secret state.
+            // Keeping removed keys cached also lets previous-epoch grace
+            // messages retain their authenticated visual identity.
+            this._identityBySignatureKey = new Map();
             // Creator-only: Update proposals received from members, keyed
             // by proposer leaf index, awaiting the next periodic Commit.
             this._pendingUpdateProposals = new Map();
@@ -295,6 +312,7 @@
                     id.signaturePublicKeyBytes,
                 );
                 this._state = 'awaiting-keypackage';
+                await this._emitAuthenticatedRoster();
             } else {
                 if (!this.expectedGroupId || !this.expectedCreatorKeyHash) {
                     throw new Error(
@@ -324,6 +342,67 @@
                 signaturePrivateKey: kp.privateKey,
                 signaturePublicKeyBytes: kp.publicKeyBytes,
             };
+        }
+
+        /**
+         * Describe one MLS member exclusively from its authenticated
+         * LeafNode.signature_key. sender_id is deliberately absent.
+         */
+        async _authenticatedIdentity(signatureKey, leafIndex, myLeafIndex) {
+            if (!(signatureKey instanceof Uint8Array) || signatureKey.length !== 65) {
+                throw new Error('mls-session: invalid member signature_key');
+            }
+            const cacheKey = base64UrlEncode(signatureKey);
+            let fingerprint = this._identityBySignatureKey.get(cacheKey);
+            if (!fingerprint) {
+                const full = hexEncode(await MLS.Labeled.sha256(signatureKey));
+                fingerprint = Object.freeze({
+                    fingerprint: full,
+                    shortFingerprint: shortFingerprint(full),
+                });
+                this._identityBySignatureKey.set(cacheKey, fingerprint);
+            }
+            const isCreator = leafIndex === CREATOR_LEAF_INDEX;
+            return Object.freeze({
+                leafIndex,
+                fingerprint: fingerprint.fingerprint,
+                shortFingerprint: fingerprint.shortFingerprint,
+                displayName: `${isCreator ? 'Creator' : 'Member'} · `
+                    + fingerprint.shortFingerprint,
+                isCreator,
+                isSelf: leafIndex === myLeafIndex,
+            });
+        }
+
+        async _authenticatedRosterEvent(group = this.group) {
+            if (!group) {
+                throw new Error('mls-session: cannot build roster without group state');
+            }
+            const members = [];
+            for (let leafIndex = 0; leafIndex < group.nLeaves; leafIndex += 1) {
+                const leaf = MLS.RatchetTree.leafFor(
+                    group.ratchetTree, leafIndex,
+                );
+                // Remove commits leave blank leaves. They are not members of
+                // the authenticated roster and must disappear only after the
+                // Commit installing that blank has been accepted.
+                if (!leaf) continue;
+                members.push(await this._authenticatedIdentity(
+                    leaf.signatureKey, leafIndex, group.myLeafIndex,
+                ));
+            }
+            return Object.freeze({
+                kind: 'roster',
+                epoch: group.epoch.toString(),
+                myLeafIndex: group.myLeafIndex,
+                members: Object.freeze(members),
+            });
+        }
+
+        async _emitAuthenticatedRoster(group = this.group) {
+            const event = await this._authenticatedRosterEvent(group);
+            this.onEvent(event);
+            return event;
         }
 
         async _sendEnvelopeOrThrow(envelope, description) {
@@ -417,6 +496,13 @@
             const pending = this._pendingCommit;
             if (!pending) return false;
 
+            // Fingerprinting is the only fallible UI preparation. Complete it
+            // before installing the candidate so a platform hash failure
+            // cannot leave the protocol advanced but the visual roster stale.
+            const rosterEvent = await this._authenticatedRosterEvent(
+                pending.candidateGroup,
+            );
+
             // Clear first so a duplicate echo cannot install or announce the
             // candidate twice. Everything below is local bookkeeping or a
             // post-acceptance Welcome; the MLS state swap itself is atomic.
@@ -429,6 +515,7 @@
                 // live Group must not retain a second complete copy.
                 supersededGroup.destroySecrets();
             }
+            this.onEvent(rosterEvent);
 
             if (pending.kind === 'add') {
                 this._leafBySenderId.set(pending.senderId, pending.addedLeafIndex);
@@ -893,8 +980,21 @@
                 expectedGroupId: this.expectedGroupId,
                 expectedCreatorKeyHash: this.expectedCreatorKeyHash,
             });
+            let rosterEvent;
+            try {
+                rosterEvent = await this._authenticatedRosterEvent(joinedGroup);
+            } catch (err) {
+                joinedGroup.destroySecrets();
+                throw new Error(
+                    `mls-session: authenticated roster derivation failed: ${err.message}`,
+                );
+            }
             this.group = joinedGroup;
             this._state = 'joined';
+            // Correlating the route is useful for diagnostics, but the relay
+            // controls this value. It is never included in roster identities.
+            this._senderIdByLeaf.set(CREATOR_LEAF_INDEX, candidate.senderId);
+            this.onEvent(rosterEvent);
             this.onEvent({ kind: 'joined' });
         }
 
@@ -912,21 +1012,22 @@
             }
             const pt = res.plaintext;
             const senderLeafIndex = res.senderLeafIndex;
+            const senderIdentity = await this._authenticatedIdentity(
+                res.senderSignatureKey,
+                senderLeafIndex,
+                this.group.myLeafIndex,
+            );
 
-            // E2E attribution (audit fix): senderLeafIndex is the
-            // signature-verified sender; the envelope's sender_id is
-            // relay-stamped and unauthenticated. Pin the first observed
-            // association and keep the pinned value on mismatch.
-            let attributedSenderId = senderId;
+            // sender_id remains useful for detecting relay routing changes,
+            // but never participates in senderIdentity or anything displayed
+            // as an MLS identity. In particular, a malicious relay may choose
+            // the FIRST association without affecting the key fingerprint.
             let attributionWarning = false;
             const pinned = this._senderIdByLeaf.get(senderLeafIndex);
             if (pinned === undefined) {
                 if (senderId) this._senderIdByLeaf.set(senderLeafIndex, senderId);
             } else if (senderId && senderId !== pinned) {
-                attributedSenderId = pinned;
                 attributionWarning = true;
-            } else {
-                attributedSenderId = pinned;
             }
 
             if (pt.length === 0) {
@@ -938,8 +1039,8 @@
                 this.onEvent({
                     kind: 'message',
                     text: new TextDecoder().decode(pt.subarray(1)),
-                    senderId: attributedSenderId,
                     senderLeafIndex,
+                    senderIdentity,
                     attributionWarning,
                 });
                 return;
@@ -960,8 +1061,8 @@
                     kind: 'image',
                     mimeType,
                     data,
-                    senderId: attributedSenderId,
                     senderLeafIndex,
+                    senderIdentity,
                     attributionWarning,
                 });
                 return;
@@ -1051,21 +1152,34 @@
          * the pending keypair is swapped in inside processCommit.
          */
         async _handleIncomingCommit(wrapped) {
+            let result;
             try {
-                const result = await this.group.processCommit(wrapped, {
+                result = await this.group.processCommit(wrapped, {
                     pendingSelfUpdate: this._pendingSelfUpdate
                         ? this._pendingSelfUpdate.keyPair
                         : null,
                 });
-                if (result.selfUpdated && this._pendingSelfUpdate) {
-                    this._pendingSelfUpdate = null;
-                }
-                this.onEvent({ kind: 'commit-applied', ...result });
             } catch (err) {
                 console.error('[MLS] processCommit failed:', err);
                 this.onEvent({ kind: 'error',
                     reason: `processCommit failed: ${err.message}` });
+                return;
             }
+            if (result.selfUpdated && this._pendingSelfUpdate) {
+                this._pendingSelfUpdate = null;
+            }
+            try {
+                await this._emitAuthenticatedRoster();
+            } catch (err) {
+                // The Commit is already accepted; never misreport it as a
+                // processCommit rollback. Suppress plaintext identities until
+                // a roster can be derived instead of falling back to relay IDs.
+                this.onEvent({ kind: 'error',
+                    reason: `authenticated roster update failed: ${err.message}`,
+                    fatalIdentity: true });
+                return;
+            }
+            this.onEvent({ kind: 'commit-applied', ...result });
         }
 
         /**

@@ -285,6 +285,9 @@ async function main() {
         const res3 = await bob.decryptApplicationMessage(w3);
         assert(res3.senderLeafIndex === alice.myLeafIndex,
             'decrypt surfaces the authenticated sender leaf index');
+        assert(hex(res3.senderSignatureKey)
+            === hex(alice.ratchetTree[0].leaf.signatureKey),
+        'decrypt surfaces the exact signature key that authenticated the sender');
     }
 
     console.log('# Group: receive ratchet advances only after full authentication');
