@@ -158,7 +158,10 @@ Verified by `tests/test-mls-group-add-3leaf.js` (N-leaf Add),
 Together these exercise PSK rejection, replay rejection, group_id
 mismatch, KeyPackage and LeafNode tamper rejection, whole-tree
 parent-hash validation, key uniqueness, removal-blanks-leaf, and
-removed-member loss-of-access.
+removed-member loss-of-access. Standalone member Updates are authenticated
+and stored by every current member; creator Commits carry their RFC 9420
+ProposalRefs, and each recipient re-verifies the exact current-epoch
+AuthenticatedContent before applying the referenced leaf update.
 
 ## Known gaps (post-MVP)
 
@@ -220,8 +223,6 @@ removed-member loss-of-access.
   path are blanked but the tree width (`nLeaves`) is not trimmed. A
   subsequent `Add` will fill the next free slot to the right of the
   blank, growing the tree rather than reusing the blanked index.
-- **Proposal-by-reference.** All proposals travel inline inside their
-  Commit; the proposal store + RefHash dispatch is not wired.
 - **`ratchet_tree` GroupInfo extension.** The new joiner currently
   receives the serialised tree as a side-channel field on the Welcome
   envelope; the standardised extension path is unimplemented.

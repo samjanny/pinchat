@@ -125,6 +125,26 @@
     }
 
     /**
+     * Stable Map key for an RFC 9420 ProposalRef. The active ciphersuite's
+     * RefHash output is Nh bytes; rejecting every other length prevents an
+     * attacker from populating ambiguous or unbounded reference keys.
+     */
+    function proposalReferenceKey(reference) {
+        if (!(reference instanceof Uint8Array) || reference.length !== HPKE.Nh) {
+            const length = reference && Number.isInteger(reference.length)
+                ? reference.length : 'malformed';
+            throw new Error(
+                `proposal-ref: expected ${HPKE.Nh} bytes, got ${length}`,
+            );
+        }
+        let out = '';
+        for (let i = 0; i < reference.length; i += 1) {
+            out += reference[i].toString(16).padStart(2, '0');
+        }
+        return out;
+    }
+
+    /**
      * Clone mutable MLS state while deliberately retaining WebCrypto key
      * handles. CryptoKey objects are immutable; byte arrays, tree nodes,
      * maps, sets, and their plain-object containers are not and must never
@@ -1096,6 +1116,85 @@
             );
         };
 
+    /**
+     * Resolve every ProposalRef against this member's authenticated,
+     * current-epoch proposal store. Store metadata is never trusted as the
+     * proof: the exact standalone PublicMessage is parsed and all of its
+     * epoch, signature, membership-tag, LeafNode-binding, and key-uniqueness
+     * checks are repeated here before the proposal reaches candidate-tree
+     * construction. Nothing is removed from the store on failure; the
+     * orchestrator consumes the epoch store only after Commit acceptance.
+     */
+    Group.prototype._resolveCommitProposalList =
+        async function _resolveCommitProposalList(
+            proposalOrRefs, proposalStore, operation,
+        ) {
+            if (!Array.isArray(proposalOrRefs)) {
+                throw new Error(`${operation}: malformed proposal list`);
+            }
+            const resolved = [];
+            const seenReferences = new Set();
+            for (let wireIndex = 0; wireIndex < proposalOrRefs.length; wireIndex += 1) {
+                const por = proposalOrRefs[wireIndex];
+                if (!por || !Number.isInteger(por.type)) {
+                    throw new Error(`${operation}: malformed proposal at index ${wireIndex}`);
+                }
+                if (por.type === Proposal.ProposalOrRefType.PROPOSAL) {
+                    resolved.push({
+                        type: por.type,
+                        proposal: por.proposal,
+                        proposalSource: 'inline',
+                    });
+                    continue;
+                }
+                if (por.type !== Proposal.ProposalOrRefType.REFERENCE) {
+                    throw new Error(
+                        `${operation}: unsupported ProposalOrRef type ${por.type}`,
+                    );
+                }
+
+                const referenceKey = proposalReferenceKey(por.reference);
+                if (seenReferences.has(referenceKey)) {
+                    throw new Error(
+                        `${operation}: duplicate ProposalRef at index ${wireIndex}`,
+                    );
+                }
+                seenReferences.add(referenceKey);
+                if (!(proposalStore instanceof Map)) {
+                    throw new Error(
+                        `${operation}: ProposalRef requires an authenticated proposal store`,
+                    );
+                }
+                const stored = proposalStore.get(referenceKey);
+                if (!stored || !(stored.messageBytes instanceof Uint8Array)) {
+                    throw new Error(
+                        `${operation}: unknown ProposalRef at index ${wireIndex}`,
+                    );
+                }
+
+                // allowOwnSender is required for the member whose own Update
+                // is being committed. Network echoes are still rejected by
+                // the ordinary receive path before storage.
+                const verified = await this.verifyUpdateProposal(
+                    stored.messageBytes, { allowOwnSender: true },
+                );
+                if (!equalBytes(verified.reference, por.reference)) {
+                    throw new Error(
+                        `${operation}: stored proposal does not match ProposalRef at index ${wireIndex}`,
+                    );
+                }
+                resolved.push({
+                    type: por.type,
+                    reference: Uint8Array.from(por.reference),
+                    proposal: verified.proposal,
+                    proposalSenderLeafIndex: verified.senderLeafIndex,
+                    proposalEpoch: verified.epoch,
+                    proposalSource: 'reference',
+                });
+            }
+            return resolved;
+        };
+
     Group.prototype.commitAddMember = async function commitAddMember({ keyPackageBytes }) {
         const kp = KeyPackage.parseKeyPackage(keyPackageBytes);
         if (kp.cipherSuite !== CIPHERSUITE) {
@@ -1668,10 +1767,13 @@
      * separate, still authenticates the proposal), and the committer
      * re-keys the tree so the old leaf key stops decrypting anything.
      *
-     * Returns { proposalMessage, pendingLeafKeyPair, pendingLeafNode }.
-     * The caller (mls-session) holds pendingLeafKeyPair until it sees the
-     * Commit that carries this proposal land, then calls
-     * applyPendingSelfUpdate().
+     * Returns the complete authenticated proposal-store entry alongside the
+     * pending private keypair. `reference` is computed over the serialized
+     * AuthenticatedContent (wire_format + FramedContent + auth), excluding
+     * both the PublicMessage membership_tag and the outer MLSMessage wrapper.
+     * The caller (mls-session) retains pendingLeafKeyPair under this exact
+     * reference and supplies it to processCommit(); the key is installed
+     * only after the referenced Commit fully authenticates.
      */
     Group.prototype.proposeUpdate = async function proposeUpdate() {
         if (this.myLeafIndex === undefined || this.myLeafIndex === null) {
@@ -1714,8 +1816,21 @@
         const pm = { content, auth, membershipTag };
         const pmBytes = PublicMessage.publicMessageBytes(pm);
         const proposalMessage = MLSMessage.serializeMLSMessage(wireFormat, pmBytes);
+        const authenticatedContent = Framing.authenticatedContentBytes({
+            wireFormat, content, auth,
+        });
+        const reference = await Commit.proposalRef(authenticatedContent);
 
-        return { proposalMessage, pendingLeafKeyPair: newLeafKeyPair, pendingLeafNode: leaf };
+        return {
+            proposalMessage,
+            messageBytes: Uint8Array.from(proposalMessage),
+            reference,
+            proposal,
+            senderLeafIndex: this.myLeafIndex,
+            epoch: this.epoch,
+            pendingLeafKeyPair: newLeafKeyPair,
+            pendingLeafNode: leaf,
+        };
     };
 
     /**
@@ -1728,10 +1843,12 @@
      * membership_tag bind the proposal to the current GroupContext/epoch.
      *
      * This method is deliberately read-only. It returns the authenticated
-     * proposal and its cryptographic sender leaf for commitUpdate().
+     * proposal, its cryptographic sender leaf, its exact message bytes, and
+     * its RFC ProposalRef for storage and later one-shot resolution.
      */
     Group.prototype.verifyUpdateProposal = async function verifyUpdateProposal(
         proposalMessageBytes,
+        { allowOwnSender = false } = {},
     ) {
         const frame = MLSMessage.parseMLSMessage(proposalMessageBytes);
         if (frame.wireFormat !== MLSMessage.WireFormat.MLS_PUBLIC_MESSAGE) {
@@ -1772,7 +1889,7 @@
                 `verifyUpdateProposal: sender leaf_index ${senderLeafIndex} out of range`,
             );
         }
-        if (senderLeafIndex === this.myLeafIndex) {
+        if (senderLeafIndex === this.myLeafIndex && !allowOwnSender) {
             throw new Error('verifyUpdateProposal: own proposal echo (filter upstream)');
         }
         const senderLeaf = RatchetTree.leafFor(this.ratchetTree, senderLeafIndex);
@@ -1817,7 +1934,17 @@
             candidateTree[ancestor] = null;
         }
         verifyTreeKeyUniqueness(candidateTree, 'verifyUpdateProposal');
-        return { proposal, senderLeafIndex, epoch: content.epoch };
+        const authenticatedContent = Framing.authenticatedContentBytes({
+            wireFormat, content, auth: pm.auth,
+        });
+        const reference = await Commit.proposalRef(authenticatedContent);
+        return {
+            proposal,
+            senderLeafIndex,
+            epoch: content.epoch,
+            reference,
+            messageBytes: Uint8Array.from(proposalMessageBytes),
+        };
     };
 
     /**
@@ -1849,20 +1976,20 @@
      * change. Used for the periodic PCS rotation in membership-stable
      * groups.
      *
-     * `updateProposals` (optional): an array of
-     * { proposal, senderLeafIndex } Update proposals to fold into this
-     * Commit. Each installs the proposer's fresh leaf and blanks that
-     * leaf's direct path BEFORE the committer builds its own UpdatePath,
-     * so the committer's re-key routes new path secrets to the updated
-     * members' new keys.
+     * `updateProposals` (optional): authenticated proposal-store entries
+     * returned by verifyUpdateProposal(). The wire Commit carries only each
+     * entry's ProposalRef; the standalone authenticated PublicMessage is
+     * re-verified before its Update is applied. Each Update installs the
+     * proposer's fresh leaf and blanks that leaf's direct path BEFORE the
+     * committer builds its own UpdatePath, so the committer's re-key routes
+     * new path secrets to the updated members' new keys.
      *
      * Scope note: this heals leakage of the current epoch secrets (an
      * attacker holding epoch n secrets cannot follow into epoch n+1
-     * without the committer's fresh path secret). It does NOT heal a
-     * compromised MEMBER leaf private key: the ciphertext addressed to
-     * that leaf remains decryptable by whoever holds it. Full PCS for
-     * member compromise needs member-initiated Update proposals, which
-     * are still post-MVP.
+     * without the committer's fresh path secret). A compromised MEMBER leaf
+     * private key is healed only when that member's authenticated Update
+     * ProposalRef is folded into a Commit; the fresh member leaf and
+     * committer path then advance the group beyond the compromised key.
      *
      * Returns { commitMessage }.
      */
@@ -1874,12 +2001,26 @@
         const newWidth = TreeMath.nodeWidth(newNLeaves);
         const newTree = Nodes.padRatchetTree(this.ratchetTree.slice(), newWidth);
 
-        const proposalOrRefs = updateProposals.map((up) => ({
-            type: Proposal.ProposalOrRefType.PROPOSAL,
-            proposal: up && up.proposal,
-        }));
+        const proposalStore = new Map();
+        const proposalOrRefs = updateProposals.map((up, index) => {
+            if (!up || !(up.reference instanceof Uint8Array)
+                || !(up.messageBytes instanceof Uint8Array)) {
+                throw new Error(
+                    `commitUpdate: proposal-store entry ${index} is incomplete`,
+                );
+            }
+            const referenceKey = proposalReferenceKey(up.reference);
+            if (!proposalStore.has(referenceKey)) proposalStore.set(referenceKey, up);
+            return {
+                type: Proposal.ProposalOrRefType.REFERENCE,
+                reference: Uint8Array.from(up.reference),
+            };
+        });
+        const resolvedProposals = await this._resolveCommitProposalList(
+            proposalOrRefs, proposalStore, 'commitUpdate',
+        );
         const proposalPlan = this._validateCommitProposalList(
-            proposalOrRefs, this.myLeafIndex, 'commitUpdate',
+            resolvedProposals, this.myLeafIndex, 'commitUpdate',
         );
         if (proposalPlan.updates.length !== proposalOrRefs.length) {
             throw new Error('commitUpdate: only Update proposals may be folded');
@@ -1888,28 +2029,21 @@
         // ---- 0. Apply Update proposals: install each proposer's fresh
         // leaf and blank its direct path (RFC §12.4.2). Verify each
         // proposal's LeafNode signature against the CURRENT leaf's
-        // signature key (no identity rotation in this MVP). The authenticated
-        // sender metadata retained by MLSSession must agree with the target
-        // resolved from the proposal's signature_key.
-        for (let i = 0; i < updateProposals.length; i += 1) {
-            const up = updateProposals[i];
-            const li = up.senderLeafIndex;
-            const resolvedLeafIndex = proposalPlan.updates[i].targetLeafIndex;
-            if (li !== resolvedLeafIndex) {
-                throw new Error(
-                    `commitUpdate: authenticated proposal sender ${li} does not match Update target ${resolvedLeafIndex}`,
-                );
-            }
+        // signature key (no identity rotation in this MVP). The target is
+        // the authenticated sender carried by the resolved ProposalRef,
+        // never a signature-key scan over an unauthenticated inline leaf.
+        for (const entry of proposalPlan.updates) {
+            const li = entry.targetLeafIndex;
             const curLeaf = RatchetTree.leafFor(this.ratchetTree, li);
             await verifyUpdateLeafBinding(
-                up.proposal.leafNode,
+                entry.proposal.leafNode,
                 curLeaf.signatureKey,
                 curLeaf.encryptionKey,
                 this.groupId,
                 li,
             );
             newTree[TreeMath.leafToNode(li)] = {
-                nodeType: Nodes.NodeType.LEAF, leaf: up.proposal.leafNode,
+                nodeType: Nodes.NodeType.LEAF, leaf: entry.proposal.leafNode,
             };
             for (const ancestor of TreeMath.directPathWithRoot(TreeMath.leafToNode(li), newNLeaves)) {
                 newTree[ancestor] = null;
@@ -2121,22 +2255,20 @@
      *   commitMessageBytes : MLSMessage(mls_public_message) bytes
      *
      * Verifies the FramedContent signature + membership_tag, validates and
-     * applies inline Update/Remove/Add proposals, walks the UpdatePath to recover our
-     * share of the new path_secret chain, and advances the local epoch
-     * state.
-     *
-     * Scope:
-     *   - Inline Add/Update/Remove proposals only. Proposal-by-reference is
-     *     not implemented yet.
+     * resolves authenticated Update ProposalRefs, applies Update/Remove/Add
+     * proposals, walks the UpdatePath to recover our share of the new
+     * path_secret chain, and advances the local epoch state.
      */
     Group.prototype.processCommit = async function processCommit(commitMessageBytes, opts = {}) {
         // pendingSelfUpdate: the { publicKeyBytes, privateKey, ... } keypair
         // we generated for an Update proposal that may be folded into this
-        // Commit. If the Commit installs our new leaf, we must decrypt the
-        // committer's UpdatePath with the NEW private key (the committer
-        // encrypted to it), so we swap leafKeyPair before the resolution
-        // walk. Ignored if this Commit does not carry our update.
+        // Commit. If the Commit installs our new leaf, we decrypt the
+        // committer's UpdatePath with the NEW private key but stage the swap
+        // until all Commit authentication (including confirmation_tag) has
+        // succeeded. Ignored if this Commit does not carry our update.
         const pendingSelfUpdate = opts.pendingSelfUpdate || null;
+        const pendingSelfUpdates = opts.pendingSelfUpdates instanceof Map
+            ? opts.pendingSelfUpdates : null;
         const frame = MLSMessage.parseMLSMessage(commitMessageBytes);
         if (frame.wireFormat !== MLSMessage.WireFormat.MLS_PUBLIC_MESSAGE) {
             throw new Error(`processCommit: expected mls_public_message, got ${frame.wireFormat}`);
@@ -2199,8 +2331,11 @@
         }
 
         const commit = content.parsed;
+        const resolvedProposals = await this._resolveCommitProposalList(
+            commit.proposals, opts.proposalStore, 'processCommit',
+        );
         const proposalPlan = this._validateCommitProposalList(
-            commit.proposals, senderLeafIndex, 'processCommit',
+            resolvedProposals, senderLeafIndex, 'processCommit',
         );
 
         // ---- Apply proposals in RFC 9420 §12.3 phases ----
@@ -2370,21 +2505,39 @@
         const provisionalGroupContextBytes =
             GroupContext.groupContextBytes(provisionalGroupContext);
 
-        // If a folded Update proposal re-keyed OUR leaf, adopt the
-        // pending private key now: the committer's UpdatePath below is
-        // encrypted to our NEW leaf encryption key, and the tree already
-        // carries the matching public key.
+        // If a referenced Update proposal re-keyed OUR leaf, stage the exact
+        // pending private key selected by that ProposalRef. Do not mutate the
+        // live leafKeyPair yet: AEAD/path, transcript, and confirmation-tag
+        // validation below may still fail, and every failure must leave the
+        // recipient state unchanged.
         let selfUpdated = false;
-        if (pendingSelfUpdate && updatedLeafIndices.includes(this.myLeafIndex)) {
-            const myLeaf = RatchetTree.leafFor(newTree, this.myLeafIndex);
-            if (myLeaf && equalBytes(myLeaf.encryptionKey, pendingSelfUpdate.publicKeyBytes)) {
-                this.leafKeyPair = {
-                    privateKey: pendingSelfUpdate.privateKey,
-                    publicKey: pendingSelfUpdate.publicKey,
-                    publicKeyBytes: pendingSelfUpdate.publicKeyBytes,
-                };
-                selfUpdated = true;
+        let nextLeafKeyPair = this.leafKeyPair;
+        const selfUpdateEntry = proposalPlan.updates.find(
+            (entry) => entry.targetLeafIndex === this.myLeafIndex,
+        );
+        if (selfUpdateEntry) {
+            let selectedPending = null;
+            if (pendingSelfUpdates && selfUpdateEntry.reference) {
+                const storedPending = pendingSelfUpdates.get(
+                    proposalReferenceKey(selfUpdateEntry.reference),
+                );
+                selectedPending = storedPending && storedPending.keyPair
+                    ? storedPending.keyPair : storedPending;
             }
+            if (!selectedPending) selectedPending = pendingSelfUpdate;
+            const myLeaf = RatchetTree.leafFor(newTree, this.myLeafIndex);
+            if (!selectedPending || !myLeaf
+                || !equalBytes(myLeaf.encryptionKey, selectedPending.publicKeyBytes)) {
+                throw new Error(
+                    'processCommit: missing private key for referenced self Update',
+                );
+            }
+            nextLeafKeyPair = {
+                privateKey: selectedPending.privateKey,
+                publicKey: selectedPending.publicKey,
+                publicKeyBytes: selectedPending.publicKeyBytes,
+            };
+            selfUpdated = true;
         }
 
         // ---- Find LCA and decrypt our share of path_secret ----
@@ -2415,8 +2568,8 @@
             const n = filtered[j];
             if (n === myLeafNodeIdx) {
                 myCtIndex = j;
-                myPrivateKey = this.leafKeyPair.privateKey;
-                myPublicKeyBytes = this.leafKeyPair.publicKeyBytes;
+                myPrivateKey = nextLeafKeyPair.privateKey;
+                myPublicKeyBytes = nextLeafKeyPair.publicKeyBytes;
                 break;
             }
             if (this.parentKeyPairs && this.parentKeyPairs.has(n)) {
@@ -2538,6 +2691,7 @@
         this._chainStates = preparedEpoch.chainStates;
         previousInitSecret.fill(0);
         this.senderRatchetGeneration = 0;
+        if (selfUpdated) this.leafKeyPair = nextLeafKeyPair;
         // Forward secrecy: keep only entries that are on our direct
         // path in the new tree. Any prior entry not in this set was
         // either a node-of-no-current-relevance (tree grew past it) or
@@ -2571,6 +2725,9 @@
             updatedLeafIndices,
             selfUpdated,
             committerLeafIndex: senderLeafIndex,
+            consumedProposalRefs: proposalPlan.updates.map(
+                (entry) => Uint8Array.from(entry.reference),
+            ),
         };
     };
 
@@ -3108,12 +3265,13 @@
     }
 
     /**
-     * Validate all inline proposals against the same pre-Commit tree before
-     * constructing a candidate state. RFC 9420 §12.2 forbids multiple
-     * Update and/or Remove proposals applying to one leaf. Resolving every
-     * target up front also prevents wire ordering from changing which leaf a
-     * proposal addresses (for example, Add followed by Remove of the newly
-     * appended index).
+     * Validate all inline or already-resolved proposals against the same
+     * pre-Commit tree before constructing a candidate state. RFC 9420 §12.2
+     * forbids multiple Update and/or Remove proposals applying to one leaf.
+     * In the creator-only PinChat profile, member Updates MUST arrive by
+     * reference: an inline Update is authored by the committer and therefore
+     * cannot authenticate some other member as its target. Add and Remove
+     * remain creator-authored inline proposals.
      *
      * The returned arrays preserve relative order within each proposal type,
      * while placing them into the application phases required by §12.3.
@@ -3145,29 +3303,37 @@
 
         for (let wireIndex = 0; wireIndex < proposalOrRefs.length; wireIndex += 1) {
             const por = proposalOrRefs[wireIndex];
-            if (!por || por.type !== Proposal.ProposalOrRefType.PROPOSAL) {
-                throw new Error(`${operation}: proposal-by-reference not supported`);
+            if (!por || (por.type !== Proposal.ProposalOrRefType.PROPOSAL
+                && por.type !== Proposal.ProposalOrRefType.REFERENCE)) {
+                throw new Error(`${operation}: malformed ProposalOrRef at index ${wireIndex}`);
             }
             const proposal = por.proposal;
             if (!proposal || !Number.isInteger(proposal.proposalType)) {
-                throw new Error(`${operation}: malformed inline proposal at index ${wireIndex}`);
+                const source = por.type === Proposal.ProposalOrRefType.REFERENCE
+                    ? 'resolved' : 'inline';
+                throw new Error(
+                    `${operation}: malformed ${source} proposal at index ${wireIndex}`,
+                );
             }
 
             if (proposal.proposalType === Proposal.ProposalType.UPDATE) {
+                if (por.type !== Proposal.ProposalOrRefType.REFERENCE) {
+                    throw new Error(
+                        `${operation}: inline Update proposals are not permitted; `
+                        + 'member Updates must be authenticated by ProposalRef',
+                    );
+                }
                 const newLeaf = proposal.leafNode;
                 if (!newLeaf || newLeaf.leafNodeSource !== Nodes.LeafNodeSource.UPDATE) {
                     throw new Error(`${operation}: Update proposal leaf not source=update`);
                 }
-                let targetLeafIndex = -1;
-                for (let leafIndex = 0; leafIndex < nLeaves; leafIndex += 1) {
-                    const existing = RatchetTree.leafFor(tree, leafIndex);
-                    if (existing && equalBytes(existing.signatureKey, newLeaf.signatureKey)) {
-                        targetLeafIndex = leafIndex;
-                        break;
-                    }
-                }
-                if (targetLeafIndex === -1) {
-                    throw new Error(`${operation}: Update proposal for an unknown member`);
+                const targetLeafIndex = por.proposalSenderLeafIndex;
+                if (!Number.isInteger(targetLeafIndex)
+                    || targetLeafIndex < 0 || targetLeafIndex >= nLeaves
+                    || !RatchetTree.leafFor(tree, targetLeafIndex)) {
+                    throw new Error(
+                        `${operation}: referenced Update has an unknown authenticated sender`,
+                    );
                 }
                 if (targetLeafIndex === committerLeafIndex) {
                     throw new Error(
@@ -3175,11 +3341,21 @@
                     );
                 }
                 claimLeaf(targetLeafIndex, 'Update');
-                plan.updates.push({ proposal, targetLeafIndex, wireIndex });
+                plan.updates.push({
+                    proposal,
+                    targetLeafIndex,
+                    wireIndex,
+                    reference: por.reference,
+                });
                 continue;
             }
 
             if (proposal.proposalType === Proposal.ProposalType.REMOVE) {
+                if (por.type !== Proposal.ProposalOrRefType.PROPOSAL) {
+                    throw new Error(
+                        `${operation}: referenced Remove proposals are not supported by this profile`,
+                    );
+                }
                 const targetLeafIndex = proposal.removed;
                 if (!Number.isInteger(targetLeafIndex)
                     || targetLeafIndex < 0 || targetLeafIndex >= nLeaves) {
@@ -3205,6 +3381,11 @@
             }
 
             if (proposal.proposalType === Proposal.ProposalType.ADD) {
+                if (por.type !== Proposal.ProposalOrRefType.PROPOSAL) {
+                    throw new Error(
+                        `${operation}: referenced Add proposals are not supported by this profile`,
+                    );
+                }
                 if (!proposal.keyPackage || !proposal.keyPackage.leafNode) {
                     throw new Error(`${operation}: malformed Add proposal at index ${wireIndex}`);
                 }
@@ -3616,5 +3797,6 @@
         signLeafNodeForKeyPackage,
         signLeafNodeInCommit,
         verifyImportedTree,
+        proposalReferenceKey,
     });
 });

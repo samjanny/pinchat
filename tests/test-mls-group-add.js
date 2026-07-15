@@ -276,7 +276,8 @@ async function main() {
         const bobOldEncKey = Buffer.from(bobOldLeaf.encryptionKey).toString('hex');
 
         // Bob proposes; keeps the pending keypair to swap in on commit.
-        const { proposalMessage, pendingLeafKeyPair } = await bobGroup.proposeUpdate();
+        const proposed = await bobGroup.proposeUpdate();
+        const { proposalMessage, pendingLeafKeyPair } = proposed;
         assert(proposalMessage instanceof Uint8Array && proposalMessage.length > 0,
             'Bob produced an Update proposal message');
 
@@ -285,18 +286,29 @@ async function main() {
         const MLSMessage = require('../static/js/mls/mls-message.js');
         const PublicMessage = require('../static/js/mls/public-message.js');
         const Proposal = require('../static/js/mls/proposal.js');
+        const Commit = require('../static/js/mls/commit.js');
         const Framing = require('../static/js/mls/framing.js');
         const pframe = MLSMessage.parseMLSMessage(proposalMessage);
         const ppm = PublicMessage.parsePublicMessage(pframe.body, (dec, ct) =>
             (ct === Framing.ContentType.PROPOSAL ? Proposal.readProposal(dec) : null));
         assert(ppm.content.parsed.proposalType === Proposal.ProposalType.UPDATE,
             'proposal parses as UPDATE');
+        const expectedProposalRef = await Commit.proposalRef(
+            Framing.authenticatedContentBytes({
+                wireFormat: pframe.wireFormat,
+                content: ppm.content,
+                auth: ppm.auth,
+            }),
+        );
+        assert(Buffer.from(proposed.reference).equals(Buffer.from(expectedProposalRef)),
+            'ProposalRef hashes serialized AuthenticatedContent exactly');
         const proposerLeaf = ppm.content.sender.leafIndex;
         assert(proposerLeaf === 1, 'proposal sender is Bob (leaf 1)');
 
         const beforeEpoch = alice.epoch;
+        const authenticatedProposal = await alice.verifyUpdateProposal(proposalMessage);
         const { commitMessage: updCommit3 } = await alice.commitUpdate({
-            updateProposals: [{ proposal: ppm.content.parsed, senderLeafIndex: proposerLeaf }],
+            updateProposals: [authenticatedProposal],
         });
         assert(alice.epoch === beforeEpoch + 1n, 'folded-Update commit advances Alice');
         const aliceBobLeaf = require('../static/js/mls/ratchet-tree.js')
@@ -309,7 +321,13 @@ async function main() {
 
         // Bob processes the Commit with the pending self-update; his
         // keypair swaps in and the group converges.
-        const res = await bobGroup.processCommit(updCommit3, { pendingSelfUpdate: pendingLeafKeyPair });
+        const proposalStore = new Map([[
+            Group.proposalReferenceKey(proposed.reference), proposed,
+        ]]);
+        const res = await bobGroup.processCommit(updCommit3, {
+            pendingSelfUpdate: pendingLeafKeyPair,
+            proposalStore,
+        });
         assert(res.selfUpdated === true, 'processCommit reports Bob self-updated');
         assert(bobGroup.epoch === alice.epoch, 'Bob converges after folded Update');
         assert(

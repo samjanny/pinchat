@@ -15,7 +15,7 @@
  *   } Commit;
  *
  * ProposalRef (§5.2):
- *   ref = RefHash("MLS 1.0 Proposal Reference", serialized_proposal_message)
+ *   ref = RefHash("MLS 1.0 Proposal Reference", AuthenticatedContent)
  */
 (function (root, factory) {
     if (typeof module !== 'undefined' && module.exports) {
@@ -85,11 +85,11 @@
 
     /**
      * RFC 9420 §5.2 ProposalRef:
-     *   ref = RefHash("MLS 1.0 Proposal Reference", serialized_proposal)
+     *   ref = RefHash("MLS 1.0 Proposal Reference", authenticated_content)
      * The label is written verbatim (no auto "MLS 1.0 " prefix in RefHash).
      */
-    async function proposalRef(proposalMessageBytes) {
-        return Labeled.refHash('MLS 1.0 Proposal Reference', proposalMessageBytes);
+    async function proposalRef(authenticatedContentBytes) {
+        return Labeled.refHash('MLS 1.0 Proposal Reference', authenticatedContentBytes);
     }
 
     return Object.freeze({

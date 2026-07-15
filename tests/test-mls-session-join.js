@@ -200,6 +200,47 @@ function parseCommitEnvelope(envelope) {
     );
 }
 
+async function rewriteCommitEnvelopeProposalList(session, envelope, proposalOrRefs) {
+    const pm = parseCommitEnvelope(envelope);
+    const rewrittenCommit = {
+        ...pm.content.parsed,
+        proposals: proposalOrRefs,
+    };
+    const content = {
+        ...pm.content,
+        payload: global.MLS.Commit.commitBytes(rewrittenCommit),
+        parsed: rewrittenCommit,
+    };
+    const wireFormat = global.MLS.MLSMessage.WireFormat.MLS_PUBLIC_MESSAGE;
+    const groupContext = session.group._buildGroupContextStruct();
+    const auth = {
+        ...pm.auth,
+        signature: await global.MLS.PublicMessage.signFramedContent(
+            session.identity.signaturePrivateKey,
+            wireFormat,
+            content,
+            groupContext,
+        ),
+    };
+    const membershipTag = await global.MLS.PublicMessage.computeMembershipTag(
+        session.group.epochSecrets.membershipKey,
+        wireFormat,
+        content,
+        auth,
+        groupContext,
+    );
+    const body = global.MLS.PublicMessage.publicMessageBytes({
+        content, auth, membershipTag,
+    });
+    return {
+        ...envelope,
+        payload: global.MLS.Codec.bytesToBase64Url(body),
+        commit_ref: global.MLS.Codec.bytesToBase64Url(
+            await global.MLS.Labeled.sha256(body),
+        ),
+    };
+}
+
 async function echoPendingCommit(session, envelope, senderId = 'creator-self') {
     await session.onRelayEnvelope({ ...envelope, sender_id: senderId });
 }
@@ -593,6 +634,13 @@ async function main() {
         .slice(joinerOutBeforeProposal)
         .find((envelope) => envelope.wire_format === WireFormat.MLS_PUBLIC_MESSAGE);
     assert(Boolean(updateProposal), 'joiner emits a standalone Update proposal');
+    assert(exchange.joiner._proposalStore.size === 1
+        && exchange.joiner._pendingSelfUpdates.size === 1,
+    'proposal author stores authenticated content and its key by ProposalRef');
+    const authoredReferenceKey = [...exchange.joiner._proposalStore.keys()][0];
+    const authoredProposalEntry = exchange.joiner._proposalStore.get(
+        authoredReferenceKey,
+    );
 
     // A valid inner LeafNode signature is not enough to authenticate a
     // standalone proposal. Tampering either outer authenticator must reject
@@ -705,6 +753,9 @@ async function main() {
         (event) => event.kind === 'update-proposal-received'
             && event.senderLeafIndex === 1,
     ), 'creator parses and buffers member Update proposal through MLSSession');
+    assert(exchange.creator._proposalStore.size === 1
+        && exchange.creator._proposalStore.has(authoredReferenceKey),
+    'creator stores the same authenticated ProposalRef as the author');
 
     const creatorOutBeforeFold = exchange.creatorOut.length;
     await exchange.creator.commitUpdate();
@@ -712,9 +763,18 @@ async function main() {
         .slice(creatorOutBeforeFold)
         .find((envelope) => envelope.wire_format === WireFormat.MLS_PUBLIC_MESSAGE);
     assert(Boolean(foldedUpdateCommit), 'creator emits Commit containing member Update');
+    const foldedUpdatePm = parseCommitEnvelope(foldedUpdateCommit);
+    const foldedProposalOrRef = foldedUpdatePm.content.parsed.proposals[0];
+    assert(foldedUpdatePm.content.parsed.proposals.length === 1
+        && foldedProposalOrRef.type
+            === global.MLS.Proposal.ProposalOrRefType.REFERENCE
+        && equalBytes(foldedProposalOrRef.reference, authoredProposalEntry.reference),
+    'member Update travels in Commit as its AuthenticatedContent ProposalRef');
     assert(exchange.creator._pendingUpdateProposals.size === 1,
         'folded Update stays queued until Commit acceptance');
     await echoPendingCommit(exchange.creator, foldedUpdateCommit);
+    assert(exchange.creator._proposalStore.size === 0,
+        'creator consumes the old-epoch proposal store only after Commit echo');
     await exchange.joiner.onRelayEnvelope({
         ...foldedUpdateCommit,
         sender_id: 'creator-1',
@@ -727,6 +787,9 @@ async function main() {
     ), 'folded Update keeps creator and joiner epoch state aligned');
     assert(exchange.joiner._pendingSelfUpdate === null,
         'joiner activates and clears pending self-update after Commit');
+    assert(exchange.joiner._proposalStore.size === 0
+        && exchange.joiner._pendingSelfUpdates.size === 0,
+    'accepted referenced Update consumes joiner proposal and private-key stores');
 
     // The LeafNode signature does not contain the epoch. Replaying this
     // once-valid proposal after the Commit would therefore roll the member
@@ -754,6 +817,86 @@ async function main() {
     const replayGuardPm = parseCommitEnvelope(replayGuardCommit);
     assert(replayGuardPm.content.parsed.proposals.length === 0,
         'next Commit does not include the rejected replay');
+
+    // A malicious creator can sign a fresh Commit around arbitrary proposal
+    // bytes. Once the previous Commit consumed the proposal store, the old
+    // reference is unknown and cannot be reused.
+    const staleReferencedCommit = await rewriteCommitEnvelopeProposalList(
+        exchange.creator,
+        replayGuardCommit,
+        [{
+            type: global.MLS.Proposal.ProposalOrRefType.REFERENCE,
+            reference: Uint8Array.from(authoredProposalEntry.reference),
+        }],
+    );
+    const joinerBeforeUnknownReference = captureLiveGroup(exchange.joiner);
+    const unknownReferenceEventsBefore = exchange.joinerEvents.length;
+    await exchange.joiner.onRelayEnvelope({
+        ...staleReferencedCommit,
+        sender_id: 'creator-1',
+    });
+    const unknownReferenceError = exchange.joinerEvents
+        .slice(unknownReferenceEventsBefore)
+        .find((event) => event.kind === 'error');
+    assert(Boolean(unknownReferenceError)
+        && unknownReferenceError.reason.includes('unknown ProposalRef'),
+    'consumed ProposalRef is one-shot and rejected as unknown');
+    assert(liveGroupMatches(exchange.joiner, joinerBeforeUnknownReference)
+        && exchange.joiner._proposalStore.size === 0,
+    'unknown ProposalRef rejection leaves all recipient state unchanged');
+
+    // Reinsert the old authenticated message to model a stale/corrupt local
+    // cache and prove that processCommit re-verifies its original epoch
+    // instead of trusting store metadata or only the inner LeafNode signature.
+    exchange.joiner._proposalStore.set(
+        authoredReferenceKey, authoredProposalEntry,
+    );
+    const joinerBeforeStaleReference = captureLiveGroup(exchange.joiner);
+    const staleReferenceEventsBefore = exchange.joinerEvents.length;
+    await exchange.joiner.onRelayEnvelope({
+        ...staleReferencedCommit,
+        sender_id: 'creator-1',
+    });
+    const staleReferenceError = exchange.joinerEvents
+        .slice(staleReferenceEventsBefore)
+        .find((event) => event.kind === 'error');
+    assert(Boolean(staleReferenceError)
+        && staleReferenceError.reason.includes('wrong epoch'),
+    'fresh creator-signed Commit cannot replay an old authenticated ProposalRef',
+    staleReferenceError ? staleReferenceError.reason : 'no error event');
+    assert(liveGroupMatches(exchange.joiner, joinerBeforeStaleReference)
+        && exchange.joiner._proposalStore.get(authoredReferenceKey)
+            === authoredProposalEntry,
+    'rejected stale ProposalRef leaves MLS and proposal-store state unchanged');
+
+    // Inline Update semantics authenticate the committer, not the member
+    // named by the LeafNode signature key. This profile therefore rejects
+    // inline member Updates even when the creator re-signs the outer Commit.
+    const inlineUpdateCommit = await rewriteCommitEnvelopeProposalList(
+        exchange.creator,
+        replayGuardCommit,
+        [{
+            type: global.MLS.Proposal.ProposalOrRefType.PROPOSAL,
+            proposal: authoredProposalEntry.proposal,
+        }],
+    );
+    const joinerBeforeInlineUpdate = captureLiveGroup(exchange.joiner);
+    const inlineUpdateEventsBefore = exchange.joinerEvents.length;
+    await exchange.joiner.onRelayEnvelope({
+        ...inlineUpdateCommit,
+        sender_id: 'creator-1',
+    });
+    const inlineUpdateError = exchange.joinerEvents
+        .slice(inlineUpdateEventsBefore)
+        .find((event) => event.kind === 'error');
+    assert(Boolean(inlineUpdateError)
+        && inlineUpdateError.reason.includes('inline Update proposals are not permitted'),
+    'creator-signed inline Update targeting another member is rejected');
+    assert(liveGroupMatches(exchange.joiner, joinerBeforeInlineUpdate)
+        && exchange.joiner._proposalStore.get(authoredReferenceKey)
+            === authoredProposalEntry,
+    'rejected inline Update leaves MLS and proposal-store state unchanged');
+
     await echoPendingCommit(exchange.creator, replayGuardCommit);
     await exchange.joiner.onRelayEnvelope({
         ...replayGuardCommit,
@@ -761,6 +904,8 @@ async function main() {
     });
     assert(exchange.joiner.group.epoch === exchange.creator.group.epoch,
         'replay-guard path-only Commit keeps members aligned');
+    assert(exchange.joiner._proposalStore.size === 0,
+        'accepted path-only Commit consumes all stale old-epoch proposals');
 
     // Remove follows the same PendingCommit path: keep both the MLS state
     // and sender/leaf routing intact until the exact relay echo arrives.
@@ -931,6 +1076,54 @@ async function main() {
         multiA.group.epochSecrets.epochAuthenticator,
         multiB.group.epochSecrets.epochAuthenticator,
     ), 'three-member simultaneous-join flow converges cryptographically');
+
+    // ProposalRef resolution is local to every recipient, not just the
+    // creator and proposal author. Exercise a passive third member so a
+    // regression that reintroduces creator-only buffering fails closed.
+    const multiAOutBeforeProposal = multiAOut.length;
+    await multiA.proposeUpdate();
+    const multiProposal = multiAOut
+        .slice(multiAOutBeforeProposal)
+        .find((envelope) => envelope.wire_format === WireFormat.MLS_PUBLIC_MESSAGE);
+    await multiCreator.onRelayEnvelope({
+        ...multiProposal,
+        sender_id: 'multi-a',
+    });
+    await multiB.onRelayEnvelope({
+        ...multiProposal,
+        sender_id: 'multi-a',
+    });
+    const multiReferenceKey = [...multiA._proposalStore.keys()][0];
+    assert(multiA._proposalStore.has(multiReferenceKey)
+        && multiCreator._proposalStore.has(multiReferenceKey)
+        && multiB._proposalStore.has(multiReferenceKey),
+    'proposal author, creator, and passive member store the same ProposalRef');
+
+    const multiCreatorOutBeforeUpdate = multiCreatorOut.length;
+    await multiCreator.commitUpdate();
+    const multiReferenceCommit = multiCreatorOut
+        .slice(multiCreatorOutBeforeUpdate)
+        .find((envelope) => envelope.wire_format === WireFormat.MLS_PUBLIC_MESSAGE);
+    await echoPendingCommit(multiCreator, multiReferenceCommit, 'multi-creator');
+    await multiA.onRelayEnvelope({
+        ...multiReferenceCommit,
+        sender_id: 'multi-creator',
+    });
+    await multiB.onRelayEnvelope({
+        ...multiReferenceCommit,
+        sender_id: 'multi-creator',
+    });
+    assert(multiCreator.group.epoch === multiA.group.epoch
+        && multiA.group.epoch === multiB.group.epoch
+        && equalBytes(
+            multiCreator.group.epochSecrets.epochAuthenticator,
+            multiB.group.epochSecrets.epochAuthenticator,
+        ),
+    'passive member resolves referenced Update and converges');
+    assert(multiA._proposalStore.size === 0
+        && multiCreator._proposalStore.size === 0
+        && multiB._proposalStore.size === 0,
+    'all members consume the ProposalRef store after accepted Commit');
 
     const noCommitExchange = await createExchange();
     let noCommitError = '';

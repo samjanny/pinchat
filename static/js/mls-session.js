@@ -61,6 +61,7 @@
     const BOOTSTRAP_PIN_BYTES = 32;
     const CORRELATION_REF_BYTES = 32;
     const MAX_PENDING_WELCOME_COMMITS = 8;
+    const MAX_PROPOSALS_PER_EPOCH = 64;
     // The visible label carries 80 bits of the SHA-256 fingerprint. The full
     // 256-bit value is always emitted alongside it for tooltips/comparison.
     const VISIBLE_FINGERPRINT_HEX = 20;
@@ -268,13 +269,24 @@
             // Keeping removed keys cached also lets previous-epoch grace
             // messages retain their authenticated visual identity.
             this._identityBySignatureKey = new Map();
-            // Creator-only: Update proposals received from members, keyed
-            // by proposer leaf index, awaiting the next periodic Commit.
+            // Every member retains the complete, authenticated standalone
+            // Proposal PublicMessages for the current epoch, keyed by their
+            // RFC ProposalRef. Commits carry only those references, so each
+            // recipient must resolve from its own store. Entries are
+            // consumed atomically only when an epoch transition succeeds.
+            this._proposalStore = new Map();
+            // Creator-only selection queue: latest newly observed Update per
+            // proposer leaf, awaiting the next periodic Commit. Older valid
+            // proposals remain resolvable in _proposalStore but a replay of
+            // an already-stored reference cannot move this pointer backward.
             this._pendingUpdateProposals = new Map();
-            // Member-only: our own in-flight Update ({ keyPair, leafNode })
-            // waiting for the creator's Commit that folds it in. Kept until
-            // processCommit reports selfUpdated (or a later proposal
-            // supersedes it).
+            // Member-only: private HPKE keys for every locally-authored
+            // current-epoch Update, keyed by ProposalRef. Keeping them by
+            // exact reference lets us process a valid Commit even if more
+            // than one of our proposals was in flight.
+            this._pendingSelfUpdates = new Map();
+            // Latest entry retained for compatibility with UI/tests; the
+            // keyed map above is authoritative during Commit processing.
             this._pendingSelfUpdate = null;
             // Locally-authored Commits are built against an isolated Group
             // candidate and remain pending until the relay sends back the
@@ -405,6 +417,42 @@
             return event;
         }
 
+        _storeAuthenticatedProposal(verified) {
+            if (!this.group || !verified || verified.epoch !== this.group.epoch) {
+                throw new Error('mls-session: proposal store entry is not for the current epoch');
+            }
+            if (!(verified.messageBytes instanceof Uint8Array)) {
+                throw new Error('mls-session: proposal store entry has no authenticated message');
+            }
+            const referenceKey = MLS.Group.proposalReferenceKey(verified.reference);
+            const existing = this._proposalStore.get(referenceKey);
+            if (existing) {
+                if (!equalBytes(existing.messageBytes, verified.messageBytes)) {
+                    throw new Error('mls-session: ProposalRef collision in proposal store');
+                }
+                return { entry: existing, isNew: false };
+            }
+            if (this._proposalStore.size >= MAX_PROPOSALS_PER_EPOCH) {
+                throw new Error('mls-session: current-epoch proposal store is full');
+            }
+            const entry = Object.freeze({
+                proposal: verified.proposal,
+                senderLeafIndex: verified.senderLeafIndex,
+                epoch: verified.epoch,
+                reference: Uint8Array.from(verified.reference),
+                messageBytes: Uint8Array.from(verified.messageBytes),
+            });
+            this._proposalStore.set(referenceKey, entry);
+            return { entry, isNew: true };
+        }
+
+        _clearEpochProposalState() {
+            this._proposalStore.clear();
+            this._pendingUpdateProposals.clear();
+            this._pendingSelfUpdates.clear();
+            this._pendingSelfUpdate = null;
+        }
+
         async _sendEnvelopeOrThrow(envelope, description) {
             let result;
             try {
@@ -515,6 +563,11 @@
                 // live Group must not retain a second complete copy.
                 supersededGroup.destroySecrets();
             }
+            // ProposalRefs are scoped to the epoch in which their
+            // AuthenticatedContent was signed. Only an accepted transition
+            // consumes the store; failures and unacknowledged candidates
+            // leave it untouched for a later valid Commit.
+            this._clearEpochProposalState();
             this.onEvent(rosterEvent);
 
             if (pending.kind === 'add') {
@@ -536,14 +589,6 @@
                     this.onEvent({ kind: 'error', reason: err.message });
                 }
             } else if (pending.kind === 'update') {
-                // Remove only queue entries that were present when this
-                // candidate was built. A newer proposal arriving meanwhile
-                // must survive for the next epoch.
-                for (const [leafIndex, entry] of pending.queuedProposalEntries) {
-                    if (this._pendingUpdateProposals.get(leafIndex) === entry) {
-                        this._pendingUpdateProposals.delete(leafIndex);
-                    }
-                }
                 this.onEvent({
                     kind: 'update-committed',
                     epoch: this.group.epoch.toString(),
@@ -677,8 +722,9 @@
             // incoming PublicMessage broadcasts. A PublicMessage is either
             // a Commit (advance epoch) or a standalone Proposal (an Update
             // proposal a member wants folded into the next Commit). We peek
-            // the content_type to route; the creator stores Update
-            // proposals, everyone processes Commits.
+            // the content_type to route; every member stores authenticated
+            // Updates for ProposalRef resolution, while only the creator
+            // selects proposals and authors Commits.
             // Own echoes are filtered upstream via sender_id.
             if (wireFormat === MLS.MLSMessage.WireFormat.MLS_PUBLIC_MESSAGE
                 && this._state === 'joined') {
@@ -1115,34 +1161,41 @@
         }
 
         /**
-         * Creator-only: buffer a member's Update proposal so the next
-         * periodic Commit folds it in. Non-creators ignore proposals
-         * (the creator is the sole committer). Authenticate the complete
-         * PublicMessage before buffering: the outer signature and
-         * membership_tag bind the Update to the current epoch, while the
-         * inner LeafNode signature binds its fresh key to the same member.
-         * The authenticated leaf index keys the buffer so a newer proposal
-         * from that member supersedes an older one.
+         * Authenticate and store a standalone member Update on EVERY member.
+         * A later Commit contains only ProposalRef, so non-committers need
+         * the same authenticated current-epoch PublicMessage in order to
+         * resolve and independently verify it. The creator additionally
+         * selects the latest newly-observed Update per sender for its next
+         * Commit; replaying an already-stored reference cannot roll that
+         * selection back.
          */
         async _handleIncomingProposal(wrappedBytes) {
-            if (this.role !== 'creator') return;
-            let proposal;
-            let senderLeafIndex;
-            let proposalEpoch;
+            let verified;
             try {
-                ({ proposal, senderLeafIndex, epoch: proposalEpoch } =
-                    await this.group.verifyUpdateProposal(wrappedBytes));
+                verified = await this.group.verifyUpdateProposal(wrappedBytes);
             } catch (err) {
                 this.onEvent({ kind: 'error',
                     reason: `invalid Update proposal: ${err.message}` });
                 return;
             }
-            this._pendingUpdateProposals.set(senderLeafIndex, {
-                proposal,
-                senderLeafIndex,
-                epoch: proposalEpoch,
+            let stored;
+            try {
+                stored = this._storeAuthenticatedProposal(verified);
+            } catch (err) {
+                this.onEvent({ kind: 'error',
+                    reason: `invalid Update proposal: ${err.message}` });
+                return;
+            }
+            if (!stored.isNew) return;
+            if (this.role === 'creator') {
+                this._pendingUpdateProposals.set(
+                    stored.entry.senderLeafIndex, stored.entry,
+                );
+            }
+            this.onEvent({
+                kind: 'update-proposal-received',
+                senderLeafIndex: stored.entry.senderLeafIndex,
             });
-            this.onEvent({ kind: 'update-proposal-received', senderLeafIndex });
         }
 
         /**
@@ -1158,6 +1211,8 @@
                     pendingSelfUpdate: this._pendingSelfUpdate
                         ? this._pendingSelfUpdate.keyPair
                         : null,
+                    pendingSelfUpdates: this._pendingSelfUpdates,
+                    proposalStore: this._proposalStore,
                 });
             } catch (err) {
                 console.error('[MLS] processCommit failed:', err);
@@ -1165,9 +1220,10 @@
                     reason: `processCommit failed: ${err.message}` });
                 return;
             }
-            if (result.selfUpdated && this._pendingSelfUpdate) {
-                this._pendingSelfUpdate = null;
-            }
+            // Every stored Proposal is now stale regardless of whether this
+            // Commit selected our own Update. Consume only after the Group
+            // transition has fully authenticated and committed.
+            this._clearEpochProposalState();
             try {
                 await this._emitAuthenticatedRoster();
             } catch (err) {
@@ -1262,22 +1318,25 @@
             if (this.role !== 'joiner') return;
             if (this._state !== 'joined') return;
             if (!this.group) return;
-            let proposalMessage;
-            let pendingLeafKeyPair;
+            let proposed;
             try {
-                ({ proposalMessage, pendingLeafKeyPair } = await this.group.proposeUpdate());
+                proposed = await this.group.proposeUpdate();
+                this._storeAuthenticatedProposal(proposed);
             } catch (err) {
                 console.error('[MLS] proposeUpdate failed:', err);
                 this.onEvent({ kind: 'error',
                     reason: `proposeUpdate failed: ${err.message}` });
                 return;
             }
-            // Supersede any earlier in-flight self-update: only the most
-            // recent proposal can be folded, older keypairs are useless.
-            this._pendingSelfUpdate = { keyPair: pendingLeafKeyPair };
+            const referenceKey = MLS.Group.proposalReferenceKey(proposed.reference);
+            this._pendingSelfUpdates.set(referenceKey, proposed.pendingLeafKeyPair);
+            this._pendingSelfUpdate = {
+                keyPair: proposed.pendingLeafKeyPair,
+                referenceKey,
+            };
             this.send({
                 type: 'mls',
-                payload: base64UrlEncode(stripMlsWrapper(proposalMessage)),
+                payload: base64UrlEncode(stripMlsWrapper(proposed.proposalMessage)),
                 wire_format: MLS.MLSMessage.WireFormat.MLS_PUBLIC_MESSAGE,
             });
             this.onEvent({ kind: 'update-proposed' });

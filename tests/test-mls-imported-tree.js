@@ -188,6 +188,27 @@ function inlineProposal(proposal) {
     };
 }
 
+function referencedProposal(entry) {
+    return {
+        type: Proposal.ProposalOrRefType.REFERENCE,
+        reference: Uint8Array.from(entry.reference),
+    };
+}
+
+function resolvedProposalReference(entry) {
+    return {
+        ...referencedProposal(entry),
+        proposal: entry.proposal,
+        proposalSenderLeafIndex: entry.senderLeafIndex,
+    };
+}
+
+function proposalStore(...entries) {
+    return new Map(entries.map((entry) => [
+        Group.proposalReferenceKey(entry.reference), entry,
+    ]));
+}
+
 /**
  * Replace only a Commit's proposal vector, then authenticate the altered
  * FramedContent with the real creator key and the recipient's current
@@ -235,6 +256,35 @@ async function rewriteCommitProposalList(
     return MLSMessage.serializeMLSMessage(
         wireFormat,
         PublicMessage.publicMessageBytes({ content, auth, membershipTag }),
+    );
+}
+
+async function tamperCommitConfirmationTag(commitMessage, recipientGroup) {
+    const frame = MLSMessage.parseMLSMessage(commitMessage);
+    const pm = PublicMessage.parsePublicMessage(frame.body, (decoder, contentType) => {
+        if (contentType === Framing.ContentType.COMMIT) return Commit.readCommit(decoder);
+        throw new Error(`test: expected Commit, got content_type ${contentType}`);
+    });
+    const auth = {
+        ...pm.auth,
+        confirmationTag: Uint8Array.from(pm.auth.confirmationTag),
+    };
+    auth.confirmationTag[0] ^= 0x01;
+    const wireFormat = MLSMessage.WireFormat.MLS_PUBLIC_MESSAGE;
+    const membershipTag = await PublicMessage.computeMembershipTag(
+        recipientGroup.epochSecrets.membershipKey,
+        wireFormat,
+        pm.content,
+        auth,
+        recipientGroup._buildGroupContextStruct(),
+    );
+    return MLSMessage.serializeMLSMessage(
+        wireFormat,
+        PublicMessage.publicMessageBytes({
+            content: pm.content,
+            auth,
+            membershipTag,
+        }),
     );
 }
 
@@ -424,18 +474,17 @@ async function main() {
         const alice = await Group.Group.create({ identity: await freshIdentity() });
         const bob = await buildKeyPackage();
         const { joined: bobGroup } = await addAndJoin(alice, bob);
-        const { pendingLeafKeyPair, pendingLeafNode } = await bobGroup.proposeUpdate();
+        const proposed = await bobGroup.proposeUpdate();
+        const { pendingLeafKeyPair } = proposed;
+        const authenticatedProposal = await alice.verifyUpdateProposal(
+            proposed.proposalMessage,
+        );
         const update = await alice.commitUpdate({
-            updateProposals: [{
-                proposal: {
-                    proposalType: Proposal.ProposalType.UPDATE,
-                    leafNode: pendingLeafNode,
-                },
-                senderLeafIndex: 1,
-            }],
+            updateProposals: [authenticatedProposal],
         });
         await bobGroup.processCommit(update.commitMessage, {
             pendingSelfUpdate: pendingLeafKeyPair,
+            proposalStore: proposalStore(proposed),
         });
 
         const carol = await buildKeyPackage();
@@ -520,17 +569,16 @@ async function main() {
         const alice = await Group.Group.create({ identity: await freshIdentity() });
         const bob = await buildKeyPackage();
         const { joined: bobGroup } = await addAndJoin(alice, bob);
-        const { pendingLeafNode } = await bobGroup.proposeUpdate();
-        const updateProposal = {
-            proposalType: Proposal.ProposalType.UPDATE,
-            leafNode: pendingLeafNode,
-        };
-        const updateEntry = { proposal: updateProposal, senderLeafIndex: 1 };
+        const proposed = await bobGroup.proposeUpdate();
+        const updateEntry = await alice.verifyUpdateProposal(
+            proposed.proposalMessage,
+        );
+        const updateProposal = updateEntry.proposal;
 
         const aliceBeforeDuplicate = captureGroupState(alice);
         await expectReject(
             alice.commitUpdate({ updateProposals: [updateEntry, updateEntry] }),
-            'multiple Update and/or Remove proposals target leaf 1',
+            'duplicate ProposalRef',
             'creator rejects duplicate Update proposals for one leaf',
         );
         assert(groupStateMatches(alice, aliceBeforeDuplicate),
@@ -543,16 +591,33 @@ async function main() {
         const validUpdate = await alice.commitUpdate({
             updateProposals: [updateEntry],
         });
+        const invalidConfirmationCommit = await tamperCommitConfirmationTag(
+            validUpdate.commitMessage, bobGroup,
+        );
+        const bobBeforeInvalidConfirmation = captureGroupState(bobGroup);
+        await expectReject(
+            bobGroup.processCommit(invalidConfirmationCommit, {
+                pendingSelfUpdate: proposed.pendingLeafKeyPair,
+                proposalStore: proposalStore(proposed),
+            }),
+            'confirmation_tag mismatch',
+            'referenced self-Update with invalid confirmation tag is rejected',
+        );
+        assert(groupStateMatches(bobGroup, bobBeforeInvalidConfirmation),
+            'failed self-Update confirmation leaves private key and epoch state unchanged');
+
         const duplicateUpdateCommit = await rewriteCommitProposalList(
             validUpdate.commitMessage,
-            [inlineProposal(updateProposal), inlineProposal(updateProposal)],
+            [referencedProposal(updateEntry), referencedProposal(updateEntry)],
             alice.identity,
             bobGroup,
         );
         const bobBeforeDuplicate = captureGroupState(bobGroup);
         await expectReject(
-            bobGroup.processCommit(duplicateUpdateCommit),
-            'multiple Update and/or Remove proposals target leaf 1',
+            bobGroup.processCommit(duplicateUpdateCommit, {
+                proposalStore: proposalStore(proposed),
+            }),
+            'duplicate ProposalRef',
             'processCommit rejects authenticated duplicate Update proposals',
         );
         assert(groupStateMatches(bobGroup, bobBeforeDuplicate),
@@ -564,13 +629,15 @@ async function main() {
         };
         const updateAndRemoveCommit = await rewriteCommitProposalList(
             validUpdate.commitMessage,
-            [inlineProposal(updateProposal), inlineProposal(removeBob)],
+            [referencedProposal(updateEntry), inlineProposal(removeBob)],
             alice.identity,
             bobGroup,
         );
         const bobBeforeConflict = captureGroupState(bobGroup);
         await expectReject(
-            bobGroup.processCommit(updateAndRemoveCommit),
+            bobGroup.processCommit(updateAndRemoveCommit, {
+                proposalStore: proposalStore(proposed),
+            }),
             'multiple Update and/or Remove proposals target leaf 1',
             'processCommit rejects Update+Remove conflict on one leaf',
         );
@@ -586,7 +653,7 @@ async function main() {
                 proposalType: Proposal.ProposalType.ADD,
                 keyPackage: carol.keyPackage,
             }),
-            inlineProposal(updateProposal),
+            resolvedProposalReference(updateEntry),
         ], 0, 'testProposalOrder');
         assert(interleavedPlan.updates.length === 1
             && interleavedPlan.updates[0].wireIndex === 1
