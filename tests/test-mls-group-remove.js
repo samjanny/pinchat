@@ -13,7 +13,8 @@
  *   4. After the Remove:
  *        - Alice and Carol share epoch-3 secrets.
  *        - Bob's epoch-2 state cannot decrypt epoch-3 application msgs.
- *        - Bob's processCommit on the Remove throws "removed from group".
+ *        - Bob's processCommit returns an authenticated terminal result and
+ *          erases its stale epoch capabilities.
  *   5. Alice can still add a new member (Dave) at epoch 4 with the
  *      blanked Bob slot still in place.
  */
@@ -87,6 +88,55 @@ async function buildKeyPackage() {
 
 function hex(u8) { return Buffer.from(u8).toString('hex'); }
 
+function previousEpochReceiveSnapshot(previousEpoch) {
+    const chains = [...previousEpoch.chainStates.entries()]
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([id, st]) => ({
+            id,
+            nextGeneration: st.nextGeneration,
+            secret: hex(st.secret),
+            skipped: [...st.skipped.entries()]
+                .sort(([a], [b]) => a - b)
+                .map(([generation, value]) => ({
+                    generation,
+                    key: hex(value.key),
+                    nonce: hex(value.nonce),
+                })),
+        }));
+    const consumed = [...previousEpoch.consumedByLeaf.entries()]
+        .sort(([a], [b]) => a - b)
+        .map(([leafIndex, generations]) => [
+            leafIndex, [...generations].sort((a, b) => a - b),
+        ]);
+    const allowed = [...previousEpoch.allowedSenderLeafIndices]
+        .sort((a, b) => a - b);
+    return JSON.stringify({ chains, consumed, allowed });
+}
+
+function groupSecretRefs(group) {
+    const refs = [
+        ...Object.values(group.epochSecrets || {}),
+        group.pskSecret,
+        ...[...(group._chainStates || new Map()).values()]
+            .flatMap((state) => [
+                state.secret,
+                ...[...state.skipped.values()].flatMap((value) => [
+                    value.key, value.nonce,
+                ]),
+            ]),
+    ];
+    if (group._prevEpoch) {
+        refs.push(group._prevEpoch.senderDataSecret);
+        for (const state of group._prevEpoch.chainStates.values()) {
+            refs.push(state.secret);
+            for (const value of state.skipped.values()) {
+                refs.push(value.key, value.nonce);
+            }
+        }
+    }
+    return refs.filter((value) => value instanceof Uint8Array);
+}
+
 async function main() {
     console.log('# Group — Remove flow');
 
@@ -132,6 +182,11 @@ async function main() {
         'Bob decrypts Alice at epoch 2');
 
     // ---- Remove Bob (leaf 1) ----
+    // This message was genuinely sent before the Remove and must remain
+    // deliverable through the grace context because Alice survives.
+    const survivingInFlight = await alice.encryptApplicationMessage(
+        'survivor in flight before remove',
+    );
     const rmRes = await alice.commitRemoveMember({ removedLeafIndex: 1 });
     assert(alice.epoch === 3n, 'Alice advanced to epoch 3 after Remove');
 
@@ -144,6 +199,46 @@ async function main() {
     'Alice and Carol share epoch_authenticator at epoch 3');
     assert(alice._chainStates.size === 4 && carolGroup._chainStates.size === 4,
         'removed blank leaf has no retained application or handshake roots');
+    assert(!alice._prevEpoch.allowedSenderLeafIndices.has(1)
+        && !carolGroup._prevEpoch.allowedSenderLeafIndices.has(1)
+        && alice._prevEpoch.allowedSenderLeafIndices.has(0)
+        && carolGroup._prevEpoch.allowedSenderLeafIndices.has(0),
+    'previous-epoch grace authorizes surviving leaves but revokes Bob immediately');
+
+    const survivingLate = await carolGroup.decryptApplicationMessage(
+        survivingInFlight,
+    );
+    assert(new TextDecoder().decode(survivingLate.plaintext)
+        === 'survivor in flight before remove',
+    'in-flight previous-epoch message from a surviving leaf is still accepted');
+
+    // Bob can still form an epoch-2 ciphertext locally after observing the
+    // transition, but recipients must reject it before advancing any retained
+    // receive chain. This closes the revocation-lag window without sacrificing
+    // late delivery for members that remain in the group.
+    const revokedOldEpoch = await bobGroup.encryptApplicationMessage(
+        'revoked sender after remove',
+    );
+    const carolPreviousEpoch = carolGroup._prevEpoch;
+    const previousChains = carolPreviousEpoch.chainStates;
+    const previousConsumed = carolPreviousEpoch.consumedByLeaf;
+    const previousBeforeReject = previousEpochReceiveSnapshot(carolPreviousEpoch);
+    let revokedRejected = false;
+    let revokedError = '';
+    try {
+        await carolGroup.decryptApplicationMessage(revokedOldEpoch);
+    } catch (err) {
+        revokedRejected = true;
+        revokedError = err.message;
+    }
+    assert(revokedRejected && revokedError.includes('was removed'),
+        'valid old-epoch ciphertext from removed Bob is rejected immediately',
+        revokedError);
+    assert(carolGroup._prevEpoch === carolPreviousEpoch
+        && carolPreviousEpoch.chainStates === previousChains
+        && carolPreviousEpoch.consumedByLeaf === previousConsumed
+        && previousEpochReceiveSnapshot(carolPreviousEpoch) === previousBeforeReject,
+    'revoked old-epoch ciphertext leaves grace ratchet and replay state unchanged');
 
     // Bob's leaf in both trees is now blank.
     const bobLeafNode = 2; // leafToNode(1) = 2
@@ -162,15 +257,23 @@ async function main() {
     } catch (_) { bobThrew = true; }
     assert(bobThrew, 'Removed Bob cannot decrypt epoch-3 traffic with stale state');
 
-    // Bob's processCommit on the Remove commit explicitly fails with
-    // "removed from group" so the orchestrator can clean up.
-    let bobProcessThrew = false;
-    let bobErrMsg = '';
-    try {
-        await bobGroup.processCommit(rmRes.commitMessage);
-    } catch (err) { bobProcessThrew = true; bobErrMsg = err.message; }
-    assert(bobProcessThrew && bobErrMsg.includes('removed'),
-        'Bob.processCommit signals removal explicitly', bobErrMsg);
+    // Bob authenticates every public component of the Remove, receives a
+    // typed terminal result, and destroys its stale epoch capabilities.
+    const bobSecretBytes = groupSecretRefs(bobGroup);
+    const bobRemoval = await bobGroup.processCommit(rmRes.commitMessage);
+    assert(bobRemoval.removedSelf === true
+        && bobRemoval.removedLeafIndex === 1
+        && bobRemoval.epoch === 3n,
+    'Bob.processCommit returns an authenticated terminal removal result');
+    assert(Object.keys(bobGroup.epochSecrets).length === 0
+        && bobGroup._chainStates.size === 0
+        && bobGroup._prevEpoch === null
+        && bobGroup.pskSecret === null
+        && bobGroup.leafKeyPair === null
+        && bobGroup.identity === null
+        && bobGroup.parentKeyPairs.size === 0
+        && bobSecretBytes.every((bytes) => bytes.every((byte) => byte === 0)),
+    'authenticated self-removal erases all retained Group secret material');
 
     // Self-remove must throw.
     let selfRmThrew = false;

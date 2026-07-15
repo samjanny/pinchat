@@ -725,6 +725,12 @@ document.addEventListener('alpine:init', () => {
             this.mlsUpdateTimer = setTimeout(tick, jitter());
         },
 
+        _stopMlsUpdateTimer() {
+            if (!this.mlsUpdateTimer) return;
+            clearTimeout(this.mlsUpdateTimer);
+            this.mlsUpdateTimer = null;
+        },
+
         _handleMlsEvent(event) {
             switch (event.kind) {
                 case 'roster': {
@@ -860,6 +866,15 @@ document.addEventListener('alpine:init', () => {
                     break;
                 case 'remove-committed':
                     this.addSystemMessage('🔁 Group re-keyed (departing member removed)');
+                    break;
+                case 'removed':
+                    this._stopMlsUpdateTimer();
+                    this.mlsReady = false;
+                    this.mlsRosterValid = false;
+                    this.mlsSelfIdentity = null;
+                    this.groupPeers = [];
+                    this.addSystemMessage('🔒 You were removed from this secure group');
+                    this.error = '⚠️ You were removed from this group. Sending is disabled.';
                     break;
                 case 'error':
                     console.error('[MLS]', event.reason);

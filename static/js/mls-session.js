@@ -31,6 +31,7 @@
  *   'keypackage-published'   — our KeyPackage has been emitted
  *   'welcome-sent'            — Alice sent a Welcome to the new member
  *   'joined'                  — Bob completed join
+ *   'removed'                 — authenticated Remove made this session terminal
  *   'roster'                  — live leaves identified by signature-key hash
  *   'message'                 — payload + authenticated sender key identity
  *   'error'                   — unrecoverable error with { reason }
@@ -82,6 +83,10 @@
         let diff = 0;
         for (let i = 0; i < a.length; i += 1) diff |= a[i] ^ b[i];
         return diff === 0;
+    }
+
+    function wipeBytes(value) {
+        if (value instanceof Uint8Array) value.fill(0);
     }
 
     function decodeCorrelationRef(value, name) {
@@ -229,7 +234,10 @@
             // commitAddMember, processCommit) so a party without the URL
             // key can neither construct nor consume valid Welcomes/Commits
             // even if they reach the relay first.
-            this.pskSecret = pskSecret || null;
+            // The session owns this copy and can erase it on authenticated
+            // removal without mutating the invite/bootstrap buffer held by
+            // the application.
+            this.pskSecret = pskSecret ? Uint8Array.from(pskSecret) : null;
             // End-to-end bootstrap pins carried in the URL fragment. The PSK
             // proves possession of the invite secret; these pins additionally
             // identify the exact group and its permanent creator at leaf 0.
@@ -266,8 +274,9 @@
             this._senderIdByLeaf = new Map();
             // Public identity cache keyed by the complete raw signature key.
             // Entries contain only SHA-256 fingerprints, never secret state.
-            // Keeping removed keys cached also lets previous-epoch grace
-            // messages retain their authenticated visual identity.
+            // Keeping prior keys cached lets surviving members' in-flight
+            // previous-epoch messages retain their authenticated identity.
+            // An authenticated Remove clears the cache completely.
             this._identityBySignatureKey = new Map();
             // Every member retains the complete, authenticated standalone
             // Proposal PublicMessages for the current epoch, keyed by their
@@ -476,6 +485,51 @@
             this._pendingUpdateProposals.clear();
             this._pendingSelfUpdates.clear();
             this._pendingSelfUpdate = null;
+        }
+
+        _transitionToRemoved(result) {
+            if (!result || result.removedSelf !== true) {
+                throw new Error('mls-session: invalid authenticated-removal result');
+            }
+
+            const liveGroup = this.group;
+            const candidateGroup = this._pendingCommit?.candidateGroup || null;
+            if (candidateGroup && candidateGroup !== liveGroup) {
+                candidateGroup.destroySecrets();
+            }
+            if (liveGroup) liveGroup.destroySecrets();
+
+            this._pendingCommit = null;
+            this._clearEpochProposalState();
+            this._pendingWelcomeCommits.clear();
+            this._deferredEnvelopes.length = 0;
+            this._deferredRemovals.clear();
+            this._leafBySenderId.clear();
+            this._senderIdByLeaf.clear();
+            this._identityBySignatureKey.clear();
+
+            wipeBytes(this.pskSecret);
+            wipeBytes(this._keyPackageRefBytes);
+            wipeBytes(this.expectedGroupId);
+            wipeBytes(this.expectedCreatorKeyHash);
+            this.pskSecret = null;
+            this._keyPackageRefBytes = null;
+            this._keyPackageRef = null;
+            this.expectedGroupId = null;
+            this.expectedCreatorKeyHash = null;
+            this.keyPackageBundle = null;
+            this.identity = null;
+            this.group = null;
+            this._localCommitBusy = false;
+            this._state = 'removed';
+
+            this.onEvent({
+                kind: 'removed',
+                removedLeafIndex: result.removedLeafIndex,
+                removedLeafIndices: [...result.removedLeafIndices],
+                committerLeafIndex: result.committerLeafIndex,
+                epoch: result.epoch.toString(),
+            });
         }
 
         async _sendEnvelopeOrThrow(envelope, description) {
@@ -1283,6 +1337,10 @@
                 console.error('[MLS] processCommit failed:', err);
                 this.onEvent({ kind: 'error',
                     reason: `processCommit failed: ${err.message}` });
+                return;
+            }
+            if (result.removedSelf === true) {
+                this._transitionToRemoved(result);
                 return;
             }
             // Every stored Proposal is now stale regardless of whether this

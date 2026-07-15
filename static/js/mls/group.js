@@ -406,9 +406,17 @@
          * zeroes) any older retained context: at most ONE previous epoch
          * is kept, for at most PREV_EPOCH_GRACE_MS.
          */
-        _snapshotPrevEpoch() {
+        _snapshotPrevEpoch(removedLeafIndices = []) {
             this._dropPrevEpoch();
             const outgoingEpochSecrets = this.epochSecrets;
+            const removed = new Set(removedLeafIndices);
+            const allowedSenderLeafIndices = new Set();
+            for (let leafIndex = 0; leafIndex < this.nLeaves; leafIndex += 1) {
+                if (RatchetTree.leafFor(this.ratchetTree, leafIndex)
+                    && !removed.has(leafIndex)) {
+                    allowedSenderLeafIndices.add(leafIndex);
+                }
+            }
             this._prevEpoch = {
                 epoch: this.epoch,
                 nLeaves: this.nLeaves,
@@ -417,6 +425,12 @@
                 senderDataSecret: outgoingEpochSecrets.senderDataSecret,
                 chainStates: this._chainStates,
                 consumedByLeaf: this.consumedByLeaf,
+                // Old-epoch delivery tolerance must not extend a member's
+                // authorization past a Remove. Surviving leaves may still
+                // deliver messages that were already in flight; removed
+                // leaves are rejected immediately after sender_data opens,
+                // before their receive chain is touched.
+                allowedSenderLeafIndices,
                 expiresAt: Date.now() + PREV_EPOCH_GRACE_MS,
             };
             // sender_data_secret remains owned by the bounded grace context.
@@ -436,6 +450,9 @@
             if (!this._prevEpoch) return;
             wipeBytes(this._prevEpoch.senderDataSecret);
             this._wipeChainStateMap(this._prevEpoch.chainStates);
+            if (this._prevEpoch.allowedSenderLeafIndices instanceof Set) {
+                this._prevEpoch.allowedSenderLeafIndices.clear();
+            }
             this._prevEpoch = null;
         }
 
@@ -443,8 +460,8 @@
          * Best-effort destruction of all extractable symmetric state owned
          * by this Group. Used when a speculative PendingCommit is abandoned
          * and when an accepted candidate supersedes the old live Group.
-         * WebCrypto private-key handles are intentionally non-extractable and
-         * cannot be overwritten from JavaScript.
+         * WebCrypto private-key handles cannot be overwritten from JavaScript;
+         * all references are dropped below so the browser can release them.
          */
         destroySecrets() {
             if (this.epochSecrets && typeof this.epochSecrets === 'object') {
@@ -457,6 +474,17 @@
             wipeBytes(this.pskSecret);
             this.pskSecret = null;
             if (this.consumedByLeaf instanceof Map) this.consumedByLeaf.clear();
+            if (this.parentKeyPairs instanceof Map) this.parentKeyPairs.clear();
+            this.parentKeyPairs = new Map();
+            // CryptoKey handles cannot be overwritten, but dropping every
+            // reference makes the browser eligible to release them. This is
+            // especially important for an authenticated Remove, where the
+            // session must become terminal rather than retain stale signing
+            // or TreeKEM capabilities.
+            this.leafKeyPair = null;
+            this.identity = null;
+            this.senderRatchetGeneration = 0;
+            this._destroyed = true;
         }
 
         /**
@@ -994,7 +1022,17 @@
                     pm,
                     senderDataSecret: pe.senderDataSecret,
                     nLeaves: pe.nLeaves,
-                    keyNonceProvider: ratchetTx.keyNonceProvider,
+                    keyNonceProvider: async (leafIndex, which, generation) => {
+                        if (!(pe.allowedSenderLeafIndices instanceof Set)
+                            || !pe.allowedSenderLeafIndices.has(leafIndex)) {
+                            throw new Error(
+                                `group: previous-epoch sender leaf ${leafIndex} was removed`,
+                            );
+                        }
+                        return ratchetTx.keyNonceProvider(
+                            leafIndex, which, generation,
+                        );
+                    },
                 });
 
                 const senderLeafIndex = out.senderData.leafIndex;
@@ -1729,7 +1767,7 @@
         // ---- 11. Apply commit to local state ----
         // Retain the outgoing epoch's decrypt context first (grace
         // window for in-flight messages), then overwrite.
-        this._snapshotPrevEpoch();
+        this._snapshotPrevEpoch([removedLeafIndex]);
         this.ratchetTree = newTree;
         this.epoch = newEpoch;
         this.treeHash = newTreeHash;
@@ -2404,12 +2442,12 @@
         }
 
         // ---- Apply UpdatePath ----
-        // If WE are the leaf being removed, our key material is no longer
-        // useful — surface a distinct error so the orchestrator can tear
-        // the session down rather than chase phantom decrypt failures.
-        if (removedLeafIndices.includes(this.myLeafIndex)) {
-            throw new Error('processCommit: removed from group');
-        }
+        // A removed member cannot decrypt the new path, but it must not tear
+        // itself down merely because an authenticated envelope contains a
+        // Remove. Continue through every validation that is possible from the
+        // old epoch (path layout, committer LeafNode, parent hashes, and final
+        // tree uniqueness) before returning a typed terminal result below.
+        const selfRemoved = removedLeafIndices.includes(this.myLeafIndex);
         const updatePath = commit.path;
         if (!updatePath) {
             throw new Error('processCommit: commit without path is not supported (Add+Path only)');
@@ -2504,6 +2542,25 @@
         };
         const provisionalGroupContextBytes =
             GroupContext.groupContextBytes(provisionalGroupContext);
+
+        if (selfRemoved) {
+            // The old-epoch membership_tag already authenticates auth_data,
+            // including confirmation_tag, and the creator's FramedContent
+            // signature authorizes the Remove. A removed member deliberately
+            // receives no path secret, so it cannot derive the new
+            // confirmation_key. At this point every public component of the
+            // candidate transition has nevertheless been validated. Destroy
+            // the old capabilities and let MLSSession enter a terminal state.
+            const result = {
+                removedSelf: true,
+                removedLeafIndex: this.myLeafIndex,
+                removedLeafIndices,
+                committerLeafIndex: senderLeafIndex,
+                epoch: newEpoch,
+            };
+            this.destroySecrets();
+            return result;
+        }
 
         // If a referenced Update proposal re-keyed OUR leaf, stage the exact
         // pending private key selected by that ProposalRef. Do not mutate the
@@ -2680,7 +2737,7 @@
         // ---- Commit the new state ----
         // Retain the outgoing epoch's decrypt context first (grace
         // window for in-flight messages), then overwrite.
-        this._snapshotPrevEpoch();
+        this._snapshotPrevEpoch(removedLeafIndices);
         this.ratchetTree = newTree;
         this.nLeaves = newNLeaves;
         this.epoch = newEpoch;

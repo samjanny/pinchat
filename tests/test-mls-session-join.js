@@ -133,6 +133,28 @@ function liveGroupMatches(session, before) {
         && after.previousEpoch === before.previousEpoch;
 }
 
+function collectGroupSecretRefs(group) {
+    const refs = [
+        ...Object.values(group.epochSecrets || {}),
+        group.pskSecret,
+    ];
+    const collectChains = (chainStates) => {
+        if (!(chainStates instanceof Map)) return;
+        for (const state of chainStates.values()) {
+            refs.push(state.secret);
+            for (const value of state.skipped.values()) {
+                refs.push(value.key, value.nonce);
+            }
+        }
+    };
+    collectChains(group._chainStates);
+    if (group._prevEpoch) {
+        refs.push(group._prevEpoch.senderDataSecret);
+        collectChains(group._prevEpoch.chainStates);
+    }
+    return refs.filter((value) => value instanceof Uint8Array);
+}
+
 function mutateProposalEnvelope(envelope, mutate) {
     const pmBytes = global.MLS.Codec.base64UrlToBytes(envelope.payload);
     const pm = global.MLS.PublicMessage.parsePublicMessage(
@@ -210,12 +232,9 @@ function parseCommitEnvelope(envelope) {
     );
 }
 
-async function rewriteCommitEnvelopeProposalList(session, envelope, proposalOrRefs) {
+async function rewriteCommitEnvelope(session, envelope, rewriteCommit) {
     const pm = parseCommitEnvelope(envelope);
-    const rewrittenCommit = {
-        ...pm.content.parsed,
-        proposals: proposalOrRefs,
-    };
+    const rewrittenCommit = rewriteCommit(pm.content.parsed);
     const content = {
         ...pm.content,
         payload: global.MLS.Commit.commitBytes(rewrittenCommit),
@@ -251,6 +270,13 @@ async function rewriteCommitEnvelopeProposalList(session, envelope, proposalOrRe
     };
 }
 
+async function rewriteCommitEnvelopeProposalList(session, envelope, proposalOrRefs) {
+    return rewriteCommitEnvelope(session, envelope, (commit) => ({
+        ...commit,
+        proposals: proposalOrRefs,
+    }));
+}
+
 async function echoPendingCommit(session, envelope, senderId = 'creator-self') {
     await session.onRelayEnvelope({ ...envelope, sender_id: senderId });
 }
@@ -266,7 +292,9 @@ async function completeExchangeJoin(exchange, senderId = 'creator-test') {
     });
 }
 
-async function createExchange({ acceptCommit = true, creatorSend = null } = {}) {
+async function createExchange({
+    acceptCommit = true, creatorSend = null, pskSecret = null,
+} = {}) {
     const creatorOut = [];
     const joinerOut = [];
     const creatorEvents = [];
@@ -278,6 +306,7 @@ async function createExchange({ acceptCommit = true, creatorSend = null } = {}) 
             return creatorSend ? creatorSend(envelope, creator) : true;
         },
         onEvent: (event) => creatorEvents.push(event),
+        pskSecret,
     });
     await creator.start();
     const beforeAdd = captureLiveGroup(creator);
@@ -286,6 +315,7 @@ async function createExchange({ acceptCommit = true, creatorSend = null } = {}) 
         role: 'joiner',
         send: (envelope) => joinerOut.push(envelope),
         onEvent: (event) => joinerEvents.push(event),
+        pskSecret,
         expectedGroupId: pins.groupId,
         expectedCreatorKeyHash: pins.creatorKeyHash,
     });
@@ -324,7 +354,10 @@ async function main() {
     // A locally-authored Add is only a candidate until the relay echoes the
     // exact Commit. Before that ACK, neither the live epoch nor membership
     // maps may change and the Welcome must not be released.
-    const exchange = await createExchange({ acceptCommit: false });
+    const exchange = await createExchange({
+        acceptCommit: false,
+        pskSecret: new Uint8Array(32).fill(0x4d),
+    });
     assert(Boolean(exchange.commit), 'creator emitted an Add Commit');
     assert(!exchange.welcome, 'creator withholds Welcome before Commit echo');
     assert(liveGroupMatches(exchange.creator, exchange.beforeAdd),
@@ -930,6 +963,10 @@ async function main() {
 
     // Remove follows the same PendingCommit path: keep both the MLS state
     // and sender/leaf routing intact until the exact relay echo arrives.
+    await exchange.joiner.proposeUpdate();
+    assert(exchange.joiner._proposalStore.size === 1
+        && exchange.joiner._pendingSelfUpdates.size === 1,
+    'joiner has current-epoch proposal/private-key state to erase on removal');
     const stateBeforeRemove = captureLiveGroup(exchange.creator);
     const creatorOutBeforeRemove = exchange.creatorOut.length;
     await exchange.creator.removeMemberBySenderId('joiner-1');
@@ -940,6 +977,38 @@ async function main() {
     assert(liveGroupMatches(exchange.creator, stateBeforeRemove)
         && exchange.creator._leafBySenderId.get('joiner-1') === 1,
     'unacknowledged Remove preserves MLS state and member routing');
+
+    // An outer signature and membership_tag are necessary but not sufficient
+    // for terminal teardown. The removed member must first validate all public
+    // UpdatePath/tree structure that it can check without the new path secret.
+    const malformedRemove = await rewriteCommitEnvelope(
+        exchange.creator,
+        removeCommit,
+        (commit) => ({
+            ...commit,
+            path: { ...commit.path, nodes: [] },
+        }),
+    );
+    const joinerBeforeMalformedRemove = captureLiveGroup(exchange.joiner);
+    const malformedRemoveEventsBefore = exchange.joinerEvents.length;
+    await exchange.joiner.onRelayEnvelope({
+        ...malformedRemove,
+        sender_id: 'creator-1',
+    });
+    const malformedRemoveError = exchange.joinerEvents
+        .slice(malformedRemoveEventsBefore)
+        .find((event) => event.kind === 'error');
+    assert(Boolean(malformedRemoveError)
+        && malformedRemoveError.reason.includes('UpdatePath nodes')
+        && exchange.joiner.state === 'joined'
+        && liveGroupMatches(exchange.joiner, joinerBeforeMalformedRemove),
+    'creator-authenticated malformed Remove is rejected without teardown');
+
+    const removedGroup = exchange.joiner.group;
+    const removedSecretRefs = collectGroupSecretRefs(removedGroup);
+    const removedSessionPsk = exchange.joiner.pskSecret;
+    exchange.joiner._deferredEnvelopes.push({ type: 'test-deferred' });
+    exchange.joiner._deferredRemovals.add('test-deferred-member');
     await echoPendingCommit(exchange.creator, removeCommit);
     assert(exchange.creator.group.epoch === stateBeforeRemove.epoch + 1n
         && !exchange.creator._leafBySenderId.has('joiner-1')
@@ -949,6 +1018,58 @@ async function main() {
     assert(rosterAfterRemove.members.length === 1
         && rosterAfterRemove.members[0].fingerprint === creatorFingerprint,
     'authenticated roster removes a member only after accepted Remove');
+
+    const validRemoveEventsBefore = exchange.joinerEvents.length;
+    await exchange.joiner.onRelayEnvelope({
+        ...removeCommit,
+        sender_id: 'creator-1',
+    });
+    const removalEvents = exchange.joinerEvents.slice(validRemoveEventsBefore);
+    const terminalRemoval = removalEvents.find((event) => event.kind === 'removed');
+    assert(Boolean(terminalRemoval)
+        && terminalRemoval.removedLeafIndex === 1
+        && terminalRemoval.committerLeafIndex === 0
+        && terminalRemoval.epoch === exchange.creator.group.epoch.toString()
+        && !removalEvents.some((event) => event.kind === 'error'),
+    'valid creator Remove emits one authenticated terminal event');
+    assert(exchange.joiner.state === 'removed'
+        && exchange.joiner.group === null
+        && exchange.joiner.identity === null
+        && exchange.joiner.keyPackageBundle === null
+        && exchange.joiner.pskSecret === null
+        && exchange.joiner.expectedGroupId === null
+        && exchange.joiner.expectedCreatorKeyHash === null,
+    'removed MLSSession drops all group, identity, bootstrap, and KeyPackage state');
+    assert(exchange.joiner._proposalStore.size === 0
+        && exchange.joiner._pendingUpdateProposals.size === 0
+        && exchange.joiner._pendingSelfUpdates.size === 0
+        && exchange.joiner._pendingSelfUpdate === null
+        && exchange.joiner._pendingWelcomeCommits.size === 0
+        && exchange.joiner._deferredEnvelopes.length === 0
+        && exchange.joiner._deferredRemovals.size === 0
+        && exchange.joiner._leafBySenderId.size === 0
+        && exchange.joiner._senderIdByLeaf.size === 0
+        && exchange.joiner._identityBySignatureKey.size === 0,
+    'removed MLSSession clears every pending, routing, and identity cache');
+    assert(Object.keys(removedGroup.epochSecrets).length === 0
+        && removedGroup._chainStates.size === 0
+        && removedGroup._prevEpoch === null
+        && removedGroup.leafKeyPair === null
+        && removedGroup.identity === null
+        && removedGroup.parentKeyPairs.size === 0
+        && removedSecretRefs.every(
+            (bytes) => bytes.every((byte) => byte === 0),
+        )
+        && removedSessionPsk.every((byte) => byte === 0),
+    'terminal removal zeroes retained symmetric Group and session secrets');
+    let removedSendRejected = false;
+    try {
+        await exchange.joiner.sendMessage('must not send after removal');
+    } catch (err) {
+        removedSendRejected = err.message.includes('removed');
+    }
+    assert(removedSendRejected,
+        'terminal removed state rejects all later application sends');
 
     // Also cover a proposal that was valid when received but sat in the
     // queue while some other local Commit advanced the creator. Its outer
