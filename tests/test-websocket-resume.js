@@ -1,0 +1,210 @@
+#!/usr/bin/env node
+
+/**
+ * Browser WebSocket reconnect credential regression tests.
+ *
+ * Exercises the production WebSocketManager with small browser/fetch mocks:
+ * the server-issued credential stays in page memory, is attached to token
+ * refreshes, is stripped before application dispatch, and fails closed for
+ * group-style callers when the server rejects it.
+ */
+
+const assert = require('assert');
+const path = require('path');
+
+const storage = new Map();
+global.sessionStorage = {
+    getItem: (key) => storage.has(key) ? storage.get(key) : null,
+    setItem: (key, value) => storage.set(key, String(value)),
+    removeItem: (key) => storage.delete(key),
+};
+
+const listeners = new Map();
+global.window = {
+    PINCHAT_PROTOCOL_VERSION: 1,
+    location: {
+        protocol: 'https:',
+        host: 'pinchat.test',
+        pathname: '/chat/test-room',
+        search: '',
+        hash: '',
+        href: '',
+    },
+    addEventListener: (name, callback) => listeners.set(name, callback),
+    removeEventListener: (name) => listeners.delete(name),
+};
+
+class FakeWebSocket {
+    static CONNECTING = 0;
+    static OPEN = 1;
+    static CLOSED = 3;
+    static instances = [];
+
+    constructor(url, protocols) {
+        this.url = url;
+        this.protocols = protocols;
+        this.protocol = 'pinchat.v1';
+        this.readyState = FakeWebSocket.OPEN;
+        this.closedWith = null;
+        FakeWebSocket.instances.push(this);
+    }
+
+    close(code, reason) {
+        this.closedWith = { code, reason };
+        this.readyState = FakeWebSocket.CLOSED;
+    }
+
+    send() {}
+}
+
+global.WebSocket = FakeWebSocket;
+global.ProofOfWork = class {
+    static generateMask() { return 'unused'; }
+    async solve() { throw new Error('PoW should not run in this test'); }
+};
+
+const csrfToken = `${'a'.repeat(32)}.${'b'.repeat(64)}`;
+const resumeToken = `${'A'.repeat(32)}.${'B'.repeat(32)}.${'C'.repeat(32)}`;
+
+function response(status, body) {
+    return {
+        status,
+        ok: status >= 200 && status < 300,
+        async json() { return body; },
+    };
+}
+
+function successToken(token) {
+    return response(200, {
+        token,
+        connection_id: 'relay-id',
+        expires_in: 30,
+        protocol_version: 1,
+        supported_subprotocols: ['pinchat.v1'],
+    });
+}
+
+let queuedResponses = [];
+let fetchCalls = [];
+global.fetch = async (url, options = {}) => {
+    fetchCalls.push({ url, options });
+    if (queuedResponses.length === 0) {
+        throw new Error(`Unexpected fetch: ${url}`);
+    }
+    return queuedResponses.shift();
+};
+
+require(path.join(__dirname, '..', 'static', 'js', 'websocket.js'));
+const { WebSocketManager } = window;
+
+let passed = 0;
+function check(condition, message) {
+    assert.ok(condition, message);
+    console.log(`  OK   ${message}`);
+    passed += 1;
+}
+
+async function main() {
+    console.log('# WebSocket stable-identity resume');
+
+    queuedResponses = [
+        response(200, { csrf_token: csrfToken }),
+        successToken('initial-upgrade-token'),
+    ];
+    fetchCalls = [];
+
+    const manager = new WebSocketManager('test-room');
+    let delivered = null;
+    let resumeError = null;
+    manager.onMessage = async (message) => { delivered = message; };
+    manager.onError = (error) => { resumeError = error.message; };
+    await manager.connect();
+
+    const socket = FakeWebSocket.instances.at(-1);
+    check(Boolean(socket), 'connect creates a WebSocket after protocol-gated token issuance');
+    socket.onopen();
+    socket.onmessage({
+        data: JSON.stringify({
+            type: 'connected',
+            user_id: 'relay-id',
+            room_type: 'group',
+            resumed: false,
+            resume_token: resumeToken,
+        }),
+    });
+    await manager._inboundQueue;
+
+    check(manager.resumeToken === resumeToken,
+        'Connected captures the server-signed resume credential in page memory');
+    check(delivered && !Object.prototype.hasOwnProperty.call(delivered, 'resume_token'),
+        'resume bearer is removed before application dispatch');
+    check(!Array.from(storage.keys()).some((key) => key.includes('resume')),
+        'resume bearer is not persisted in sessionStorage');
+
+    queuedResponses = [
+        response(200, { csrf_token: csrfToken }),
+        successToken('resumed-upgrade-token'),
+    ];
+    fetchCalls = [];
+    const refreshed = await manager.requestWsToken();
+    check(refreshed === 'resumed-upgrade-token',
+        'resume credential obtains a fresh single-use upgrade token');
+    check(fetchCalls[1].options.headers['X-PinChat-Resume-Token'] === resumeToken,
+        'token refresh sends the resume credential only in its dedicated header');
+
+    manager.onResumeRejected = () => false;
+    queuedResponses = [
+        response(200, { csrf_token: csrfToken }),
+        response(409, { code: 'RESUME_REJECTED' }),
+    ];
+    const rejected = await manager.requestWsToken();
+    check(rejected === null && manager._fatalAuthFailure,
+        'resume rejection fails closed when a fresh relay identity is forbidden');
+    check(manager.resumeToken === null && resumeError === 'RESUME_REJECTED',
+        'rejected bearer is erased and surfaced as a distinct terminal error');
+
+    const oneToOne = new WebSocketManager('one-to-one-room');
+    oneToOne.resumeToken = resumeToken;
+    oneToOne.onResumeRejected = () => true;
+    queuedResponses = [
+        response(200, { csrf_token: csrfToken }),
+        response(409, { code: 'RESUME_REJECTED' }),
+        response(200, { csrf_token: csrfToken }),
+        successToken('fresh-identity-token'),
+    ];
+    fetchCalls = [];
+    const fresh = await oneToOne.requestWsToken();
+    check(fresh === 'fresh-identity-token' && !oneToOne._fatalAuthFailure,
+        'explicit 1:1 policy may fall back to a fresh relay identity');
+    check(fetchCalls[1].options.headers['X-PinChat-Resume-Token'] === resumeToken
+        && !Object.prototype.hasOwnProperty.call(
+            fetchCalls[3].options.headers,
+            'X-PinChat-Resume-Token',
+        ),
+    'fresh-identity retry cannot replay the rejected resume bearer');
+
+    const deliveredBeforeInvalid = delivered;
+    resumeError = null;
+    socket.onmessage({
+        data: JSON.stringify({
+            type: 'connected',
+            user_id: 'relay-id',
+            room_type: 'group',
+            resumed: true,
+            resume_token: 'malformed',
+        }),
+    });
+    await manager._inboundQueue;
+    check(socket.closedWith && socket.closedWith.code === 1008
+        && resumeError === 'RESUME_TOKEN_INVALID',
+    'malformed server resume credential closes the transport fail-closed');
+    check(delivered === deliveredBeforeInvalid,
+        'invalid Connected frame is never dispatched to application state');
+
+    console.log(`\n${passed} assertions passed`);
+}
+
+main().catch((error) => {
+    console.error('FAILED:', error);
+    process.exit(1);
+});

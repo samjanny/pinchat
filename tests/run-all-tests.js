@@ -34,6 +34,11 @@ const TEST_SUITES = {
         file: 'test-security.js',
         description: 'Key extractability invariants (bootstrap key, identity key)'
     },
+    'websocket-resume': {
+        name: 'WebSocket stable-identity resume',
+        file: 'test-websocket-resume.js',
+        description: 'In-memory resume bearer propagation and fail-closed identity recovery'
+    },
     correctness: {
         name: 'Ratchet Correctness',
         file: 'test-ratchet-correctness.js',

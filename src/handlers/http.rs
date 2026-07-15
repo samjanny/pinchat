@@ -381,6 +381,7 @@ mod tests {
             jwt_token_ttl_secs: 30,
             jwt_issuer: crate::jwt::DEFAULT_JWT_ISSUER.to_string(),
             max_ws_connection_age_secs: 1800,
+            ws_reconnect_grace_secs: 20,
             ecdh_burst_limit: 8,
             ecdh_burst_window_secs: 60,
             room_cleanup_interval_secs: 60,

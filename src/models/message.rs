@@ -86,6 +86,13 @@ pub enum Message {
         max_image_size: usize,
         /// Room creation timestamp (for accurate countdown calculation)
         created_at: DateTime<Utc>,
+        /// Server-signed bearer credential for reclaiming this exact relay
+        /// identity during the configured reconnect grace window. Sent only
+        /// to this socket in its direct Connected frame, never broadcast.
+        resume_token: String,
+        /// True when this socket reclaimed a grace-reserved participant ID;
+        /// false on the participant's first admission.
+        resumed: bool,
     },
 
     /// ECDH public key exchange (for Perfect Forward Secrecy)

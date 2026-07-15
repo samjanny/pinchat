@@ -18,6 +18,15 @@ pub enum RoomCreationError {
     AtCapacity,
 }
 
+/// Result of admitting a WebSocket relay identity into a room.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionAdmission {
+    /// First successful socket for this participant ID.
+    New,
+    /// A valid resume token reclaimed an ID still reserved in the grace window.
+    Resumed,
+}
+
 /// Application state shared across all threads
 #[derive(Clone)]
 pub struct AppState {
@@ -247,12 +256,17 @@ impl AppState {
         // cleanup after this method; removing the connection mapping first
         // would otherwise make that cleanup a no-op and leak these entries
         // forever across room churn.
-        let connection_ids: Vec<Uuid> = self
-            .connections
-            .iter()
-            .filter(|entry| entry.value() == room_id)
-            .map(|entry| *entry.key())
-            .collect();
+        let mut connection_ids: HashSet<Uuid> = self
+            .rooms
+            .get(room_id)
+            .map(|room| room.participant_ids.iter().copied().collect())
+            .unwrap_or_default();
+        connection_ids.extend(
+            self.connections
+                .iter()
+                .filter(|entry| entry.value() == room_id)
+                .map(|entry| *entry.key()),
+        );
         for connection_id in connection_ids {
             self.connections.remove(&connection_id);
             self.connection_message_timestamps.remove(&connection_id);
@@ -275,37 +289,97 @@ impl AppState {
         tracing::debug!("Room removed");
     }
 
-    /// Adds a connection to a room
-    pub fn add_connection(&self, connection_id: Uuid, room_id: Uuid) -> bool {
-        if let Some(mut room) = self.rooms.get_mut(&room_id) {
-            if room.add_participant(connection_id) {
-                self.connections.insert(connection_id, room_id);
+    /// Admit one active socket. An existing participant ID may only be
+    /// reclaimed by a short-lived WebSocket token explicitly marked as a
+    /// resume. A second simultaneously active socket for the same ID is always
+    /// rejected, even if it has a valid bearer credential.
+    pub fn add_connection(
+        &self,
+        connection_id: Uuid,
+        room_id: Uuid,
+        allow_resume: bool,
+    ) -> Option<ConnectionAdmission> {
+        match self.connections.entry(connection_id) {
+            Entry::Occupied(_) => None,
+            Entry::Vacant(active_slot) => {
+                let mut room = self.rooms.get_mut(&room_id)?;
+                let admission = if allow_resume {
+                    // Fail closed if the grace reservation disappeared after
+                    // the resume upgrade token was minted but before the
+                    // WebSocket was admitted. A resume credential must never
+                    // silently turn into a fresh participant admission.
+                    if !room.participant_ids.contains(&connection_id) {
+                        return None;
+                    }
+                    ConnectionAdmission::Resumed
+                } else {
+                    if room.participant_ids.contains(&connection_id) {
+                        return None;
+                    }
+                    if !room.add_participant(connection_id) {
+                        return None;
+                    }
+                    ConnectionAdmission::New
+                };
+                active_slot.insert(room_id);
                 room.update_activity();
-                return true;
+                Some(admission)
             }
         }
-        false
     }
 
-    /// Removes a connection from a room
-    pub fn remove_connection(&self, connection_id: &Uuid) -> Option<Uuid> {
+    /// Detach the active socket while retaining its participant reservation.
+    /// Per-identity rate-limit state is deliberately retained: a resumed
+    /// participant must not gain a fresh Commit/message budget by cycling its
+    /// transport. Membership and limiter state are removed together after the
+    /// reconnect grace period.
+    pub fn detach_connection(&self, connection_id: &Uuid) -> Option<Uuid> {
         if let Some((_, room_id)) = self.connections.remove(connection_id) {
             if let Some(mut room) = self.rooms.get_mut(&room_id) {
-                room.remove_participant(connection_id);
                 room.update_activity();
             }
-
-            // Cleanup rate limiting timestamps for this connection
-            self.connection_message_timestamps.remove(connection_id);
-            self.connection_commit_timestamps.remove(connection_id);
-            self.connection_frame_timestamps.remove(connection_id);
-            self.connection_protocol_errors.remove(connection_id);
-            self.connection_ecdh_timestamps.remove(connection_id);
-
             Some(room_id)
         } else {
             None
         }
+    }
+
+    /// Remove a grace-reserved participant only if no newer active socket has
+    /// reclaimed the same stable ID. Holding the vacant DashMap entry prevents
+    /// a reconnect from racing between the active check and room removal.
+    pub fn finalize_disconnection(
+        &self,
+        connection_id: &Uuid,
+        expected_room_id: Uuid,
+    ) -> Option<usize> {
+        match self.connections.entry(*connection_id) {
+            Entry::Occupied(_) => None,
+            Entry::Vacant(_reservation) => {
+                let mut room = self.rooms.get_mut(&expected_room_id)?;
+                if !room.remove_participant(connection_id) {
+                    return None;
+                }
+                room.update_activity();
+                let participant_count = room.participant_count();
+                drop(room);
+
+                self.connection_message_timestamps.remove(connection_id);
+                self.connection_commit_timestamps.remove(connection_id);
+                self.connection_frame_timestamps.remove(connection_id);
+                self.connection_protocol_errors.remove(connection_id);
+                self.connection_ecdh_timestamps.remove(connection_id);
+
+                Some(participant_count)
+            }
+        }
+    }
+
+    /// Immediate removal for setup failures and explicit administrative
+    /// cleanup paths that must not retain a reconnect reservation.
+    pub fn remove_connection(&self, connection_id: &Uuid) -> Option<Uuid> {
+        let room_id = self.detach_connection(connection_id)?;
+        let _ = self.finalize_disconnection(connection_id, room_id);
+        Some(room_id)
     }
 
     /// Gets the number of participants in a room

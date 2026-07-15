@@ -154,10 +154,13 @@ removed-member loss-of-access.
   removed any more; the group must be re-created from a fresh room.
 - **No out-of-band verification ceremony.** Group identities are
   fresh per-session signature keys whose credential is the key
-  itself; there is no SAS equivalent and no identity continuity
-  across reconnects. Peer authentication rests entirely on the URL
-  fragment PSK (the link is the capability) plus the TOFU
-  `leaf -> sender_id` pinning described above.
+  itself; there is no SAS equivalent or identity continuity across a
+  page reload. A live page can reclaim the same relay `sender_id`
+  during the short, server-authenticated reconnect grace period, while
+  an expired/missing resume credential is rejected fail-closed for MLS.
+  Peer authentication rests entirely on the URL fragment PSK (the link
+  is the capability) plus the TOFU `leaf -> sender_id` pinning described
+  above.
 - **Filtered direct path on the wire (§7.6).** `commitAddMember` emits
   the *full* direct path with empty `encrypted_path_secret` lists where
   the copath sibling resolution is empty, instead of dropping those

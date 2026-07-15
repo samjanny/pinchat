@@ -39,6 +39,7 @@ document.addEventListener('alpine:init', () => {
         myNickname: null,  // User's own nickname (generated from userId)
         initialized: false,
         wasConnectedBefore: false,  // Track if we've connected at least once (for reconnection detection)
+        transportReconnectPending: false,
 
         // Messages
         messages: [],
@@ -159,17 +160,16 @@ document.addEventListener('alpine:init', () => {
                 // Detect if this is a reconnection (vs initial connection)
                 const isReconnection = this.wasConnectedBefore;
                 this.wasConnectedBefore = true;
+                this.transportReconnectPending = isReconnection;
 
                 this.connected = true;
                 this.connecting = false;
                 this.error = '';
 
-                // If PFS was active and this is a reconnection, restart handshake to resync Chain Ratchet
-                // This prevents permanent desynchronization when messages are lost during disconnection
-                if (isReconnection && this.pfsActive) {
-                    debugLog('[RECONNECT] Detected reconnection with active PFS → restarting handshake to resync Chain Ratchet');
-                    await this.restartECDHHandshake();
-                }
+                // Secure-protocol recovery waits for the server's Connected
+                // frame. That frame authenticates whether the relay identity
+                // was resumed and supplies the current user_id; restarting a
+                // handshake here would race ahead using stale routing state.
             };
 
             this.wsManager.onDisconnected = () => {
@@ -204,8 +204,22 @@ document.addEventListener('alpine:init', () => {
                     this.error = '⚠️ Internal error establishing secure session. Please refresh.';
                     return;
                 }
+                if (msg === 'RESUME_REJECTED') {
+                    this.mlsReady = false;
+                    this.error = this.roomType === 'group'
+                        ? '⚠️ Secure group reconnect window expired. Refresh to request a fresh MLS join; the original creator must create a new room.'
+                        : '⚠️ Secure reconnect expired. Please refresh to establish a new session.';
+                    return;
+                }
+                if (msg === 'RESUME_TOKEN_INVALID') {
+                    this.mlsReady = false;
+                    this.error = '⚠️ Server returned an invalid reconnect credential. Connection stopped.';
+                    return;
+                }
                 this.error = '⚠️ Connection error. Retrying automatically...';
             };
+
+            this.wsManager.onResumeRejected = () => this.roomType !== 'group';
 
             this.wsManager.onPowProgress = (attempts) => {
                 if (attempts === 0) {
@@ -227,6 +241,22 @@ document.addEventListener('alpine:init', () => {
         async handleWebSocketMessage(message) {
             switch (message.type) {
                 case 'connected':
+                    // MLS state is bound to both the authenticated leaf and
+                    // this stable relay identity. A reconnect must explicitly
+                    // reclaim the same ID; silently accepting a fresh one would
+                    // cause peers to Remove the old leaf while this tab keeps
+                    // using its stale epoch state.
+                    if (this.userId && message.room_type === 'group'
+                        && (message.user_id !== this.userId || message.resumed !== true)) {
+                        this.mlsReady = false;
+                        this.error = '⚠️ Group relay identity was not resumed safely. Refresh to rejoin.';
+                        if (this.wsManager) {
+                            this.wsManager.disconnectWithError(
+                                1008, 'Group relay identity changed during reconnect',
+                            );
+                        }
+                        return;
+                    }
                     this.userId = message.user_id;
                     this.myNickname = generateNickname(message.user_id).display;  // Generate user's own nickname
                     this.participantCount = message.participant_count;
@@ -261,6 +291,16 @@ document.addEventListener('alpine:init', () => {
                         debugLog('[CONFIG] Max image size from server:', this.formatFileSize(message.max_image_size));
                         this.maxImageSize = message.max_image_size;
                     }
+
+                    // For 1:1 rooms a reconnect may intentionally fall back to
+                    // a fresh relay ID after the grace window. Restart only now,
+                    // after userId has been updated from the Connected frame.
+                    if (this.transportReconnectPending
+                        && message.room_type === 'onetoone' && this.pfsActive) {
+                        debugLog('[RECONNECT] Stable/fresh relay admission confirmed → restarting 1:1 handshake');
+                        await this.restartECDHHandshake();
+                    }
+                    this.transportReconnectPending = false;
 
                     // Group room: spin up an MLS session. The creator
                     // starts immediately so it is listening for the

@@ -531,6 +531,7 @@ These settings control application behavior only. They do not automatically conf
 | `POW_MAX_DIFFICULTY` | `18` | Maximum proof-of-work difficulty, in bits |
 | `CHALLENGE_TTL_SECS` | `300` | Proof-of-work challenge TTL |
 | `JWT_TOKEN_TTL_SECS` | `30` | WebSocket JWT TTL, in seconds |
+| `WS_RECONNECT_GRACE_SECS` | `20` | Seconds a disconnected relay identity remains reserved for authenticated in-memory resume (range: 1–120) |
 | `ROOM_CLEANUP_INTERVAL_SECS` | `60` | Room cleanup interval |
 | `CHALLENGE_CLEANUP_INTERVAL_SECS` | `60` | Proof-of-work cache cleanup interval |
 | `PINCHAT_PASSWORD_HASHES` | empty | Semicolon-separated Argon2id hashes. If empty, password auth is disabled |

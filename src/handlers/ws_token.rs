@@ -23,10 +23,13 @@ use uuid::Uuid;
 
 use crate::handlers::auth::verify_csrf_for_api;
 use crate::ip_hash::{extract_client_ip_with_proxy, hash_ip};
-use crate::jwt::{WsTokenClaims, sign_token};
+use crate::jwt::{WsTokenClaims, sign_token, verify_resume_token};
 use crate::pow::{PowChallenge, calculate_difficulty};
 use crate::pow_session::{pow_cache_key, resolve_pow_session, should_use_secure_pow_cookies};
 use crate::state::AppState;
+
+const RESUME_TOKEN_HEADER: &str = "x-pinchat-resume-token";
+const MAX_RESUME_TOKEN_LEN: usize = 2048;
 
 fn pow_error_response(
     status: StatusCode,
@@ -197,10 +200,51 @@ pub async fn generate_ws_token(
         }
     }
 
-    // Verify room exists and validate state atomically with a single map read
-    // to avoid races between contains/get in concurrent cleanup scenarios.
-    let (room_is_expired, room_is_full) = match state.rooms.get(&room_id) {
-        Some(room) => (room.is_expired(), room.is_full()),
+    // A resume credential is a longer-lived bearer token issued only after a
+    // socket was admitted. It can mint a fresh single-use upgrade JWT for the
+    // same stable participant ID, but only while that ID is still reserved in
+    // this room's reconnect grace window.
+    let resume_claims = match headers.get(RESUME_TOKEN_HEADER) {
+        None => None,
+        Some(value) => {
+            let token = value
+                .to_str()
+                .ok()
+                .filter(|s| s.len() <= MAX_RESUME_TOKEN_LEN);
+            let claims = token
+                .and_then(|token| {
+                    verify_resume_token(token, &state.jwt_secret, &state.config.jwt_issuer).ok()
+                })
+                .filter(|claims| claims.room_id == room_id);
+            match claims {
+                Some(claims) => Some(claims),
+                None => {
+                    return Err((
+                        StatusCode::CONFLICT,
+                        Json(json!({
+                            "error": "Secure reconnect credential is invalid or expired",
+                            "code": "RESUME_REJECTED"
+                        })),
+                    )
+                        .into_response());
+                }
+            }
+        }
+    };
+
+    // Verify room exists and snapshot whether a valid resume ID is still
+    // grace-reserved. This lets a reconnect reclaim its slot even when the
+    // room is otherwise full, without letting arbitrary fresh clients bypass
+    // the participant cap.
+    let (room_is_expired, room_is_full, resume_is_reserved) = match state.rooms.get(&room_id) {
+        Some(room) => (
+            room.is_expired(),
+            room.is_full(),
+            resume_claims
+                .as_ref()
+                .map(|claims| room.participant_ids.contains(&claims.connection_id))
+                .unwrap_or(false),
+        ),
         None => {
             return Err((
                 StatusCode::NOT_FOUND,
@@ -219,7 +263,18 @@ pub async fn generate_ws_token(
             .into_response());
     }
 
-    if room_is_full {
+    if resume_claims.is_some() && !resume_is_reserved {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "Secure reconnect grace period has expired",
+                "code": "RESUME_REJECTED"
+            })),
+        )
+            .into_response());
+    }
+
+    if room_is_full && !resume_is_reserved {
         // Return 404 (same as "not found") to avoid leaking room existence to
         // callers probing UUIDs. See http.rs::room_page for rationale.
         return Err((
@@ -231,7 +286,15 @@ pub async fn generate_ws_token(
 
     // Generate JWT claims with configurable TTL
     let ttl_secs = state.config.jwt_token_ttl_secs;
-    let claims = WsTokenClaims::new(room_id, ttl_secs, &state.config.jwt_issuer);
+    let claims = match resume_claims {
+        Some(resume) => WsTokenClaims::for_resume(
+            room_id,
+            resume.connection_id,
+            ttl_secs,
+            &state.config.jwt_issuer,
+        ),
+        None => WsTokenClaims::new(room_id, ttl_secs, &state.config.jwt_issuer),
+    };
     let connection_id = claims.connection_id;
 
     // Sign JWT token

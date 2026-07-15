@@ -103,6 +103,13 @@ pub struct Config {
     // resource usage from clients that keep heartbeating indefinitely.
     pub max_ws_connection_age_secs: u64,
 
+    // Time for which a disconnected participant ID remains reserved. A client
+    // presenting its server-signed resume credential can reconnect during this
+    // window without producing UserLeft/UserJoined or changing its relay ID.
+    // After the window, normal departure processing resumes and MLS removes the
+    // member fail-closed.
+    pub ws_reconnect_grace_secs: u64,
+
     // Cleanup intervals
     pub room_cleanup_interval_secs: u64,
     pub challenge_cleanup_interval_secs: u64,
@@ -263,6 +270,14 @@ impl Config {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(30 * 60),
+
+            // Stable-identity reconnect grace (default: 20 seconds). This is
+            // long enough for the normal PoW/JWT retry path while keeping the
+            // delay before a genuine MLS Remove bounded.
+            ws_reconnect_grace_secs: env::var("WS_RECONNECT_GRACE_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(20),
 
             // ECDH burst (default: 8 frames per 60 seconds).
             ecdh_burst_limit: env::var("ECDH_BURST_LIMIT")
@@ -470,6 +485,9 @@ impl Config {
         }
         if self.max_ws_connection_age_secs == 0 {
             panic!("MAX_WS_CONNECTION_AGE_SECS must be greater than 0");
+        }
+        if self.ws_reconnect_grace_secs == 0 || self.ws_reconnect_grace_secs > 120 {
+            panic!("WS_RECONNECT_GRACE_SECS must be between 1 and 120");
         }
         if self.ecdh_burst_limit == 0 {
             panic!("ECDH_BURST_LIMIT must be greater than 0");

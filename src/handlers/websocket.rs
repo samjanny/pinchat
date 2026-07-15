@@ -13,9 +13,9 @@ use std::collections::{HashSet, VecDeque};
 use tokio::time::{Duration, Instant, interval};
 use uuid::Uuid;
 
-use crate::jwt::verify_token;
+use crate::jwt::{WsResumeTokenClaims, sign_resume_token, verify_token};
 use crate::models::{IncomingMessage, Message};
-use crate::state::AppState;
+use crate::state::{AppState, ConnectionAdmission};
 
 /// Maximum allowed size for ECDH public key payload (8KB)
 /// Typical ECDH payload with P-256: ~500 bytes (65-byte key + encryption overhead + AAD)
@@ -197,6 +197,7 @@ pub async fn ws_handler(
     );
 
     let connection_id = claims.connection_id;
+    let resume_requested = claims.resume;
     let ws_size = max_ws_size(state.config.max_image_size);
 
     // Echo only the base subprotocol back (do NOT echo the jwt.* companion —
@@ -205,7 +206,9 @@ pub async fn ws_handler(
     ws.protocols(["pinchat.v1"])
         .max_message_size(ws_size)
         .max_frame_size(ws_size)
-        .on_upgrade(move |socket| handle_socket(socket, state, room_id, connection_id))
+        .on_upgrade(move |socket| {
+            handle_socket(socket, state, room_id, connection_id, resume_requested)
+        })
 }
 
 /// Increments the per-connection protocol-error counter. Returns true once the
@@ -240,7 +243,13 @@ fn bump_protocol_error(state: &AppState, connection_id: Uuid) -> bool {
 /// * `state` - Application state
 /// * `room_id` - Room ID (already validated by ws_handler)
 /// * `connection_id` - Pre-allocated connection ID from JWT token (ensures uniqueness)
-async fn handle_socket(socket: WebSocket, state: AppState, room_id: Uuid, connection_id: Uuid) {
+async fn handle_socket(
+    socket: WebSocket,
+    state: AppState,
+    room_id: Uuid,
+    connection_id: Uuid,
+    resume_requested: bool,
+) {
     // Verify that the room exists AND is not expired.
     // Without the is_expired() gate, a room past its hard TTL can still accept
     // new WebSocket connections until the next cleanup tick (default 60s).
@@ -262,23 +271,24 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: Uuid, connec
 
     // connection_id is pre-allocated from JWT token (not generated here)
 
-    // Attempt to add the connection to the room
-    if !state.add_connection(connection_id, room_id) {
-        #[cfg(debug_assertions)]
-        tracing::debug!("Failed to add connection to room (full or unavailable)");
-        // Room is full or another error
-        let _ = send_error(socket, "Room is full or unavailable").await;
-        return;
-    }
+    // Attempt to add the connection to the room. Reclaiming an ID that is
+    // already grace-reserved requires the resume bit from the signed upgrade
+    // JWT; two simultaneously active sockets with the same ID are rejected.
+    let admission = match state.add_connection(connection_id, room_id, resume_requested) {
+        Some(admission) => admission,
+        None => {
+            #[cfg(debug_assertions)]
+            tracing::debug!("Failed to add connection to room (full, active, or unavailable)");
+            let _ = send_error(socket, "Room is full or reconnect is unavailable").await;
+            return;
+        }
+    };
 
     #[cfg(debug_assertions)]
     tracing::debug!(
         "Connection joined room ({} participants)",
         state.get_participant_count(&room_id)
     );
-
-    // Split the socket into sender and receiver
-    let (mut sender, mut receiver) = socket.split();
 
     // Get validated room configuration from server (prevents URL spoofing)
     let (room_type, ttl_minutes, max_participants, created_at) = {
@@ -291,6 +301,31 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: Uuid, connec
         )
     };
 
+    // Issue the longer-lived resume credential only after successful room
+    // admission. It is sent in the direct Connected frame and never through
+    // the room broadcast channel. The room's own hard TTL remains the final
+    // authority even if this bearer token's wall-clock lifetime is longer by
+    // a small scheduling margin.
+    let resume_claims = WsResumeTokenClaims::new(
+        room_id,
+        connection_id,
+        u64::from(ttl_minutes).saturating_mul(60),
+        &state.config.jwt_issuer,
+    );
+    let resume_token = match sign_resume_token(&resume_claims, &state.jwt_secret) {
+        Ok(token) => token,
+        Err(err) => {
+            tracing::error!("Failed to sign WebSocket resume credential: {}", err);
+            state.remove_connection(&connection_id);
+            let _ = send_error(socket, "Unable to establish reconnect state").await;
+            return;
+        }
+    };
+
+    // Split the socket into sender and receiver only after all fallible setup
+    // that needs ownership of the unsplit socket has completed.
+    let (mut sender, mut receiver) = socket.split();
+
     // Send connection confirmation message with validated room config
     let connected_msg = Message::Connected {
         user_id: connection_id,
@@ -301,21 +336,27 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: Uuid, connec
         max_participants,                            // Validated from server
         max_image_size: state.config.max_image_size, // From server config
         created_at,                                  // Room creation timestamp for countdown
+        resume_token,
+        resumed: admission == ConnectionAdmission::Resumed,
     };
 
     if let Ok(json) = serde_json::to_string(&connected_msg) {
         let _ = sender.send(WsMessage::Text(json)).await;
     }
 
-    // Notify other users that someone joined (broadcast BEFORE subscribing)
-    let join_msg = Message::UserJoined {
-        user_id: connection_id,
-        participant_count: state.get_participant_count(&room_id),
-    };
+    // A resumed socket is the same MLS member and relay identity, so it must
+    // not generate a synthetic leave/join cycle. Only first admission is
+    // announced to peers.
+    if admission == ConnectionAdmission::New {
+        let join_msg = Message::UserJoined {
+            user_id: connection_id,
+            participant_count: state.get_participant_count(&room_id),
+        };
 
-    if let Ok(json) = serde_json::to_string(&join_msg) {
-        if let Some(tx) = state.broadcast_channels.get(&room_id) {
-            let _ = tx.send(json);
+        if let Ok(json) = serde_json::to_string(&join_msg) {
+            if let Some(tx) = state.broadcast_channels.get(&room_id) {
+                let _ = tx.send(json);
+            }
         }
     }
 
@@ -997,26 +1038,37 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: Uuid, connec
         }
     }
 
-    // Cleanup: remove the connection
-    state.remove_connection(&connection_id);
+    // Detach the socket now, but keep the stable participant ID reserved for a
+    // short grace period. A valid resume reconnect cancels departure simply by
+    // reclaiming the ID before the delayed finalizer runs.
+    if let Some(detached_room_id) = state.detach_connection(&connection_id) {
+        let grace_state = state.clone();
+        let grace = Duration::from_secs(state.config.ws_reconnect_grace_secs);
+        tokio::spawn(async move {
+            tokio::time::sleep(grace).await;
+            let Some(participant_count) =
+                grace_state.finalize_disconnection(&connection_id, detached_room_id)
+            else {
+                return;
+            };
 
-    // Notify other users that someone left
-    let leave_msg = Message::UserLeft {
-        user_id: connection_id,
-        participant_count: state.get_participant_count(&room_id),
-    };
+            let leave_msg = Message::UserLeft {
+                user_id: connection_id,
+                participant_count,
+            };
+            if let Ok(json) = serde_json::to_string(&leave_msg)
+                && let Some(tx) = grace_state.broadcast_channels.get(&detached_room_id)
+            {
+                let _ = tx.send(json);
+            }
 
-    if let Ok(json) = serde_json::to_string(&leave_msg) {
-        if let Some(tx) = state.broadcast_channels.get(&room_id) {
-            let _ = tx.send(json);
-        }
+            #[cfg(debug_assertions)]
+            tracing::debug!(
+                "Reconnect grace expired; participant left room ({} remaining)",
+                participant_count
+            );
+        });
     }
-
-    #[cfg(debug_assertions)]
-    tracing::debug!(
-        "Connection left room ({} participants remaining)",
-        state.get_participant_count(&room_id)
-    );
 }
 
 /// Sends an error message and closes the connection
@@ -1082,6 +1134,7 @@ mod tests {
             jwt_token_ttl_secs: 30,
             jwt_issuer: crate::jwt::DEFAULT_JWT_ISSUER.to_string(),
             max_ws_connection_age_secs: 30 * 60,
+            ws_reconnect_grace_secs: 20,
             ecdh_burst_limit: 8,
             ecdh_burst_window_secs: 60,
             room_cleanup_interval_secs: 60,
@@ -1258,6 +1311,7 @@ mod tests {
             jti: Uuid::new_v4(),
             aud: crate::jwt::WS_TOKEN_AUDIENCE.to_string(),
             iss: state.config.jwt_issuer.clone(),
+            resume: false,
         };
         let token = sign_token(&expired, &state.jwt_secret).unwrap();
         let sp = format!("pinchat.v1, pinchat.v1.jwt.{}", token);
@@ -1336,6 +1390,78 @@ mod tests {
         assert!(
             !head.contains("pinchat.v1.jwt."),
             "server must NOT echo the jwt token subprotocol"
+        );
+    }
+
+    #[test]
+    fn reconnect_reservation_is_reclaimed_fail_closed() {
+        let state = AppState::new(1000, test_config());
+        let room = Room::new(RoomConfig {
+            room_type: RoomType::Group,
+            ttl_minutes: 60,
+            max_participants: 4,
+        });
+        let room_id = room.id;
+        state.try_create_room(room).unwrap();
+        let connection_id = Uuid::new_v4();
+
+        assert_eq!(
+            state.add_connection(connection_id, room_id, false),
+            Some(ConnectionAdmission::New)
+        );
+        assert_eq!(state.get_participant_count(&room_id), 1);
+        state
+            .connection_commit_timestamps
+            .insert(connection_id, VecDeque::from([Utc::now()]));
+
+        // Even a valid resume credential cannot open two simultaneously
+        // active sockets for the same relay identity.
+        assert_eq!(state.add_connection(connection_id, room_id, true), None);
+
+        assert_eq!(state.detach_connection(&connection_id), Some(room_id));
+        assert_eq!(state.get_participant_count(&room_id), 1);
+        assert_eq!(
+            state
+                .connection_commit_timestamps
+                .get(&connection_id)
+                .map(|timestamps| timestamps.len()),
+            Some(1),
+            "transport cycling must not reset the stable identity's rate budget"
+        );
+
+        // The reserved ID cannot be reclaimed by a normal fresh-token path.
+        assert_eq!(state.add_connection(connection_id, room_id, false), None);
+        assert_eq!(
+            state.add_connection(connection_id, room_id, true),
+            Some(ConnectionAdmission::Resumed)
+        );
+        assert_eq!(state.get_participant_count(&room_id), 1);
+
+        // An older grace finalizer observes the resumed active socket and
+        // cannot remove its participant reservation.
+        assert_eq!(state.finalize_disconnection(&connection_id, room_id), None);
+        assert_eq!(state.get_participant_count(&room_id), 1);
+
+        assert_eq!(state.detach_connection(&connection_id), Some(room_id));
+        assert_eq!(
+            state.finalize_disconnection(&connection_id, room_id),
+            Some(0)
+        );
+        assert!(
+            !state
+                .connection_commit_timestamps
+                .contains_key(&connection_id),
+            "final departure must erase retained limiter state"
+        );
+
+        // Critical race regression: if grace expires after token issuance but
+        // before upgrade, a resume token must fail rather than be admitted as
+        // a brand-new participant under the old ID.
+        assert_eq!(state.add_connection(connection_id, room_id, true), None);
+        assert_eq!(state.get_participant_count(&room_id), 0);
+        assert_eq!(
+            state.add_connection(connection_id, room_id, false),
+            Some(ConnectionAdmission::New)
         );
     }
 }

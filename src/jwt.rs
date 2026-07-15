@@ -29,6 +29,13 @@ use uuid::Uuid;
 /// handler. The verifier MUST require exactly this audience.
 pub const WS_TOKEN_AUDIENCE: &str = "pinchat-ws";
 
+/// Separate audience for the longer-lived bearer credential that authorizes
+/// reconnecting with an already-admitted relay identity. Keeping this distinct
+/// from `WS_TOKEN_AUDIENCE` prevents a resume token from being accepted at the
+/// WebSocket upgrade endpoint (or vice versa), even though both use the same
+/// deployment-local HMAC key.
+pub const WS_RESUME_TOKEN_AUDIENCE: &str = "pinchat-ws-resume";
+
 /// Default JWT issuer when `JWT_ISSUER` is not set. Operators running
 /// multiple PinChat instances behind the same secret store should set
 /// `JWT_ISSUER` per instance so tokens are not cross-instance valid.
@@ -59,6 +66,12 @@ pub struct WsTokenClaims {
     /// Issuer claim (RFC 7519 §4.1.1). Bound to the deployment via
     /// `JWT_ISSUER` config. Verifier requires an exact match.
     pub iss: String,
+
+    /// True only when this short-lived upgrade token was minted from a valid
+    /// resume credential. The socket admission path requires this bit before
+    /// it will attach to an existing, grace-reserved participant ID.
+    #[serde(default)]
+    pub resume: bool,
 }
 
 impl WsTokenClaims {
@@ -82,6 +95,46 @@ impl WsTokenClaims {
             jti: Uuid::new_v4(),
             aud: WS_TOKEN_AUDIENCE.to_string(),
             iss: issuer.to_string(),
+            resume: false,
+        }
+    }
+
+    /// Mint a fresh, single-use WebSocket token for an existing participant.
+    /// A new JTI is generated on every attempt while the stable connection ID
+    /// remains unchanged.
+    pub fn for_resume(room_id: Uuid, connection_id: Uuid, ttl_secs: u64, issuer: &str) -> Self {
+        let mut claims = Self::new(room_id, ttl_secs, issuer);
+        claims.connection_id = connection_id;
+        claims.resume = true;
+        claims
+    }
+}
+
+/// Long-lived, server-signed authorization to request fresh single-use
+/// WebSocket tokens for one already-admitted room participant. This token is
+/// delivered only over the participant's own WebSocket and held in page
+/// memory; it is never broadcast to the room or persisted with MLS secrets.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct WsResumeTokenClaims {
+    pub room_id: Uuid,
+    pub connection_id: Uuid,
+    pub exp: u64,
+    pub aud: String,
+    pub iss: String,
+}
+
+impl WsResumeTokenClaims {
+    pub fn new(room_id: Uuid, connection_id: Uuid, ttl_secs: u64, issuer: &str) -> Self {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("Time went backwards")
+            .as_secs();
+        Self {
+            room_id,
+            connection_id,
+            exp: now + ttl_secs,
+            aud: WS_RESUME_TOKEN_AUDIENCE.to_string(),
+            iss: issuer.to_string(),
         }
     }
 }
@@ -99,6 +152,15 @@ pub fn sign_token(
     secret: &[u8; 32],
 ) -> Result<String, jsonwebtoken::errors::Error> {
     let header = Header::default(); // HS256 (HMAC-SHA256)
+    let encoding_key = EncodingKey::from_secret(secret);
+    encode(&header, claims, &encoding_key)
+}
+
+pub fn sign_resume_token(
+    claims: &WsResumeTokenClaims,
+    secret: &[u8; 32],
+) -> Result<String, jsonwebtoken::errors::Error> {
+    let header = Header::default();
     let encoding_key = EncodingKey::from_secret(secret);
     encode(&header, claims, &encoding_key)
 }
@@ -143,6 +205,23 @@ pub fn verify_token(
     Ok(token_data.claims)
 }
 
+/// Verify a reconnect credential under a dedicated audience. Resume tokens
+/// are intentionally reusable during their lifetime; each use only authorizes
+/// minting a new short-lived WebSocket token with its own single-use JTI.
+pub fn verify_resume_token(
+    token: &str,
+    secret: &[u8; 32],
+    expected_issuer: &str,
+) -> Result<WsResumeTokenClaims, jsonwebtoken::errors::Error> {
+    let decoding_key = DecodingKey::from_secret(secret);
+    let mut validation = Validation::new(Algorithm::HS256);
+    validation.set_required_spec_claims(&["exp", "aud", "iss"]);
+    validation.aud = Some(HashSet::from([WS_RESUME_TOKEN_AUDIENCE.to_string()]));
+    validation.iss = Some(HashSet::from([expected_issuer.to_string()]));
+    let token_data = decode::<WsResumeTokenClaims>(token, &decoding_key, &validation)?;
+    Ok(token_data.claims)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -166,6 +245,39 @@ mod tests {
         assert_eq!(decoded.connection_id, connection_id);
         assert_eq!(decoded.aud, WS_TOKEN_AUDIENCE);
         assert_eq!(decoded.iss, TEST_ISS);
+        assert!(!decoded.resume);
+    }
+
+    #[test]
+    fn resumed_upgrade_token_preserves_connection_identity() {
+        let secret = [21u8; 32];
+        let room_id = Uuid::new_v4();
+        let connection_id = Uuid::new_v4();
+        let claims = WsTokenClaims::for_resume(room_id, connection_id, 30, TEST_ISS);
+        let token = sign_token(&claims, &secret).expect("sign resumed upgrade token");
+        let decoded = verify_token(&token, &secret, TEST_ISS).expect("verify resumed token");
+        assert_eq!(decoded.room_id, room_id);
+        assert_eq!(decoded.connection_id, connection_id);
+        assert!(decoded.resume);
+    }
+
+    #[test]
+    fn resume_credential_has_separate_audience_and_roundtrips() {
+        let secret = [22u8; 32];
+        let room_id = Uuid::new_v4();
+        let connection_id = Uuid::new_v4();
+        let claims = WsResumeTokenClaims::new(room_id, connection_id, 60, TEST_ISS);
+        let token = sign_resume_token(&claims, &secret).expect("sign resume credential");
+        let decoded =
+            verify_resume_token(&token, &secret, TEST_ISS).expect("verify resume credential");
+        assert_eq!(decoded.room_id, room_id);
+        assert_eq!(decoded.connection_id, connection_id);
+        assert_eq!(decoded.aud, WS_RESUME_TOKEN_AUDIENCE);
+        assert!(verify_token(&token, &secret, TEST_ISS).is_err());
+
+        let short = WsTokenClaims::new(room_id, 30, TEST_ISS);
+        let short_token = sign_token(&short, &secret).expect("sign upgrade token");
+        assert!(verify_resume_token(&short_token, &secret, TEST_ISS).is_err());
     }
 
     #[test]
@@ -195,6 +307,7 @@ mod tests {
             jti: Uuid::new_v4(),
             aud: WS_TOKEN_AUDIENCE.to_string(),
             iss: TEST_ISS.to_string(),
+            resume: false,
         };
 
         let token = sign_token(&expired_claims, &secret).expect("Failed to sign");

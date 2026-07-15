@@ -18,6 +18,13 @@ async function _fetchCsrfTokenForWs() {
     return data.csrf_token;
 }
 
+function _isValidWsResumeToken(value) {
+    return typeof value === 'string'
+        && value.length >= 64
+        && value.length <= 2048
+        && /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(value);
+}
+
 class WebSocketManager {
     constructor(roomId) {
         this.roomId = roomId;
@@ -46,6 +53,10 @@ class WebSocketManager {
         // Token caching for reconnection (avoids PoW on every reconnect)
         this.cachedToken = null;
         this.tokenExpiresAt = 0;
+        // Server-signed, room/member-bound reconnect credential. It is kept
+        // in page memory only: persisting it across a reload would preserve a
+        // relay identity while the corresponding in-memory MLS state is gone.
+        this.resumeToken = null;
 
         // Callbacks
         this.onConnected = null;
@@ -53,6 +64,10 @@ class WebSocketManager {
         this.onMessage = null;
         this.onError = null;
         this.onPowProgress = null; // Callback for PoW progress updates
+        // Return true to fall back to a brand-new relay identity when resume
+        // has expired. Group rooms return false because silently doing so
+        // would detach sender_id from the still-live MLS leaf.
+        this.onResumeRejected = null;
 
         // Close WebSocket on page unload to prevent rate limit issues on refresh
         this._boundBeforeUnload = () => this._handleBeforeUnload();
@@ -88,16 +103,49 @@ class WebSocketManager {
             // /api/csrf endpoint sets a Set-Cookie alongside its JSON
             // response so the cookie/header always agree.
             const csrfToken = await _fetchCsrfTokenForWs();
+            const tokenHeaders = (powNonce = null) => {
+                const headers = {
+                    'Content-Type': 'application/json',
+                    'X-CSRF-Token': csrfToken,
+                };
+                if (powNonce !== null) headers['X-Pow-Nonce'] = powNonce.toString();
+                if (this.resumeToken) {
+                    if (!_isValidWsResumeToken(this.resumeToken)) {
+                        throw new Error('Stored WebSocket resume credential is malformed');
+                    }
+                    headers['X-PinChat-Resume-Token'] = this.resumeToken;
+                }
+                return headers;
+            };
+
+            const handleResumeRejection = async (response) => {
+                if (response.status !== 409) return { handled: false, token: null };
+                let body = null;
+                try { body = await response.json(); } catch (_) { /* malformed error */ }
+                if (!body || body.code !== 'RESUME_REJECTED') {
+                    return { handled: false, token: null };
+                }
+                this.resumeToken = null;
+                const allowFreshIdentity = this.onResumeRejected
+                    ? await this.onResumeRejected()
+                    : false;
+                if (allowFreshIdentity) {
+                    return { handled: true, token: await this.requestWsToken() };
+                }
+                this._fatalAuthFailure = true;
+                if (this.onError) this.onError(new Error('RESUME_REJECTED'));
+                return { handled: true, token: null };
+            };
 
             // First attempt: request token (may succeed if PoW already solved for room creation)
             let response = await fetch(`/api/ws-token/${this.roomId}`, {
                 method: 'POST',
                 credentials: 'same-origin',
-                headers: {
-                    'Content-Type': 'application/json',
-                    'X-CSRF-Token': csrfToken
-                }
+                headers: tokenHeaders(),
             });
+
+            let resumeResult = await handleResumeRejection(response);
+            if (resumeResult.handled) return resumeResult.token;
 
             // If 401 Unauthorized, redirect to login with return URL (relative path only)
             if (response.status === 401) {
@@ -161,12 +209,11 @@ class WebSocketManager {
                 response = await fetch(`/api/ws-token/${this.roomId}`, {
                     method: 'POST',
                     credentials: 'same-origin',
-                    headers: {
-                        'Content-Type': 'application/json',
-                        'X-Pow-Nonce': nonce.toString(),
-                        'X-CSRF-Token': csrfToken,
-                    }
+                    headers: tokenHeaders(nonce),
                 });
+
+                resumeResult = await handleResumeRejection(response);
+                if (resumeResult.handled) return resumeResult.token;
 
                 if (!response.ok) {
                     // Handle 401 after PoW (session may have expired)
@@ -415,6 +462,22 @@ class WebSocketManager {
                 try {
                     const message = JSON.parse(event.data);
                     console.log('WebSocket message received:', message.type);
+
+                    // The resume credential is sent only in our direct
+                    // Connected frame. Capture it before application dispatch
+                    // and remove it from the message object so UI/debug code
+                    // cannot accidentally retain or render the bearer token.
+                    if (message.type === 'connected') {
+                        if (!_isValidWsResumeToken(message.resume_token)) {
+                            this._fatalAuthFailure = true;
+                            this.resumeToken = null;
+                            try { this.ws.close(1008, 'Invalid resume credential'); } catch (_) {}
+                            if (this.onError) this.onError(new Error('RESUME_TOKEN_INVALID'));
+                            return;
+                        }
+                        this.resumeToken = message.resume_token;
+                        delete message.resume_token;
+                    }
 
                     if (this.onMessage) {
                         // C-01: enqueue on the inbound mutex. Each onMessage
