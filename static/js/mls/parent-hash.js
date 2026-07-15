@@ -78,17 +78,35 @@
 
     /**
      * tree_hash of the subtree rooted at `siblingNode`, with the given
-     * unmerged leaves removed (blanked) from a working copy. `tree` is a
-     * padded Array<optional<Node>> of length nodeWidth(nLeaves).
+     * unmerged leaves removed from a working copy. RFC 9420 §7.9 requires
+     * both blanking each leaf AND removing it from every ParentNode's
+     * unmerged_leaves vector before hashing. `tree` is a padded
+     * Array<optional<Node>> of length nodeWidth(nLeaves).
      */
     async function originalSiblingTreeHash(tree, siblingNode, unmergedLeaves, nLeaves) {
         if (!unmergedLeaves || unmergedLeaves.length === 0) {
             return TreeHash.hashNode(tree, siblingNode, nLeaves);
         }
-        const work = tree.slice();
-        for (const leafIdx of unmergedLeaves) {
-            const n = TreeMath.leafToNode(leafIdx);
-            if (n < work.length) work[n] = null;
+        const removed = new Set(unmergedLeaves);
+        const work = tree.map((slot, nodeIdx) => {
+            if (!slot) return null;
+            if (TreeMath.level(nodeIdx) === 0) {
+                return removed.has(TreeMath.nodeToLeaf(nodeIdx)) ? null : slot;
+            }
+            if (slot.nodeType !== Nodes.NodeType.PARENT) return slot;
+            const filtered = (slot.parent.unmergedLeaves || [])
+                .filter((leafIdx) => !removed.has(leafIdx));
+            if (filtered.length === (slot.parent.unmergedLeaves || []).length) {
+                return slot;
+            }
+            return {
+                nodeType: slot.nodeType,
+                parent: { ...slot.parent, unmergedLeaves: filtered },
+            };
+        });
+        for (const leafIdx of removed) {
+            const nodeIdx = TreeMath.leafToNode(leafIdx);
+            if (nodeIdx < work.length) work[nodeIdx] = null;
         }
         return TreeHash.hashNode(work, siblingNode, nLeaves);
     }

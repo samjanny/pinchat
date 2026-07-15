@@ -82,6 +82,7 @@ async function addMember(committer, others) {
         identity: joiner.identity,
         leafEncKeyPair: joiner.initKp,
         ratchetTreeBytes,
+        expectedSignerLeafIndex: committer.myLeafIndex,
     });
     for (const o of others) await o.processCommit(commitMessage);
     return { joined, commitMessage };

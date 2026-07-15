@@ -95,6 +95,7 @@ async function main() {
         identity: bob.identity,
         leafEncKeyPair: bob.leafEncKp,
         ratchetTreeBytes: tree1,
+        expectedSignerLeafIndex: 0,
     });
 
     // Add Carol → epoch 2.
@@ -109,6 +110,7 @@ async function main() {
         identity: carol.identity,
         leafEncKeyPair: carol.leafEncKp,
         ratchetTreeBytes: tree2,
+        expectedSignerLeafIndex: 0,
     });
     assert(alice.epoch === 2n && bobGroup.epoch === 2n && carolGroup.epoch === 2n,
         'A/B/C all at epoch 2 after second Add');
@@ -193,6 +195,7 @@ async function main() {
         identity: dave.identity,
         leafEncKeyPair: dave.leafEncKp,
         ratchetTreeBytes: tree4,
+        expectedSignerLeafIndex: 0,
     });
     assert(daveGroup.myLeafIndex === 3, 'Dave joined at leaf 3 (after blank Bob slot)');
 

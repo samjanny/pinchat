@@ -99,6 +99,11 @@ const TEST_SUITES = {
         file: 'test-mls-parent-hash.js',
         description: 'Parent-hash chain round-trip + subtree-splice rejection (RFC 9420 §7.9)'
     },
+    'mls-imported-tree': {
+        name: 'MLS imported Welcome tree validation',
+        file: 'test-mls-imported-tree.js',
+        description: 'Whole-tree LeafNode, parent-hash, and key-uniqueness validation at join'
+    },
     'mls-ratchet-tree': {
         name: 'MLS ratchet-tree container',
         file: 'test-mls-ratchet-tree.js',

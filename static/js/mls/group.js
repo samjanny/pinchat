@@ -686,11 +686,10 @@
     // committer's direct path stay blank — TreeKEM resolution recurses
     // through them automatically.
     //
-    // Parent-hash chaining (§7.9) is intentionally skipped; commit-source
-    // leaves carry an empty parent_hash byte string. Signatures still
-    // verify because we encode and verify the same field consistently
-    // on both sides. Adding stricter parent-hash validation is a
-    // post-MVP hardening item.
+    // Every Commit stamps the committer's parent-hash chain (§7.9).
+    // Existing members verify that newly applied path; a Welcome joiner
+    // additionally validates every non-blank leaf and parent in the
+    // imported tree before accepting epoch secrets.
     // ------------------------------------------------------------------
 
     Group.prototype.commitAddMember = async function commitAddMember({ keyPackageBytes }) {
@@ -1980,6 +1979,8 @@
      *                       init_key from the KeyPackage, reused as the
      *                       leaf's encryption_key until we rotate
      *   ratchetTreeBytes  : serialised tree (out-of-band from Welcome)
+     *   expectedSignerLeafIndex : member sender_leaf_index parsed from the
+     *                       Commit paired with this Welcome (required)
      */
     Group.joinFromWelcomeWithTree = async function joinFromWelcomeWithTree({
         welcomeMessage, keyPackageBytes, initPrivateKey, identity,
@@ -2022,22 +2023,6 @@
         const nLeaves = TreeMath.numLeaves(parsedTree.length);
         const tree = Nodes.padRatchetTree(parsedTree, TreeMath.nodeWidth(nLeaves));
 
-        // Locate our own leaf by matching the encryption_key against our
-        // KeyPackage's leaf-node encryption_key (the committer copies it
-        // into the tree verbatim on Add).
-        const myEncKey = kp.leafNode.encryptionKey;
-        let myLeafIndex = -1;
-        for (let li = 0; li < nLeaves; li += 1) {
-            const leaf = RatchetTree.leafFor(tree, li);
-            if (leaf && equalBytes(leaf.encryptionKey, myEncKey)) {
-                myLeafIndex = li;
-                break;
-            }
-        }
-        if (myLeafIndex === -1) {
-            throw new Error('group.join: cannot locate our leaf in the ratchet_tree');
-        }
-
         // Verify GroupInfo signature with the signer's signature_key.
         const signerLeafIndex = groupInfo.signer;
         if (!Number.isInteger(signerLeafIndex) || signerLeafIndex < 0
@@ -2049,12 +2034,15 @@
         // M-1 (RFC §12.4.3.1): GroupInfo MUST be signed by the
         // member that committed the epoch this Welcome introduces.
         // The orchestrator extracts the Commit's FramedContent
-        // sender_leaf_index and passes it as expectedSignerLeafIndex;
-        // a null value means the orchestrator couldn't observe a
-        // Commit (degraded mode) and the binding is not enforced.
-        if (expectedSignerLeafIndex !== null
-            && expectedSignerLeafIndex !== undefined
-            && expectedSignerLeafIndex !== signerLeafIndex) {
+        // sender_leaf_index and passes it as expectedSignerLeafIndex.
+        // This is fail-closed: without an observable Commit there is no
+        // authenticated claim about which member created the epoch.
+        if (!Number.isInteger(expectedSignerLeafIndex)) {
+            throw new Error(
+                'group.join: missing Commit sender; refusing unbound Welcome',
+            );
+        }
+        if (expectedSignerLeafIndex !== signerLeafIndex) {
             throw new Error(
                 `group.join: GroupInfo.signer ${signerLeafIndex} != Commit sender ${expectedSignerLeafIndex}`,
             );
@@ -2075,18 +2063,30 @@
             throw new Error('group.join: tree_hash mismatch');
         }
 
-        // Parent-hash chaining verification (§7.9). The GroupInfo signer
-        // is the member that committed the epoch this Welcome introduces,
-        // so its leaf is commit-source and its direct path carries the
-        // parent-hash chain. Recompute it from the received tree and
-        // confirm the signer's LeafNode.parent_hash matches, which binds
-        // the signer's already-verified signature to the surrounding tree
-        // shape, so a relay cannot hand us a spliced ratchet_tree.
-        const signerLeafForPh = RatchetTree.leafFor(tree, signerLeafIndex);
-        if (signerLeafForPh
-            && signerLeafForPh.leafNodeSource === Nodes.LeafNodeSource.COMMIT) {
-            await verifyCommitterParentHashes(
-                tree, signerLeafIndex, signerLeafForPh, nLeaves,
+        // RFC 9420 §§7.3, 7.9, and 12.4.3.1: a Welcome imports the whole
+        // public ratchet tree, so validate every live leaf, every live
+        // parent-hash chain, unmerged-leaf metadata, and key uniqueness
+        // before deriving or retaining any epoch secret.
+        await verifyImportedTree(
+            tree, nLeaves, groupInfo.groupContext.groupId,
+        );
+
+        // RFC §12.4.3.1 identifies our leaf by equality with the LeafNode
+        // in the consumed KeyPackage, not merely by one public key. This
+        // also prevents a malicious committer from rebinding our Welcome
+        // entry to a different, independently valid LeafNode.
+        const myLeafBytes = Nodes.leafNodeBytes(kp.leafNode);
+        let myLeafIndex = -1;
+        for (let li = 0; li < nLeaves; li += 1) {
+            const leaf = RatchetTree.leafFor(tree, li);
+            if (leaf && equalBytes(Nodes.leafNodeBytes(leaf), myLeafBytes)) {
+                myLeafIndex = li;
+                break;
+            }
+        }
+        if (myLeafIndex === -1) {
+            throw new Error(
+                'group.join: KeyPackage LeafNode not present verbatim in ratchet_tree',
             );
         }
 
@@ -2347,6 +2347,312 @@
         }
     }
 
+    function bytesMapKey(bytes, fieldName) {
+        if (!(bytes instanceof Uint8Array) || bytes.length === 0) {
+            throw new Error(`imported-tree: ${fieldName} is empty or malformed`);
+        }
+        let out = '';
+        for (let i = 0; i < bytes.length; i += 1) {
+            out += bytes[i].toString(16).padStart(2, '0');
+        }
+        return out;
+    }
+
+    function validateLeafCapabilities(leaf, leafIndex) {
+        const caps = leaf.capabilities;
+        if (!caps || !Array.isArray(caps.versions)
+            || !Array.isArray(caps.cipherSuites)
+            || !Array.isArray(caps.extensions)
+            || !Array.isArray(caps.credentials)) {
+            throw new Error(
+                `imported-tree: leaf ${leafIndex} has malformed capabilities`,
+            );
+        }
+        if (!caps.versions.includes(PROTOCOL_VERSION)) {
+            throw new Error(
+                `imported-tree: leaf ${leafIndex} does not support MLS 1.0`,
+            );
+        }
+        if (!caps.cipherSuites.includes(CIPHERSUITE)) {
+            throw new Error(
+                `imported-tree: leaf ${leafIndex} does not support ciphersuite 0x${CIPHERSUITE.toString(16)}`,
+            );
+        }
+        if (!leaf.credential
+            || leaf.credential.credentialType !== Nodes.CredentialType.BASIC
+            || !(leaf.credential.identity instanceof Uint8Array)
+            || leaf.credential.identity.length === 0) {
+            throw new Error(
+                `imported-tree: leaf ${leafIndex} has an invalid basic credential`,
+            );
+        }
+        if (!caps.credentials.includes(leaf.credential.credentialType)) {
+            throw new Error(
+                `imported-tree: leaf ${leafIndex} does not advertise its credential type`,
+            );
+        }
+        for (const ext of leaf.extensions || []) {
+            if (!caps.extensions.includes(ext.extensionType)) {
+                throw new Error(
+                    `imported-tree: leaf ${leafIndex} does not advertise extension ${ext.extensionType}`,
+                );
+            }
+        }
+    }
+
+    /**
+     * Verify a LeafNode as it appears in an imported ratchet tree. The
+     * LeafNodeTBS context depends on leaf_node_source: KeyPackage leaves
+     * carry Lifetime and no group context, while Update/Commit leaves append
+     * group_id and leaf_index to the common TBS prefix (RFC 9420 §7.2).
+     */
+    async function verifyImportedLeaf(leaf, groupId, leafIndex) {
+        validateLeafCapabilities(leaf, leafIndex);
+
+        const encoder = new Codec.Encoder();
+        Nodes.writeLeafNodeTbs(encoder, leaf);
+        if (leaf.leafNodeSource === Nodes.LeafNodeSource.KEY_PACKAGE) {
+            const lt = leaf.lifetime;
+            if (!lt || typeof lt.notBefore !== 'bigint'
+                || typeof lt.notAfter !== 'bigint'
+                || lt.notBefore >= lt.notAfter) {
+                throw new Error(
+                    `imported-tree: leaf ${leafIndex} has malformed Lifetime`,
+                );
+            }
+        } else if (leaf.leafNodeSource === Nodes.LeafNodeSource.UPDATE
+            || leaf.leafNodeSource === Nodes.LeafNodeSource.COMMIT) {
+            encoder.writeOpaque(groupId);
+            encoder.writeU32(leafIndex);
+        } else {
+            throw new Error(
+                `imported-tree: leaf ${leafIndex} has unsupported leaf_node_source ${leaf.leafNodeSource}`,
+            );
+        }
+
+        let sigPub;
+        try {
+            sigPub = await Signature.importPublicKey(leaf.signatureKey);
+        } catch (err) {
+            throw new Error(
+                `imported-tree: leaf ${leafIndex} signature_key invalid: ${err.message}`,
+            );
+        }
+        const ok = await Labeled.verifyWithLabel(
+            sigPub, 'LeafNodeTBS', encoder.bytes(), leaf.signature,
+        );
+        if (!ok) {
+            throw new Error(
+                `imported-tree: leaf ${leafIndex} LeafNode signature invalid`,
+            );
+        }
+    }
+
+    function validateUnmergedLeaves(tree, parentNodeIndex, nLeaves) {
+        const parent = tree[parentNodeIndex].parent;
+        const unmerged = parent.unmergedLeaves || [];
+        const descendants = new Set(
+            TreeMath.leafDescendants(parentNodeIndex, nLeaves),
+        );
+        let previous = -1;
+        for (const leafIndex of unmerged) {
+            if (!Number.isInteger(leafIndex) || leafIndex < 0
+                || leafIndex >= nLeaves) {
+                throw new Error(
+                    `imported-tree: parent ${parentNodeIndex} has out-of-range unmerged leaf ${leafIndex}`,
+                );
+            }
+            if (leafIndex <= previous) {
+                throw new Error(
+                    `imported-tree: parent ${parentNodeIndex} unmerged_leaves not strictly sorted`,
+                );
+            }
+            previous = leafIndex;
+            if (!descendants.has(leafIndex)
+                || !RatchetTree.leafFor(tree, leafIndex)) {
+                throw new Error(
+                    `imported-tree: parent ${parentNodeIndex} references invalid unmerged leaf ${leafIndex}`,
+                );
+            }
+
+            let node = TreeMath.leafToNode(leafIndex);
+            while (node !== parentNodeIndex) {
+                node = TreeMath.parent(node, nLeaves);
+                if (node === parentNodeIndex) break;
+                const intermediate = tree[node];
+                if (intermediate
+                    && !intermediate.parent.unmergedLeaves.includes(leafIndex)) {
+                    throw new Error(
+                        `imported-tree: unmerged leaf ${leafIndex} missing from intermediate parent ${node}`,
+                    );
+                }
+            }
+        }
+    }
+
+    function parentHashAtNode(tree, nodeIndex) {
+        const slot = tree[nodeIndex];
+        if (!slot) return null;
+        if (slot.nodeType === Nodes.NodeType.PARENT) {
+            return slot.parent.parentHash;
+        }
+        if (slot.nodeType === Nodes.NodeType.LEAF
+            && slot.leaf.leafNodeSource === Nodes.LeafNodeSource.COMMIT) {
+            return slot.leaf.parentHash;
+        }
+        return null;
+    }
+
+    function sameNodeSet(a, b) {
+        if (a.length !== b.length) return false;
+        const bs = new Set(b);
+        if (bs.size !== b.length) return false;
+        return a.every((node) => bs.has(node));
+    }
+
+    /**
+     * RFC 9420 §7.9.2 top-down parent-hash validation. A live parent P is
+     * valid only when exactly one already-authenticated descendant D in a
+     * child resolution links to P. Commit-source leaves seed the chains;
+     * a validated lower parent can extend its chain toward the root.
+     */
+    async function verifyImportedParentHashes(tree, nLeaves) {
+        const authenticated = new Set();
+        const parents = [];
+        for (let nodeIndex = 0; nodeIndex < tree.length; nodeIndex += 1) {
+            const slot = tree[nodeIndex];
+            if (!slot) continue;
+            if (slot.nodeType === Nodes.NodeType.LEAF
+                && slot.leaf.leafNodeSource === Nodes.LeafNodeSource.COMMIT) {
+                authenticated.add(nodeIndex);
+            } else if (slot.nodeType === Nodes.NodeType.PARENT) {
+                parents.push(nodeIndex);
+            }
+        }
+        parents.sort((a, b) => TreeMath.level(a) - TreeMath.level(b));
+
+        for (const parentNodeIndex of parents) {
+            const parentSlot = tree[parentNodeIndex];
+            const left = TreeMath.left(parentNodeIndex);
+            const right = TreeMath.right(parentNodeIndex, nLeaves);
+            const validDescendants = [];
+
+            for (const [child, sibling] of [[left, right], [right, left]]) {
+                const resolution = RatchetTree.resolution(tree, child);
+                const childLeaves = new Set(
+                    TreeMath.leafDescendants(child, nLeaves),
+                );
+                const expectedUnmerged = (parentSlot.parent.unmergedLeaves || [])
+                    .filter((leafIndex) => childLeaves.has(leafIndex))
+                    .map((leafIndex) => TreeMath.leafToNode(leafIndex));
+                const expectedHash = await ParentHash.parentHash(
+                    tree, parentSlot.parent, sibling, nLeaves,
+                );
+
+                for (const descendant of resolution) {
+                    if (!authenticated.has(descendant)) continue;
+                    const carriedHash = parentHashAtNode(tree, descendant);
+                    if (!carriedHash || !equalBytes(carriedHash, expectedHash)) continue;
+                    const remainder = resolution.filter((node) => node !== descendant);
+                    if (!sameNodeSet(remainder, expectedUnmerged)) continue;
+                    validDescendants.push(descendant);
+                }
+            }
+
+            if (validDescendants.length !== 1) {
+                throw new Error(
+                    `imported-tree: parent ${parentNodeIndex} is not parent-hash valid (found ${validDescendants.length} authenticating descendants)`,
+                );
+            }
+            authenticated.add(parentNodeIndex);
+        }
+    }
+
+    /**
+     * Validate every non-blank entry of a ratchet tree imported with a
+     * Welcome before any epoch secret is derived (RFC 9420 §12.4.3.1).
+     */
+    async function verifyImportedTree(tree, nLeaves, groupId) {
+        if (!Number.isInteger(nLeaves) || nLeaves < 1
+            || tree.length !== TreeMath.nodeWidth(nLeaves)) {
+            throw new Error('imported-tree: invalid ratchet-tree shape');
+        }
+
+        const signatureKeys = new Map();
+        const encryptionKeys = new Map();
+        const registerEncryptionKey = (keyBytes, nodeIndex) => {
+            const key = bytesMapKey(keyBytes, `node ${nodeIndex} encryption_key`);
+            if (encryptionKeys.has(key)) {
+                throw new Error(
+                    `imported-tree: duplicate encryption_key at nodes ${encryptionKeys.get(key)} and ${nodeIndex}`,
+                );
+            }
+            encryptionKeys.set(key, nodeIndex);
+        };
+
+        // Validate positional node types first so later structural checks
+        // can safely traverse parent links even in a malicious encoding.
+        for (let nodeIndex = 0; nodeIndex < tree.length; nodeIndex += 1) {
+            const slot = tree[nodeIndex];
+            if (!slot) continue;
+            const isLeafPosition = TreeMath.level(nodeIndex) === 0;
+            if (isLeafPosition && slot.nodeType !== Nodes.NodeType.LEAF) {
+                throw new Error(
+                    `imported-tree: parent node encoded at leaf position ${nodeIndex}`,
+                );
+            }
+            if (!isLeafPosition && slot.nodeType !== Nodes.NodeType.PARENT) {
+                throw new Error(
+                    `imported-tree: leaf node encoded at parent position ${nodeIndex}`,
+                );
+            }
+        }
+
+        for (let nodeIndex = 0; nodeIndex < tree.length; nodeIndex += 1) {
+            const slot = tree[nodeIndex];
+            if (!slot) continue;
+            if (slot.nodeType === Nodes.NodeType.LEAF) {
+                const leafIndex = TreeMath.nodeToLeaf(nodeIndex);
+                const signatureKey = bytesMapKey(
+                    slot.leaf.signatureKey, `leaf ${leafIndex} signature_key`,
+                );
+                if (signatureKeys.has(signatureKey)) {
+                    throw new Error(
+                        `imported-tree: duplicate signature_key at leaves ${signatureKeys.get(signatureKey)} and ${leafIndex}`,
+                    );
+                }
+                signatureKeys.set(signatureKey, leafIndex);
+                registerEncryptionKey(slot.leaf.encryptionKey, nodeIndex);
+            } else {
+                registerEncryptionKey(slot.parent.encryptionKey, nodeIndex);
+                validateUnmergedLeaves(tree, nodeIndex, nLeaves);
+            }
+        }
+
+        // P-256 is used for both HPKE and signatures in this ciphersuite;
+        // reusing one public key across the two roles violates the ratchet
+        // tree key-pair uniqueness invariant (RFC §16.7).
+        for (const [key, leafIndex] of signatureKeys) {
+            if (encryptionKeys.has(key)) {
+                throw new Error(
+                    `imported-tree: signature_key at leaf ${leafIndex} collides with encryption_key at node ${encryptionKeys.get(key)}`,
+                );
+            }
+        }
+
+        const rootSlot = tree[TreeMath.root(nLeaves)];
+        if (rootSlot && rootSlot.nodeType === Nodes.NodeType.PARENT
+            && rootSlot.parent.parentHash.length !== 0) {
+            throw new Error('imported-tree: root parent_hash must be empty');
+        }
+
+        for (let leafIndex = 0; leafIndex < nLeaves; leafIndex += 1) {
+            const leaf = RatchetTree.leafFor(tree, leafIndex);
+            if (leaf) await verifyImportedLeaf(leaf, groupId, leafIndex);
+        }
+        await verifyImportedParentHashes(tree, nLeaves);
+    }
+
     async function signLeafNodeForKeyPackage(signaturePrivateKey, leaf) {
         const tbs = Nodes.leafNodeTbsBytes(leaf);
         return Labeled.signWithLabel(signaturePrivateKey, 'LeafNodeTBS', tbs);
@@ -2419,5 +2725,6 @@
         buildSelfLeaf,
         signLeafNodeForKeyPackage,
         signLeafNodeInCommit,
+        verifyImportedTree,
     });
 });

@@ -366,36 +366,39 @@
             // FramedContent sender of the Commit that produced this
             // epoch. Extract the Commit's sender_leaf_index from the
             // buffered PublicMessage and pass it to the join routine.
-            // Without a buffered Commit we degrade to "not enforced" —
-            // valid for our creator-only architecture today, since the
-            // creator's leaf signs both, but the binding becomes
-            // load-bearing when Update / non-creator commits land.
-            let expectedSignerLeafIndex = null;
-            if (this._pendingCommitBytes) {
-                try {
-                    const commitWrapped = MLS.MLSMessage.serializeMLSMessage(
-                        MLS.MLSMessage.WireFormat.MLS_PUBLIC_MESSAGE,
-                        this._pendingCommitBytes,
-                    );
-                    const frame = MLS.MLSMessage.parseMLSMessage(commitWrapped);
-                    const pm = MLS.PublicMessage.parsePublicMessage(
-                        frame.body,
-                        (decoder, ct) => {
-                            // We only need the FramedContent header; skip
-                            // body parsing by returning an opaque object.
-                            if (ct === MLS.Framing.ContentType.COMMIT) return null;
-                            return null;
-                        },
-                    );
-                    if (pm.content && pm.content.sender
-                        && pm.content.sender.senderType === MLS.Framing.SenderType.MEMBER) {
-                        expectedSignerLeafIndex = pm.content.sender.leafIndex;
-                    }
-                } catch (err) {
-                    console.warn('[MLS] failed to extract Commit sender_leaf_index:', err);
-                    // Don't fail the join — leave expectedSignerLeafIndex
-                    // null so the binding check is skipped (degraded mode).
+            // Fail closed if the Commit was absent, malformed, not actually
+            // a Commit, or not sent as a group member. A Welcome without
+            // this binding cannot establish who created the imported epoch.
+            if (!this._pendingCommitBytes) {
+                throw new Error(
+                    'mls-session: Welcome received without a buffered Commit',
+                );
+            }
+            let expectedSignerLeafIndex;
+            try {
+                const commitWrapped = MLS.MLSMessage.serializeMLSMessage(
+                    MLS.MLSMessage.WireFormat.MLS_PUBLIC_MESSAGE,
+                    this._pendingCommitBytes,
+                );
+                const frame = MLS.MLSMessage.parseMLSMessage(commitWrapped);
+                const pm = MLS.PublicMessage.parsePublicMessage(
+                    frame.body, () => null,
+                );
+                if (!pm.content
+                    || pm.content.contentType !== MLS.Framing.ContentType.COMMIT) {
+                    throw new Error('buffered PublicMessage is not a Commit');
                 }
+                if (!pm.content.sender
+                    || pm.content.sender.senderType !== MLS.Framing.SenderType.MEMBER
+                    || !Number.isInteger(pm.content.sender.leafIndex)) {
+                    throw new Error('buffered Commit has no member sender_leaf_index');
+                }
+                expectedSignerLeafIndex = pm.content.sender.leafIndex;
+            } catch (err) {
+                throw new Error(
+                    `mls-session: cannot bind Welcome to Commit: ${err.message}`,
+                );
+            } finally {
                 this._pendingCommitBytes = null;
             }
 

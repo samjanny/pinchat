@@ -116,6 +116,7 @@ async function main() {
         identity: bob.identity,
         leafEncKeyPair: bob.initKp,
         ratchetTreeBytes,
+        expectedSignerLeafIndex: 0,
     });
     assert(bobGroup.nLeaves === 2, 'Bob sees 2-leaf tree');
     assert(bobGroup.epoch === 1n, 'Bob at epoch 1');

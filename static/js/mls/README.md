@@ -107,21 +107,19 @@ The browser-facing flow runs entirely over MLS for group rooms:
   UpdatePath, RFC 9420 compliant) re-keying its own leaf and direct
   path, and folds in any pending member Update proposals. This heals
   leaked epoch-level secrets in membership-stable groups.
-- **Parent-hash chaining (§7.9).** Every Commit computes the top-down
-  parent-hash chain over the committer's direct path
-  (`parent-hash.js`), stamps each parent node's `parent_hash`, and binds
-  the committer's commit-source LeafNode to it before signing. Receivers
-  recompute the chain from the tree they hold and reject a Commit (or a
-  Welcome/join whose signer leaf is commit-source) whose leaf
-  `parent_hash` does not match, which defeats subtree splicing: a
-  malicious member or relay can no longer graft a subtree from one tree
-  into another and still present validly-signed nodes. Implements
-  `ParentHashInput` with `original_sibling_tree_hash` (unmerged-leaf
-  filtering included, though our commits always write empty
-  `unmerged_leaves`). No IETF vectors for the chain ship in our local
-  cache, so coverage is behavioural: `test-mls-parent-hash.js` asserts
-  round-trip stamping, single-leaf empty hash, and rejection of both a
-  tampered leaf `parent_hash` and a tampered parent `encryption_key`.
+- **Parent-hash chaining and imported-tree validation (§§7.3, 7.9).**
+  Every Commit computes the top-down parent-hash chain over the
+  committer's direct path (`parent-hash.js`), stamps each parent node's
+  `parent_hash`, and binds the committer's commit-source LeafNode to it
+  before signing. Existing members verify the newly applied path. A
+  Welcome joiner performs the stronger whole-tree check required by the
+  RFC: every non-blank LeafNode signature is verified with the correct
+  source-dependent TBS, every non-blank parent must be reachable through
+  exactly one valid parent-hash chain, `unmerged_leaves` metadata is
+  checked, and signature/HPKE public keys must be unique. The
+  `GroupInfo.signer` binding is fail-closed when no Commit was observed.
+  `ParentHashInput.original_sibling_tree_hash` removes unmerged leaves
+  from both leaf slots and parent metadata before hashing.
 - **Per-member PCS via Update proposals.** Each non-creator member
   periodically sends an `Update` proposal (RFC 9420 §12.1.2): a fresh
   leaf HPKE keypair signed with its existing identity key. The creator
@@ -138,11 +136,13 @@ The browser-facing flow runs entirely over MLS for group rooms:
   envelope kind with `wire_format` and an optional `ratchet_tree`
   side-channel, never inspecting the body.
 
-Verified by `tests/test-mls-group-add-3leaf.js` (N-leaf Add) and
-`tests/test-mls-group-remove.js` (Remove + post-remove Add). Together
-these exercise PSK rejection, replay rejection, group_id mismatch,
-KeyPackage tamper rejection, removal-blanks-leaf, and removed-member
-loss-of-access.
+Verified by `tests/test-mls-group-add-3leaf.js` (N-leaf Add),
+`tests/test-mls-group-remove.js` (Remove + post-remove Add), and
+`tests/test-mls-imported-tree.js` (malicious-committer Welcome trees).
+Together these exercise PSK rejection, replay rejection, group_id
+mismatch, KeyPackage and LeafNode tamper rejection, whole-tree
+parent-hash validation, key uniqueness, removal-blanks-leaf, and
+removed-member loss-of-access.
 
 ## Known gaps (post-MVP)
 

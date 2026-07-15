@@ -99,6 +99,7 @@ async function main() {
         identity: bob.identity,
         leafEncKeyPair: bob.leafEncKp,
         ratchetTreeBytes: tree1Bytes,
+        expectedSignerLeafIndex: 0,
     });
     assert(alice.epoch === 1n && bobGroup.epoch === 1n,
         'Alice and Bob at epoch 1 after first Add');
@@ -126,6 +127,7 @@ async function main() {
         identity: carol.identity,
         leafEncKeyPair: carol.leafEncKp,
         ratchetTreeBytes: tree2Bytes,
+        expectedSignerLeafIndex: 0,
     });
     assert(carolGroup.epoch === 2n && carolGroup.nLeaves === 3,
         'Carol joined into 3-leaf tree at epoch 2');
@@ -182,6 +184,7 @@ async function main() {
         identity: dave.identity,
         leafEncKeyPair: dave.leafEncKp,
         ratchetTreeBytes: tree3Bytes,
+        expectedSignerLeafIndex: 0,
     });
     assert(daveGroup.myLeafIndex === 3, 'Dave is leaf 3');
     assert(daveGroup.epoch === 3n && daveGroup.nLeaves === 4,
@@ -381,6 +384,7 @@ async function main() {
             leafEncKeyPair: bobKp.leafEncKp,
             ratchetTreeBytes: tx,
             pskSecret: psk,
+            expectedSignerLeafIndex: 0,
         });
         assert(bobOk.epoch === 1n, 'matching PSK joins (sanity)');
 
@@ -395,6 +399,7 @@ async function main() {
                 leafEncKeyPair: bobKp.leafEncKp,
                 ratchetTreeBytes: tx,
                 pskSecret: wrongPsk,
+                expectedSignerLeafIndex: 0,
             });
         } catch (_) { threwPsk = true; }
         assert(threwPsk, 'wrong PSK rejected by Welcome decryption');
@@ -409,6 +414,7 @@ async function main() {
                 identity: bobKp.identity,
                 leafEncKeyPair: bobKp.leafEncKp,
                 ratchetTreeBytes: tx,
+                expectedSignerLeafIndex: 0,
                 // pskSecret omitted → defaults to zeros, which mismatches `psk`
             });
         } catch (_) { threwNoPsk = true; }
@@ -489,6 +495,7 @@ async function main() {
             identity: otherBob.identity,
             leafEncKeyPair: otherBob.leafEncKp,
             ratchetTreeBytes: otherTreeBytes,
+            expectedSignerLeafIndex: 0,
         });
         const foreignWire = await otherAlice.encryptApplicationMessage('foreign');
         let threwGid = false;
