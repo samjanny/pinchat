@@ -1,10 +1,8 @@
 # PinChat
 
-> ## ⚠️ EXPERIMENTAL TEST PROJECT — DO NOT USE FOR HIGH-SECURITY PURPOSES
+> ## ⚠️ EXPERIMENTAL TEST PROJECT — NOT FOR HIGH-SECURITY USE
 >
-> **PinChat is a test/research project.** It has **not** been independently audited, it has **not** received a formal cryptographic review, and it is **not** intended for protecting sensitive, confidential, personal, financial, life-critical, or otherwise high-risk communications.
->
-> It may contain subtle bugs, incorrect assumptions, or security flaws that have not been caught. **Do not trust it for anything that matters.**
+> **PinChat is an experimental test/research project.** It has **not** been independently audited, it has **not** received a formal cryptographic review, and it is **not** intended for protecting sensitive, confidential, personal, financial, life-critical, or otherwise high-risk communications. As experimental, unaudited software, it may contain subtle bugs, incorrect assumptions, or security flaws that have not been caught. **Do not trust it for anything that matters.**
 >
 > Do **not** use PinChat for:
 > - whistleblowing, source protection, or activist safety;
