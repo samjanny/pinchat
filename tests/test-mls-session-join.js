@@ -70,6 +70,16 @@ function bytesTag(bytes) {
     return Buffer.from(bytes || []).toString('base64url');
 }
 
+function deferred() {
+    let resolve;
+    let reject;
+    const promise = new Promise((res, rej) => {
+        resolve = res;
+        reject = rej;
+    });
+    return { promise, resolve, reject };
+}
+
 async function signatureKeyFingerprint(group, leafIndex) {
     const leaf = global.MLS.RatchetTree.leafFor(
         group.ratchetTree, leafIndex,
@@ -243,6 +253,17 @@ async function rewriteCommitEnvelopeProposalList(session, envelope, proposalOrRe
 
 async function echoPendingCommit(session, envelope, senderId = 'creator-self') {
     await session.onRelayEnvelope({ ...envelope, sender_id: senderId });
+}
+
+async function completeExchangeJoin(exchange, senderId = 'creator-test') {
+    await exchange.joiner.onRelayEnvelope({
+        ...exchange.commit,
+        sender_id: senderId,
+    });
+    await exchange.joiner.onRelayEnvelope({
+        ...exchange.welcome,
+        sender_id: senderId,
+    });
 }
 
 async function createExchange({ acceptCommit = true, creatorSend = null } = {}) {
@@ -1124,6 +1145,270 @@ async function main() {
         && multiCreator._proposalStore.size === 0
         && multiB._proposalStore.size === 0,
     'all members consume the ProposalRef store after accepted Commit');
+
+    // The mutex must not deadlock an in-memory transport that resolves the
+    // Commit send only after synchronously feeding its exact acceptance echo
+    // back to the same session.
+    let synchronousEchoSent = false;
+    const synchronousEcho = await createExchange({
+        acceptCommit: false,
+        creatorSend: (envelope, creator) => {
+            if (!synchronousEchoSent
+                && envelope.wire_format === WireFormat.MLS_PUBLIC_MESSAGE) {
+                synchronousEchoSent = true;
+                return creator.onRelayEnvelope({
+                    ...envelope,
+                    sender_id: 'creator-synchronous-self',
+                });
+            }
+            return true;
+        },
+    });
+    assert(synchronousEchoSent
+        && synchronousEcho.creator._pendingCommit === null
+        && synchronousEcho.creator.group.epoch
+            === synchronousEcho.beforeAdd.epoch + 1n
+        && Boolean(synchronousEcho.welcome),
+    'exact synchronous Commit echo bypasses the queue only for atomic acceptance');
+
+    // Every public MLSSession entry point shares one operation mutex. An
+    // application encryption crosses signature, SecretTree, and AEAD awaits;
+    // a periodic Commit requested in the middle must not fork a candidate
+    // from that half-advanced send ratchet.
+    const sendRace = await createExchange();
+    await completeExchangeJoin(sendRace, 'creator-send-race');
+    const sendRaceGroup = sendRace.creator.group;
+    const originalEncrypt = sendRaceGroup.encryptApplicationMessage.bind(
+        sendRaceGroup,
+    );
+    const encryptEntered = deferred();
+    const releaseEncrypt = deferred();
+    sendRaceGroup.encryptApplicationMessage = async (payload) => {
+        encryptEntered.resolve();
+        await releaseEncrypt.promise;
+        // Do not copy this test hook into the PendingCommit candidate.
+        delete sendRaceGroup.encryptApplicationMessage;
+        return originalEncrypt(payload);
+    };
+    const sendRaceOutBefore = sendRace.creatorOut.length;
+    const inFlightSend = sendRace.creator.sendMessage('serialize send first');
+    await encryptEntered.promise;
+    const commitAfterSend = sendRace.creator.commitUpdate();
+    await Promise.resolve();
+    await Promise.resolve();
+    assert(sendRace.creator._pendingCommit === null
+        && !sendRace.creatorOut.slice(sendRaceOutBefore).some(
+            (envelope) => envelope.wire_format === WireFormat.MLS_PUBLIC_MESSAGE,
+        ),
+    'Commit waits while an application ratchet operation is in flight');
+    releaseEncrypt.resolve();
+    await inFlightSend;
+    await commitAfterSend;
+    const serializedSendOutput = sendRace.creatorOut.slice(sendRaceOutBefore);
+    const serializedApplication = serializedSendOutput.find(
+        (envelope) => envelope.wire_format === WireFormat.MLS_PRIVATE_MESSAGE,
+    );
+    const serializedCommit = serializedSendOutput.find(
+        (envelope) => envelope.wire_format === WireFormat.MLS_PUBLIC_MESSAGE,
+    );
+    assert(Boolean(serializedApplication) && Boolean(serializedCommit)
+        && serializedSendOutput.indexOf(serializedApplication)
+            < serializedSendOutput.indexOf(serializedCommit),
+    'application transport handoff completes before queued Commit construction');
+    await sendRace.joiner.onRelayEnvelope({
+        ...serializedApplication,
+        sender_id: 'creator-send-race',
+    });
+    await echoPendingCommit(
+        sendRace.creator, serializedCommit, 'creator-send-race-self',
+    );
+    await sendRace.joiner.onRelayEnvelope({
+        ...serializedCommit,
+        sender_id: 'creator-send-race',
+    });
+    assert(sendRace.creator.group.epoch === sendRace.joiner.group.epoch
+        && equalBytes(
+            sendRace.creator.group.epochSecrets.epochAuthenticator,
+            sendRace.joiner.group.epochSecrets.epochAuthenticator,
+        ),
+    'send/Commit interleaving converges on one authenticated epoch');
+
+    // Concurrent UI sends must serialize the stateful SecretTree chain too,
+    // not merely allocate distinct generation numbers. Every ciphertext must
+    // remain decryptable in FIFO order after the preceding Commit.
+    const burstOutBefore = sendRace.creatorOut.length;
+    const burstEventsBefore = sendRace.joinerEvents.length;
+    const burstCount = 12;
+    await Promise.all(Array.from({ length: burstCount }, (_, index) =>
+        sendRace.creator.sendMessage(`serialized burst ${index}`)));
+    const burst = sendRace.creatorOut.slice(burstOutBefore).filter(
+        (envelope) => envelope.wire_format === WireFormat.MLS_PRIVATE_MESSAGE,
+    );
+    for (const envelope of burst) {
+        await sendRace.joiner.onRelayEnvelope({
+            ...envelope,
+            sender_id: 'creator-send-race',
+        });
+    }
+    const burstMessages = sendRace.joinerEvents.slice(burstEventsBefore).filter(
+        (event) => event.kind === 'message'
+            && event.text.startsWith('serialized burst '),
+    );
+    assert(burst.length === burstCount && burstMessages.length === burstCount
+        && burstMessages.every(
+            (event, index) => event.text === `serialized burst ${index}`,
+        ),
+    'concurrent session sends consume the SecretTree chain exactly once each');
+
+    // Receive-side authentication is part of the same critical section. If
+    // a Commit snapshot overtook a decrypt, its previous-epoch grace state
+    // would forget that the ciphertext had already been consumed and could
+    // accept a replay after the Commit lands.
+    const receiveRace = await createExchange();
+    await completeExchangeJoin(receiveRace, 'creator-receive-race');
+    const joinerOutBeforeRaceMessage = receiveRace.joinerOut.length;
+    await receiveRace.joiner.sendMessage('consume before snapshot');
+    const receiveRaceMessage = receiveRace.joinerOut
+        .slice(joinerOutBeforeRaceMessage)
+        .find((envelope) => envelope.wire_format === WireFormat.MLS_PRIVATE_MESSAGE);
+    const receiveRaceGroup = receiveRace.creator.group;
+    const originalDecrypt = receiveRaceGroup.decryptApplicationMessage.bind(
+        receiveRaceGroup,
+    );
+    const decryptEntered = deferred();
+    const releaseDecrypt = deferred();
+    receiveRaceGroup.decryptApplicationMessage = async (wrapped) => {
+        decryptEntered.resolve();
+        await releaseDecrypt.promise;
+        // Do not copy this test hook into the PendingCommit candidate.
+        delete receiveRaceGroup.decryptApplicationMessage;
+        return originalDecrypt(wrapped);
+    };
+    const receiveEventsBefore = receiveRace.creatorEvents.length;
+    const inFlightReceive = receiveRace.creator.onRelayEnvelope({
+        ...receiveRaceMessage,
+        sender_id: 'joiner-1',
+    });
+    await decryptEntered.promise;
+    const receiveRaceOutBefore = receiveRace.creatorOut.length;
+    const commitAfterReceive = receiveRace.creator.commitUpdate();
+    await Promise.resolve();
+    await Promise.resolve();
+    assert(receiveRace.creator._pendingCommit === null,
+        'Commit waits for in-flight receive authentication and ratchet commit');
+    releaseDecrypt.resolve();
+    await inFlightReceive;
+    await commitAfterReceive;
+    const receiveRaceCommit = receiveRace.creatorOut
+        .slice(receiveRaceOutBefore)
+        .find((envelope) => envelope.wire_format === WireFormat.MLS_PUBLIC_MESSAGE);
+    assert(receiveRace.creatorEvents.slice(receiveEventsBefore).filter(
+        (event) => event.kind === 'message'
+            && event.text === 'consume before snapshot',
+    ).length === 1,
+    'in-flight message authenticates exactly once before Commit snapshot');
+    await echoPendingCommit(
+        receiveRace.creator, receiveRaceCommit, 'creator-receive-race-self',
+    );
+    await receiveRace.creator.onRelayEnvelope({
+        ...receiveRaceMessage,
+        sender_id: 'joiner-1',
+    });
+    const receiveRaceEvents = receiveRace.creatorEvents.slice(receiveEventsBefore);
+    assert(receiveRaceEvents.filter(
+        (event) => event.kind === 'message'
+            && event.text === 'consume before snapshot',
+    ).length === 1 && receiveRaceEvents.some(
+        (event) => event.kind === 'error'
+            && (event.reason.includes('replayed')
+                || event.reason.includes('expired application message')),
+    ),
+    'accepted candidate preserves receive consumption and rejects old-epoch replay');
+
+    // A member Update can finish constructing authenticated old-epoch bytes
+    // while a creator Commit arrives. The inbound Commit must wait until the
+    // proposal and its private key are installed atomically, then consume
+    // them as stale when it advances the epoch.
+    const proposalRace = await createExchange();
+    await completeExchangeJoin(proposalRace, 'creator-proposal-race');
+    const proposalRaceEpoch = proposalRace.joiner.group.epoch;
+    const proposalRaceCreatorOutBefore = proposalRace.creatorOut.length;
+    await proposalRace.creator.commitUpdate();
+    const proposalRaceCommit = proposalRace.creatorOut
+        .slice(proposalRaceCreatorOutBefore)
+        .find((envelope) => envelope.wire_format === WireFormat.MLS_PUBLIC_MESSAGE);
+    const proposalRaceGroup = proposalRace.joiner.group;
+    const originalPropose = proposalRaceGroup.proposeUpdate.bind(
+        proposalRaceGroup,
+    );
+    const proposalBuilt = deferred();
+    const releaseProposal = deferred();
+    proposalRaceGroup.proposeUpdate = async () => {
+        const proposed = await originalPropose();
+        proposalBuilt.resolve();
+        await releaseProposal.promise;
+        delete proposalRaceGroup.proposeUpdate;
+        return proposed;
+    };
+    const proposalRaceOutBefore = proposalRace.joinerOut.length;
+    const inFlightProposal = proposalRace.joiner.proposeUpdate();
+    await proposalBuilt.promise;
+    const incomingDuringProposal = proposalRace.joiner.onRelayEnvelope({
+        ...proposalRaceCommit,
+        sender_id: 'creator-proposal-race',
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    assert(proposalRace.joiner.group.epoch === proposalRaceEpoch
+        && proposalRace.joiner._proposalStore.size === 0,
+    'incoming Commit cannot overtake an in-flight local Update proposal');
+    releaseProposal.resolve();
+    await inFlightProposal;
+    await incomingDuringProposal;
+    const serializedProposal = proposalRace.joinerOut
+        .slice(proposalRaceOutBefore)
+        .find((envelope) => envelope.wire_format === WireFormat.MLS_PUBLIC_MESSAGE);
+    assert(Boolean(serializedProposal)
+        && proposalRace.joiner.group.epoch === proposalRaceEpoch + 1n
+        && proposalRace.joiner._proposalStore.size === 0
+        && proposalRace.joiner._pendingSelfUpdates.size === 0
+        && proposalRace.joiner._pendingSelfUpdate === null,
+    'proposal completes first and subsequent Commit atomically clears stale state');
+    assert(!proposalRace.joinerEvents.some(
+        (event) => event.kind === 'error'
+            && event.reason.includes('proposeUpdate failed'),
+    ), 'serialized proposal/Commit race produces no mixed-epoch proposal error');
+    await echoPendingCommit(
+        proposalRace.creator, proposalRaceCommit, 'creator-proposal-race-self',
+    );
+
+    // Transport rejection rolls back proposal-store bookkeeping, and the
+    // promise mutex remains usable by the next attempt.
+    const rollbackProposal = await createExchange();
+    await completeExchangeJoin(rollbackProposal, 'creator-proposal-rollback');
+    const normalProposalSend = rollbackProposal.joiner.send;
+    rollbackProposal.joiner.send = (envelope) => {
+        if (envelope.wire_format === WireFormat.MLS_PUBLIC_MESSAGE) return false;
+        return normalProposalSend(envelope);
+    };
+    const rollbackEventsBefore = rollbackProposal.joinerEvents.length;
+    await rollbackProposal.joiner.proposeUpdate();
+    assert(rollbackProposal.joiner._proposalStore.size === 0
+        && rollbackProposal.joiner._pendingSelfUpdates.size === 0
+        && rollbackProposal.joiner._pendingSelfUpdate === null,
+    'transport-rejected Update proposal rolls back all pending local state');
+    assert(rollbackProposal.joinerEvents.slice(rollbackEventsBefore).some(
+        (event) => event.kind === 'error'
+            && event.reason.includes('transport rejected envelope'),
+    ), 'transport-rejected Update proposal reports a fail-closed error');
+    rollbackProposal.joiner.send = normalProposalSend;
+    const retryProposalOutBefore = rollbackProposal.joinerOut.length;
+    await rollbackProposal.joiner.proposeUpdate();
+    assert(rollbackProposal.joinerOut.slice(retryProposalOutBefore).some(
+        (envelope) => envelope.wire_format === WireFormat.MLS_PUBLIC_MESSAGE,
+    ) && rollbackProposal.joiner._proposalStore.size === 1
+        && rollbackProposal.joiner._pendingSelfUpdates.size === 1,
+    'operation mutex recovers after rejection and accepts the next proposal');
 
     const noCommitExchange = await createExchange();
     let noCommitError = '';

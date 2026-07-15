@@ -294,6 +294,15 @@
             // merely because WebSocket.send accepted bytes locally.
             this._pendingCommit = null;
             this._localCommitBusy = false;
+            // One promise mutex serializes every browser-facing operation
+            // that can read or mutate MLS state. Crypto operations cross
+            // multiple await points (signature/HPKE/AEAD), so checking a
+            // boolean before the first await is not sufficient: a timer,
+            // UI send, or inbound WebSocket frame could otherwise observe a
+            // half-advanced ratchet or build a Commit from an unstable
+            // epoch. Rejections are removed from the tail so one malformed
+            // peer message cannot poison subsequent work.
+            this._operationMutex = Promise.resolve();
             // While a local Commit is being built or awaiting its relay
             // echo, defer peer envelopes. This prevents application-ratchet
             // or proposal state from changing underneath the candidate and
@@ -301,6 +310,18 @@
             this._deferredEnvelopes = [];
             this._deferredRemovals = new Set();
             this._drainingDeferredEnvelopes = false;
+        }
+
+        /**
+         * Run one complete MLS operation after all earlier operations have
+         * settled. Callers already executing inside this gate must invoke
+         * private implementation helpers directly; recursively queueing and
+         * awaiting the public wrapper would deadlock.
+         */
+        _serializeOperation(operation) {
+            const task = this._operationMutex.then(() => operation());
+            this._operationMutex = task.catch(() => undefined);
+            return task;
         }
 
         /**
@@ -312,6 +333,10 @@
          *            Welcome addressed to us.
          */
         async start() {
+            return this._serializeOperation(() => this._start());
+        }
+
+        async _start() {
             if (this.role === 'creator') {
                 const id = await this._freshIdentity();
                 this.identity = id;
@@ -532,7 +557,13 @@
                     commitEnvelope, 'Commit broadcast failed before acceptance',
                 );
             } catch (err) {
-                if (this._pendingCommit === pending) this._pendingCommit = null;
+                // A synchronous/in-memory relay may echo and accept the
+                // Commit before its send promise settles. In that case the
+                // echo is authoritative; never erase the now-live candidate
+                // merely because the transport subsequently reports an
+                // inconsistent failure.
+                if (this._pendingCommit !== pending) return true;
+                this._pendingCommit = null;
                 candidateGroup.destroySecrets();
                 this.onEvent({ kind: 'error', reason: err.message });
                 return false;
@@ -543,13 +574,26 @@
         async _acceptPendingCommit() {
             const pending = this._pendingCommit;
             if (!pending) return false;
+            // Claim this exact PendingCommit before the first await. Duplicate
+            // relay echoes can arrive back-to-back; without the claim both
+            // handlers could derive a roster and install/announce it twice.
+            if (pending.accepting) return false;
+            pending.accepting = true;
 
             // Fingerprinting is the only fallible UI preparation. Complete it
             // before installing the candidate so a platform hash failure
             // cannot leave the protocol advanced but the visual roster stale.
-            const rosterEvent = await this._authenticatedRosterEvent(
-                pending.candidateGroup,
-            );
+            let rosterEvent;
+            try {
+                rosterEvent = await this._authenticatedRosterEvent(
+                    pending.candidateGroup,
+                );
+            } catch (err) {
+                // Keep the candidate pending so a transient local hashing
+                // failure can be retried by a later exact echo.
+                pending.accepting = false;
+                throw err;
+            }
 
             // Clear first so a duplicate echo cannot install or announce the
             // candidate twice. Everything below is local bookkeeping or a
@@ -625,7 +669,7 @@
                     && !this._pendingCommit) {
                     if (this._deferredEnvelopes.length > 0) {
                         const envelope = this._deferredEnvelopes.shift();
-                        await this.onRelayEnvelope(envelope);
+                        await this._onRelayEnvelope(envelope);
                         continue;
                     }
                     // userleft handling is deliberately fire-and-forget in
@@ -636,7 +680,7 @@
                     const nextRemoval = this._deferredRemovals.values().next();
                     if (nextRemoval.done) break;
                     this._deferredRemovals.delete(nextRemoval.value);
-                    await this.removeMemberBySenderId(nextRemoval.value);
+                    await this._removeMemberBySenderId(nextRemoval.value);
                 }
             } finally {
                 this._drainingDeferredEnvelopes = false;
@@ -648,6 +692,24 @@
          * are filtered upstream except for shouldHandleOwnEnvelope().
          */
         async onRelayEnvelope(envelope) {
+            // Preserve support for a transport that synchronously feeds the
+            // exact Commit echo back from inside send(). The candidate is
+            // complete once _pendingCommit exists, and waiting behind the
+            // operation mutex here would deadlock that transport. All other
+            // relay traffic enters the same queue as local UI/timer work.
+            if (this._localCommitBusy && this.shouldHandleOwnEnvelope(envelope)) {
+                return this._acceptPendingCommit();
+            }
+            // Queue an immutable-by-convention snapshot. Otherwise a caller
+            // retaining the transport object could change routing metadata or
+            // payload strings while an earlier crypto operation is awaiting.
+            const queuedEnvelope = { ...envelope };
+            return this._serializeOperation(
+                () => this._onRelayEnvelope(queuedEnvelope),
+            );
+        }
+
+        async _onRelayEnvelope(envelope) {
             if (this.shouldHandleOwnEnvelope(envelope)) {
                 await this._acceptPendingCommit();
                 return;
@@ -984,7 +1046,10 @@
             } finally {
                 this._localCommitBusy = false;
             }
-            if (!staged) await this._drainDeferredEnvelopes();
+            // Usually a staged Commit is still pending and this is a no-op.
+            // It matters for a synchronous relay echo, which may already
+            // have accepted the candidate while _localCommitBusy was true.
+            await this._drainDeferredEnvelopes();
         }
 
         async _handleWelcome(mlsMessageBytes, ratchetTreeBytes, candidate) {
@@ -1243,7 +1308,10 @@
          * we haven't joined the group yet.
          */
         async sendMessage(text) {
-            await this._sendApplicationPayload(encodeTextPayload(text));
+            const payload = encodeTextPayload(text);
+            return this._serializeOperation(
+                () => this._sendApplicationPayload(payload),
+            );
         }
 
         /**
@@ -1253,7 +1321,10 @@
          * MLS application_data, so the relay never sees them.
          */
         async sendImage(imageBytes, mimeType) {
-            await this._sendApplicationPayload(encodeImagePayload(imageBytes, mimeType));
+            const payload = encodeImagePayload(imageBytes, mimeType);
+            return this._serializeOperation(
+                () => this._sendApplicationPayload(payload),
+            );
         }
 
         /**
@@ -1264,6 +1335,10 @@
          * the caller is typically a timer.
          */
         async commitUpdate() {
+            return this._serializeOperation(() => this._commitUpdate());
+        }
+
+        async _commitUpdate() {
             if (this.role !== 'creator') return;
             if (this._state !== 'joined') return;
             if (!this.group || this.group.nLeaves < 2) return;
@@ -1304,7 +1379,7 @@
             } finally {
                 this._localCommitBusy = false;
             }
-            if (!staged) await this._drainDeferredEnvelopes();
+            await this._drainDeferredEnvelopes();
         }
 
         /**
@@ -1315,30 +1390,79 @@
          * via its own periodic path Commit) or before we have joined.
          */
         async proposeUpdate() {
+            return this._serializeOperation(() => this._proposeUpdate());
+        }
+
+        async _proposeUpdate() {
             if (this.role !== 'joiner') return;
             if (this._state !== 'joined') return;
             if (!this.group) return;
+            if (this._pendingCommit) {
+                this.onEvent({ kind: 'error',
+                    reason: 'proposeUpdate blocked while a Commit awaits relay acceptance' });
+                return;
+            }
             let proposed;
+            let stored = null;
+            let referenceKey = null;
+            let hadPendingKey = false;
+            let previousPendingKey;
+            const previousLatest = this._pendingSelfUpdate;
             try {
                 proposed = await this.group.proposeUpdate();
-                this._storeAuthenticatedProposal(proposed);
+                stored = this._storeAuthenticatedProposal(proposed);
+                referenceKey = MLS.Group.proposalReferenceKey(proposed.reference);
+                hadPendingKey = this._pendingSelfUpdates.has(referenceKey);
+                previousPendingKey = this._pendingSelfUpdates.get(referenceKey);
+                this._pendingSelfUpdates.set(
+                    referenceKey, proposed.pendingLeafKeyPair,
+                );
+                this._pendingSelfUpdate = {
+                    keyPair: proposed.pendingLeafKeyPair,
+                    referenceKey,
+                };
+                // Publish only after the author has installed all local
+                // ProposalRef/private-key state required to consume a
+                // synchronously returned Commit. Keep the operation mutex
+                // held through the transport handoff.
+                await this._sendEnvelopeOrThrow({
+                    type: 'mls',
+                    payload: base64UrlEncode(stripMlsWrapper(
+                        proposed.proposalMessage,
+                    )),
+                    wire_format: MLS.MLSMessage.WireFormat.MLS_PUBLIC_MESSAGE,
+                }, 'Update proposal broadcast failed');
             } catch (err) {
+                // A locally-created proposal that never reached the relay
+                // must not occupy the bounded current-epoch store or leave a
+                // private key that can never be selected. Restore exactly
+                // the entries that existed before this attempt.
+                if (referenceKey !== null) {
+                    if (stored?.isNew
+                        && this._proposalStore.get(referenceKey) === stored.entry) {
+                        this._proposalStore.delete(referenceKey);
+                    }
+                    if (this._pendingSelfUpdates.get(referenceKey)
+                        === proposed?.pendingLeafKeyPair) {
+                        if (hadPendingKey) {
+                            this._pendingSelfUpdates.set(
+                                referenceKey, previousPendingKey,
+                            );
+                        } else {
+                            this._pendingSelfUpdates.delete(referenceKey);
+                        }
+                    }
+                    if (this._pendingSelfUpdate?.referenceKey === referenceKey
+                        && this._pendingSelfUpdate?.keyPair
+                            === proposed?.pendingLeafKeyPair) {
+                        this._pendingSelfUpdate = previousLatest;
+                    }
+                }
                 console.error('[MLS] proposeUpdate failed:', err);
                 this.onEvent({ kind: 'error',
                     reason: `proposeUpdate failed: ${err.message}` });
                 return;
             }
-            const referenceKey = MLS.Group.proposalReferenceKey(proposed.reference);
-            this._pendingSelfUpdates.set(referenceKey, proposed.pendingLeafKeyPair);
-            this._pendingSelfUpdate = {
-                keyPair: proposed.pendingLeafKeyPair,
-                referenceKey,
-            };
-            this.send({
-                type: 'mls',
-                payload: base64UrlEncode(stripMlsWrapper(proposed.proposalMessage)),
-                wire_format: MLS.MLSMessage.WireFormat.MLS_PUBLIC_MESSAGE,
-            });
             this.onEvent({ kind: 'update-proposed' });
         }
 
@@ -1350,6 +1474,12 @@
          * creator's own previous tab, or never published a KP).
          */
         async removeMemberBySenderId(senderId) {
+            return this._serializeOperation(
+                () => this._removeMemberBySenderId(senderId),
+            );
+        }
+
+        async _removeMemberBySenderId(senderId) {
             if (this.role !== 'creator') return;
             if (this._state !== 'joined') return;
             if (!this._leafBySenderId.has(senderId)) return;
@@ -1381,7 +1511,7 @@
             } finally {
                 this._localCommitBusy = false;
             }
-            if (!staged) await this._drainDeferredEnvelopes();
+            await this._drainDeferredEnvelopes();
         }
 
         async _sendApplicationPayload(payloadBytes) {
@@ -1393,13 +1523,16 @@
                     'mls-session: cannot send while a Commit awaits relay acceptance',
                 );
             }
+            // The operation mutex remains held through ratchet advancement
+            // and transport handoff. A failed handoff deliberately consumes
+            // the generation rather than risking AES-GCM nonce reuse.
             const wrapped = await this.group.encryptApplicationMessage(payloadBytes);
             const body = stripMlsWrapper(wrapped);
-            this.send({
+            await this._sendEnvelopeOrThrow({
                 type: 'mls',
                 payload: base64UrlEncode(body),
                 wire_format: MLS.MLSMessage.WireFormat.MLS_PRIVATE_MESSAGE,
-            });
+            }, 'application message broadcast failed');
         }
 
         get state() { return this._state; }
