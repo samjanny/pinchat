@@ -99,6 +99,7 @@
 
     const PROTOCOL_VERSION = 0x0001;
     const CIPHERSUITE = 0x0002;
+    const CREATOR_LEAF_INDEX = 0;
 
     function getCrypto() {
         if (typeof globalThis !== 'undefined' && globalThis.crypto) return globalThis.crypto;
@@ -994,6 +995,9 @@
             || removedLeafIndex >= this.nLeaves) {
             throw new Error(`commitRemoveMember: invalid leaf_index ${removedLeafIndex}`);
         }
+        if (removedLeafIndex === CREATOR_LEAF_INDEX) {
+            throw new Error('commitRemoveMember: creator leaf 0 cannot be removed');
+        }
         if (removedLeafIndex === this.myLeafIndex) {
             throw new Error('commitRemoveMember: cannot remove self');
         }
@@ -1600,6 +1604,17 @@
         );
         if (!membOk) throw new Error('processCommit: membership_tag invalid');
 
+        // PinChat's current group architecture has one permanent admin: the
+        // creator at leaf 0. The signature and membership tag above bind this
+        // authorization decision to leaf 0's authenticated identity. A future
+        // multiple- or transferable-admin model must instead bind its admin
+        // key set into the authenticated GroupContext.
+        if (senderLeafIndex !== CREATOR_LEAF_INDEX) {
+            throw new Error(
+                `processCommit: only creator leaf 0 may commit (got leaf ${senderLeafIndex})`,
+            );
+        }
+
         const commit = content.parsed;
 
         // ---- Apply Add / Remove proposals ----
@@ -1671,6 +1686,9 @@
                 const rmIdx = proposal.removed;
                 if (typeof rmIdx !== 'number' || rmIdx < 0 || rmIdx >= newNLeaves) {
                     throw new Error(`processCommit: invalid removed leaf_index ${rmIdx}`);
+                }
+                if (rmIdx === CREATOR_LEAF_INDEX) {
+                    throw new Error('processCommit: creator leaf 0 cannot be removed');
                 }
                 if (rmIdx === senderLeafIndex) {
                     throw new Error('processCommit: committer cannot remove themself');
@@ -1766,6 +1784,13 @@
         )) {
             throw new Error('parent-hash: committer LeafNode.parent_hash mismatch');
         }
+
+        // RFC 9420 §§7.3 and 7.8 require signature keys to be unique among
+        // leaves and HPKE encryption keys to be unique across the complete
+        // ratchet tree. Welcome import enforces the same invariant; check it
+        // here as well so an Add cannot install a colliding key for members
+        // that are processing the Commit in steady state.
+        verifyTreeKeyUniqueness(newTree, 'processCommit');
 
         // Provisional group context for HPKE info string.
         const newTreeHash = await TreeHash.hashRoot(newTree);
@@ -2569,6 +2594,57 @@
     }
 
     /**
+     * Enforce the ratchet-tree key-pair uniqueness invariant shared by
+     * imported-tree validation and steady-state Commit processing.
+     */
+    function verifyTreeKeyUniqueness(tree, errorPrefix) {
+        const signatureKeys = new Map();
+        const encryptionKeys = new Map();
+        const registerEncryptionKey = (keyBytes, nodeIndex) => {
+            const key = bytesMapKey(keyBytes, `node ${nodeIndex} encryption_key`);
+            if (encryptionKeys.has(key)) {
+                throw new Error(
+                    `${errorPrefix}: duplicate encryption_key at nodes ${encryptionKeys.get(key)} and ${nodeIndex}`,
+                );
+            }
+            encryptionKeys.set(key, nodeIndex);
+        };
+
+        for (let nodeIndex = 0; nodeIndex < tree.length; nodeIndex += 1) {
+            const slot = tree[nodeIndex];
+            if (!slot) continue;
+            if (slot.nodeType === Nodes.NodeType.LEAF) {
+                const leafIndex = TreeMath.nodeToLeaf(nodeIndex);
+                const signatureKey = bytesMapKey(
+                    slot.leaf.signatureKey, `leaf ${leafIndex} signature_key`,
+                );
+                if (signatureKeys.has(signatureKey)) {
+                    throw new Error(
+                        `${errorPrefix}: duplicate signature_key at leaves ${signatureKeys.get(signatureKey)} and ${leafIndex}`,
+                    );
+                }
+                signatureKeys.set(signatureKey, leafIndex);
+                registerEncryptionKey(slot.leaf.encryptionKey, nodeIndex);
+            } else if (slot.nodeType === Nodes.NodeType.PARENT) {
+                registerEncryptionKey(slot.parent.encryptionKey, nodeIndex);
+            } else {
+                throw new Error(`${errorPrefix}: invalid node type at ${nodeIndex}`);
+            }
+        }
+
+        // P-256 is used for both HPKE and signatures in this ciphersuite;
+        // reusing one public key across the two roles violates the ratchet
+        // tree key-pair uniqueness invariant (RFC §16.7).
+        for (const [key, leafIndex] of signatureKeys) {
+            if (encryptionKeys.has(key)) {
+                throw new Error(
+                    `${errorPrefix}: signature_key at leaf ${leafIndex} collides with encryption_key at node ${encryptionKeys.get(key)}`,
+                );
+            }
+        }
+    }
+
+    /**
      * Validate every non-blank entry of a ratchet tree imported with a
      * Welcome before any epoch secret is derived (RFC 9420 §12.4.3.1).
      */
@@ -2577,18 +2653,6 @@
             || tree.length !== TreeMath.nodeWidth(nLeaves)) {
             throw new Error('imported-tree: invalid ratchet-tree shape');
         }
-
-        const signatureKeys = new Map();
-        const encryptionKeys = new Map();
-        const registerEncryptionKey = (keyBytes, nodeIndex) => {
-            const key = bytesMapKey(keyBytes, `node ${nodeIndex} encryption_key`);
-            if (encryptionKeys.has(key)) {
-                throw new Error(
-                    `imported-tree: duplicate encryption_key at nodes ${encryptionKeys.get(key)} and ${nodeIndex}`,
-                );
-            }
-            encryptionKeys.set(key, nodeIndex);
-        };
 
         // Validate positional node types first so later structural checks
         // can safely traverse parent links even in a malicious encoding.
@@ -2608,35 +2672,13 @@
             }
         }
 
+        verifyTreeKeyUniqueness(tree, 'imported-tree');
+
         for (let nodeIndex = 0; nodeIndex < tree.length; nodeIndex += 1) {
             const slot = tree[nodeIndex];
             if (!slot) continue;
-            if (slot.nodeType === Nodes.NodeType.LEAF) {
-                const leafIndex = TreeMath.nodeToLeaf(nodeIndex);
-                const signatureKey = bytesMapKey(
-                    slot.leaf.signatureKey, `leaf ${leafIndex} signature_key`,
-                );
-                if (signatureKeys.has(signatureKey)) {
-                    throw new Error(
-                        `imported-tree: duplicate signature_key at leaves ${signatureKeys.get(signatureKey)} and ${leafIndex}`,
-                    );
-                }
-                signatureKeys.set(signatureKey, leafIndex);
-                registerEncryptionKey(slot.leaf.encryptionKey, nodeIndex);
-            } else {
-                registerEncryptionKey(slot.parent.encryptionKey, nodeIndex);
+            if (slot.nodeType === Nodes.NodeType.PARENT) {
                 validateUnmergedLeaves(tree, nodeIndex, nLeaves);
-            }
-        }
-
-        // P-256 is used for both HPKE and signatures in this ciphersuite;
-        // reusing one public key across the two roles violates the ratchet
-        // tree key-pair uniqueness invariant (RFC §16.7).
-        for (const [key, leafIndex] of signatureKeys) {
-            if (encryptionKeys.has(key)) {
-                throw new Error(
-                    `imported-tree: signature_key at leaf ${leafIndex} collides with encryption_key at node ${encryptionKeys.get(key)}`,
-                );
             }
         }
 

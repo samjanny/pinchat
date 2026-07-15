@@ -382,7 +382,7 @@
                 );
                 const frame = MLS.MLSMessage.parseMLSMessage(commitWrapped);
                 const pm = MLS.PublicMessage.parsePublicMessage(
-                    frame.body, () => null,
+                    frame.body, (decoder) => MLS.Commit.readCommit(decoder),
                 );
                 if (!pm.content
                     || pm.content.contentType !== MLS.Framing.ContentType.COMMIT) {

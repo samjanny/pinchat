@@ -159,6 +159,11 @@ const TEST_SUITES = {
         file: 'test-mls-group.js',
         description: 'Group.create + app-message encrypt/decrypt between two members'
     },
+    'mls-session-join': {
+        name: 'MLS session Welcome orchestration',
+        file: 'test-mls-session-join.js',
+        description: 'Browser-level Commit buffering + fail-closed Welcome join'
+    },
     'mls-group-add': {
         name: 'MLS Group Add/Commit/Welcome flow',
         file: 'test-mls-group-add.js',
@@ -173,6 +178,11 @@ const TEST_SUITES = {
         name: 'MLS Group Remove flow',
         file: 'test-mls-group-remove.js',
         description: 'Remove proposal + tree blanking; removed member loses access'
+    },
+    'mls-creator-policy': {
+        name: 'MLS creator-only Commit policy',
+        file: 'test-mls-creator-policy.js',
+        description: 'Authenticated leaf-0 admin enforcement and creator preservation'
     }
 };
 

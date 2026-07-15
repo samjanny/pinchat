@@ -83,6 +83,19 @@ async function buildKeyPackage() {
     };
 }
 
+async function replaceKeyPackageLeafEncryptionKey(bundle, encryptionKey) {
+    bundle.leaf.encryptionKey = Uint8Array.from(encryptionKey);
+    bundle.leaf.signature = await Group.signLeafNodeForKeyPackage(
+        bundle.identity.signaturePrivateKey, bundle.leaf,
+    );
+    bundle.keyPackage.signature = await Labeled.signWithLabel(
+        bundle.identity.signaturePrivateKey,
+        'KeyPackageTBS',
+        KeyPackage.keyPackageTbsBytes(bundle.keyPackage),
+    );
+    bundle.keyPackageBytes = KeyPackage.keyPackageBytes(bundle.keyPackage);
+}
+
 function joinFrom(committer, result, joiner, expectedSignerLeafIndex = committer.myLeafIndex) {
     return Group.Group.joinFromWelcomeWithTree({
         welcomeMessage: result.welcomeMessage,
@@ -241,6 +254,43 @@ async function main() {
         );
     }
 
+    // ---- Steady-state Add processing enforces key uniqueness ------------
+    {
+        const alice = await Group.Group.create({ identity: await freshIdentity() });
+        const bob = await buildKeyPackage();
+        const { joined: bobGroup } = await addAndJoin(alice, bob);
+
+        // Positive control: an ordinary Add must still advance an existing
+        // member after the whole-tree uniqueness check is introduced.
+        const carol = await buildKeyPackage();
+        const normalAdd = await alice.commitAddMember({
+            keyPackageBytes: carol.keyPackageBytes,
+        });
+        const normalResult = await bobGroup.processCommit(normalAdd.commitMessage);
+        assert(normalResult.addedLeafIndex === 2 && bobGroup.epoch === 2n,
+            'normal non-colliding Add succeeds in processCommit');
+
+        // Build an independently signed KeyPackage whose leaf HPKE key is a
+        // byte-for-byte copy of Bob's existing leaf key. The committer can
+        // construct and authenticate this Commit, but existing members must
+        // reject it before advancing their epoch.
+        const dave = await buildKeyPackage();
+        await replaceKeyPackageLeafEncryptionKey(
+            dave, bob.leaf.encryptionKey,
+        );
+        const collidingAdd = await alice.commitAddMember({
+            keyPackageBytes: dave.keyPackageBytes,
+        });
+        const bobEpochBefore = bobGroup.epoch;
+        await expectReject(
+            bobGroup.processCommit(collidingAdd.commitMessage),
+            'duplicate encryption_key',
+            'processCommit rejects Add with duplicate leaf encryption_key',
+        );
+        assert(bobGroup.epoch === bobEpochBefore,
+            'rejected colliding Add does not advance recipient epoch');
+    }
+
     // ---- G-1(b): every parent, including off-signer-path, is valid ------
     {
         const alice = await Group.Group.create({ identity: await freshIdentity() });
@@ -253,22 +303,22 @@ async function main() {
             alice, dave, [bobGroup, carolGroup],
         );
 
-        // Dave refreshes the right-hand path (leaf 3 -> parent 5 -> root),
-        // making parent 5 a live node authenticated by Dave's signed leaf.
-        const daveUpdate = await daveGroup.commitUpdate();
-        await alice.processCommit(daveUpdate.commitMessage);
-        await bobGroup.processCommit(daveUpdate.commitMessage);
-        await carolGroup.processCommit(daveUpdate.commitMessage);
+        // Construct a standards-valid historical right-hand path locally on
+        // Dave's state. PinChat's creator-only application policy prevents
+        // the other members from accepting Dave's Commit, but the imported
+        // tree validator remains responsible for checking arbitrary valid
+        // MLS tree shapes independently of that authorization policy.
+        await daveGroup.commitUpdate();
 
         await Group.verifyImportedTree(
-            alice.ratchetTree, alice.nLeaves, alice.groupId,
+            daveGroup.ratchetTree, daveGroup.nLeaves, daveGroup.groupId,
         );
         assert(true,
             'valid tree with multiple historical committer paths is accepted');
 
         // A parent HPKE key may not collide with any other tree node key.
         const collisionTree = Nodes.parseRatchetTree(
-            Nodes.ratchetTreeBytes(alice.ratchetTree),
+            Nodes.ratchetTreeBytes(daveGroup.ratchetTree),
         );
         collisionTree[2].leaf.encryptionKey = Uint8Array.from(
             collisionTree[5].parent.encryptionKey,
@@ -277,24 +327,23 @@ async function main() {
             bob.identity.signaturePrivateKey, collisionTree[2].leaf,
         );
         await expectReject(
-            Group.verifyImportedTree(collisionTree, 4, alice.groupId),
+            Group.verifyImportedTree(collisionTree, 4, daveGroup.groupId),
             'duplicate encryption_key',
             'parent/leaf HPKE encryption_key collision rejected',
         );
 
-        // Corrupt the off-path parent's upward link. Alice's following Add
-        // refreshes and correctly signs only her own path; the old
-        // signer-path-only join check would therefore accept this tree.
-        const offPathParent = alice.ratchetTree[5].parent;
+        // Corrupt the off-path parent's upward link. A signer-path-only
+        // import check would miss this historical branch.
+        const offPathParent = daveGroup.ratchetTree[5].parent;
         offPathParent.parentHash = Uint8Array.from(offPathParent.parentHash);
         offPathParent.parentHash[0] ^= 0x01;
 
-        const eve = await buildKeyPackage();
-        const result = await alice.commitAddMember({ keyPackageBytes: eve.keyPackageBytes });
         await expectReject(
-            joinFrom(alice, result, eve),
+            Group.verifyImportedTree(
+                daveGroup.ratchetTree, daveGroup.nLeaves, daveGroup.groupId,
+            ),
             'parent 5 is not parent-hash valid',
-            'invalid off-signer-path parent-hash chain rejected at join',
+            'invalid off-signer-path parent-hash chain rejected on import',
         );
     }
 
