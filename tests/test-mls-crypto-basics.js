@@ -45,6 +45,55 @@ function hex(u8) {
     return Array.from(u8).map((b) => b.toString(16).padStart(2, '0')).join('');
 }
 
+function throws(fn, name) {
+    let threw = false;
+    try {
+        fn();
+    } catch (_err) {
+        threw = true;
+    }
+    assert(threw, name, threw ? null : 'expected throw');
+}
+
+function bytesToBigInt(bytes) {
+    return BigInt(`0x${hex(bytes)}`);
+}
+
+function bigIntToFixed(value, length) {
+    const out = new Uint8Array(length);
+    let remaining = value;
+    for (let i = length - 1; i >= 0; i -= 1) {
+        out[i] = Number(remaining & 0xffn);
+        remaining >>= 8n;
+    }
+    if (remaining !== 0n) throw new Error('test scalar overflow');
+    return out;
+}
+
+// Independent test encoder: unlike production rawToDer(), preserve high-S so
+// the rejection path can be exercised with a mathematically valid signature.
+function rawToDerPreservingS(raw) {
+    function integer(bytes) {
+        let start = 0;
+        while (start < bytes.length - 1 && bytes[start] === 0) start += 1;
+        const value = bytes.subarray(start);
+        const padded = (value[0] & 0x80) !== 0;
+        const out = new Uint8Array(2 + value.length + (padded ? 1 : 0));
+        out[0] = 0x02;
+        out[1] = out.length - 2;
+        out.set(value, padded ? 3 : 2);
+        return out;
+    }
+    const r = integer(raw.subarray(0, 32));
+    const s = integer(raw.subarray(32));
+    const out = new Uint8Array(2 + r.length + s.length);
+    out[0] = 0x30;
+    out[1] = out.length - 2;
+    out.set(r, 2);
+    out.set(s, 2 + r.length);
+    return out;
+}
+
 async function main() {
     const v = VECTORS.find((x) => x.cipher_suite === 2);
     if (!v) {
@@ -116,6 +165,69 @@ async function main() {
         const verifiedMine = await Labeled.verifyWithLabel(pub, label, content, mySig);
         assert(verifiedMine === true,
             `SignWithLabel round-trip (priv import + sign + verify)`);
+
+        // Canonical DER is unique and consumes the complete SEQUENCE.
+        const rawVectorSig = Signature.derToRaw(vectorSig);
+        assert(hex(Signature.rawToDer(rawVectorSig)) === hex(vectorSig),
+            'DER parse + re-encode is byte-exact for canonical signature');
+
+        const extraInside = new Uint8Array(vectorSig.length + 1);
+        extraInside.set(vectorSig);
+        extraInside[1] += 1;
+        extraInside[extraInside.length - 1] = 0;
+        throws(() => Signature.derToRaw(extraInside),
+            'DER rejects unconsumed byte inside ECDSA SEQUENCE');
+
+        const trailingOutside = new Uint8Array(vectorSig.length + 1);
+        trailingOutside.set(vectorSig);
+        throws(() => Signature.derToRaw(trailingOutside),
+            'DER rejects byte after ECDSA SEQUENCE');
+
+        const longSequenceLength = new Uint8Array(vectorSig.length + 1);
+        longSequenceLength[0] = 0x30;
+        longSequenceLength[1] = 0x81;
+        longSequenceLength[2] = vectorSig.length - 2;
+        longSequenceLength.set(vectorSig.subarray(2), 3);
+        throws(() => Signature.derToRaw(longSequenceLength),
+            'DER rejects non-minimal long-form SEQUENCE length');
+
+        // The vector's r starts below 0x80, so a leading zero is redundant.
+        const rLen = vectorSig[3];
+        const redundantRZero = new Uint8Array(vectorSig.length + 1);
+        redundantRZero[0] = 0x30;
+        redundantRZero[1] = vectorSig[1] + 1;
+        redundantRZero[2] = 0x02;
+        redundantRZero[3] = rLen + 1;
+        redundantRZero[4] = 0x00;
+        redundantRZero.set(vectorSig.subarray(4, 4 + rLen), 5);
+        redundantRZero.set(vectorSig.subarray(4 + rLen), 5 + rLen);
+        throws(() => Signature.derToRaw(redundantRZero),
+            'DER rejects redundant INTEGER sign octet');
+        throws(() => Signature.derToRaw(hexDecode('3006020180020101')),
+            'DER rejects negative INTEGER');
+        throws(() => Signature.derToRaw(hexDecode('3006020100020101')),
+            'DER rejects zero r scalar');
+
+        // (r, n-s) is mathematically equivalent, but the PinChat profile
+        // accepts only the low-S representative.
+        const order = 0xffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551n;
+        const lowS = bytesToBigInt(rawVectorSig.subarray(32));
+        const highRaw = new Uint8Array(rawVectorSig);
+        highRaw.set(bigIntToFixed(order - lowS, 32), 32);
+        const highDer = rawToDerPreservingS(highRaw);
+        const signContent = Labeled.signContentBytes(label, content);
+        const mathematicallyValid = await require('crypto').webcrypto.subtle.verify(
+            { name: 'ECDSA', hash: 'SHA-256' }, pub, highRaw, signContent);
+        assert(mathematicallyValid === true,
+            'high-S twin is mathematically valid ECDSA');
+        assert(await Signature.verify(pub, signContent, highDer) === false,
+            'PinChat verification rejects canonical high-S signature');
+        throws(() => Signature.derToRaw(highDer),
+            'DER-to-raw production boundary rejects high-S');
+        assert(hex(Signature.normalizeDerLowS(highDer)) === hex(vectorSig),
+            'explicit migration helper maps high-S twin to unique low-S DER');
+        assert(hex(Signature.normalizeDerLowS(mySig)) === hex(mySig),
+            'SignWithLabel always emits canonical low-S DER');
     }
 
     // --- EncryptWithLabel / DecryptWithLabel ---

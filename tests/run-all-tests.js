@@ -89,6 +89,11 @@ const TEST_SUITES = {
         file: 'test-mls-crypto-basics.js',
         description: 'RFC 9420 §5.1 / §5.2 labeled operations vs IETF vectors'
     },
+    'mls-signature-canonical': {
+        name: 'MLS canonical ECDSA signatures',
+        file: 'test-mls-signature-canonical.js',
+        description: 'Strict DER consumption, low-S profile, and Commit rollback'
+    },
     'mls-transcript-hashes': {
         name: 'MLS transcript hashes',
         file: 'test-mls-transcript-hashes.js',

@@ -17,6 +17,15 @@ Rationale: every primitive is already in the PinChat TCB, natively exposed
 through WebCrypto, and the ciphersuite is a first-class citizen of RFC 9420.
 See [`ciphersuite.js`](ciphersuite.js) for the full profile.
 
+PinChat further narrows the ciphersuite's ECDSA signature acceptance to
+canonical, completely consumed ASN.1 DER with P-256 scalars in range and a
+low-S value. Generated signatures are normalized to low-S; received high-S
+signatures are rejected rather than normalized. This removes the equivalent
+`(r, s)` / `(r, n-s)` byte-level malleability from MLS authenticated and
+transcript structures. Low-S is a PinChat profile restriction, not an MLS
+requirement, so high-S signatures from otherwise conforming implementations
+are intentionally not interoperable.
+
 ## Foundation (landed)
 
 | Module                                   | Status | Tests                                                                                  |
@@ -26,7 +35,7 @@ See [`ciphersuite.js`](ciphersuite.js) for the full profile.
 | [`codec.js`](codec.js)                   |   ✅   | [`test-mls-codec.js`](../../../tests/test-mls-codec.js)                                |
 | [`hpke.js`](hpke.js)                     |   ✅   | [`test-mls-hpke.js`](../../../tests/test-mls-hpke.js)                                  |
 | [`key-schedule.js`](key-schedule.js)     |   ✅   | [`test-mls-key-schedule.js`](../../../tests/test-mls-key-schedule.js) (IETF vectors)        |
-| [`signature.js`](signature.js)           |   ✅   | [`test-mls-crypto-basics.js`](../../../tests/test-mls-crypto-basics.js) (IETF vectors)      |
+| [`signature.js`](signature.js)           |   ✅   | [`test-mls-crypto-basics.js`](../../../tests/test-mls-crypto-basics.js) (IETF vectors) + [`test-mls-signature-canonical.js`](../../../tests/test-mls-signature-canonical.js) (strict DER/low-S + state rollback) |
 | [`labeled.js`](labeled.js)               |   ✅   | [`test-mls-crypto-basics.js`](../../../tests/test-mls-crypto-basics.js) (IETF vectors)      |
 | [`transcript-hashes.js`](transcript-hashes.js) | ✅ | [`test-mls-transcript-hashes.js`](../../../tests/test-mls-transcript-hashes.js) (IETF vectors) |
 | [`nodes.js`](nodes.js)                   |   ✅   | [`test-mls-tree-hash.js`](../../../tests/test-mls-tree-hash.js) (IETF vectors)               |

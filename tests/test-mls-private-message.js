@@ -116,10 +116,18 @@ async function verifyOne(v, label, wrappedHex, rawPayloadHex, contentType) {
         payload: out.content.payloadBytes,
     };
     const sigPub = await Signature.importPublicKey(hexDecode(v.signature_pub));
-    const sigOk = await PublicMessage.verifyFramedContent(
+    const profileSignature = Signature.normalizeDerLowS(out.content.auth.signature);
+    const originalIsLowS = hex(profileSignature) === hex(out.content.auth.signature);
+    const originalSigOk = await PublicMessage.verifyFramedContent(
         sigPub, frame.wireFormat, content, groupContext, out.content.auth.signature
     );
-    assert(sigOk === true, `${label}: SignWithLabel("FramedContentTBS") verifies`);
+    assert(originalSigOk === originalIsLowS,
+        `${label}: PinChat profile accepts low-S and rejects high-S IETF form`);
+    const sigOk = await PublicMessage.verifyFramedContent(
+        sigPub, frame.wireFormat, content, groupContext, profileSignature
+    );
+    assert(sigOk === true,
+        `${label}: normalized IETF signature verifies under PinChat profile`);
 
     // Re-encrypt with our path and round-trip
     const reenc = await PrivateMessage.encryptPrivateMessage({

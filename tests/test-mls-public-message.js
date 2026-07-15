@@ -94,14 +94,26 @@ async function verifyOne(v, label, wrappedHex) {
 
     // Signature verification (FramedContentTBS).
     const sigPub = await Signature.importPublicKey(hexDecode(v.signature_pub));
-    const sigOk = await PublicMessage.verifyFramedContent(
+    const profileSignature = Signature.normalizeDerLowS(pm.auth.signature);
+    const originalIsLowS = hex(profileSignature) === hex(pm.auth.signature);
+    const originalSigOk = await PublicMessage.verifyFramedContent(
         sigPub,
         frame.wireFormat,
         pm.content,
         groupContextStruct,
         pm.auth.signature,
     );
-    assert(sigOk === true, `${label}: SignWithLabel("FramedContentTBS") verifies`);
+    assert(originalSigOk === originalIsLowS,
+        `${label}: PinChat profile accepts low-S and rejects high-S IETF form`);
+    const sigOk = await PublicMessage.verifyFramedContent(
+        sigPub,
+        frame.wireFormat,
+        pm.content,
+        groupContextStruct,
+        profileSignature,
+    );
+    assert(sigOk === true,
+        `${label}: normalized IETF signature verifies under PinChat profile`);
 
     // Tampered content: signature must fail.
     const tamperedContent = {
@@ -109,7 +121,7 @@ async function verifyOne(v, label, wrappedHex) {
         authenticatedData: new Uint8Array([0x01]),
     };
     const sigBad = await PublicMessage.verifyFramedContent(
-        sigPub, frame.wireFormat, tamperedContent, groupContextStruct, pm.auth.signature
+        sigPub, frame.wireFormat, tamperedContent, groupContextStruct, profileSignature
     );
     assert(sigBad === false, `${label}: signature rejects tampered content`);
 

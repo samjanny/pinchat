@@ -3,12 +3,18 @@
  *
  * Ciphersuite 0x0002 specifies `ecdsa_secp256r1_sha256` as the signature
  * scheme, with signatures serialized in the TLS 1.3 way — i.e. DER-encoded
- * ECDSA signatures (RFC 5480 + ASN.1). WebCrypto's `subtle.sign` / `verify`
+ * ECDSA signatures (RFC 8446 §4.2.3 + ASN.1 DER). WebCrypto's `subtle.sign` / `verify`
  * for ECDSA use raw IEEE P1363 r||s instead, so we convert between the
  * two at the module boundary:
  *
  *   WebCrypto raw r||s   <->  DER SEQUENCE { INTEGER r, INTEGER s }
  *       (32+32=64 bytes)      (variable: ~70-72 bytes for P-256)
+ *
+ * PinChat additionally profiles ECDSA signatures to low-S. Standard ECDSA
+ * accepts both (r, s) and (r, n-s), but signature bytes are included in MLS
+ * authenticated/transcript structures. Requiring the unique low-S
+ * representative removes that remaining byte-level malleability. This is a
+ * PinChat profile restriction, not a requirement imposed by RFC 9420.
  *
  * The raw-key helpers below accept an uncompressed public point
  * (65 bytes, 0x04||X||Y) and a private scalar (32 bytes). WebCrypto only
@@ -36,6 +42,9 @@
 
     const COORD_LEN = 32;      // P-256 coordinate / scalar length
     const RAW_SIG_LEN = 64;    // raw ECDSA r||s length
+    // NIST P-256 subgroup order (RFC 6979 Appendix A.2.5).
+    const P256_ORDER = 0xffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551n;
+    const P256_HALF_ORDER = P256_ORDER >> 1n;
 
     // --- Key import / generation -------------------------------------------
 
@@ -96,54 +105,50 @@
     // Encoded bytes:
     //   0x30 <seq_len> 0x02 <r_len> <r_bytes> 0x02 <s_len> <s_bytes>
 
-    function derToRaw(der) {
-        if (!(der instanceof Uint8Array)) throw new Error('derToRaw: Uint8Array required');
-        if (der.length < 8 || der[0] !== 0x30) throw new Error('derToRaw: not a SEQUENCE');
-
-        let p = 1;
-        let seqLen = der[p]; p += 1;
-        if (seqLen & 0x80) {
-            // Long-form length — only used for sequences > 127 bytes. P-256
-            // signatures are always below that, but handle it for safety.
-            const n = seqLen & 0x7f;
-            if (n > 2 || p + n > der.length) throw new Error('derToRaw: bad length');
-            seqLen = 0;
-            for (let i = 0; i < n; i += 1) seqLen = (seqLen << 8) | der[p + i];
-            p += n;
-        }
-        if (p + seqLen !== der.length) {
-            throw new Error('derToRaw: trailing bytes in signature');
-        }
-
-        function readInt() {
-            if (der[p] !== 0x02) throw new Error('derToRaw: expected INTEGER');
-            p += 1;
-            let len = der[p]; p += 1;
-            if (len & 0x80) throw new Error('derToRaw: long INTEGER length not supported');
-            // Strip an optional leading 0x00 sign byte.
-            if (len > 0 && der[p] === 0x00) {
-                p += 1;
-                len -= 1;
-            }
-            if (len > COORD_LEN) throw new Error('derToRaw: INTEGER too large for P-256');
-            const out = new Uint8Array(COORD_LEN);
-            out.set(der.subarray(p, p + len), COORD_LEN - len);
-            p += len;
-            return out;
-        }
-
-        const r = readInt();
-        const s = readInt();
-        const raw = new Uint8Array(RAW_SIG_LEN);
-        raw.set(r, 0);
-        raw.set(s, COORD_LEN);
-        return raw;
+    function bytesToBigInt(bytes) {
+        let value = 0n;
+        for (const byte of bytes) value = (value << 8n) | BigInt(byte);
+        return value;
     }
 
-    function rawToDer(raw) {
-        if (!(raw instanceof Uint8Array) || raw.length !== RAW_SIG_LEN) {
-            throw new Error('rawToDer: expected 64-byte IEEE P1363 signature');
+    function bigIntToFixed(value, length) {
+        const out = new Uint8Array(length);
+        let remaining = value;
+        for (let i = length - 1; i >= 0; i -= 1) {
+            out[i] = Number(remaining & 0xffn);
+            remaining >>= 8n;
         }
+        if (remaining !== 0n) throw new Error('signature: scalar does not fit fixed width');
+        return out;
+    }
+
+    function validateRawSignature(raw, requireLowS) {
+        if (!(raw instanceof Uint8Array) || raw.length !== RAW_SIG_LEN) {
+            throw new Error('signature: expected 64-byte IEEE P1363 signature');
+        }
+        const r = bytesToBigInt(raw.subarray(0, COORD_LEN));
+        const s = bytesToBigInt(raw.subarray(COORD_LEN, RAW_SIG_LEN));
+        if (r <= 0n || r >= P256_ORDER || s <= 0n || s >= P256_ORDER) {
+            throw new Error('signature: r/s outside P-256 scalar range');
+        }
+        if (requireLowS && s > P256_HALF_ORDER) {
+            throw new Error('signature: high-S value rejected by PinChat profile');
+        }
+        return { r, s };
+    }
+
+    function normalizeRawLowS(raw) {
+        const { s } = validateRawSignature(raw, false);
+        const out = new Uint8Array(raw);
+        if (s > P256_HALF_ORDER) {
+            out.set(bigIntToFixed(P256_ORDER - s, COORD_LEN), COORD_LEN);
+        }
+        return out;
+    }
+
+    /** Encode valid raw scalars as canonical DER without changing s. */
+    function encodeCanonicalDer(raw) {
+        validateRawSignature(raw, false);
         const r = raw.subarray(0, COORD_LEN);
         const s = raw.subarray(COORD_LEN, RAW_SIG_LEN);
 
@@ -179,16 +184,109 @@
         return out;
     }
 
+    /**
+     * Parse a complete canonical DER ECDSA-Sig-Value. This parser accepts a
+     * mathematically valid high-S scalar so normalizeDerLowS() can translate
+     * external standards vectors, but production derToRaw() rejects it.
+     */
+    function parseCanonicalDer(der) {
+        if (!(der instanceof Uint8Array)) throw new Error('derToRaw: Uint8Array required');
+        // P-256 DER signatures are 8..72 bytes and therefore always use the
+        // one-byte DER length form. Accepting long-form here would itself be
+        // a non-canonical encoding.
+        if (der.length < 8 || der.length > 72 || der[0] !== 0x30) {
+            throw new Error('derToRaw: not a P-256 ECDSA SEQUENCE');
+        }
+        if ((der[1] & 0x80) !== 0 || der[1] !== der.length - 2) {
+            throw new Error('derToRaw: non-canonical or mismatched SEQUENCE length');
+        }
+
+        let p = 2;
+        function readInt(name) {
+            if (p + 2 > der.length || der[p] !== 0x02) {
+                throw new Error(`derToRaw: expected INTEGER ${name}`);
+            }
+            p += 1;
+            const len = der[p]; p += 1;
+            if ((len & 0x80) !== 0 || len === 0 || len > COORD_LEN + 1) {
+                throw new Error(`derToRaw: invalid INTEGER ${name} length`);
+            }
+            const end = p + len;
+            if (end > der.length) throw new Error(`derToRaw: truncated INTEGER ${name}`);
+
+            const first = der[p];
+            if ((first & 0x80) !== 0) {
+                throw new Error(`derToRaw: negative INTEGER ${name}`);
+            }
+            if (len > 1 && first === 0x00 && (der[p + 1] & 0x80) === 0) {
+                throw new Error(`derToRaw: redundant INTEGER ${name} sign octet`);
+            }
+
+            const magnitudeStart = first === 0x00 ? p + 1 : p;
+            const magnitudeLen = end - magnitudeStart;
+            if (magnitudeLen > COORD_LEN) {
+                throw new Error(`derToRaw: INTEGER ${name} too large for P-256`);
+            }
+            const out = new Uint8Array(COORD_LEN);
+            out.set(der.subarray(magnitudeStart, end), COORD_LEN - magnitudeLen);
+            p = end;
+            return out;
+        }
+
+        const r = readInt('r');
+        const s = readInt('s');
+        if (p !== der.length) {
+            throw new Error('derToRaw: unconsumed bytes inside ECDSA SEQUENCE');
+        }
+
+        const raw = new Uint8Array(RAW_SIG_LEN);
+        raw.set(r, 0);
+        raw.set(s, COORD_LEN);
+        validateRawSignature(raw, false);
+
+        // Defense in depth: the strict parser and canonical encoder must
+        // agree byte-for-byte. This catches any overlooked alternate DER form.
+        if (!Codec.bytesEqual(encodeCanonicalDer(raw), der)) {
+            throw new Error('derToRaw: signature is not canonical DER');
+        }
+        return raw;
+    }
+
+    /** Parse canonical DER and enforce PinChat's low-S profile. */
+    function derToRaw(der) {
+        const raw = parseCanonicalDer(der);
+        validateRawSignature(raw, true);
+        return raw;
+    }
+
+    /** Serialize raw r||s as the unique canonical low-S DER form. */
+    function rawToDer(raw) {
+        return encodeCanonicalDer(normalizeRawLowS(raw));
+    }
+
+    /**
+     * Explicit standards-vector/migration helper. Verification code must not
+     * normalize received signatures: production policy is fail-closed.
+     */
+    function normalizeDerLowS(der) {
+        return encodeCanonicalDer(normalizeRawLowS(parseCanonicalDer(der)));
+    }
+
     // --- Raw sign / verify --------------------------------------------------
 
     async function signRaw(privateKey, data) {
         const sig = await getSubtle().sign(
             { name: 'ECDSA', hash: 'SHA-256' }, privateKey, data
         );
-        return new Uint8Array(sig);
+        return normalizeRawLowS(new Uint8Array(sig));
     }
 
     async function verifyRaw(publicKey, data, rawSignature) {
+        try {
+            validateRawSignature(rawSignature, true);
+        } catch (_e) {
+            return false;
+        }
         return getSubtle().verify(
             { name: 'ECDSA', hash: 'SHA-256' }, publicKey, rawSignature, data
         );
@@ -217,6 +315,7 @@
         importPrivateKey,
         derToRaw,
         rawToDer,
+        normalizeDerLowS,
         sign,
         verify,
         signRaw,

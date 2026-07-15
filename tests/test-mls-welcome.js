@@ -143,8 +143,16 @@ async function main() {
     // Verify GroupInfoTBS signature against the vector's signer_pub.
     const signerPub = await Signature.importPublicKey(signerPubBytes);
     const tbs = GroupInfo.groupInfoTbsBytes(gi);
-    const sigOk = await Labeled.verifyWithLabel(signerPub, 'GroupInfoTBS', tbs, gi.signature);
-    assert(sigOk === true, 'SignWithLabel("GroupInfoTBS") verifies with signer_pub');
+    const profileSignature = Signature.normalizeDerLowS(gi.signature);
+    const originalIsLowS = hex(profileSignature) === hex(gi.signature);
+    const originalSigOk = await Labeled.verifyWithLabel(
+        signerPub, 'GroupInfoTBS', tbs, gi.signature);
+    assert(originalSigOk === originalIsLowS,
+        'GroupInfo PinChat profile accepts low-S and rejects high-S IETF form');
+    const sigOk = await Labeled.verifyWithLabel(
+        signerPub, 'GroupInfoTBS', tbs, profileSignature);
+    assert(sigOk === true,
+        'normalized GroupInfo signature verifies with signer_pub');
 
     // Step 9: Welcome byte round-trip with our own serde.
     const welcomeBodyOut = Welcome.welcomeBytes(welcome);
