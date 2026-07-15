@@ -1275,6 +1275,108 @@
     };
 
     /**
+     * Authenticate a standalone member Update proposal before an
+     * orchestrator buffers it for a later Commit. The LeafNode signature
+     * alone is not sufficient here: its TBS binds group_id + leaf_index but
+     * not the epoch, so accepting only that signature would allow a relay to
+     * replay an old, once-valid Update and roll a member back to an obsolete
+     * HPKE leaf key. The surrounding PublicMessage signature and
+     * membership_tag bind the proposal to the current GroupContext/epoch.
+     *
+     * This method is deliberately read-only. It returns the authenticated
+     * proposal and its cryptographic sender leaf for commitUpdate().
+     */
+    Group.prototype.verifyUpdateProposal = async function verifyUpdateProposal(
+        proposalMessageBytes,
+    ) {
+        const frame = MLSMessage.parseMLSMessage(proposalMessageBytes);
+        if (frame.wireFormat !== MLSMessage.WireFormat.MLS_PUBLIC_MESSAGE) {
+            throw new Error(
+                `verifyUpdateProposal: expected mls_public_message, got ${frame.wireFormat}`,
+            );
+        }
+        const pm = PublicMessage.parsePublicMessage(frame.body, (decoder, contentType) => {
+            if (contentType !== Framing.ContentType.PROPOSAL) {
+                throw new Error(
+                    `verifyUpdateProposal: expected proposal, got content_type ${contentType}`,
+                );
+            }
+            return Proposal.readProposal(decoder);
+        });
+        const content = pm.content;
+        if (content.contentType !== Framing.ContentType.PROPOSAL) {
+            throw new Error(
+                `verifyUpdateProposal: expected proposal, got ${content.contentType}`,
+            );
+        }
+        if (!equalBytes(content.groupId, this.groupId)) {
+            throw new Error('verifyUpdateProposal: group_id mismatch');
+        }
+        if (content.epoch !== this.epoch) {
+            throw new Error(
+                `verifyUpdateProposal: wrong epoch (got ${content.epoch}, expected ${this.epoch})`,
+            );
+        }
+        if (!content.sender
+            || content.sender.senderType !== Framing.SenderType.MEMBER) {
+            throw new Error('verifyUpdateProposal: non-member sender not supported');
+        }
+        const senderLeafIndex = content.sender.leafIndex;
+        if (!Number.isInteger(senderLeafIndex) || senderLeafIndex < 0
+            || senderLeafIndex >= this.nLeaves) {
+            throw new Error(
+                `verifyUpdateProposal: sender leaf_index ${senderLeafIndex} out of range`,
+            );
+        }
+        if (senderLeafIndex === this.myLeafIndex) {
+            throw new Error('verifyUpdateProposal: own proposal echo (filter upstream)');
+        }
+        const senderLeaf = RatchetTree.leafFor(this.ratchetTree, senderLeafIndex);
+        if (!senderLeaf) {
+            throw new Error(`verifyUpdateProposal: unknown sender leaf ${senderLeafIndex}`);
+        }
+
+        const wireFormat = MLSMessage.WireFormat.MLS_PUBLIC_MESSAGE;
+        const senderSigPub = await Signature.importPublicKey(senderLeaf.signatureKey);
+        const sigOk = await PublicMessage.verifyFramedContent(
+            senderSigPub, wireFormat, content,
+            this._buildGroupContextStruct(), pm.auth.signature,
+        );
+        if (!sigOk) {
+            throw new Error('verifyUpdateProposal: FramedContent signature invalid');
+        }
+        const membershipOk = await PublicMessage.verifyMembershipTag(
+            this.epochSecrets.membershipKey, wireFormat, content, pm.auth,
+            this._buildGroupContextStruct(), pm.membershipTag,
+        );
+        if (!membershipOk) {
+            throw new Error('verifyUpdateProposal: membership_tag invalid');
+        }
+
+        const proposal = content.parsed;
+        if (!proposal || proposal.proposalType !== Proposal.ProposalType.UPDATE) {
+            throw new Error('verifyUpdateProposal: only Update proposals are supported');
+        }
+        await verifyUpdateLeafBinding(
+            proposal.leafNode, senderLeaf.signatureKey, senderLeaf.encryptionKey,
+            this.groupId, senderLeafIndex,
+        );
+        const candidateTree = this.ratchetTree.slice();
+        const senderNodeIndex = TreeMath.leafToNode(senderLeafIndex);
+        candidateTree[senderNodeIndex] = {
+            nodeType: Nodes.NodeType.LEAF,
+            leaf: proposal.leafNode,
+        };
+        for (const ancestor of TreeMath.directPathWithRoot(
+            senderNodeIndex, this.nLeaves,
+        )) {
+            candidateTree[ancestor] = null;
+        }
+        verifyTreeKeyUniqueness(candidateTree, 'verifyUpdateProposal');
+        return { proposal, senderLeafIndex, epoch: content.epoch };
+    };
+
+    /**
      * Swap in the leaf keypair we generated in proposeUpdate() once the
      * Commit carrying that proposal has been applied. The updated leaf's
      * public key is already in the tree (installed by processCommit);
@@ -1339,7 +1441,11 @@
             const curLeaf = RatchetTree.leafFor(this.ratchetTree, li);
             if (!curLeaf) continue;
             await verifyUpdateLeafBinding(
-                up.proposal.leafNode, curLeaf.signatureKey, this.groupId, li,
+                up.proposal.leafNode,
+                curLeaf.signatureKey,
+                curLeaf.encryptionKey,
+                this.groupId,
+                li,
             );
             newTree[TreeMath.leafToNode(li)] = {
                 nodeType: Nodes.NodeType.LEAF, leaf: up.proposal.leafNode,
@@ -1399,6 +1505,13 @@
             this.groupId,
             this.myLeafIndex,
         );
+
+        // RFC 9420 §7.3: applying authenticated Update proposals must not
+        // create duplicate leaf signature/encryption keys or duplicate HPKE
+        // encryption keys anywhere in the resulting ratchet tree. Check on
+        // the committer side before hashing the tree or deriving epoch state;
+        // receivers enforce the same invariant in processCommit().
+        verifyTreeKeyUniqueness(newTree, 'commitUpdate');
 
         // ---- 4. New tree hash + provisional GroupContext ----
         const newTreeHash = await TreeHash.hashRoot(newTree);
@@ -1671,8 +1784,13 @@
                 if (updLeafIndex === senderLeafIndex) {
                     throw new Error('processCommit: committer must re-key via its own path, not an Update');
                 }
+                const currentUpdateLeaf = RatchetTree.leafFor(newTree, updLeafIndex);
                 await verifyUpdateLeafBinding(
-                    newLeaf, newLeaf.signatureKey, this.groupId, updLeafIndex,
+                    newLeaf,
+                    currentUpdateLeaf.signatureKey,
+                    currentUpdateLeaf.encryptionKey,
+                    this.groupId,
+                    updLeafIndex,
                 );
                 newTree[TreeMath.leafToNode(updLeafIndex)] = {
                     nodeType: Nodes.NodeType.LEAF, leaf: newLeaf,
@@ -2389,7 +2507,13 @@
      * (no identity rotation in this MVP), so the re-key is bound to the
      * same authenticated member.
      */
-    async function verifyUpdateLeafBinding(leaf, expectedSignatureKey, groupId, leafIndex) {
+    async function verifyUpdateLeafBinding(
+        leaf,
+        expectedSignatureKey,
+        previousEncryptionKey,
+        groupId,
+        leafIndex,
+    ) {
         if (leaf.leafNodeSource !== Nodes.LeafNodeSource.UPDATE) {
             throw new Error(
                 `verifyUpdateLeaf: expected source=UPDATE, got ${leaf.leafNodeSource}`,
@@ -2399,6 +2523,17 @@
             throw new Error(
                 'verifyUpdateLeaf: signature_key rotation in update not supported',
             );
+        }
+        if (equalBytes(leaf.encryptionKey, previousEncryptionKey)) {
+            throw new Error(
+                'verifyUpdateLeaf: encryption_key must differ from the current leaf',
+            );
+        }
+        validateLeafCapabilities(leaf, leafIndex);
+        try {
+            await HPKE.deserializePublicKey(leaf.encryptionKey);
+        } catch (err) {
+            throw new Error(`verifyUpdateLeaf: encryption_key invalid: ${err.message}`);
         }
         const sigPub = await Signature.importPublicKey(leaf.signatureKey);
         const encoder = new Codec.Encoder();

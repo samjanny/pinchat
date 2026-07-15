@@ -332,7 +332,7 @@
             // Own echoes are filtered upstream via sender_id.
             if (wireFormat === MLS.MLSMessage.WireFormat.MLS_PUBLIC_MESSAGE
                 && this._state === 'joined') {
-                await this._handlePublicMessage(payload, envelope.sender_id);
+                await this._handlePublicMessage(payload);
                 return;
             }
             if (wireFormat === MLS.MLSMessage.WireFormat.MLS_PUBLIC_MESSAGE
@@ -544,7 +544,7 @@
          * processCommit deliberately re-parses the original bytes while doing
          * its cryptographic validation.
          */
-        async _handlePublicMessage(mlsMessageBytes, senderId) {
+        async _handlePublicMessage(mlsMessageBytes) {
             const wrapped = MLS.MLSMessage.serializeMLSMessage(
                 MLS.MLSMessage.WireFormat.MLS_PUBLIC_MESSAGE, mlsMessageBytes,
             );
@@ -566,7 +566,7 @@
                 return;
             }
             if (pm.content.contentType === MLS.Framing.ContentType.PROPOSAL) {
-                await this._handleIncomingProposal(wrapped, senderId, pm);
+                await this._handleIncomingProposal(wrapped);
                 return;
             }
             if (pm.content.contentType === MLS.Framing.ContentType.COMMIT) {
@@ -580,39 +580,31 @@
         /**
          * Creator-only: buffer a member's Update proposal so the next
          * periodic Commit folds it in. Non-creators ignore proposals
-         * (the creator is the sole committer). The proposal is fully
-         * verified when applied (commitUpdate / processCommit run the
-         * signature checks); here we only parse and stash it, keyed by
-         * the proposer's leaf index so a re-proposal supersedes.
+         * (the creator is the sole committer). Authenticate the complete
+         * PublicMessage before buffering: the outer signature and
+         * membership_tag bind the Update to the current epoch, while the
+         * inner LeafNode signature binds its fresh key to the same member.
+         * The authenticated leaf index keys the buffer so a newer proposal
+         * from that member supersedes an older one.
          */
-        async _handleIncomingProposal(wrappedBytes, senderId, parsedPublicMessage = null) {
+        async _handleIncomingProposal(wrappedBytes) {
             if (this.role !== 'creator') return;
             let proposal;
             let senderLeafIndex;
+            let proposalEpoch;
             try {
-                let pm = parsedPublicMessage;
-                if (!pm) {
-                    const frame = MLS.MLSMessage.parseMLSMessage(wrappedBytes);
-                    pm = MLS.PublicMessage.parsePublicMessage(frame.body, (decoder, ct) => {
-                        if (ct !== MLS.Framing.ContentType.PROPOSAL) {
-                            throw new Error(`expected Proposal, got content_type ${ct}`);
-                        }
-                        return MLS.Proposal.readProposal(decoder);
-                    });
-                }
-                if (pm.content.sender.senderType !== MLS.Framing.SenderType.MEMBER) return;
-                senderLeafIndex = pm.content.sender.leafIndex;
-                proposal = pm.content.parsed;
+                ({ proposal, senderLeafIndex, epoch: proposalEpoch } =
+                    await this.group.verifyUpdateProposal(wrappedBytes));
             } catch (err) {
                 this.onEvent({ kind: 'error',
-                    reason: `malformed Update proposal: ${err.message}` });
+                    reason: `invalid Update proposal: ${err.message}` });
                 return;
             }
-            if (!proposal || proposal.proposalType !== MLS.Proposal.ProposalType.UPDATE) {
-                // We only fold Update proposals; Add/Remove are creator-driven.
-                return;
-            }
-            this._pendingUpdateProposals.set(senderLeafIndex, { proposal, senderLeafIndex });
+            this._pendingUpdateProposals.set(senderLeafIndex, {
+                proposal,
+                senderLeafIndex,
+                epoch: proposalEpoch,
+            });
             this.onEvent({ kind: 'update-proposal-received', senderLeafIndex });
         }
 
@@ -670,10 +662,16 @@
             if (this._state !== 'joined') return;
             if (!this.group || this.group.nLeaves < 2) return;
             // Fold any pending member Update proposals into this Commit,
-            // dropping stale ones (proposer no longer in the tree).
+            // dropping stale ones. Standalone proposals are authenticated
+            // for one specific epoch; an Add/Remove or another local Commit
+            // can advance the creator while a proposal is queued, so never
+            // carry an old-epoch leaf update forward merely because its
+            // inner LeafNode signature is still valid.
             const updateProposals = [];
             for (const [li, entry] of this._pendingUpdateProposals) {
-                if (li < this.group.nLeaves) updateProposals.push(entry);
+                if (entry.epoch === this.group.epoch && li < this.group.nLeaves) {
+                    updateProposals.push(entry);
+                }
             }
             this._pendingUpdateProposals = new Map();
             let commitMessage;

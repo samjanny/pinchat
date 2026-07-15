@@ -66,6 +66,83 @@ function equalBytes(a, b) {
     return Buffer.from(a).equals(Buffer.from(b));
 }
 
+function mutateProposalEnvelope(envelope, mutate) {
+    const pmBytes = global.MLS.Codec.base64UrlToBytes(envelope.payload);
+    const pm = global.MLS.PublicMessage.parsePublicMessage(
+        pmBytes,
+        (decoder, contentType) => {
+            if (contentType !== global.MLS.Framing.ContentType.PROPOSAL) {
+                throw new Error(`expected Proposal, got content_type ${contentType}`);
+            }
+            return global.MLS.Proposal.readProposal(decoder);
+        },
+    );
+    mutate(pm);
+    return {
+        ...envelope,
+        payload: global.MLS.Codec.bytesToBase64Url(
+            global.MLS.PublicMessage.publicMessageBytes(pm),
+        ),
+    };
+}
+
+async function rewriteAndResignUpdateEnvelope(session, envelope, mutateLeaf) {
+    const pmBytes = global.MLS.Codec.base64UrlToBytes(envelope.payload);
+    const pm = global.MLS.PublicMessage.parsePublicMessage(
+        pmBytes,
+        (decoder, contentType) => {
+            if (contentType !== global.MLS.Framing.ContentType.PROPOSAL) {
+                throw new Error(`expected Proposal, got content_type ${contentType}`);
+            }
+            return global.MLS.Proposal.readProposal(decoder);
+        },
+    );
+    const leaf = pm.content.parsed.leafNode;
+    mutateLeaf(leaf);
+    leaf.signature = await global.MLS.Group.signLeafNodeInCommit(
+        session.identity.signaturePrivateKey,
+        leaf,
+        session.group.groupId,
+        session.group.myLeafIndex,
+    );
+    pm.content.payload = global.MLS.Proposal.proposalBytes(pm.content.parsed);
+    const wireFormat = global.MLS.MLSMessage.WireFormat.MLS_PUBLIC_MESSAGE;
+    pm.auth = {
+        signature: await global.MLS.PublicMessage.signFramedContent(
+            session.identity.signaturePrivateKey,
+            wireFormat,
+            pm.content,
+            session.group._buildGroupContextStruct(),
+        ),
+    };
+    pm.membershipTag = await global.MLS.PublicMessage.computeMembershipTag(
+        session.group.epochSecrets.membershipKey,
+        wireFormat,
+        pm.content,
+        pm.auth,
+        session.group._buildGroupContextStruct(),
+    );
+    return {
+        ...envelope,
+        payload: global.MLS.Codec.bytesToBase64Url(
+            global.MLS.PublicMessage.publicMessageBytes(pm),
+        ),
+    };
+}
+
+function parseCommitEnvelope(envelope) {
+    const pmBytes = global.MLS.Codec.base64UrlToBytes(envelope.payload);
+    return global.MLS.PublicMessage.parsePublicMessage(
+        pmBytes,
+        (decoder, contentType) => {
+            if (contentType !== global.MLS.Framing.ContentType.COMMIT) {
+                throw new Error(`expected Commit, got content_type ${contentType}`);
+            }
+            return global.MLS.Commit.readCommit(decoder);
+        },
+    );
+}
+
 async function createExchange() {
     const creatorOut = [];
     const joinerOut = [];
@@ -170,6 +247,110 @@ async function main() {
         .slice(joinerOutBeforeProposal)
         .find((envelope) => envelope.wire_format === WireFormat.MLS_PUBLIC_MESSAGE);
     assert(Boolean(updateProposal), 'joiner emits a standalone Update proposal');
+
+    // A valid inner LeafNode signature is not enough to authenticate a
+    // standalone proposal. Tampering either outer authenticator must reject
+    // the proposal before it reaches the creator's pending-Update buffer.
+    const badSignatureProposal = mutateProposalEnvelope(updateProposal, (pm) => {
+        pm.auth.signature = Uint8Array.from(pm.auth.signature);
+        pm.auth.signature[0] ^= 0x01;
+    });
+    const signatureEventsBefore = exchange.creatorEvents.length;
+    await exchange.creator.onRelayEnvelope({
+        ...badSignatureProposal,
+        sender_id: 'joiner-1',
+    });
+    const signatureError = exchange.creatorEvents
+        .slice(signatureEventsBefore)
+        .find((event) => event.kind === 'error');
+    assert(
+        Boolean(signatureError)
+            && signatureError.reason.includes('FramedContent signature invalid'),
+        'tampered Update FramedContent signature is rejected',
+        signatureError ? signatureError.reason : 'no error event',
+    );
+    assert(exchange.creator._pendingUpdateProposals.size === 0,
+        'signature-invalid Update is never buffered');
+
+    const badMembershipProposal = mutateProposalEnvelope(updateProposal, (pm) => {
+        pm.membershipTag = Uint8Array.from(pm.membershipTag);
+        pm.membershipTag[0] ^= 0x01;
+    });
+    const membershipEventsBefore = exchange.creatorEvents.length;
+    await exchange.creator.onRelayEnvelope({
+        ...badMembershipProposal,
+        sender_id: 'joiner-1',
+    });
+    const membershipError = exchange.creatorEvents
+        .slice(membershipEventsBefore)
+        .find((event) => event.kind === 'error');
+    assert(
+        Boolean(membershipError)
+            && membershipError.reason.includes('membership_tag invalid'),
+        'tampered Update membership_tag is rejected',
+        membershipError ? membershipError.reason : 'no error event',
+    );
+    assert(exchange.creator._pendingUpdateProposals.size === 0,
+        'membership-invalid Update is never buffered');
+
+    // Even a completely re-signed proposal is invalid if it does not rotate
+    // the sender's leaf key or if it collides with another live tree key.
+    const joinerCurrentLeaf = global.MLS.RatchetTree.leafFor(
+        exchange.joiner.group.ratchetTree,
+        exchange.joiner.group.myLeafIndex,
+    );
+    const reusedLeafKeyProposal = await rewriteAndResignUpdateEnvelope(
+        exchange.joiner,
+        updateProposal,
+        (leaf) => {
+            leaf.encryptionKey = Uint8Array.from(joinerCurrentLeaf.encryptionKey);
+        },
+    );
+    const reusedKeyEventsBefore = exchange.creatorEvents.length;
+    await exchange.creator.onRelayEnvelope({
+        ...reusedLeafKeyProposal,
+        sender_id: 'joiner-1',
+    });
+    const reusedKeyError = exchange.creatorEvents
+        .slice(reusedKeyEventsBefore)
+        .find((event) => event.kind === 'error');
+    assert(
+        Boolean(reusedKeyError)
+            && reusedKeyError.reason.includes('must differ from the current leaf'),
+        'authenticated Update that reuses current leaf key is rejected',
+        reusedKeyError ? reusedKeyError.reason : 'no error event',
+    );
+    assert(exchange.creator._pendingUpdateProposals.size === 0,
+        'non-rotating authenticated Update is never buffered');
+
+    const creatorCurrentLeaf = global.MLS.RatchetTree.leafFor(
+        exchange.creator.group.ratchetTree,
+        exchange.creator.group.myLeafIndex,
+    );
+    const collidingLeafKeyProposal = await rewriteAndResignUpdateEnvelope(
+        exchange.joiner,
+        updateProposal,
+        (leaf) => {
+            leaf.encryptionKey = Uint8Array.from(creatorCurrentLeaf.encryptionKey);
+        },
+    );
+    const collisionEventsBefore = exchange.creatorEvents.length;
+    await exchange.creator.onRelayEnvelope({
+        ...collidingLeafKeyProposal,
+        sender_id: 'joiner-1',
+    });
+    const collisionError = exchange.creatorEvents
+        .slice(collisionEventsBefore)
+        .find((event) => event.kind === 'error');
+    assert(
+        Boolean(collisionError)
+            && collisionError.reason.includes('duplicate encryption_key'),
+        'authenticated Update with colliding tree key is rejected',
+        collisionError ? collisionError.reason : 'no error event',
+    );
+    assert(exchange.creator._pendingUpdateProposals.size === 0,
+        'key-colliding authenticated Update is never buffered');
+
     await exchange.creator.onRelayEnvelope({
         ...updateProposal,
         sender_id: 'joiner-1',
@@ -197,6 +378,79 @@ async function main() {
     ), 'folded Update keeps creator and joiner secrets aligned');
     assert(exchange.joiner._pendingSelfUpdate === null,
         'joiner activates and clears pending self-update after Commit');
+
+    // The LeafNode signature does not contain the epoch. Replaying this
+    // once-valid proposal after the Commit would therefore roll the member
+    // back to its previous HPKE key unless the outer PublicMessage epoch and
+    // authenticators are checked before buffering.
+    const replayEventsBefore = exchange.creatorEvents.length;
+    await exchange.creator.onRelayEnvelope({
+        ...updateProposal,
+        sender_id: 'joiner-1',
+    });
+    const replayError = exchange.creatorEvents
+        .slice(replayEventsBefore)
+        .find((event) => event.kind === 'error');
+    assert(Boolean(replayError) && replayError.reason.includes('wrong epoch'),
+        'previous-epoch Update proposal replay is rejected',
+        replayError ? replayError.reason : 'no error event');
+    assert(exchange.creator._pendingUpdateProposals.size === 0,
+        'replayed Update is never buffered');
+
+    const creatorOutBeforeReplayGuard = exchange.creatorOut.length;
+    await exchange.creator.commitUpdate();
+    const replayGuardCommit = exchange.creatorOut
+        .slice(creatorOutBeforeReplayGuard)
+        .find((envelope) => envelope.wire_format === WireFormat.MLS_PUBLIC_MESSAGE);
+    const replayGuardPm = parseCommitEnvelope(replayGuardCommit);
+    assert(replayGuardPm.content.parsed.proposals.length === 0,
+        'next Commit does not include the rejected replay');
+    await exchange.joiner.onRelayEnvelope({
+        ...replayGuardCommit,
+        sender_id: 'creator-1',
+    });
+    assert(exchange.joiner.group.epoch === exchange.creator.group.epoch,
+        'replay-guard path-only Commit keeps members aligned');
+
+    // Also cover a proposal that was valid when received but sat in the
+    // queue while some other local Commit advanced the creator. Its outer
+    // authentication already succeeded, so the queue must retain and check
+    // that authenticated epoch at fold time rather than trusting the still-
+    // valid inner LeafNode signature.
+    const queuedExchange = await createExchange();
+    await queuedExchange.joiner.onRelayEnvelope({
+        ...queuedExchange.commit,
+        sender_id: 'creator-queued',
+    });
+    await queuedExchange.joiner.onRelayEnvelope({
+        ...queuedExchange.welcome,
+        sender_id: 'creator-queued',
+    });
+    const queuedJoinerOutBefore = queuedExchange.joinerOut.length;
+    await queuedExchange.joiner.proposeUpdate();
+    const queuedProposal = queuedExchange.joinerOut
+        .slice(queuedJoinerOutBefore)
+        .find((envelope) => envelope.wire_format === WireFormat.MLS_PUBLIC_MESSAGE);
+    await queuedExchange.creator.onRelayEnvelope({
+        ...queuedProposal,
+        sender_id: 'joiner-1',
+    });
+    assert(queuedExchange.creator._pendingUpdateProposals.size === 1,
+        'current-epoch Update is buffered before an intervening Commit');
+    const queuedEpoch = queuedExchange.creator.group.epoch;
+    await queuedExchange.creator.group.commitUpdate();
+    assert(queuedExchange.creator.group.epoch === queuedEpoch + 1n,
+        'intervening local Commit advances beyond buffered proposal epoch');
+    const queuedCreatorOutBefore = queuedExchange.creatorOut.length;
+    await queuedExchange.creator.commitUpdate();
+    const staleQueueGuardCommit = queuedExchange.creatorOut
+        .slice(queuedCreatorOutBefore)
+        .find((envelope) => envelope.wire_format === WireFormat.MLS_PUBLIC_MESSAGE);
+    const staleQueueGuardPm = parseCommitEnvelope(staleQueueGuardCommit);
+    assert(staleQueueGuardPm.content.parsed.proposals.length === 0,
+        'previously validated but now stale Update is not folded');
+    assert(queuedExchange.creator._pendingUpdateProposals.size === 0,
+        'stale authenticated Update is removed from the queue');
 
     const noCommitExchange = await createExchange();
     let noCommitError = '';
