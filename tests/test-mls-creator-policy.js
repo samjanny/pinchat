@@ -107,6 +107,39 @@ function equalBytes(a, b) {
 async function main() {
     console.log('# MLS creator-only Commit policy');
 
+    // The join path must enforce the same creator-only rule as
+    // processCommit.  Make leaf 1 produce an internally consistent Add +
+    // Welcome and pass the matching Commit sender explicitly; the legacy
+    // signer/committer binding therefore succeeds, so rejection exercises
+    // only the creator-at-leaf-0 policy.
+    {
+        const welcomeCreator = await Group.Group.create({
+            identity: await freshIdentity(),
+        });
+        const nonCreatorGroup = await addAndJoin(
+            welcomeCreator, await buildKeyPackage(),
+        );
+        const target = await buildKeyPackage();
+        const unauthorizedWelcome = await nonCreatorGroup.commitAddMember({
+            keyPackageBytes: target.keyPackageBytes,
+        });
+        await expectReject(
+            Group.Group.joinFromWelcomeWithTree({
+                welcomeMessage: unauthorizedWelcome.welcomeMessage,
+                keyPackageBytes: target.keyPackageBytes,
+                initPrivateKey: target.initKp.privateKey,
+                identity: target.identity,
+                leafEncKeyPair: target.leafEncKp,
+                ratchetTreeBytes: Nodes.ratchetTreeBytes(
+                    nonCreatorGroup.ratchetTree,
+                ),
+                expectedSignerLeafIndex: 1,
+            }),
+            'only creator leaf 0 may sign GroupInfo',
+            'Welcome signed by authenticated non-creator leaf is rejected',
+        );
+    }
+
     const alice = await Group.Group.create({ identity: await freshIdentity() });
     const bobGroup = await addAndJoin(alice, await buildKeyPackage());
     const carolGroup = await addAndJoin(

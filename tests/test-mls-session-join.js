@@ -213,6 +213,68 @@ async function main() {
     assert(noCommitExchange.joiner.state === 'awaiting-welcome',
         'failed Welcome does not advance joiner state');
 
+    // Creator-centric policy must also hold before Group.join is entered.
+    // First establish a real leaf-1 member, then let that member construct an
+    // otherwise valid Add + Welcome for a fresh session.  The buffered Commit
+    // is authentic and GroupInfo.signer matches it, but neither is leaf 0.
+    const unauthorizedExchange = await createExchange();
+    await unauthorizedExchange.joiner.onRelayEnvelope({
+        ...unauthorizedExchange.commit,
+        sender_id: 'creator-3',
+    });
+    await unauthorizedExchange.joiner.onRelayEnvelope({
+        ...unauthorizedExchange.welcome,
+        sender_id: 'creator-3',
+    });
+    const targetOut = [];
+    const targetEvents = [];
+    const target = new MLSSession({
+        role: 'joiner',
+        send: (envelope) => targetOut.push(envelope),
+        onEvent: (event) => targetEvents.push(event),
+    });
+    await target.start();
+    const unauthorized = await unauthorizedExchange.joiner.group.commitAddMember({
+        keyPackageBytes: target.keyPackageBundle.keyPackageBytes,
+    });
+    const unauthorizedCommitBody = global.MLS.MLSMessage.parseMLSMessage(
+        unauthorized.commitMessage,
+    ).body;
+    const unauthorizedWelcomeBody = global.MLS.MLSMessage.parseMLSMessage(
+        unauthorized.welcomeMessage,
+    ).body;
+    await target.onRelayEnvelope({
+        type: 'mls',
+        payload: global.MLS.Codec.bytesToBase64Url(unauthorizedCommitBody),
+        wire_format: WireFormat.MLS_PUBLIC_MESSAGE,
+        sender_id: 'non-creator-1',
+    });
+    let nonCreatorError = '';
+    try {
+        await target.onRelayEnvelope({
+            type: 'mls',
+            payload: global.MLS.Codec.bytesToBase64Url(unauthorizedWelcomeBody),
+            wire_format: WireFormat.MLS_WELCOME,
+            ratchet_tree: global.MLS.Codec.bytesToBase64Url(
+                global.MLS.Nodes.ratchetTreeBytes(
+                    unauthorizedExchange.joiner.group.ratchetTree,
+                ),
+            ),
+            sender_id: 'non-creator-1',
+        });
+    } catch (err) {
+        nonCreatorError = err.message;
+    }
+    assert(
+        nonCreatorError.includes('only creator leaf 0 may commit a Welcome epoch'),
+        'MLSSession rejects Welcome paired with non-creator Commit',
+        nonCreatorError,
+    );
+    assert(target.state === 'awaiting-welcome' && target.group === null,
+        'non-creator Welcome leaves target unjoined');
+    assert(target._pendingCommitBytes === null,
+        'rejected non-creator Welcome clears buffered Commit');
+
     console.log('');
     console.log(`mls-session-join: ${passed} passed, ${failed} failed`);
     process.exit(failed === 0 ? 0 : 1);

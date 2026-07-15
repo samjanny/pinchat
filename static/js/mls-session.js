@@ -53,6 +53,7 @@
     // ciphertext-protected payload.
     const PAYLOAD_TEXT = 0x01;
     const PAYLOAD_IMAGE = 0x02;
+    const CREATOR_LEAF_INDEX = 0;
 
     function encodeTextPayload(text) {
         const utf8 = new TextEncoder().encode(String(text));
@@ -392,6 +393,12 @@
                     || pm.content.sender.senderType !== MLS.Framing.SenderType.MEMBER
                     || !Number.isInteger(pm.content.sender.leafIndex)) {
                     throw new Error('buffered Commit has no member sender_leaf_index');
+                }
+                if (pm.content.sender.leafIndex !== CREATOR_LEAF_INDEX) {
+                    throw new Error(
+                        'only creator leaf 0 may commit a Welcome epoch '
+                        + `(got leaf ${pm.content.sender.leafIndex})`,
+                    );
                 }
                 expectedSignerLeafIndex = pm.content.sender.leafIndex;
             } catch (err) {

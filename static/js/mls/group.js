@@ -2056,6 +2056,17 @@
                 `group.join: signer leaf_index ${signerLeafIndex} out of range [0,${nLeaves})`,
             );
         }
+        // PinChat's single-admin architecture authenticates the permanent
+        // creator as leaf 0. Apply the same policy while importing a Welcome
+        // as processCommit applies to steady-state epochs; otherwise a member
+        // could create a valid side-group that only the new joiner accepts.
+        // Multiple or transferable admins would require an authenticated
+        // admin key set bound into GroupContext instead of this fixed index.
+        if (signerLeafIndex !== CREATOR_LEAF_INDEX) {
+            throw new Error(
+                `group.join: only creator leaf 0 may sign GroupInfo (got leaf ${signerLeafIndex})`,
+            );
+        }
         // M-1 (RFC §12.4.3.1): GroupInfo MUST be signed by the
         // member that committed the epoch this Welcome introduces.
         // The orchestrator extracts the Commit's FramedContent
@@ -2070,6 +2081,11 @@
         if (expectedSignerLeafIndex !== signerLeafIndex) {
             throw new Error(
                 `group.join: GroupInfo.signer ${signerLeafIndex} != Commit sender ${expectedSignerLeafIndex}`,
+            );
+        }
+        if (expectedSignerLeafIndex !== CREATOR_LEAF_INDEX) {
+            throw new Error(
+                `group.join: only creator leaf 0 may commit a Welcome epoch (got leaf ${expectedSignerLeafIndex})`,
             );
         }
         const signerLeaf = RatchetTree.leafFor(tree, signerLeafIndex);
