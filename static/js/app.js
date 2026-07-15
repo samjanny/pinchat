@@ -291,13 +291,21 @@ document.addEventListener('alpine:init', () => {
                     break;
 
                 case 'mls':
-                    // Group-room MLS envelope. Ignore our own echoes.
-                    if (message.sender_id !== this.userId && this.mlsSession) {
+                    // Group-room MLS envelope. Ignore our own echoes except
+                    // the exact locally-pending Commit: that echo is the
+                    // relay ACK which atomically installs the candidate MLS
+                    // epoch and (for Add) releases its Welcome.
+                    if (this.mlsSession) {
+                        const isOwnEnvelope = message.sender_id === this.userId;
+                        const isPendingCommitAck = isOwnEnvelope
+                            && this.mlsSession.shouldHandleOwnEnvelope(message);
+                        if (isOwnEnvelope && !isPendingCommitAck) break;
                         // Discover peers we never got a userjoined for —
                         // a member who joins late never sees join events
                         // for the existing participants, so we backfill
                         // the sidebar from the envelope's sender_id.
-                        if (this.roomType === 'group' && message.sender_id
+                        if (!isOwnEnvelope
+                            && this.roomType === 'group' && message.sender_id
                             && !this.groupPeers.find((p) => p.userId === message.sender_id)) {
                             this.groupPeers.push({
                                 userId: message.sender_id,

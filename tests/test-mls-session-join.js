@@ -66,6 +66,51 @@ function equalBytes(a, b) {
     return Buffer.from(a).equals(Buffer.from(b));
 }
 
+function bytesTag(bytes) {
+    return Buffer.from(bytes || []).toString('base64url');
+}
+
+function captureLiveGroup(session) {
+    const group = session.group;
+    return {
+        reference: group,
+        epoch: group.epoch,
+        nLeaves: group.nLeaves,
+        tree: bytesTag(global.MLS.Nodes.ratchetTreeBytes(group.ratchetTree)),
+        treeHash: bytesTag(group.treeHash),
+        confirmedTranscriptHash: bytesTag(group.confirmedTranscriptHash),
+        interimTranscriptHash: bytesTag(group.interimTranscriptHash),
+        senderRatchetGeneration: group.senderRatchetGeneration,
+        epochSecrets: Object.fromEntries(Object.entries(group.epochSecrets)
+            .map(([name, value]) => [name, bytesTag(value)])),
+        leafPrivateKey: group.leafKeyPair.privateKey,
+        leafPublicKey: group.leafKeyPair.publicKey,
+        leafPublicKeyBytes: bytesTag(group.leafKeyPair.publicKeyBytes),
+        chainStateCount: group._chainStates.size,
+        consumedCount: group.consumedByLeaf.size,
+        previousEpoch: group._prevEpoch,
+    };
+}
+
+function liveGroupMatches(session, before) {
+    const after = captureLiveGroup(session);
+    return after.reference === before.reference
+        && after.epoch === before.epoch
+        && after.nLeaves === before.nLeaves
+        && after.tree === before.tree
+        && after.treeHash === before.treeHash
+        && after.confirmedTranscriptHash === before.confirmedTranscriptHash
+        && after.interimTranscriptHash === before.interimTranscriptHash
+        && after.senderRatchetGeneration === before.senderRatchetGeneration
+        && JSON.stringify(after.epochSecrets) === JSON.stringify(before.epochSecrets)
+        && after.leafPrivateKey === before.leafPrivateKey
+        && after.leafPublicKey === before.leafPublicKey
+        && after.leafPublicKeyBytes === before.leafPublicKeyBytes
+        && after.chainStateCount === before.chainStateCount
+        && after.consumedCount === before.consumedCount
+        && after.previousEpoch === before.previousEpoch;
+}
+
 function mutateProposalEnvelope(envelope, mutate) {
     const pmBytes = global.MLS.Codec.base64UrlToBytes(envelope.payload);
     const pm = global.MLS.PublicMessage.parsePublicMessage(
@@ -143,17 +188,25 @@ function parseCommitEnvelope(envelope) {
     );
 }
 
-async function createExchange() {
+async function echoPendingCommit(session, envelope, senderId = 'creator-self') {
+    await session.onRelayEnvelope({ ...envelope, sender_id: senderId });
+}
+
+async function createExchange({ acceptCommit = true, creatorSend = null } = {}) {
     const creatorOut = [];
     const joinerOut = [];
     const creatorEvents = [];
     const joinerEvents = [];
     const creator = new MLSSession({
         role: 'creator',
-        send: (envelope) => creatorOut.push(envelope),
+        send: (envelope) => {
+            creatorOut.push(envelope);
+            return creatorSend ? creatorSend(envelope) : true;
+        },
         onEvent: (event) => creatorEvents.push(event),
     });
     await creator.start();
+    const beforeAdd = captureLiveGroup(creator);
     const pins = creator.bootstrapPins;
     const joiner = new MLSSession({
         role: 'joiner',
@@ -169,6 +222,13 @@ async function createExchange() {
     );
     await creator.onRelayEnvelope({ ...keyPackage, sender_id: 'joiner-1' });
 
+    const commit = creatorOut.find(
+        (envelope) => envelope.wire_format === WireFormat.MLS_PUBLIC_MESSAGE,
+    );
+    if (acceptCommit && commit) {
+        await echoPendingCommit(creator, commit);
+    }
+
     return {
         creator,
         joiner,
@@ -176,9 +236,8 @@ async function createExchange() {
         joinerOut,
         creatorEvents,
         joinerEvents,
-        commit: creatorOut.find(
-            (envelope) => envelope.wire_format === WireFormat.MLS_PUBLIC_MESSAGE,
-        ),
+        beforeAdd,
+        commit,
         welcome: creatorOut.find(
             (envelope) => envelope.wire_format === WireFormat.MLS_WELCOME,
         ),
@@ -188,9 +247,86 @@ async function createExchange() {
 async function main() {
     console.log('# MLS session — Welcome join orchestration');
 
-    const exchange = await createExchange();
+    // A locally-authored Add is only a candidate until the relay echoes the
+    // exact Commit. Before that ACK, neither the live epoch nor membership
+    // maps may change and the Welcome must not be released.
+    const exchange = await createExchange({ acceptCommit: false });
     assert(Boolean(exchange.commit), 'creator emitted an Add Commit');
+    assert(!exchange.welcome, 'creator withholds Welcome before Commit echo');
+    assert(liveGroupMatches(exchange.creator, exchange.beforeAdd),
+        'unacknowledged Add leaves live MLS state byte-for-byte unchanged');
+    assert(exchange.creator.state === 'awaiting-keypackage'
+        && exchange.creator._leafBySenderId.size === 0,
+    'unacknowledged Add leaves session membership state unchanged');
+    assert(Boolean(exchange.creator._pendingCommit),
+        'unacknowledged Add is retained as PendingCommit');
+    assert(exchange.creator.shouldHandleOwnEnvelope({
+        ...exchange.commit, sender_id: 'creator-self',
+    }), 'only the exact pending Commit is recognized as an own-echo ACK');
+    const mismatchedPayload = exchange.commit.payload.slice(0, -1)
+        + (exchange.commit.payload.endsWith('A') ? 'B' : 'A');
+    assert(!exchange.creator.shouldHandleOwnEnvelope({
+        ...exchange.commit, payload: mismatchedPayload, sender_id: 'creator-self',
+    }), 'non-matching own PublicMessage is not accepted as Commit ACK');
+
+    await echoPendingCommit(exchange.creator, exchange.commit);
+    exchange.welcome = exchange.creatorOut.find(
+        (envelope) => envelope.wire_format === WireFormat.MLS_WELCOME,
+    );
     assert(Boolean(exchange.welcome), 'creator emitted a Welcome');
+    assert(exchange.creator._pendingCommit === null,
+        'Commit echo atomically clears PendingCommit');
+    assert(exchange.creator.group.epoch === exchange.beforeAdd.epoch + 1n,
+        'Commit echo atomically installs candidate epoch');
+
+    // WebSocketManager reports a synchronous send rejection with `false`.
+    // The candidate must be discarded without changing the live Group or
+    // consuming the sender-to-leaf binding.
+    const sendFailure = await createExchange({
+        acceptCommit: false,
+        creatorSend: (envelope) => (
+            envelope.wire_format === WireFormat.MLS_PUBLIC_MESSAGE ? false : true
+        ),
+    });
+    assert(Boolean(sendFailure.commit) && !sendFailure.welcome,
+        'transport-rejected Add emits neither an accepted Commit nor Welcome');
+    assert(liveGroupMatches(sendFailure.creator, sendFailure.beforeAdd),
+        'transport-rejected Add leaves live MLS state byte-for-byte unchanged');
+    assert(sendFailure.creator._pendingCommit === null
+        && sendFailure.creator._leafBySenderId.size === 0,
+    'transport-rejected Add clears candidate and preserves membership maps');
+    const sendFailureError = sendFailure.creatorEvents.find(
+        (event) => event.kind === 'error'
+            && event.reason.includes('transport rejected envelope'),
+    );
+    assert(Boolean(sendFailureError),
+        'transport-rejected Commit surfaces a fail-closed error');
+
+    // app.js reports userleft without awaiting the Remove promise. If that
+    // races an already-pending local Commit, retain the revocation request
+    // and stage it immediately after the first Commit is accepted.
+    const removalRace = await createExchange();
+    const removalRaceOutBefore = removalRace.creatorOut.length;
+    await removalRace.creator.commitUpdate();
+    const racingUpdate = removalRace.creatorOut
+        .slice(removalRaceOutBefore)
+        .find((envelope) => envelope.wire_format === WireFormat.MLS_PUBLIC_MESSAGE);
+    await removalRace.creator.removeMemberBySenderId('joiner-1');
+    assert(removalRace.creator._deferredRemovals.has('joiner-1'),
+        'Remove racing a PendingCommit is retained rather than dropped');
+    await echoPendingCommit(removalRace.creator, racingUpdate, 'creator-race-self');
+    const racingPublicMessages = removalRace.creatorOut
+        .slice(removalRaceOutBefore)
+        .filter((envelope) => envelope.wire_format === WireFormat.MLS_PUBLIC_MESSAGE);
+    const deferredRemoveCommit = racingPublicMessages[1];
+    assert(Boolean(deferredRemoveCommit)
+        && removalRace.creator._pendingCommit?.kind === 'remove',
+    'deferred Remove is staged after preceding Commit acceptance');
+    await echoPendingCommit(
+        removalRace.creator, deferredRemoveCommit, 'creator-race-self',
+    );
+    assert(!removalRace.creator._leafBySenderId.has('joiner-1'),
+        'deferred Remove applies after its own relay echo');
 
     await exchange.joiner.onRelayEnvelope({
         ...exchange.commit,
@@ -215,6 +351,7 @@ async function main() {
     // intentionally routed through MLSSession.onRelayEnvelope: Group-level
     // tests do not cover the PublicMessage body parser used for dispatch.
     const epochBeforeCreatorUpdate = exchange.creator.group.epoch;
+    const stateBeforeCreatorUpdate = captureLiveGroup(exchange.creator);
     const creatorOutBeforeUpdate = exchange.creatorOut.length;
     await exchange.creator.commitUpdate();
     const creatorUpdateCommit = exchange.creatorOut
@@ -222,6 +359,32 @@ async function main() {
         .find((envelope) => envelope.wire_format === WireFormat.MLS_PUBLIC_MESSAGE);
     assert(Boolean(creatorUpdateCommit),
         'creator emits a steady-state Update Commit after join');
+    assert(exchange.creator.group.epoch === epochBeforeCreatorUpdate,
+        'steady-state Update remains pending before its relay echo');
+    assert(liveGroupMatches(exchange.creator, stateBeforeCreatorUpdate),
+        'pending steady-state Update leaves live tree and secrets unchanged');
+
+    // A peer may send under the old epoch while our Commit is in flight.
+    // Queue it without touching the live receive ratchet; once the Commit is
+    // accepted, the candidate's previous-epoch grace context decrypts it.
+    const joinerOutBeforeInFlight = exchange.joinerOut.length;
+    const creatorEventsBeforeInFlight = exchange.creatorEvents.length;
+    await exchange.joiner.sendMessage('old-epoch in flight');
+    const inFlightApplication = exchange.joinerOut
+        .slice(joinerOutBeforeInFlight)
+        .find((envelope) => envelope.wire_format === WireFormat.MLS_PRIVATE_MESSAGE);
+    await exchange.creator.onRelayEnvelope({
+        ...inFlightApplication,
+        sender_id: 'joiner-1',
+    });
+    assert(exchange.creator._deferredEnvelopes.length === 1
+        && !exchange.creatorEvents.slice(creatorEventsBeforeInFlight)
+            .some((event) => event.kind === 'message'),
+    'peer traffic is deferred without ratchet mutation while Commit is pending');
+    await echoPendingCommit(exchange.creator, creatorUpdateCommit);
+    assert(exchange.creatorEvents.slice(creatorEventsBeforeInFlight).some(
+        (event) => event.kind === 'message' && event.text === 'old-epoch in flight',
+    ), 'deferred old-epoch traffic decrypts after atomic Commit acceptance');
     await exchange.joiner.onRelayEnvelope({
         ...creatorUpdateCommit,
         sender_id: 'creator-1',
@@ -366,6 +529,9 @@ async function main() {
         .slice(creatorOutBeforeFold)
         .find((envelope) => envelope.wire_format === WireFormat.MLS_PUBLIC_MESSAGE);
     assert(Boolean(foldedUpdateCommit), 'creator emits Commit containing member Update');
+    assert(exchange.creator._pendingUpdateProposals.size === 1,
+        'folded Update stays queued until Commit acceptance');
+    await echoPendingCommit(exchange.creator, foldedUpdateCommit);
     await exchange.joiner.onRelayEnvelope({
         ...foldedUpdateCommit,
         sender_id: 'creator-1',
@@ -405,12 +571,31 @@ async function main() {
     const replayGuardPm = parseCommitEnvelope(replayGuardCommit);
     assert(replayGuardPm.content.parsed.proposals.length === 0,
         'next Commit does not include the rejected replay');
+    await echoPendingCommit(exchange.creator, replayGuardCommit);
     await exchange.joiner.onRelayEnvelope({
         ...replayGuardCommit,
         sender_id: 'creator-1',
     });
     assert(exchange.joiner.group.epoch === exchange.creator.group.epoch,
         'replay-guard path-only Commit keeps members aligned');
+
+    // Remove follows the same PendingCommit path: keep both the MLS state
+    // and sender/leaf routing intact until the exact relay echo arrives.
+    const stateBeforeRemove = captureLiveGroup(exchange.creator);
+    const creatorOutBeforeRemove = exchange.creatorOut.length;
+    await exchange.creator.removeMemberBySenderId('joiner-1');
+    const removeCommit = exchange.creatorOut
+        .slice(creatorOutBeforeRemove)
+        .find((envelope) => envelope.wire_format === WireFormat.MLS_PUBLIC_MESSAGE);
+    assert(Boolean(removeCommit), 'creator emits a Remove Commit candidate');
+    assert(liveGroupMatches(exchange.creator, stateBeforeRemove)
+        && exchange.creator._leafBySenderId.get('joiner-1') === 1,
+    'unacknowledged Remove preserves MLS state and member routing');
+    await echoPendingCommit(exchange.creator, removeCommit);
+    assert(exchange.creator.group.epoch === stateBeforeRemove.epoch + 1n
+        && !exchange.creator._leafBySenderId.has('joiner-1')
+        && !exchange.creator._senderIdByLeaf.has(1),
+    'Remove applies atomically and clears routing only after Commit echo');
 
     // Also cover a proposal that was valid when received but sat in the
     // queue while some other local Commit advanced the creator. Its outer
@@ -449,6 +634,10 @@ async function main() {
     const staleQueueGuardPm = parseCommitEnvelope(staleQueueGuardCommit);
     assert(staleQueueGuardPm.content.parsed.proposals.length === 0,
         'previously validated but now stale Update is not folded');
+    assert(queuedExchange.creator._pendingUpdateProposals.size === 1,
+        'stale queued Update remains until replacement Commit is accepted');
+    await echoPendingCommit(queuedExchange.creator, staleQueueGuardCommit,
+        'creator-queued-self');
     assert(queuedExchange.creator._pendingUpdateProposals.size === 0,
         'stale authenticated Update is removed from the queue');
 
@@ -587,6 +776,9 @@ async function main() {
     });
     const alternateCommit = attackerOut.find(
         (envelope) => envelope.wire_format === WireFormat.MLS_PUBLIC_MESSAGE,
+    );
+    await echoPendingCommit(
+        alternateCreator, alternateCommit, 'alternate-creator-self',
     );
     const alternateWelcome = attackerOut.find(
         (envelope) => envelope.wire_format === WireFormat.MLS_WELCOME,

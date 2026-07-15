@@ -21,7 +21,8 @@
  *
  * Transport contract
  * ------------------
- * The `send(envelope)` callback must broadcast to the room relay; the
+ * The `send(envelope)` callback must broadcast to the room relay and may
+ * return `false` to report a synchronous transport rejection; the
  * envelope is `{ type: 'mls', payload, wire_format, ratchet_tree? }`
  * (same shape the Rust server's Message::Mls expects). `onEvent` fires
  * with `{ kind, ... }` for UI updates. `kind` values:
@@ -226,6 +227,19 @@
             // processCommit reports selfUpdated (or a later proposal
             // supersedes it).
             this._pendingSelfUpdate = null;
+            // Locally-authored Commits are built against an isolated Group
+            // candidate and remain pending until the relay sends back the
+            // exact PublicMessage payload. The live Group MUST NOT advance
+            // merely because WebSocket.send accepted bytes locally.
+            this._pendingCommit = null;
+            this._localCommitBusy = false;
+            // While a local Commit is being built or awaiting its relay
+            // echo, defer peer envelopes. This prevents application-ratchet
+            // or proposal state from changing underneath the candidate and
+            // being rolled back when the candidate is installed.
+            this._deferredEnvelopes = [];
+            this._deferredRemovals = new Set();
+            this._drainingDeferredEnvelopes = false;
         }
 
         /**
@@ -276,12 +290,174 @@
             };
         }
 
+        async _sendEnvelopeOrThrow(envelope, description) {
+            let result;
+            try {
+                result = await this.send(envelope);
+            } catch (err) {
+                throw new Error(`${description}: ${err.message}`);
+            }
+            if (result === false) {
+                throw new Error(`${description}: transport rejected envelope`);
+            }
+        }
+
         /**
-         * Dispatch an incoming `mls` envelope from the relay. Envelopes
-         * from our own sender_id should be filtered upstream — this
-         * method assumes every envelope is from a peer.
+         * The application normally filters relay echoes carrying our own
+         * sender_id. The sole exception is the exact Commit currently in
+         * PendingCommit: its echo is the relay-acceptance signal that makes
+         * the staged epoch eligible for atomic installation.
+         */
+        shouldHandleOwnEnvelope(envelope) {
+            const pending = this._pendingCommit;
+            return Boolean(
+                pending
+                && envelope
+                && envelope.type === 'mls'
+                && envelope.wire_format
+                    === MLS.MLSMessage.WireFormat.MLS_PUBLIC_MESSAGE
+                && envelope.payload === pending.commitEnvelope.payload,
+            );
+        }
+
+        async _stagePendingCommit({ candidateGroup, commitMessage, kind, ...metadata }) {
+            if (this._pendingCommit) {
+                throw new Error('mls-session: another Commit is already awaiting relay acceptance');
+            }
+            const commitEnvelope = {
+                type: 'mls',
+                payload: base64UrlEncode(stripMlsWrapper(commitMessage)),
+                wire_format: MLS.MLSMessage.WireFormat.MLS_PUBLIC_MESSAGE,
+            };
+            const pending = { candidateGroup, commitEnvelope, kind, ...metadata };
+            // Install the pending marker BEFORE calling the transport so a
+            // synchronous/in-memory relay cannot race its echo ahead of us.
+            this._pendingCommit = pending;
+            try {
+                await this._sendEnvelopeOrThrow(
+                    commitEnvelope, 'Commit broadcast failed before acceptance',
+                );
+            } catch (err) {
+                if (this._pendingCommit === pending) this._pendingCommit = null;
+                this.onEvent({ kind: 'error', reason: err.message });
+                return false;
+            }
+            return true;
+        }
+
+        async _acceptPendingCommit() {
+            const pending = this._pendingCommit;
+            if (!pending) return false;
+
+            // Clear first so a duplicate echo cannot install or announce the
+            // candidate twice. Everything below is local bookkeeping or a
+            // post-acceptance Welcome; the MLS state swap itself is atomic.
+            this._pendingCommit = null;
+            this.group = pending.candidateGroup;
+
+            if (pending.kind === 'add') {
+                this._leafBySenderId.set(pending.senderId, pending.addedLeafIndex);
+                this._senderIdByLeaf.set(pending.addedLeafIndex, pending.senderId);
+                this._state = 'joined';
+                try {
+                    // A Welcome describes the now-accepted epoch and must
+                    // never precede acceptance of the Commit that created it.
+                    await this._sendEnvelopeOrThrow(
+                        pending.welcomeEnvelope,
+                        'Welcome broadcast failed after Commit acceptance',
+                    );
+                    this.onEvent({ kind: 'welcome-sent' });
+                } catch (err) {
+                    // The Commit was already accepted, so rolling back here
+                    // would fork existing members. Keep the accepted epoch and
+                    // report that the intended joiner needs a fresh retry.
+                    this.onEvent({ kind: 'error', reason: err.message });
+                }
+            } else if (pending.kind === 'update') {
+                // Remove only queue entries that were present when this
+                // candidate was built. A newer proposal arriving meanwhile
+                // must survive for the next epoch.
+                for (const [leafIndex, entry] of pending.queuedProposalEntries) {
+                    if (this._pendingUpdateProposals.get(leafIndex) === entry) {
+                        this._pendingUpdateProposals.delete(leafIndex);
+                    }
+                }
+                this.onEvent({
+                    kind: 'update-committed',
+                    epoch: this.group.epoch.toString(),
+                    foldedUpdates: pending.foldedUpdates,
+                });
+            } else if (pending.kind === 'remove') {
+                if (this._leafBySenderId.get(pending.senderId)
+                    === pending.removedLeafIndex) {
+                    this._leafBySenderId.delete(pending.senderId);
+                }
+                if (this._senderIdByLeaf.get(pending.removedLeafIndex)
+                    === pending.senderId) {
+                    this._senderIdByLeaf.delete(pending.removedLeafIndex);
+                }
+                this.onEvent({
+                    kind: 'remove-committed',
+                    removedLeafIndex: pending.removedLeafIndex,
+                });
+            } else {
+                throw new Error(`mls-session: unknown pending Commit kind "${pending.kind}"`);
+            }
+
+            await this._drainDeferredEnvelopes();
+            return true;
+        }
+
+        async _drainDeferredEnvelopes() {
+            if (this._drainingDeferredEnvelopes
+                || this._localCommitBusy
+                || this._pendingCommit) return;
+            this._drainingDeferredEnvelopes = true;
+            try {
+                while (!this._localCommitBusy
+                    && !this._pendingCommit) {
+                    if (this._deferredEnvelopes.length > 0) {
+                        const envelope = this._deferredEnvelopes.shift();
+                        await this.onRelayEnvelope(envelope);
+                        continue;
+                    }
+                    // userleft handling is deliberately fire-and-forget in
+                    // app.js, so a Remove request can race an in-flight local
+                    // Commit without passing through onRelayEnvelope. Retain
+                    // it here instead of silently losing the membership
+                    // revocation.
+                    const nextRemoval = this._deferredRemovals.values().next();
+                    if (nextRemoval.done) break;
+                    this._deferredRemovals.delete(nextRemoval.value);
+                    await this.removeMemberBySenderId(nextRemoval.value);
+                }
+            } finally {
+                this._drainingDeferredEnvelopes = false;
+            }
+        }
+
+        /**
+         * Dispatch an incoming `mls` envelope from the relay. Own echoes
+         * are filtered upstream except for shouldHandleOwnEnvelope().
          */
         async onRelayEnvelope(envelope) {
+            if (this.shouldHandleOwnEnvelope(envelope)) {
+                await this._acceptPendingCommit();
+                return;
+            }
+            if (this._localCommitBusy || this._pendingCommit) {
+                // Room membership is capped well below this. The bound keeps
+                // a withheld ACK from turning this into an unbounded queue.
+                if (this._deferredEnvelopes.length >= 64) {
+                    this.onEvent({
+                        kind: 'error',
+                        reason: 'MLS envelope queue full while Commit awaits acceptance',
+                    });
+                    return;
+                }
+                this._deferredEnvelopes.push({ ...envelope });
+                return;
+            }
             const payload = base64UrlDecode(envelope.payload);
             const wireFormat = envelope.wire_format;
 
@@ -356,41 +532,44 @@
             // rides as a separate envelope field, so the bytes are NOT wrapped
             // in MLSMessage framing. Pass them straight to commitAddMember
             // which calls KeyPackage.parseKeyPackage internally.
-            let commitMessage, welcomeMessage, addedLeafIndex;
+            if (this._localCommitBusy || this._pendingCommit) {
+                throw new Error('mls-session: cannot build Add while another Commit is pending');
+            }
+            this._localCommitBusy = true;
+            let staged = false;
             try {
-                ({ commitMessage, welcomeMessage } = await this.group.commitAddMember({
+                const candidateGroup = this.group.forkForPendingCommit();
+                const { commitMessage, welcomeMessage } =
+                    await candidateGroup.commitAddMember({
                     keyPackageBytes: kpBytes,
-                }));
+                    });
                 // commitAddMember always inserts at `nLeaves` (pre-bump).
-                // After the call, this.group.nLeaves has been bumped, so
-                // the new leaf occupies index nLeaves - 1.
-                addedLeafIndex = this.group.nLeaves - 1;
+                // Only the candidate has advanced at this point.
+                const addedLeafIndex = candidateGroup.nLeaves - 1;
+                const ratchetTreeBytes = MLS.Nodes.ratchetTreeBytes(
+                    candidateGroup.ratchetTree,
+                );
+                const welcomeEnvelope = {
+                    type: 'mls',
+                    payload: base64UrlEncode(stripMlsWrapper(welcomeMessage)),
+                    wire_format: MLS.MLSMessage.WireFormat.MLS_WELCOME,
+                    ratchet_tree: base64UrlEncode(ratchetTreeBytes),
+                };
+                staged = await this._stagePendingCommit({
+                    candidateGroup,
+                    commitMessage,
+                    kind: 'add',
+                    senderId,
+                    addedLeafIndex,
+                    welcomeEnvelope,
+                });
             } catch (err) {
                 console.error('[MLS] commitAddMember failed:', err);
                 this.onEvent({ kind: 'error', reason: `commitAddMember failed: ${err.message}` });
-                return;
+            } finally {
+                this._localCommitBusy = false;
             }
-            if (senderId !== undefined) {
-                this._leafBySenderId.set(senderId, addedLeafIndex);
-                this._senderIdByLeaf.set(addedLeafIndex, senderId);
-            }
-            const ratchetTreeBytes = MLS.Nodes.ratchetTreeBytes(this.group.ratchetTree);
-
-            // Broadcast commit + welcome. We ship the ratchet_tree as a
-            // side-channel on the welcome envelope only.
-            this.send({
-                type: 'mls',
-                payload: base64UrlEncode(stripMlsWrapper(commitMessage)),
-                wire_format: MLS.MLSMessage.WireFormat.MLS_PUBLIC_MESSAGE,
-            });
-            this.send({
-                type: 'mls',
-                payload: base64UrlEncode(stripMlsWrapper(welcomeMessage)),
-                wire_format: MLS.MLSMessage.WireFormat.MLS_WELCOME,
-                ratchet_tree: base64UrlEncode(ratchetTreeBytes),
-            });
-            this._state = 'joined';
-            this.onEvent({ kind: 'welcome-sent' });
+            if (!staged) await this._drainDeferredEnvelopes();
         }
 
         async _handleWelcome(mlsMessageBytes, ratchetTreeBytes) {
@@ -661,6 +840,7 @@
             if (this.role !== 'creator') return;
             if (this._state !== 'joined') return;
             if (!this.group || this.group.nLeaves < 2) return;
+            if (this._localCommitBusy || this._pendingCommit) return;
             // Fold any pending member Update proposals into this Commit,
             // dropping stale ones. Standalone proposals are authenticated
             // for one specific epoch; an Add/Remove or another local Commit
@@ -668,31 +848,34 @@
             // carry an old-epoch leaf update forward merely because its
             // inner LeafNode signature is still valid.
             const updateProposals = [];
-            for (const [li, entry] of this._pendingUpdateProposals) {
+            const queuedProposalEntries = [...this._pendingUpdateProposals.entries()];
+            for (const [li, entry] of queuedProposalEntries) {
                 if (entry.epoch === this.group.epoch && li < this.group.nLeaves) {
                     updateProposals.push(entry);
                 }
             }
-            this._pendingUpdateProposals = new Map();
-            let commitMessage;
+            this._localCommitBusy = true;
+            let staged = false;
             try {
-                ({ commitMessage } = await this.group.commitUpdate({ updateProposals }));
+                const candidateGroup = this.group.forkForPendingCommit();
+                const { commitMessage } = await candidateGroup.commitUpdate({
+                    updateProposals,
+                });
+                staged = await this._stagePendingCommit({
+                    candidateGroup,
+                    commitMessage,
+                    kind: 'update',
+                    queuedProposalEntries,
+                    foldedUpdates: updateProposals.length,
+                });
             } catch (err) {
                 console.error('[MLS] commitUpdate failed:', err);
                 this.onEvent({ kind: 'error',
                     reason: `commitUpdate failed: ${err.message}` });
-                return;
+            } finally {
+                this._localCommitBusy = false;
             }
-            this.send({
-                type: 'mls',
-                payload: base64UrlEncode(stripMlsWrapper(commitMessage)),
-                wire_format: MLS.MLSMessage.WireFormat.MLS_PUBLIC_MESSAGE,
-            });
-            this.onEvent({
-                kind: 'update-committed',
-                epoch: this.group.epoch.toString(),
-                foldedUpdates: updateProposals.length,
-            });
+            if (!staged) await this._drainDeferredEnvelopes();
         }
 
         /**
@@ -738,32 +921,43 @@
             if (this.role !== 'creator') return;
             if (this._state !== 'joined') return;
             if (!this._leafBySenderId.has(senderId)) return;
+            if (this._localCommitBusy || this._pendingCommit) {
+                this._deferredRemovals.add(senderId);
+                return;
+            }
             const leafIndex = this._leafBySenderId.get(senderId);
-            this._leafBySenderId.delete(senderId);
-            this._senderIdByLeaf.delete(leafIndex);
-
-            let commitMessage;
+            this._localCommitBusy = true;
+            let staged = false;
             try {
-                ({ commitMessage } = await this.group.commitRemoveMember({
+                const candidateGroup = this.group.forkForPendingCommit();
+                const { commitMessage } = await candidateGroup.commitRemoveMember({
                     removedLeafIndex: leafIndex,
-                }));
+                });
+                staged = await this._stagePendingCommit({
+                    candidateGroup,
+                    commitMessage,
+                    kind: 'remove',
+                    senderId,
+                    removedLeafIndex: leafIndex,
+                });
             } catch (err) {
                 console.error('[MLS] commitRemoveMember failed:', err);
                 this.onEvent({ kind: 'error',
                     reason: `commitRemoveMember failed: ${err.message}` });
-                return;
+            } finally {
+                this._localCommitBusy = false;
             }
-            this.send({
-                type: 'mls',
-                payload: base64UrlEncode(stripMlsWrapper(commitMessage)),
-                wire_format: MLS.MLSMessage.WireFormat.MLS_PUBLIC_MESSAGE,
-            });
-            this.onEvent({ kind: 'remove-committed', removedLeafIndex: leafIndex });
+            if (!staged) await this._drainDeferredEnvelopes();
         }
 
         async _sendApplicationPayload(payloadBytes) {
             if (this._state !== 'joined') {
                 throw new Error(`mls-session: cannot send in state "${this._state}"`);
+            }
+            if (this._localCommitBusy || this._pendingCommit) {
+                throw new Error(
+                    'mls-session: cannot send while a Commit awaits relay acceptance',
+                );
             }
             const wrapped = await this.group.encryptApplicationMessage(payloadBytes);
             const body = stripMlsWrapper(wrapped);

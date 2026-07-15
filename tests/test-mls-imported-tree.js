@@ -16,6 +16,10 @@ const Nodes = require(path.join(__dirname, '..', 'static', 'js', 'mls', 'nodes.j
 const KeyPackage = require(path.join(__dirname, '..', 'static', 'js', 'mls', 'key-package.js'));
 const Labeled = require(path.join(__dirname, '..', 'static', 'js', 'mls', 'labeled.js'));
 const Proposal = require(path.join(__dirname, '..', 'static', 'js', 'mls', 'proposal.js'));
+const Commit = require(path.join(__dirname, '..', 'static', 'js', 'mls', 'commit.js'));
+const Framing = require(path.join(__dirname, '..', 'static', 'js', 'mls', 'framing.js'));
+const MLSMessage = require(path.join(__dirname, '..', 'static', 'js', 'mls', 'mls-message.js'));
+const PublicMessage = require(path.join(__dirname, '..', 'static', 'js', 'mls', 'public-message.js'));
 
 let passed = 0;
 let failed = 0;
@@ -27,6 +31,52 @@ function assert(cond, name, detail) {
         console.log(`  FAIL ${name}${detail ? `  — ${detail}` : ''}`);
         failed += 1;
     }
+}
+
+function bytesTag(bytes) {
+    return Buffer.from(bytes || []).toString('base64url');
+}
+
+function captureGroupState(group) {
+    return {
+        reference: group,
+        epoch: group.epoch,
+        nLeaves: group.nLeaves,
+        tree: bytesTag(Nodes.ratchetTreeBytes(group.ratchetTree)),
+        treeHash: bytesTag(group.treeHash),
+        confirmedTranscriptHash: bytesTag(group.confirmedTranscriptHash),
+        interimTranscriptHash: bytesTag(group.interimTranscriptHash),
+        senderRatchetGeneration: group.senderRatchetGeneration,
+        epochSecrets: Object.fromEntries(Object.entries(group.epochSecrets)
+            .map(([name, value]) => [name, bytesTag(value)])),
+        leafPrivateKey: group.leafKeyPair.privateKey,
+        leafPublicKey: group.leafKeyPair.publicKey,
+        leafPublicKeyBytes: bytesTag(group.leafKeyPair.publicKeyBytes),
+        parentKeyPairs: group.parentKeyPairs,
+        chainStates: group._chainStates,
+        consumedByLeaf: group.consumedByLeaf,
+        previousEpoch: group._prevEpoch,
+    };
+}
+
+function groupStateMatches(group, before) {
+    const after = captureGroupState(group);
+    return after.reference === before.reference
+        && after.epoch === before.epoch
+        && after.nLeaves === before.nLeaves
+        && after.tree === before.tree
+        && after.treeHash === before.treeHash
+        && after.confirmedTranscriptHash === before.confirmedTranscriptHash
+        && after.interimTranscriptHash === before.interimTranscriptHash
+        && after.senderRatchetGeneration === before.senderRatchetGeneration
+        && JSON.stringify(after.epochSecrets) === JSON.stringify(before.epochSecrets)
+        && after.leafPrivateKey === before.leafPrivateKey
+        && after.leafPublicKey === before.leafPublicKey
+        && after.leafPublicKeyBytes === before.leafPublicKeyBytes
+        && after.parentKeyPairs === before.parentKeyPairs
+        && after.chainStates === before.chainStates
+        && after.consumedByLeaf === before.consumedByLeaf
+        && after.previousEpoch === before.previousEpoch;
 }
 
 async function expectReject(promise, expectedText, name) {
@@ -103,6 +153,89 @@ async function replaceKeyPackageLeafEncryptionKey(bundle, encryptionKey) {
         KeyPackage.keyPackageTbsBytes(bundle.keyPackage),
     );
     bundle.keyPackageBytes = KeyPackage.keyPackageBytes(bundle.keyPackage);
+}
+
+async function replaceKeyPackageLeafSignatureIdentity(bundle, identity) {
+    bundle.leaf.signatureKey = Uint8Array.from(identity.signaturePublicKeyBytes);
+    bundle.leaf.credential = {
+        ...bundle.leaf.credential,
+        identity: Uint8Array.from(identity.signaturePublicKeyBytes),
+    };
+    bundle.leaf.signature = await Group.signLeafNodeForKeyPackage(
+        identity.signaturePrivateKey, bundle.leaf,
+    );
+    bundle.keyPackage.signature = await Labeled.signWithLabel(
+        identity.signaturePrivateKey,
+        'KeyPackageTBS',
+        KeyPackage.keyPackageTbsBytes(bundle.keyPackage),
+    );
+    bundle.keyPackageBytes = KeyPackage.keyPackageBytes(bundle.keyPackage);
+}
+
+async function maliciousCommitAddWithoutFinalTreeGate(group, keyPackageBytes) {
+    group._verifyFinalTreeKeyUniqueness = () => {};
+    try {
+        return await group.commitAddMember({ keyPackageBytes });
+    } finally {
+        delete group._verifyFinalTreeKeyUniqueness;
+    }
+}
+
+function inlineProposal(proposal) {
+    return {
+        type: Proposal.ProposalOrRefType.PROPOSAL,
+        proposal,
+    };
+}
+
+/**
+ * Replace only a Commit's proposal vector, then authenticate the altered
+ * FramedContent with the real creator key and the recipient's current
+ * membership key. The original path/confirmation tag intentionally remain
+ * untouched: proposal-list validation must reject before either is used.
+ */
+async function rewriteCommitProposalList(
+    commitMessage,
+    proposalOrRefs,
+    signerIdentity,
+    recipientGroup,
+) {
+    const frame = MLSMessage.parseMLSMessage(commitMessage);
+    const pm = PublicMessage.parsePublicMessage(frame.body, (decoder, contentType) => {
+        if (contentType === Framing.ContentType.COMMIT) return Commit.readCommit(decoder);
+        throw new Error(`test: expected Commit, got content_type ${contentType}`);
+    });
+    const rewrittenCommit = {
+        ...pm.content.parsed,
+        proposals: proposalOrRefs,
+    };
+    const content = {
+        ...pm.content,
+        payload: Commit.commitBytes(rewrittenCommit),
+        parsed: rewrittenCommit,
+    };
+    const wireFormat = MLSMessage.WireFormat.MLS_PUBLIC_MESSAGE;
+    const groupContext = recipientGroup._buildGroupContextStruct();
+    const auth = {
+        ...pm.auth,
+        signature: await PublicMessage.signFramedContent(
+            signerIdentity.signaturePrivateKey,
+            wireFormat,
+            content,
+            groupContext,
+        ),
+    };
+    const membershipTag = await PublicMessage.computeMembershipTag(
+        recipientGroup.epochSecrets.membershipKey,
+        wireFormat,
+        content,
+        auth,
+        groupContext,
+    );
+    return MLSMessage.serializeMLSMessage(
+        wireFormat,
+        PublicMessage.publicMessageBytes({ content, auth, membershipTag }),
+    );
 }
 
 async function joinFrom(
@@ -222,7 +355,9 @@ async function main() {
         bobLeaf.signature[0] ^= 0x01;
 
         const carol = await buildKeyPackage();
-        const result = await alice.commitAddMember({ keyPackageBytes: carol.keyPackageBytes });
+        const result = await alice.commitAddMember({
+            keyPackageBytes: carol.keyPackageBytes,
+        });
         await expectReject(
             joinFrom(alice, result, carol),
             'leaf 1 LeafNode signature invalid',
@@ -249,7 +384,9 @@ async function main() {
         );
 
         const carol = await buildKeyPackage();
-        const result = await alice.commitAddMember({ keyPackageBytes: carol.keyPackageBytes });
+        const result = await maliciousCommitAddWithoutFinalTreeGate(
+            alice, carol.keyPackageBytes,
+        );
         await expectReject(
             joinFrom(alice, result, carol),
             'duplicate signature_key',
@@ -272,7 +409,9 @@ async function main() {
             bob.identity.signaturePrivateKey, bobLeaf,
         );
 
-        const result = await alice.commitAddMember({ keyPackageBytes: carol.keyPackageBytes });
+        const result = await maliciousCommitAddWithoutFinalTreeGate(
+            alice, carol.keyPackageBytes,
+        );
         await expectReject(
             joinFrom(alice, result, carol),
             'duplicate encryption_key',
@@ -333,16 +472,39 @@ async function main() {
             'normal non-colliding Add succeeds in processCommit');
 
         // Build an independently signed KeyPackage whose leaf HPKE key is a
-        // byte-for-byte copy of Bob's existing leaf key. The committer can
-        // construct and authenticate this Commit, but existing members must
-        // reject it before advancing their epoch.
+        // byte-for-byte copy of Bob's existing leaf key. An honest committer
+        // must now reject it before hashing a candidate tree or mutating any
+        // live epoch state.
         const dave = await buildKeyPackage();
         await replaceKeyPackageLeafEncryptionKey(
             dave, bob.leaf.encryptionKey,
         );
-        const collidingAdd = await alice.commitAddMember({
-            keyPackageBytes: dave.keyPackageBytes,
-        });
+        const aliceBeforeCollision = captureGroupState(alice);
+        await expectReject(
+            alice.commitAddMember({ keyPackageBytes: dave.keyPackageBytes }),
+            'duplicate encryption_key',
+            'creator rejects Add with duplicate leaf encryption_key',
+        );
+        assert(groupStateMatches(alice, aliceBeforeCollision),
+            'rejected colliding Add leaves creator state byte-for-byte unchanged');
+
+        const erin = await buildKeyPackage();
+        await replaceKeyPackageLeafSignatureIdentity(erin, alice.identity);
+        const aliceBeforeSignatureCollision = captureGroupState(alice);
+        await expectReject(
+            alice.commitAddMember({ keyPackageBytes: erin.keyPackageBytes }),
+            'duplicate signature_key',
+            'creator rejects Add with duplicate leaf signature_key',
+        );
+        assert(groupStateMatches(alice, aliceBeforeSignatureCollision),
+            'signature-colliding Add also leaves creator state unchanged');
+
+        // A group member is adversarial and can run a modified client which
+        // removes its own guard. Model that explicitly so processCommit's
+        // independent receiver-side gate remains covered as well.
+        const collidingAdd = await maliciousCommitAddWithoutFinalTreeGate(
+            alice, dave.keyPackageBytes,
+        );
         const bobEpochBefore = bobGroup.epoch;
         await expectReject(
             bobGroup.processCommit(collidingAdd.commitMessage),
@@ -351,6 +513,117 @@ async function main() {
         );
         assert(bobGroup.epoch === bobEpochBefore,
             'rejected colliding Add does not advance recipient epoch');
+    }
+
+    // ---- Commit proposal-list validation and phased application ---------
+    {
+        const alice = await Group.Group.create({ identity: await freshIdentity() });
+        const bob = await buildKeyPackage();
+        const { joined: bobGroup } = await addAndJoin(alice, bob);
+        const { pendingLeafNode } = await bobGroup.proposeUpdate();
+        const updateProposal = {
+            proposalType: Proposal.ProposalType.UPDATE,
+            leafNode: pendingLeafNode,
+        };
+        const updateEntry = { proposal: updateProposal, senderLeafIndex: 1 };
+
+        const aliceBeforeDuplicate = captureGroupState(alice);
+        await expectReject(
+            alice.commitUpdate({ updateProposals: [updateEntry, updateEntry] }),
+            'multiple Update and/or Remove proposals target leaf 1',
+            'creator rejects duplicate Update proposals for one leaf',
+        );
+        assert(groupStateMatches(alice, aliceBeforeDuplicate),
+            'duplicate Update rejection leaves creator state unchanged');
+
+        // A valid Commit supplies an authenticated outer frame and path. We
+        // then let a malicious creator replace its proposal vector and
+        // re-authenticate the frame, so these are processCommit rejections,
+        // not parser-only tests.
+        const validUpdate = await alice.commitUpdate({
+            updateProposals: [updateEntry],
+        });
+        const duplicateUpdateCommit = await rewriteCommitProposalList(
+            validUpdate.commitMessage,
+            [inlineProposal(updateProposal), inlineProposal(updateProposal)],
+            alice.identity,
+            bobGroup,
+        );
+        const bobBeforeDuplicate = captureGroupState(bobGroup);
+        await expectReject(
+            bobGroup.processCommit(duplicateUpdateCommit),
+            'multiple Update and/or Remove proposals target leaf 1',
+            'processCommit rejects authenticated duplicate Update proposals',
+        );
+        assert(groupStateMatches(bobGroup, bobBeforeDuplicate),
+            'duplicate Update rejection leaves recipient state unchanged');
+
+        const removeBob = {
+            proposalType: Proposal.ProposalType.REMOVE,
+            removed: 1,
+        };
+        const updateAndRemoveCommit = await rewriteCommitProposalList(
+            validUpdate.commitMessage,
+            [inlineProposal(updateProposal), inlineProposal(removeBob)],
+            alice.identity,
+            bobGroup,
+        );
+        const bobBeforeConflict = captureGroupState(bobGroup);
+        await expectReject(
+            bobGroup.processCommit(updateAndRemoveCommit),
+            'multiple Update and/or Remove proposals target leaf 1',
+            'processCommit rejects Update+Remove conflict on one leaf',
+        );
+        assert(groupStateMatches(bobGroup, bobBeforeConflict),
+            'Update+Remove rejection leaves recipient state unchanged');
+
+        // The RFC constrains application phases, not the vector's wire order.
+        // An Add before an Update on the wire is accepted by the validator,
+        // while the returned plan places the Update phase first.
+        const carol = await buildKeyPackage();
+        const interleavedPlan = bobGroup._validateCommitProposalList([
+            inlineProposal({
+                proposalType: Proposal.ProposalType.ADD,
+                keyPackage: carol.keyPackage,
+            }),
+            inlineProposal(updateProposal),
+        ], 0, 'testProposalOrder');
+        assert(interleavedPlan.updates.length === 1
+            && interleavedPlan.updates[0].wireIndex === 1
+            && interleavedPlan.adds.length === 1
+            && interleavedPlan.adds[0].wireIndex === 0,
+            'wire-interleaved proposals produce Update-before-Add application phases');
+    }
+
+    // Duplicate Removes are also rejected globally before candidate state or
+    // path processing, including when the authenticated Commit targets some
+    // other member than the recipient.
+    {
+        const alice = await Group.Group.create({ identity: await freshIdentity() });
+        const bob = await buildKeyPackage();
+        const { joined: bobGroup } = await addAndJoin(alice, bob);
+        const carol = await buildKeyPackage();
+        await addAndJoin(alice, carol, [bobGroup]);
+
+        const validRemove = await alice.commitRemoveMember({ removedLeafIndex: 2 });
+        const removeCarol = {
+            proposalType: Proposal.ProposalType.REMOVE,
+            removed: 2,
+        };
+        const duplicateRemoveCommit = await rewriteCommitProposalList(
+            validRemove.commitMessage,
+            [inlineProposal(removeCarol), inlineProposal(removeCarol)],
+            alice.identity,
+            bobGroup,
+        );
+        const bobBeforeRemove = captureGroupState(bobGroup);
+        await expectReject(
+            bobGroup.processCommit(duplicateRemoveCommit),
+            'multiple Update and/or Remove proposals target leaf 2',
+            'processCommit rejects authenticated duplicate Remove proposals',
+        );
+        assert(groupStateMatches(bobGroup, bobBeforeRemove),
+            'duplicate Remove rejection leaves recipient state unchanged');
     }
 
     // ---- G-1(b): every parent, including off-signer-path, is valid ------

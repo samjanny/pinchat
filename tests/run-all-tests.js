@@ -99,6 +99,11 @@ const TEST_SUITES = {
         file: 'test-mls-parent-hash.js',
         description: 'Parent-hash chain round-trip + subtree-splice rejection (RFC 9420 §7.9)'
     },
+    'mls-update-path-validation': {
+        name: 'MLS UpdatePath ciphertext layout',
+        file: 'test-mls-update-path-validation.js',
+        description: 'Whole-path copath-resolution cardinality validation (RFC 9420 §7.6)'
+    },
     'mls-imported-tree': {
         name: 'MLS imported Welcome tree validation',
         file: 'test-mls-imported-tree.js',

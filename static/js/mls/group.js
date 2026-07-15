@@ -122,6 +122,55 @@
         return diff === 0;
     }
 
+    /**
+     * Clone mutable MLS state while deliberately retaining WebCrypto key
+     * handles. CryptoKey objects are immutable; byte arrays, tree nodes,
+     * maps, sets, and their plain-object containers are not and must never
+     * be shared between a live Group and a speculative PendingCommit.
+     */
+    function cloneMutableState(value, seen = new Map()) {
+        if (value === null || value === undefined || typeof value !== 'object') {
+            return value;
+        }
+        if (value instanceof Uint8Array) return Uint8Array.from(value);
+        if (value instanceof ArrayBuffer) return value.slice(0);
+        if (ArrayBuffer.isView(value)) {
+            return new value.constructor(value);
+        }
+        if (seen.has(value)) return seen.get(value);
+        if (Array.isArray(value)) {
+            const copy = [];
+            seen.set(value, copy);
+            for (const item of value) copy.push(cloneMutableState(item, seen));
+            return copy;
+        }
+        if (value instanceof Map) {
+            const copy = new Map();
+            seen.set(value, copy);
+            for (const [key, item] of value) {
+                copy.set(cloneMutableState(key, seen), cloneMutableState(item, seen));
+            }
+            return copy;
+        }
+        if (value instanceof Set) {
+            const copy = new Set();
+            seen.set(value, copy);
+            for (const item of value) copy.add(cloneMutableState(item, seen));
+            return copy;
+        }
+        // CryptoKey and other host objects have a non-plain prototype and
+        // are immutable handles for our purposes. Sharing them cannot let a
+        // candidate transition mutate the live epoch.
+        const prototype = Object.getPrototypeOf(value);
+        if (prototype !== Object.prototype && prototype !== null) return value;
+        const copy = {};
+        seen.set(value, copy);
+        for (const [key, item] of Object.entries(value)) {
+            copy[key] = cloneMutableState(item, seen);
+        }
+        return copy;
+    }
+
     // Out-of-order tolerance bounds for the stateful secret-tree chains.
     // A forward jump larger than MAX_GENERATION_SKIP is rejected (DoS
     // bound on chain derivations); at most MAX_SKIPPED_PER_CHAIN cached
@@ -426,6 +475,31 @@
             return GroupContext.groupContextBytes(this._buildGroupContextStruct());
         }
 
+        /**
+         * Produce an isolated candidate for one locally-authored Commit.
+         * The existing commitAddMember / commitUpdate / commitRemoveMember
+         * implementations may mutate this candidate normally, while the
+         * live Group remains on the accepted epoch until the relay echoes
+         * the exact Commit. The previous-previous epoch is intentionally
+         * omitted: every successful transition drops it before snapshotting
+         * the current epoch, so copying it would only retain obsolete key
+         * material for longer.
+         */
+        forkForPendingCommit() {
+            const state = {};
+            for (const [key, value] of Object.entries(this)) {
+                if (key === 'consumedByLeaf'
+                    || key === '_chainStates'
+                    || key === '_prevEpoch') continue;
+                state[key] = cloneMutableState(value);
+            }
+            const candidate = new Group(state);
+            candidate.consumedByLeaf = cloneMutableState(this.consumedByLeaf);
+            candidate._chainStates = cloneMutableState(this._chainStates);
+            candidate._prevEpoch = null;
+            return candidate;
+        }
+
         async _deriveEpoch({ initSecretPrev, commitSecret, pskSecret }) {
             const groupContextBytes = this._groupContextBytes();
             const out = await KeySchedule.deriveEpoch({
@@ -694,6 +768,36 @@
     // imported tree before accepting epoch secrets.
     // ------------------------------------------------------------------
 
+    /**
+     * Single final-tree gate for every Commit transition. Keeping this as a
+     * Group method gives the malicious-committer tests an explicit seam to
+     * model a modified client which bypasses its own checks; honest receivers
+     * still run their independent copy from processCommit().
+     */
+    Group.prototype._verifyFinalTreeKeyUniqueness =
+        function _verifyFinalTreeKeyUniqueness(tree, operation) {
+            verifyTreeKeyUniqueness(tree, operation);
+        };
+
+    /**
+     * Validate the complete proposal list against the pre-Commit tree and
+     * return the RFC 9420 §12.3 application phases.  The proposal vector's
+     * wire order remains untouched (it is signed and transcript-bound); only
+     * application is phased as Update -> Remove -> Add.  Keeping this as a
+     * Group method also gives honest committers and independent receivers the
+     * same fail-closed gate.
+     */
+    Group.prototype._validateCommitProposalList =
+        function _validateCommitProposalList(proposalOrRefs, committerLeafIndex, operation) {
+            return validateCommitProposalList(
+                proposalOrRefs,
+                this.ratchetTree,
+                this.nLeaves,
+                committerLeafIndex,
+                operation,
+            );
+        };
+
     Group.prototype.commitAddMember = async function commitAddMember({ keyPackageBytes }) {
         const kp = KeyPackage.parseKeyPackage(keyPackageBytes);
         if (kp.cipherSuite !== CIPHERSUITE) {
@@ -767,6 +871,12 @@
             this.groupId,
             this.myLeafIndex,
         );
+
+        // Reject a malicious KeyPackage which reuses any live signature or
+        // HPKE key, and also guard against collisions involving the freshly
+        // generated committer path. This runs before tree_hash, transcripts,
+        // epoch-secret derivation, Welcome construction, or local mutation.
+        this._verifyFinalTreeKeyUniqueness(newTree, 'commitAddMember');
 
         // ---- 5. Compute new tree hash + provisional GroupContext ----
         const newTreeHash = await TreeHash.hashRoot(newTree);
@@ -1064,6 +1174,11 @@
             this.groupId,
             this.myLeafIndex,
         );
+
+        // Remove cannot introduce an attacker-chosen leaf, but its fresh
+        // committer leaf and path still form a new final tree and therefore
+        // pass through the same invariant gate as every other Commit.
+        this._verifyFinalTreeKeyUniqueness(newTree, 'commitRemoveMember');
 
         // ---- 5. New tree hash + provisional GroupContext ----
         const newTreeHash = await TreeHash.hashRoot(newTree);
@@ -1423,23 +1538,40 @@
      * Returns { commitMessage }.
      */
     Group.prototype.commitUpdate = async function commitUpdate({ updateProposals = [] } = {}) {
+        if (!Array.isArray(updateProposals)) {
+            throw new Error('commitUpdate: updateProposals must be an array');
+        }
         const newNLeaves = this.nLeaves;
         const newWidth = TreeMath.nodeWidth(newNLeaves);
         const newTree = Nodes.padRatchetTree(this.ratchetTree.slice(), newWidth);
 
+        const proposalOrRefs = updateProposals.map((up) => ({
+            type: Proposal.ProposalOrRefType.PROPOSAL,
+            proposal: up && up.proposal,
+        }));
+        const proposalPlan = this._validateCommitProposalList(
+            proposalOrRefs, this.myLeafIndex, 'commitUpdate',
+        );
+        if (proposalPlan.updates.length !== proposalOrRefs.length) {
+            throw new Error('commitUpdate: only Update proposals may be folded');
+        }
+
         // ---- 0. Apply Update proposals: install each proposer's fresh
         // leaf and blank its direct path (RFC §12.4.2). Verify each
         // proposal's LeafNode signature against the CURRENT leaf's
-        // signature key (no identity rotation in this MVP). Skip a
-        // proposal for a leaf we're not tracking or whose signer changed.
-        const proposalOrRefs = [];
-        for (const up of updateProposals) {
+        // signature key (no identity rotation in this MVP). The authenticated
+        // sender metadata retained by MLSSession must agree with the target
+        // resolved from the proposal's signature_key.
+        for (let i = 0; i < updateProposals.length; i += 1) {
+            const up = updateProposals[i];
             const li = up.senderLeafIndex;
-            if (li === this.myLeafIndex) {
-                throw new Error('commitUpdate: committer must use its own path re-key, not an Update proposal');
+            const resolvedLeafIndex = proposalPlan.updates[i].targetLeafIndex;
+            if (li !== resolvedLeafIndex) {
+                throw new Error(
+                    `commitUpdate: authenticated proposal sender ${li} does not match Update target ${resolvedLeafIndex}`,
+                );
             }
             const curLeaf = RatchetTree.leafFor(this.ratchetTree, li);
-            if (!curLeaf) continue;
             await verifyUpdateLeafBinding(
                 up.proposal.leafNode,
                 curLeaf.signatureKey,
@@ -1453,10 +1585,6 @@
             for (const ancestor of TreeMath.directPathWithRoot(TreeMath.leafToNode(li), newNLeaves)) {
                 newTree[ancestor] = null;
             }
-            proposalOrRefs.push({
-                type: Proposal.ProposalOrRefType.PROPOSAL,
-                proposal: up.proposal,
-            });
         }
 
         // ---- 1. Fresh leaf_secret + path-secret chain for committer ----
@@ -1511,7 +1639,7 @@
         // encryption keys anywhere in the resulting ratchet tree. Check on
         // the committer side before hashing the tree or deriving epoch state;
         // receivers enforce the same invariant in processCommit().
-        verifyTreeKeyUniqueness(newTree, 'commitUpdate');
+        this._verifyFinalTreeKeyUniqueness(newTree, 'commitUpdate');
 
         // ---- 4. New tree hash + provisional GroupContext ----
         const newTreeHash = await TreeHash.hashRoot(newTree);
@@ -1650,15 +1778,14 @@
      * Process a Commit broadcast by another member. Inputs:
      *   commitMessageBytes : MLSMessage(mls_public_message) bytes
      *
-     * Verifies the FramedContent signature + membership_tag, applies
-     * inline Add/Remove proposals, walks the UpdatePath to recover our
+     * Verifies the FramedContent signature + membership_tag, validates and
+     * applies inline Update/Remove/Add proposals, walks the UpdatePath to recover our
      * share of the new path_secret chain, and advances the local epoch
      * state.
      *
      * Scope:
-     *   - Inline proposals only (Add, Remove). Proposal-by-reference is
-     *     not implemented.
-     *   - Update proposals are not yet handled.
+     *   - Inline Add/Update/Remove proposals only. Proposal-by-reference is
+     *     not implemented yet.
      */
     Group.prototype.processCommit = async function processCommit(commitMessageBytes, opts = {}) {
         // pendingSelfUpdate: the { publicKeyBytes, privateKey, ... } keypair
@@ -1730,107 +1857,80 @@
         }
 
         const commit = content.parsed;
+        const proposalPlan = this._validateCommitProposalList(
+            commit.proposals, senderLeafIndex, 'processCommit',
+        );
 
-        // ---- Apply Add / Remove proposals ----
-        // Adds insert at the next free leaf and grow the tree; Removes
-        // blank the target leaf AND every parent on its direct path so
-        // the removed member can no longer derive any subsequent epoch
-        // secret. nLeaves stays unchanged on Remove (we don't prune).
+        // ---- Apply proposals in RFC 9420 §12.3 phases ----
+        // The signed proposal vector need not itself be sorted. Updates are
+        // applied first, then Removes, then Adds in their original relative
+        // order. The validation pass above resolves every target against the
+        // pre-Commit tree and rejects all same-leaf Update/Remove conflicts
+        // before any candidate-tree work begins.
         let newTree = this.ratchetTree.slice();
         let newNLeaves = this.nLeaves;
+        const addedLeafIndices = [];
+        const removedLeafIndices = [];
         let lastAddedLeafIndex = null;
         let lastRemovedLeafIndex = null;
         // Leaves updated by a folded Update proposal, used below so the
         // committing member can swap in its own pending keypair.
         const updatedLeafIndices = [];
-        for (const por of commit.proposals) {
-            if (por.type !== Proposal.ProposalOrRefType.PROPOSAL) {
-                throw new Error('processCommit: proposal-by-reference not supported');
+
+        for (const entry of proposalPlan.updates) {
+            const newLeaf = entry.proposal.leafNode;
+            const updLeafIndex = entry.targetLeafIndex;
+            const currentUpdateLeaf = RatchetTree.leafFor(
+                this.ratchetTree, updLeafIndex,
+            );
+            await verifyUpdateLeafBinding(
+                newLeaf,
+                currentUpdateLeaf.signatureKey,
+                currentUpdateLeaf.encryptionKey,
+                this.groupId,
+                updLeafIndex,
+            );
+            newTree[TreeMath.leafToNode(updLeafIndex)] = {
+                nodeType: Nodes.NodeType.LEAF, leaf: newLeaf,
+            };
+            for (const ancestor of TreeMath.directPathWithRoot(
+                TreeMath.leafToNode(updLeafIndex), newNLeaves,
+            )) {
+                newTree[ancestor] = null;
             }
-            const proposal = por.proposal;
-            if (proposal.proposalType === Proposal.ProposalType.ADD) {
-                const addLeafIndex = newNLeaves;
-                newNLeaves += 1;
-                const newWidth = TreeMath.nodeWidth(newNLeaves);
-                newTree = Nodes.padRatchetTree(newTree, newWidth);
-                newTree[TreeMath.leafToNode(addLeafIndex)] = {
-                    nodeType: Nodes.NodeType.LEAF, leaf: proposal.keyPackage.leafNode,
-                };
-                lastAddedLeafIndex = addLeafIndex;
-            } else if (proposal.proposalType === Proposal.ProposalType.UPDATE) {
-                // Member-initiated re-key (RFC §12.4.2): the proposal
-                // must have come from a member (its own leaf); the
-                // committer applies the new LeafNode and blanks that
-                // leaf's direct path. We cannot recover the leaf_index
-                // from the inline proposal alone, so we match the new
-                // LeafNode's signature key against an existing leaf (no
-                // identity rotation in this MVP) and verify the
-                // UPDATE-source LeafNode signature over that index.
-                const newLeaf = proposal.leafNode;
-                if (newLeaf.leafNodeSource !== Nodes.LeafNodeSource.UPDATE) {
-                    throw new Error('processCommit: Update proposal leaf not source=update');
-                }
-                let updLeafIndex = -1;
-                for (let li = 0; li < newNLeaves; li += 1) {
-                    const existing = RatchetTree.leafFor(newTree, li);
-                    if (existing && equalBytes(existing.signatureKey, newLeaf.signatureKey)) {
-                        updLeafIndex = li;
-                        break;
-                    }
-                }
-                if (updLeafIndex === -1) {
-                    throw new Error('processCommit: Update proposal for an unknown member');
-                }
-                if (updLeafIndex === senderLeafIndex) {
-                    throw new Error('processCommit: committer must re-key via its own path, not an Update');
-                }
-                const currentUpdateLeaf = RatchetTree.leafFor(newTree, updLeafIndex);
-                await verifyUpdateLeafBinding(
-                    newLeaf,
-                    currentUpdateLeaf.signatureKey,
-                    currentUpdateLeaf.encryptionKey,
-                    this.groupId,
-                    updLeafIndex,
-                );
-                newTree[TreeMath.leafToNode(updLeafIndex)] = {
-                    nodeType: Nodes.NodeType.LEAF, leaf: newLeaf,
-                };
-                for (const ancestor of TreeMath.directPathWithRoot(
-                    TreeMath.leafToNode(updLeafIndex), newNLeaves,
-                )) {
-                    newTree[ancestor] = null;
-                }
-                updatedLeafIndices.push(updLeafIndex);
-            } else if (proposal.proposalType === Proposal.ProposalType.REMOVE) {
-                const rmIdx = proposal.removed;
-                if (typeof rmIdx !== 'number' || rmIdx < 0 || rmIdx >= newNLeaves) {
-                    throw new Error(`processCommit: invalid removed leaf_index ${rmIdx}`);
-                }
-                if (rmIdx === CREATOR_LEAF_INDEX) {
-                    throw new Error('processCommit: creator leaf 0 cannot be removed');
-                }
-                if (rmIdx === senderLeafIndex) {
-                    throw new Error('processCommit: committer cannot remove themself');
-                }
-                const rmNode = TreeMath.leafToNode(rmIdx);
-                if (!newTree[rmNode] || newTree[rmNode].nodeType !== Nodes.NodeType.LEAF) {
-                    throw new Error(`processCommit: leaf ${rmIdx} already blank`);
-                }
-                newTree[rmNode] = null;
-                for (const ancestor of TreeMath.directPathWithRoot(rmNode, newNLeaves)) {
-                    newTree[ancestor] = null;
-                }
-                lastRemovedLeafIndex = rmIdx;
-            } else {
-                throw new Error(`processCommit: unsupported proposal_type ${proposal.proposalType}`);
+            updatedLeafIndices.push(updLeafIndex);
+        }
+
+        for (const entry of proposalPlan.removes) {
+            const rmIdx = entry.targetLeafIndex;
+            const rmNode = TreeMath.leafToNode(rmIdx);
+            newTree[rmNode] = null;
+            for (const ancestor of TreeMath.directPathWithRoot(rmNode, newNLeaves)) {
+                newTree[ancestor] = null;
             }
+            removedLeafIndices.push(rmIdx);
+            lastRemovedLeafIndex = rmIdx;
+        }
+
+        for (const entry of proposalPlan.adds) {
+            await verifyKeyPackageBindings(entry.proposal.keyPackage);
+            const addLeafIndex = newNLeaves;
+            newNLeaves += 1;
+            const newWidth = TreeMath.nodeWidth(newNLeaves);
+            newTree = Nodes.padRatchetTree(newTree, newWidth);
+            newTree[TreeMath.leafToNode(addLeafIndex)] = {
+                nodeType: Nodes.NodeType.LEAF,
+                leaf: entry.proposal.keyPackage.leafNode,
+            };
+            addedLeafIndices.push(addLeafIndex);
+            lastAddedLeafIndex = addLeafIndex;
         }
 
         // ---- Apply UpdatePath ----
         // If WE are the leaf being removed, our key material is no longer
         // useful — surface a distinct error so the orchestrator can tear
         // the session down rather than chase phantom decrypt failures.
-        if (lastRemovedLeafIndex === this.myLeafIndex) {
+        if (removedLeafIndices.includes(this.myLeafIndex)) {
             throw new Error('processCommit: removed from group');
         }
         const updatePath = commit.path;
@@ -1845,6 +1945,18 @@
                 `processCommit: UpdatePath nodes ${updatePath.nodes.length} != direct path ${committerDirectPath.length}`,
             );
         }
+        const addedLeafNodes = new Set(
+            addedLeafIndices.map((leafIndex) => TreeMath.leafToNode(leafIndex)),
+        );
+        const pathCopathResolutions = verifyUpdatePathCiphertextLayout(
+            newTree,
+            newNLeaves,
+            senderLeafIndex,
+            committerDirectPath,
+            updatePath.nodes,
+            addedLeafNodes,
+            'processCommit',
+        );
 
         // Verify the committer's NEW LeafNode is properly signed by the
         // same identity key that signed the FramedContent. Without this
@@ -1858,16 +1970,6 @@
             this.groupId,
             senderLeafIndex,
         );
-
-        // Apply Add proposals' KeyPackages: each leafNode the committer
-        // is inserting must itself carry valid signatures (otherwise the
-        // committer could smuggle attacker-controlled leaves through Adds).
-        for (const por of commit.proposals) {
-            if (por.type === Proposal.ProposalOrRefType.PROPOSAL
-                && por.proposal.proposalType === Proposal.ProposalType.ADD) {
-                await verifyKeyPackageBindings(por.proposal.keyPackage);
-            }
-        }
 
         // Replace committer's leaf and stamp parent encryption_keys.
         newTree[TreeMath.leafToNode(senderLeafIndex)] = {
@@ -1909,7 +2011,7 @@
         // ratchet tree. Welcome import enforces the same invariant; check it
         // here as well so an Add cannot install a colliding key for members
         // that are processing the Commit in steady state.
-        verifyTreeKeyUniqueness(newTree, 'processCommit');
+        this._verifyFinalTreeKeyUniqueness(newTree, 'processCommit');
 
         // Provisional group context for HPKE info string.
         const newTreeHash = await TreeHash.hashRoot(newTree);
@@ -1958,15 +2060,10 @@
             throw new Error(`processCommit: my leaf ${this.myLeafIndex} not under any committer ancestor`);
         }
 
-        // Resolution of committer's copath sibling at the LCA level.
-        const childOnPathAtLca = lcaIdxInPath === 0
-            ? TreeMath.leafToNode(senderLeafIndex)
-            : committerDirectPath[lcaIdxInPath - 1];
-        const copathSibling = TreeMath.sibling(childOnPathAtLca, newNLeaves);
-        const resolution = RatchetTree.resolution(newTree, copathSibling);
-        const filtered = lastAddedLeafIndex !== null
-            ? resolution.filter((n) => n !== TreeMath.leafToNode(lastAddedLeafIndex))
-            : resolution;
+        // Reuse the exact filtered copath resolution whose cardinality was
+        // validated for every UpdatePathNode above. This keeps ciphertext
+        // indexing and structural validation on one canonical computation.
+        const filtered = pathCopathResolutions[lcaIdxInPath];
 
         const myLeafNodeIdx = TreeMath.leafToNode(this.myLeafIndex);
         let myCtIndex = -1;
@@ -2101,7 +2198,9 @@
 
         return {
             addedLeafIndex: lastAddedLeafIndex,
+            addedLeafIndices,
             removedLeafIndex: lastRemovedLeafIndex,
+            removedLeafIndices,
             updatedLeafIndices,
             selfUpdated,
             committerLeafIndex: senderLeafIndex,
@@ -2546,6 +2645,166 @@
         if (!ok) {
             throw new Error('verifyUpdateLeaf: LeafNode signature invalid');
         }
+    }
+
+    /**
+     * RFC 9420 §7.6 binds each UpdatePathNode's ciphertext vector to the
+     * ordered resolution of its corresponding copath node, excluding every
+     * leaf introduced by an Add in the same Commit. Validate every level,
+     * including levels from which this recipient will not decrypt, so all
+     * recipients make the same structural acceptance decision.
+     *
+     * Returns the filtered resolutions for subsequent ciphertext lookup.
+     */
+    function verifyUpdatePathCiphertextLayout(
+        tree,
+        nLeaves,
+        committerLeafIndex,
+        committerDirectPath,
+        updatePathNodes,
+        addedLeafNodes,
+        operation,
+    ) {
+        const resolutions = [];
+        for (let pathIndex = 0; pathIndex < committerDirectPath.length; pathIndex += 1) {
+            const childOnPath = pathIndex === 0
+                ? TreeMath.leafToNode(committerLeafIndex)
+                : committerDirectPath[pathIndex - 1];
+            const copathSibling = TreeMath.sibling(childOnPath, nLeaves);
+            const resolution = RatchetTree.resolution(tree, copathSibling);
+            const filtered = addedLeafNodes.size > 0
+                ? resolution.filter((nodeIndex) => !addedLeafNodes.has(nodeIndex))
+                : resolution;
+            const updatePathNode = updatePathNodes[pathIndex];
+            const ciphertexts = updatePathNode && updatePathNode.encryptedPathSecret;
+            if (!Array.isArray(ciphertexts)) {
+                throw new Error(
+                    `${operation}: UpdatePath node ${pathIndex} has malformed encrypted_path_secret`,
+                );
+            }
+            if (ciphertexts.length !== filtered.length) {
+                throw new Error(
+                    `${operation}: UpdatePath node ${pathIndex} (tree node `
+                    + `${committerDirectPath[pathIndex]}) encrypted_path_secret length `
+                    + `${ciphertexts.length} != filtered copath resolution ${filtered.length}`,
+                );
+            }
+            resolutions.push(filtered);
+        }
+        return resolutions;
+    }
+
+    /**
+     * Validate all inline proposals against the same pre-Commit tree before
+     * constructing a candidate state. RFC 9420 §12.2 forbids multiple
+     * Update and/or Remove proposals applying to one leaf. Resolving every
+     * target up front also prevents wire ordering from changing which leaf a
+     * proposal addresses (for example, Add followed by Remove of the newly
+     * appended index).
+     *
+     * The returned arrays preserve relative order within each proposal type,
+     * while placing them into the application phases required by §12.3.
+     */
+    function validateCommitProposalList(
+        proposalOrRefs,
+        tree,
+        nLeaves,
+        committerLeafIndex,
+        operation = 'commit',
+    ) {
+        if (!Array.isArray(proposalOrRefs)) {
+            throw new Error(`${operation}: malformed proposal list`);
+        }
+
+        const plan = { updates: [], removes: [], adds: [] };
+        const leafActions = new Map();
+
+        function claimLeaf(targetLeafIndex, action) {
+            const previous = leafActions.get(targetLeafIndex);
+            if (previous) {
+                throw new Error(
+                    `${operation}: multiple Update and/or Remove proposals target leaf `
+                    + `${targetLeafIndex} (${previous} + ${action})`,
+                );
+            }
+            leafActions.set(targetLeafIndex, action);
+        }
+
+        for (let wireIndex = 0; wireIndex < proposalOrRefs.length; wireIndex += 1) {
+            const por = proposalOrRefs[wireIndex];
+            if (!por || por.type !== Proposal.ProposalOrRefType.PROPOSAL) {
+                throw new Error(`${operation}: proposal-by-reference not supported`);
+            }
+            const proposal = por.proposal;
+            if (!proposal || !Number.isInteger(proposal.proposalType)) {
+                throw new Error(`${operation}: malformed inline proposal at index ${wireIndex}`);
+            }
+
+            if (proposal.proposalType === Proposal.ProposalType.UPDATE) {
+                const newLeaf = proposal.leafNode;
+                if (!newLeaf || newLeaf.leafNodeSource !== Nodes.LeafNodeSource.UPDATE) {
+                    throw new Error(`${operation}: Update proposal leaf not source=update`);
+                }
+                let targetLeafIndex = -1;
+                for (let leafIndex = 0; leafIndex < nLeaves; leafIndex += 1) {
+                    const existing = RatchetTree.leafFor(tree, leafIndex);
+                    if (existing && equalBytes(existing.signatureKey, newLeaf.signatureKey)) {
+                        targetLeafIndex = leafIndex;
+                        break;
+                    }
+                }
+                if (targetLeafIndex === -1) {
+                    throw new Error(`${operation}: Update proposal for an unknown member`);
+                }
+                if (targetLeafIndex === committerLeafIndex) {
+                    throw new Error(
+                        `${operation}: committer must re-key via its own path, not an Update`,
+                    );
+                }
+                claimLeaf(targetLeafIndex, 'Update');
+                plan.updates.push({ proposal, targetLeafIndex, wireIndex });
+                continue;
+            }
+
+            if (proposal.proposalType === Proposal.ProposalType.REMOVE) {
+                const targetLeafIndex = proposal.removed;
+                if (!Number.isInteger(targetLeafIndex)
+                    || targetLeafIndex < 0 || targetLeafIndex >= nLeaves) {
+                    throw new Error(
+                        `${operation}: invalid removed leaf_index ${targetLeafIndex}`,
+                    );
+                }
+                if (targetLeafIndex === CREATOR_LEAF_INDEX) {
+                    throw new Error(`${operation}: creator leaf 0 cannot be removed`);
+                }
+                if (targetLeafIndex === committerLeafIndex) {
+                    throw new Error(`${operation}: committer cannot remove themself`);
+                }
+                const targetNode = tree[TreeMath.leafToNode(targetLeafIndex)];
+                if (!targetNode || targetNode.nodeType !== Nodes.NodeType.LEAF) {
+                    throw new Error(
+                        `${operation}: leaf ${targetLeafIndex} already blank`,
+                    );
+                }
+                claimLeaf(targetLeafIndex, 'Remove');
+                plan.removes.push({ proposal, targetLeafIndex, wireIndex });
+                continue;
+            }
+
+            if (proposal.proposalType === Proposal.ProposalType.ADD) {
+                if (!proposal.keyPackage || !proposal.keyPackage.leafNode) {
+                    throw new Error(`${operation}: malformed Add proposal at index ${wireIndex}`);
+                }
+                plan.adds.push({ proposal, wireIndex });
+                continue;
+            }
+
+            throw new Error(
+                `${operation}: unsupported proposal_type ${proposal.proposalType}`,
+            );
+        }
+
+        return plan;
     }
 
     function bytesMapKey(bytes, fieldName) {
