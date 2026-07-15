@@ -59,8 +59,9 @@ async function bootstrapPins(group) {
 async function buildKeyPackage() {
     const identity = await freshIdentity();
     const initKp = await HPKE.generateKeyPair();
+    const leafEncKp = await HPKE.generateKeyPair();
     const leaf = Group.buildSelfLeaf({
-        encryptionKeyBytes: initKp.publicKeyBytes,
+        encryptionKeyBytes: leafEncKp.publicKeyBytes,
         signatureKeyBytes: identity.signaturePublicKeyBytes,
         credentialIdentity: identity.signaturePublicKeyBytes,
         leafNodeSource: Nodes.LeafNodeSource.KEY_PACKAGE,
@@ -73,7 +74,13 @@ async function buildKeyPackage() {
     kp.signature = await Labeled.signWithLabel(
         identity.signaturePrivateKey, 'KeyPackageTBS', KeyPackage.keyPackageTbsBytes(kp),
     );
-    return { identity, initKp, keyPackage: kp, keyPackageBytes: KeyPackage.keyPackageBytes(kp) };
+    return {
+        identity,
+        initKp,
+        leafEncKp,
+        keyPackage: kp,
+        keyPackageBytes: KeyPackage.keyPackageBytes(kp),
+    };
 }
 
 // Add a joiner to `committer`, returning the joined Group and the raw
@@ -89,7 +96,7 @@ async function addMember(committer, others) {
         keyPackageBytes: joiner.keyPackageBytes,
         initPrivateKey: joiner.initKp.privateKey,
         identity: joiner.identity,
-        leafEncKeyPair: joiner.initKp,
+        leafEncKeyPair: joiner.leafEncKp,
         ratchetTreeBytes,
         expectedSignerLeafIndex: committer.myLeafIndex,
         ...await bootstrapPins(committer),

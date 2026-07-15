@@ -90,10 +90,11 @@ async function bootstrapPins(group) {
 async function buildBobKeyPackage() {
     const identity = await freshIdentity();
     const initKp = await HPKE.generateKeyPair();
+    const leafEncKp = await HPKE.generateKeyPair();
 
     // Leaf with source = KEY_PACKAGE (we'll be added, not committing).
     const leaf = Group.buildSelfLeaf({
-        encryptionKeyBytes: initKp.publicKeyBytes, // leaf.encryption_key reuses init_key
+        encryptionKeyBytes: leafEncKp.publicKeyBytes,
         signatureKeyBytes: identity.signaturePublicKeyBytes,
         credentialIdentity: identity.signaturePublicKeyBytes,
         leafNodeSource: Nodes.LeafNodeSource.KEY_PACKAGE,
@@ -116,7 +117,14 @@ async function buildBobKeyPackage() {
         identity.signaturePrivateKey, 'KeyPackageTBS', tbs,
     );
     const bytes = KeyPackage.keyPackageBytes(kp);
-    return { identity, initKp, leaf, keyPackage: kp, keyPackageBytes: bytes };
+    return {
+        identity,
+        initKp,
+        leafEncKp,
+        leaf,
+        keyPackage: kp,
+        keyPackageBytes: bytes,
+    };
 }
 
 async function main() {
@@ -148,7 +156,7 @@ async function main() {
         keyPackageBytes: bob.keyPackageBytes,
         initPrivateKey: bob.initKp.privateKey,
         identity: bob.identity,
-        leafEncKeyPair: bob.initKp,
+        leafEncKeyPair: bob.leafEncKp,
         ratchetTreeBytes,
         expectedSignerLeafIndex: 0,
         ...await bootstrapPins(alice),

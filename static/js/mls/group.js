@@ -103,6 +103,7 @@
     const CIPHERSUITE = 0x0002;
     const CREATOR_LEAF_INDEX = 0;
     const BOOTSTRAP_PIN_BYTES = 32;
+    const MAX_KEY_PACKAGE_LIFETIME_SECONDS = 24n * 60n * 60n;
 
     function getCrypto() {
         if (typeof globalThis !== 'undefined' && globalThis.crypto) return globalThis.crypto;
@@ -656,11 +657,21 @@
         static async create({ identity, groupId, credentialIdentity, pskSecret }) {
             const gid = groupId || randomBytes(32);
             const encKeyPair = await HPKE.generateKeyPair();
+            const basicCredentialIdentity = credentialIdentity
+                || identity.signaturePublicKeyBytes;
+            if (!equalBytes(
+                basicCredentialIdentity, identity.signaturePublicKeyBytes,
+            )) {
+                throw new Error(
+                    'group.create: basic credential identity must equal signature_key '
+                    + 'in the PinChat profile',
+                );
+            }
 
             const leaf = buildSelfLeaf({
                 encryptionKeyBytes: encKeyPair.publicKeyBytes,
                 signatureKeyBytes: identity.signaturePublicKeyBytes,
-                credentialIdentity: credentialIdentity || identity.signaturePublicKeyBytes,
+                credentialIdentity: basicCredentialIdentity,
                 leafNodeSource: Nodes.LeafNodeSource.KEY_PACKAGE,
             });
             leaf.signature = await signLeafNodeForKeyPackage(
@@ -1235,9 +1246,6 @@
 
     Group.prototype.commitAddMember = async function commitAddMember({ keyPackageBytes }) {
         const kp = KeyPackage.parseKeyPackage(keyPackageBytes);
-        if (kp.cipherSuite !== CIPHERSUITE) {
-            throw new Error(`group: KeyPackage cipher_suite mismatch (got ${kp.cipherSuite})`);
-        }
 
         // ---- 0. Verify the joiner's KeyPackage and inner LeafNode ----
         // Without this, a malicious relay could substitute leafNode fields
@@ -1245,7 +1253,7 @@
         // an attacker-controlled leaf into the tree. The signing key is
         // taken from kp.leafNode.signatureKey because our credential model
         // ties identity to the signature key directly.
-        await verifyKeyPackageBindings(kp);
+        await verifyKeyPackageBindings(kp, 'commitAddMember');
 
         // ---- 1. Compute new tree shape, insert new leaf ----
         const newLeafIndex = this.nLeaves;
@@ -2428,7 +2436,9 @@
         }
 
         for (const entry of proposalPlan.adds) {
-            await verifyKeyPackageBindings(entry.proposal.keyPackage);
+            await verifyKeyPackageBindings(
+                entry.proposal.keyPackage, 'processCommit',
+            );
             const addLeafIndex = newNLeaves;
             newNLeaves += 1;
             const newWidth = TreeMath.nodeWidth(newNLeaves);
@@ -2482,6 +2492,7 @@
         await verifyCommitLeafBinding(
             updatePath.leafNode,
             senderLeaf.signatureKey,
+            senderLeaf.encryptionKey,
             this.groupId,
             senderLeafIndex,
         );
@@ -2800,8 +2811,8 @@
      *   initPrivateKey    : ECDH CryptoKey matching keyPackage.init_key
      *   identity          : our signature identity (as in Group.create)
      *   leafEncKeyPair    : the full HPKE keypair for the leaf — the
-     *                       init_key from the KeyPackage, reused as the
-     *                       leaf's encryption_key until we rotate
+     *                       distinct encryption_key advertised by the
+     *                       KeyPackage LeafNode
      *   ratchetTreeBytes  : serialised tree (out-of-band from Welcome)
      *   expectedSignerLeafIndex : member sender_leaf_index parsed from the
      *                       Commit paired with this Welcome (required)
@@ -2839,19 +2850,59 @@
         }
 
         const frame = MLSMessage.parseMLSMessage(welcomeMessage);
+        if (frame.wireFormat !== MLSMessage.WireFormat.MLS_WELCOME) {
+            throw new Error(
+                `group.join: expected mls_welcome, got wire_format ${frame.wireFormat}`,
+            );
+        }
         const welcome = Welcome.parseWelcome(frame.body);
+        if (welcome.cipherSuite !== CIPHERSUITE) {
+            throw new Error(
+                `group.join: unsupported Welcome cipher_suite ${welcome.cipherSuite}`,
+            );
+        }
 
         const kp = KeyPackage.parseKeyPackage(keyPackageBytes);
+        await verifyKeyPackageBindings(kp, 'group.join KeyPackage');
+        if (kp.cipherSuite !== welcome.cipherSuite) {
+            throw new Error(
+                'group.join: Welcome cipher_suite does not match KeyPackage',
+            );
+        }
+        if (!identity || !equalBytes(
+            identity.signaturePublicKeyBytes, kp.leafNode.signatureKey,
+        )) {
+            throw new Error(
+                'group.join: local identity does not match KeyPackage signature_key',
+            );
+        }
+        if (!leafEncKeyPair || !equalBytes(
+            leafEncKeyPair.publicKeyBytes, kp.leafNode.encryptionKey,
+        )) {
+            throw new Error(
+                'group.join: local leaf private key does not match KeyPackage encryption_key',
+            );
+        }
         const myRef = await KeyPackage.keyPackageRef(keyPackageBytes);
-        const entry = welcome.secrets.find((s) =>
+        const matchingEntries = welcome.secrets.filter((s) =>
             s.newMember.length === myRef.length
             && s.newMember.every((b, i) => b === myRef[i])
         );
-        if (!entry) throw new Error('group.join: no EncryptedGroupSecrets for our KeyPackage');
+        if (matchingEntries.length !== 1) {
+            throw new Error(
+                `group.join: expected exactly one EncryptedGroupSecrets for our KeyPackage (got ${matchingEntries.length})`,
+            );
+        }
+        const entry = matchingEntries[0];
 
         const gs = await Welcome.decryptGroupSecrets(
             entry.encryptedGroupSecrets, initPrivateKey, kp.initKey, welcome.encryptedGroupInfo,
         );
+        if (!Array.isArray(gs.psks) || gs.psks.length !== 0) {
+            throw new Error(
+                'group.join: MLS PSK identifiers are unsupported by the PinChat profile',
+            );
+        }
         // Welcome AEAD is keyed off (joiner_secret, psk_secret). A joiner
         // with the wrong PSK will fail the AES-GCM auth tag here, which
         // is exactly the bootstrap-key gating we want.
@@ -2870,6 +2921,22 @@
             wNonce.fill(0);
         }
         const groupInfo = GroupInfo.parseGroupInfo(giBytes);
+        if (groupInfo.groupContext.version !== PROTOCOL_VERSION) {
+            throw new Error(
+                `group.join: unsupported GroupContext version ${groupInfo.groupContext.version}`,
+            );
+        }
+        if (groupInfo.groupContext.cipherSuite !== kp.cipherSuite) {
+            throw new Error(
+                'group.join: GroupContext cipher_suite does not match KeyPackage',
+            );
+        }
+        if (!Array.isArray(groupInfo.groupContext.extensions)
+            || groupInfo.groupContext.extensions.length !== 0) {
+            throw new Error(
+                'group.join: unsupported GroupContext extensions',
+            );
+        }
         if (!equalBytes(groupInfo.groupContext.groupId, expectedGroupId)) {
             throw new Error('group.join: group_id does not match invite bootstrap pin');
         }
@@ -3134,9 +3201,11 @@
             lifetime: leafNodeSource === Nodes.LeafNodeSource.KEY_PACKAGE
                 ? (() => {
                     const nowSecs = BigInt(Math.floor(Date.now() / 1000));
+                    const notBefore = nowSecs - 60n;
                     return {
-                        notBefore: nowSecs - 60n,           // 1 min clock-skew
-                        notAfter: nowSecs + 24n * 60n * 60n, // 24h
+                        notBefore, // 1 min clock-skew
+                        notAfter: notBefore
+                            + MAX_KEY_PACKAGE_LIFETIME_SECONDS,
                     };
                 })()
                 : undefined,
@@ -3154,10 +3223,20 @@
      *
      * Throws on any mismatch; returns void on success.
      */
-    async function verifyKeyPackageBindings(kp) {
+    async function verifyKeyPackageBindings(kp, errorPrefix = 'verifyKeyPackage') {
+        if (kp.version !== PROTOCOL_VERSION) {
+            throw new Error(
+                `${errorPrefix}: protocol version ${kp.version} does not match MLS 1.0`,
+            );
+        }
+        if (kp.cipherSuite !== CIPHERSUITE) {
+            throw new Error(
+                `${errorPrefix}: cipher_suite ${kp.cipherSuite} does not match group ciphersuite`,
+            );
+        }
         if (kp.leafNode.leafNodeSource !== Nodes.LeafNodeSource.KEY_PACKAGE) {
             throw new Error(
-                `verifyKeyPackage: expected source=KEY_PACKAGE, got ${kp.leafNode.leafNodeSource}`,
+                `${errorPrefix}: expected source=KEY_PACKAGE, got ${kp.leafNode.leafNodeSource}`,
             );
         }
         // RFC §7.2.3: enforce now ∈ [notBefore, notAfter). Rejects
@@ -3165,33 +3244,59 @@
         // off a captured invite.
         const lt = kp.leafNode.lifetime;
         if (!lt || typeof lt.notBefore !== 'bigint' || typeof lt.notAfter !== 'bigint') {
-            throw new Error('verifyKeyPackage: missing or malformed Lifetime');
+            throw new Error(`${errorPrefix}: missing or malformed Lifetime`);
+        }
+        if (lt.notBefore >= lt.notAfter) {
+            throw new Error(`${errorPrefix}: malformed Lifetime range`);
+        }
+        if (lt.notAfter - lt.notBefore > MAX_KEY_PACKAGE_LIFETIME_SECONDS) {
+            throw new Error(
+                `${errorPrefix}: Lifetime exceeds the 24-hour profile maximum`,
+            );
         }
         const nowSecs = BigInt(Math.floor(Date.now() / 1000));
         if (nowSecs < lt.notBefore) {
             throw new Error(
-                `verifyKeyPackage: Lifetime not yet valid (now=${nowSecs} < notBefore=${lt.notBefore})`,
+                `${errorPrefix}: Lifetime not yet valid (now=${nowSecs} < notBefore=${lt.notBefore})`,
             );
         }
         if (nowSecs >= lt.notAfter) {
             throw new Error(
-                `verifyKeyPackage: Lifetime expired (now=${nowSecs} >= notAfter=${lt.notAfter})`,
+                `${errorPrefix}: Lifetime expired (now=${nowSecs} >= notAfter=${lt.notAfter})`,
             );
         }
-        const sigPub = await Signature.importPublicKey(kp.leafNode.signatureKey);
+        const sigPub = await validateLeafNodeProfile(
+            kp.leafNode, 'KeyPackage leaf', errorPrefix,
+        );
+        try {
+            await HPKE.deserializePublicKey(kp.initKey);
+        } catch (err) {
+            throw new Error(`${errorPrefix}: init_key invalid: ${err.message}`);
+        }
+        if (equalBytes(kp.initKey, kp.leafNode.encryptionKey)) {
+            throw new Error(
+                `${errorPrefix}: init_key must differ from LeafNode encryption_key`,
+            );
+        }
+        validateAdvertisedExtensions(
+            kp.extensions,
+            kp.leafNode.capabilities,
+            errorPrefix,
+            'KeyPackage extensions',
+        );
         const leafTbs = Nodes.leafNodeTbsBytes(kp.leafNode);
         const leafOk = await Labeled.verifyWithLabel(
             sigPub, 'LeafNodeTBS', leafTbs, kp.leafNode.signature,
         );
         if (!leafOk) {
-            throw new Error('verifyKeyPackage: inner LeafNode signature invalid');
+            throw new Error(`${errorPrefix}: inner LeafNode signature invalid`);
         }
         const kpTbs = KeyPackage.keyPackageTbsBytes(kp);
         const kpOk = await Labeled.verifyWithLabel(
             sigPub, 'KeyPackageTBS', kpTbs, kp.signature,
         );
         if (!kpOk) {
-            throw new Error('verifyKeyPackage: outer KeyPackage signature invalid');
+            throw new Error(`${errorPrefix}: outer KeyPackage signature invalid`);
         }
     }
 
@@ -3202,7 +3307,13 @@
      * support identity rotation in this MVP) — that ties the commit's
      * new leaf back to the same member who signed the FramedContent.
      */
-    async function verifyCommitLeafBinding(leaf, expectedSignatureKey, groupId, leafIndex) {
+    async function verifyCommitLeafBinding(
+        leaf,
+        expectedSignatureKey,
+        previousEncryptionKey,
+        groupId,
+        leafIndex,
+    ) {
         if (leaf.leafNodeSource !== Nodes.LeafNodeSource.COMMIT) {
             throw new Error(
                 `verifyCommitLeaf: expected source=COMMIT, got ${leaf.leafNodeSource}`,
@@ -3213,7 +3324,14 @@
                 'verifyCommitLeaf: signature_key rotation in commit not supported',
             );
         }
-        const sigPub = await Signature.importPublicKey(leaf.signatureKey);
+        if (equalBytes(leaf.encryptionKey, previousEncryptionKey)) {
+            throw new Error(
+                'verifyCommitLeaf: encryption_key must differ from the current leaf',
+            );
+        }
+        const sigPub = await validateLeafNodeProfile(
+            leaf, `leaf ${leafIndex}`, 'verifyCommitLeaf',
+        );
         const encoder = new Codec.Encoder();
         Nodes.writeLeafNodeTbs(encoder, leaf);
         encoder.writeOpaque(groupId);
@@ -3255,13 +3373,9 @@
                 'verifyUpdateLeaf: encryption_key must differ from the current leaf',
             );
         }
-        validateLeafCapabilities(leaf, leafIndex);
-        try {
-            await HPKE.deserializePublicKey(leaf.encryptionKey);
-        } catch (err) {
-            throw new Error(`verifyUpdateLeaf: encryption_key invalid: ${err.message}`);
-        }
-        const sigPub = await Signature.importPublicKey(leaf.signatureKey);
+        const sigPub = await validateLeafNodeProfile(
+            leaf, `leaf ${leafIndex}`, 'verifyUpdateLeaf',
+        );
         const encoder = new Codec.Encoder();
         Nodes.writeLeafNodeTbs(encoder, leaf);
         encoder.writeOpaque(groupId);
@@ -3469,24 +3583,58 @@
         return out;
     }
 
-    function validateLeafCapabilities(leaf, leafIndex) {
+    function validateAdvertisedExtensions(
+        extensions,
+        capabilities,
+        errorPrefix,
+        fieldName,
+    ) {
+        if (!Array.isArray(extensions)) {
+            throw new Error(`${errorPrefix}: ${fieldName} are malformed`);
+        }
+        for (const ext of extensions) {
+            if (!ext || !Number.isInteger(ext.extensionType)
+                || !(ext.extensionData instanceof Uint8Array)) {
+                throw new Error(`${errorPrefix}: ${fieldName} contain a malformed extension`);
+            }
+            if (!capabilities.extensions.includes(ext.extensionType)) {
+                throw new Error(
+                    `${errorPrefix}: ${fieldName} contain unadvertised extension ${ext.extensionType}`,
+                );
+            }
+        }
+    }
+
+    function validateLeafCapabilities(leaf, leafDescription, errorPrefix) {
         const caps = leaf.capabilities;
         if (!caps || !Array.isArray(caps.versions)
             || !Array.isArray(caps.cipherSuites)
             || !Array.isArray(caps.extensions)
+            || !Array.isArray(caps.proposals)
             || !Array.isArray(caps.credentials)) {
             throw new Error(
-                `imported-tree: leaf ${leafIndex} has malformed capabilities`,
+                `${errorPrefix}: ${leafDescription} has malformed capabilities`,
             );
+        }
+        for (const name of [
+            'versions', 'cipherSuites', 'extensions', 'proposals', 'credentials',
+        ]) {
+            const values = caps[name];
+            if (!values.every((value) => Number.isInteger(value)
+                && value >= 0 && value <= 0xffff)) {
+                throw new Error(
+                    `${errorPrefix}: ${leafDescription} has malformed ${name} capabilities`,
+                );
+            }
         }
         if (!caps.versions.includes(PROTOCOL_VERSION)) {
             throw new Error(
-                `imported-tree: leaf ${leafIndex} does not support MLS 1.0`,
+                `${errorPrefix}: ${leafDescription} does not support MLS 1.0`,
             );
         }
         if (!caps.cipherSuites.includes(CIPHERSUITE)) {
             throw new Error(
-                `imported-tree: leaf ${leafIndex} does not support ciphersuite 0x${CIPHERSUITE.toString(16)}`,
+                `${errorPrefix}: ${leafDescription} does not support ciphersuite 0x${CIPHERSUITE.toString(16)}`,
             );
         }
         if (!leaf.credential
@@ -3494,21 +3642,53 @@
             || !(leaf.credential.identity instanceof Uint8Array)
             || leaf.credential.identity.length === 0) {
             throw new Error(
-                `imported-tree: leaf ${leafIndex} has an invalid basic credential`,
+                `${errorPrefix}: ${leafDescription} has an invalid basic credential`,
             );
         }
         if (!caps.credentials.includes(leaf.credential.credentialType)) {
             throw new Error(
-                `imported-tree: leaf ${leafIndex} does not advertise its credential type`,
+                `${errorPrefix}: ${leafDescription} does not advertise its credential type`,
             );
         }
-        for (const ext of leaf.extensions || []) {
-            if (!caps.extensions.includes(ext.extensionType)) {
-                throw new Error(
-                    `imported-tree: leaf ${leafIndex} does not advertise extension ${ext.extensionType}`,
-                );
-            }
+        validateAdvertisedExtensions(
+            leaf.extensions,
+            caps,
+            errorPrefix,
+            `${leafDescription} extensions`,
+        );
+    }
+
+    /**
+     * Validate the semantic LeafNode profile shared by KeyPackage download,
+     * Add/Update/Commit processing, and imported-tree validation. PinChat's
+     * BasicCredential deliberately uses the signature public key bytes as
+     * its opaque identity, so enforce that application-level binding instead
+     * of accepting an arbitrary self-asserted identity blob.
+     */
+    async function validateLeafNodeProfile(leaf, leafDescription, errorPrefix) {
+        validateLeafCapabilities(leaf, leafDescription, errorPrefix);
+        if (!equalBytes(leaf.credential.identity, leaf.signatureKey)) {
+            throw new Error(
+                `${errorPrefix}: ${leafDescription} basic credential identity `
+                + 'must equal signature_key in the PinChat profile',
+            );
         }
+        let signaturePublicKey;
+        try {
+            signaturePublicKey = await Signature.importPublicKey(leaf.signatureKey);
+        } catch (err) {
+            throw new Error(
+                `${errorPrefix}: ${leafDescription} signature_key invalid: ${err.message}`,
+            );
+        }
+        try {
+            await HPKE.deserializePublicKey(leaf.encryptionKey);
+        } catch (err) {
+            throw new Error(
+                `${errorPrefix}: ${leafDescription} encryption_key invalid: ${err.message}`,
+            );
+        }
+        return signaturePublicKey;
     }
 
     /**
@@ -3518,7 +3698,9 @@
      * group_id and leaf_index to the common TBS prefix (RFC 9420 §7.2).
      */
     async function verifyImportedLeaf(leaf, groupId, leafIndex) {
-        validateLeafCapabilities(leaf, leafIndex);
+        const sigPub = await validateLeafNodeProfile(
+            leaf, `leaf ${leafIndex}`, 'imported-tree',
+        );
 
         const encoder = new Codec.Encoder();
         Nodes.writeLeafNodeTbs(encoder, leaf);
@@ -3541,14 +3723,6 @@
             );
         }
 
-        let sigPub;
-        try {
-            sigPub = await Signature.importPublicKey(leaf.signatureKey);
-        } catch (err) {
-            throw new Error(
-                `imported-tree: leaf ${leafIndex} signature_key invalid: ${err.message}`,
-            );
-        }
         const ok = await Labeled.verifyWithLabel(
             sigPub, 'LeafNodeTBS', encoder.bytes(), leaf.signature,
         );

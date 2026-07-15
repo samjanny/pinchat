@@ -142,6 +142,19 @@ async function buildKeyPackage() {
     };
 }
 
+async function resignKeyPackage(bundle) {
+    bundle.keyPackage.leafNode.signature = await Group.signLeafNodeForKeyPackage(
+        bundle.identity.signaturePrivateKey,
+        bundle.keyPackage.leafNode,
+    );
+    bundle.keyPackage.signature = await Labeled.signWithLabel(
+        bundle.identity.signaturePrivateKey,
+        'KeyPackageTBS',
+        KeyPackage.keyPackageTbsBytes(bundle.keyPackage),
+    );
+    bundle.keyPackageBytes = KeyPackage.keyPackageBytes(bundle.keyPackage);
+}
+
 async function replaceKeyPackageLeafEncryptionKey(bundle, encryptionKey) {
     bundle.leaf.encryptionKey = Uint8Array.from(encryptionKey);
     bundle.leaf.signature = await Group.signLeafNodeForKeyPackage(
@@ -344,6 +357,26 @@ async function main() {
 
         await expectReject(
             Group.Group.joinFromWelcomeWithTree({
+                ...args,
+                identity: await freshIdentity(),
+                expectedSignerLeafIndex: 0,
+            }),
+            'local identity does not match KeyPackage signature_key',
+            'Welcome is bound to the local KeyPackage signature identity',
+        );
+
+        await expectReject(
+            Group.Group.joinFromWelcomeWithTree({
+                ...args,
+                leafEncKeyPair: await HPKE.generateKeyPair(),
+                expectedSignerLeafIndex: 0,
+            }),
+            'local leaf private key does not match KeyPackage encryption_key',
+            'Welcome is bound to the local TreeKEM leaf keypair',
+        );
+
+        await expectReject(
+            Group.Group.joinFromWelcomeWithTree({
                 ...baseArgs, expectedSignerLeafIndex: 0,
             }),
             'group_id bootstrap pin',
@@ -389,6 +422,125 @@ async function main() {
             'creator signature_key does not match invite bootstrap pin',
             'same-group-id alternative creator is rejected by key pin',
         );
+    }
+
+    // ---- RFC §§7.3/10.1: complete KeyPackage semantic validation -------
+    // Every sample below is re-signed after mutation. The rejection must
+    // therefore come from the semantic KeyPackage gate, not from a damaged
+    // LeafNode or KeyPackage signature.
+    {
+        const alice = await Group.Group.create({ identity: await freshIdentity() });
+
+        async function rejectKeyPackage(mutate, expectedText, name) {
+            const bundle = await buildKeyPackage();
+            await mutate(bundle);
+            await resignKeyPackage(bundle);
+            const before = captureGroupState(alice);
+            await expectReject(
+                alice.commitAddMember({ keyPackageBytes: bundle.keyPackageBytes }),
+                expectedText,
+                name,
+            );
+            assert(groupStateMatches(alice, before),
+                `${name} leaves creator state unchanged`);
+        }
+
+        await rejectKeyPackage(
+            async (bundle) => {
+                bundle.keyPackage.initKey = Uint8Array.from(
+                    bundle.keyPackage.leafNode.encryptionKey,
+                );
+            },
+            'init_key must differ from LeafNode encryption_key',
+            'fully signed KeyPackage with reused HPKE key is rejected',
+        );
+
+        await rejectKeyPackage(
+            async (bundle) => { bundle.keyPackage.version = 0x0002; },
+            'protocol version 2 does not match MLS 1.0',
+            'fully signed KeyPackage with a mismatched version is rejected',
+        );
+
+        await rejectKeyPackage(
+            async (bundle) => {
+                bundle.keyPackage.leafNode.capabilities.cipherSuites = [];
+            },
+            'does not support ciphersuite',
+            'LeafNode missing the group ciphersuite capability is rejected',
+        );
+
+        await rejectKeyPackage(
+            async (bundle) => {
+                bundle.keyPackage.leafNode.credential.identity = new Uint8Array([1]);
+            },
+            'basic credential identity must equal signature_key',
+            'self-signed but misbound PinChat basic credential is rejected',
+        );
+
+        await rejectKeyPackage(
+            async (bundle) => {
+                bundle.keyPackage.initKey = new Uint8Array(65);
+            },
+            'init_key invalid',
+            'fully signed KeyPackage with an invalid HPKE init_key is rejected',
+        );
+
+        await rejectKeyPackage(
+            async (bundle) => {
+                bundle.keyPackage.extensions = [{
+                    extensionType: 0x4242,
+                    extensionData: new Uint8Array([1]),
+                }];
+            },
+            'KeyPackage extensions contain unadvertised extension',
+            'unadvertised KeyPackage extension is rejected',
+        );
+
+        await rejectKeyPackage(
+            async (bundle) => {
+                const now = BigInt(Math.floor(Date.now() / 1000));
+                bundle.keyPackage.leafNode.lifetime = {
+                    notBefore: now - 1n,
+                    notAfter: now + 86400n,
+                };
+            },
+            'Lifetime exceeds the 24-hour profile maximum',
+            'overlong KeyPackage lifetime is rejected',
+        );
+    }
+
+    // A malicious creator can bypass its local KeyPackage gate. Existing
+    // members must independently reject the same fully authenticated Add
+    // before advancing any epoch or candidate-tree state.
+    {
+        const alice = await Group.Group.create({ identity: await freshIdentity() });
+        const bob = await buildKeyPackage();
+        const { joined: bobGroup } = await addAndJoin(alice, bob);
+        const carol = await buildKeyPackage();
+        const validAdd = await alice.commitAddMember({
+            keyPackageBytes: carol.keyPackageBytes,
+        });
+        carol.keyPackage.initKey = Uint8Array.from(
+            carol.keyPackage.leafNode.encryptionKey,
+        );
+        await resignKeyPackage(carol);
+        const invalidAdd = await rewriteCommitProposalList(
+            validAdd.commitMessage,
+            [inlineProposal({
+                proposalType: Proposal.ProposalType.ADD,
+                keyPackage: carol.keyPackage,
+            })],
+            alice.identity,
+            bobGroup,
+        );
+        const before = captureGroupState(bobGroup);
+        await expectReject(
+            bobGroup.processCommit(invalidAdd),
+            'init_key must differ from LeafNode encryption_key',
+            'processCommit rejects authenticated Add with a reused HPKE key',
+        );
+        assert(groupStateMatches(bobGroup, before),
+            'malformed Add rejection leaves recipient state byte-for-byte unchanged');
     }
 
     // ---- G-1(a): every non-blank leaf signature is checked --------------
