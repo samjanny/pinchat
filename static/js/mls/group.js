@@ -233,6 +233,30 @@
         }
 
         /**
+         * Best-effort zeroisation for one map of stateful SecretTree
+         * chains. The map itself may be a live epoch, a previous-epoch
+         * grace context, or a tentative receive transaction.
+         */
+        _wipeChainStateMap(chainStates) {
+            if (!(chainStates instanceof Map)) return;
+            for (const st of chainStates.values()) {
+                this._wipeChainState(st);
+            }
+            chainStates.clear();
+        }
+
+        _wipeChainState(st) {
+            if (!st || typeof st !== 'object') return;
+            if (st.secret instanceof Uint8Array) st.secret.fill(0);
+            if (!(st.skipped instanceof Map)) return;
+            for (const v of st.skipped.values()) {
+                if (v.key instanceof Uint8Array) v.key.fill(0);
+                if (v.nonce instanceof Uint8Array) v.nonce.fill(0);
+            }
+            st.skipped.clear();
+        }
+
+        /**
          * Zero and drop all stateful chain material. Called on every
          * epoch transition: the next epoch's chains re-root from the new
          * encryption_secret on first use.
@@ -242,14 +266,7 @@
                 this._chainStates = new Map();
                 return;
             }
-            for (const st of this._chainStates.values()) {
-                if (st.secret) st.secret.fill(0);
-                for (const v of st.skipped.values()) {
-                    v.key.fill(0);
-                    v.nonce.fill(0);
-                }
-                st.skipped.clear();
-            }
+            this._wipeChainStateMap(this._chainStates);
             this._chainStates = new Map();
         }
 
@@ -284,15 +301,92 @@
          */
         _dropPrevEpoch() {
             if (!this._prevEpoch) return;
-            for (const st of this._prevEpoch.chainStates.values()) {
-                if (st.secret) st.secret.fill(0);
-                for (const v of st.skipped.values()) {
-                    v.key.fill(0);
-                    v.nonce.fill(0);
-                }
-                st.skipped.clear();
-            }
+            this._wipeChainStateMap(this._prevEpoch.chainStates);
             this._prevEpoch = null;
+        }
+
+        /**
+         * Stage a receive-ratchet advance without touching live state.
+         *
+         * PrivateMessage must derive the content key before it can perform
+         * AEAD authentication, and the FramedContent signature is inside
+         * that ciphertext. Advancing the live chain at derivation time
+         * would therefore let a corrupt ciphertext (or an AEAD-valid message
+         * with an invalid signature) burn a generation. Instead, derive on a
+         * deep copy and make the caller explicitly commit only after every
+         * authentication and replay check succeeds.
+         */
+        _beginReceiveRatchetTransaction(
+            chainStates, encryptionSecret, nLeaves,
+        ) {
+            // Copy the map container, then detach only the single sender
+            // chain selected by decrypted sender_data. Cloning every other
+            // sender's skipped-key cache for each message would turn the
+            // authentication safeguard itself into an avoidable DoS cost.
+            const stagedChainStates = new Map(chainStates);
+            const ephemeralKeyNonces = [];
+            let touchedChainId = null;
+            let originalChainState = null;
+            let stagedChainState = null;
+            let settled = false;
+
+            return {
+                keyNonceProvider: async (leafIndex, which, generation) => {
+                    if (touchedChainId !== null) {
+                        throw new Error('group: receive transaction requested more than one chain');
+                    }
+                    touchedChainId = `${leafIndex}:${which}`;
+                    originalChainState = chainStates.get(touchedChainId) || null;
+                    if (originalChainState) {
+                        stagedChainStates.set(
+                            touchedChainId, cloneMutableState(originalChainState),
+                        );
+                    }
+                    let keyNonce;
+                    try {
+                        keyNonce = await this._chainKeyNonceIn(
+                            stagedChainStates, encryptionSecret,
+                            nLeaves, leafIndex, which, generation,
+                        );
+                    } finally {
+                        stagedChainState = stagedChainStates.get(touchedChainId) || null;
+                    }
+                    // The selected generation is no longer retained in the
+                    // staged map. Track its one-shot key material so both
+                    // commit and rollback can erase our last JS references.
+                    ephemeralKeyNonces.push(keyNonce);
+                    return keyNonce;
+                },
+                commit: () => {
+                    if (settled) return null;
+                    settled = true;
+                    for (const value of ephemeralKeyNonces) {
+                        if (value.key instanceof Uint8Array) value.key.fill(0);
+                        if (value.nonce instanceof Uint8Array) value.nonce.fill(0);
+                    }
+                    ephemeralKeyNonces.length = 0;
+                    if (originalChainState) this._wipeChainState(originalChainState);
+                    // Unchanged chain objects are deliberately shared with
+                    // stagedChainStates. Drop only the superseded map
+                    // container; wiping it would destroy those accepted
+                    // chains as well.
+                    chainStates.clear();
+                    return stagedChainStates;
+                },
+                rollback: () => {
+                    if (settled) return;
+                    settled = true;
+                    for (const value of ephemeralKeyNonces) {
+                        if (value.key instanceof Uint8Array) value.key.fill(0);
+                        if (value.nonce instanceof Uint8Array) value.nonce.fill(0);
+                    }
+                    ephemeralKeyNonces.length = 0;
+                    if (stagedChainState && stagedChainState !== originalChainState) {
+                        this._wipeChainState(stagedChainState);
+                    }
+                    stagedChainStates.clear();
+                },
+            };
         }
 
         /**
@@ -308,10 +402,9 @@
          *   - a generation below the chain position with no cached key
          *     is a replay (or fell out of the skip window) and throws.
          *
-         * Note: the key is consumed at derivation time, BEFORE the AEAD
-         * runs. A tampered ciphertext therefore burns its generation and
-         * the original cannot be decrypted afterwards; that is equivalent
-         * to the relay dropping the message, which it can always do.
+         * Sending consumes immediately after derivation. Receiving calls
+         * this helper only against a tentative chain copy and installs that
+         * copy after AEAD, replay, sender, and signature authentication.
          */
         async _chainKeyNonce(leafIndex, which, generation) {
             return this._chainKeyNonceIn(
@@ -602,67 +695,84 @@
                 return this._decryptFromPreviousEpoch(pm);
             }
 
-            const out = await PrivateMessage.decryptPrivateMessage({
-                pm,
-                senderDataSecret: this.epochSecrets.senderDataSecret,
-                encryptionSecret: this.epochSecrets.encryptionSecret,
-                nLeaves: this.nLeaves,
-                keyNonceProvider: (li, which, gen) => this._chainKeyNonce(li, which, gen),
-            });
-
-            const senderLeafIndex = out.senderData.leafIndex;
-            const generation = out.senderData.generation;
-            // Defense-in-depth bounds check before tree lookup. Even
-            // though leafFor returns falsy for OOB, an explicit guard
-            // makes a future port (e.g. typed-array-backed RatchetTree)
-            // memory-safe by construction.
-            if (!Number.isInteger(senderLeafIndex) || senderLeafIndex < 0
-                || senderLeafIndex >= this.nLeaves) {
-                throw new Error(
-                    `group: sender leaf_index ${senderLeafIndex} out of range [0,${this.nLeaves})`,
-                );
-            }
-            // Replay protection: reject (leafIndex, generation) duplicates
-            // within the current epoch. Reset on every epoch transition.
-            // The legitimate sender increments senderRatchetGeneration once
-            // per send, so seeing the same (leaf, gen) twice means either
-            // a relay-level retransmission or an attacker replaying a
-            // captured ciphertext — both must be dropped to preserve
-            // AES-GCM nonce uniqueness guarantees.
-            if (this._isGenerationConsumed(senderLeafIndex, generation)) {
-                throw new Error(
-                    `group: replayed application message (leaf=${senderLeafIndex}, gen=${generation})`,
-                );
-            }
-
-            const senderLeaf = RatchetTree.leafFor(this.ratchetTree, senderLeafIndex);
-            if (!senderLeaf) {
-                throw new Error(`group: unknown sender leaf_index ${senderLeafIndex}`);
-            }
-
-            const sigPub = await Signature.importPublicKey(senderLeaf.signatureKey);
-            const content = {
-                groupId: pm.groupId,
-                epoch: pm.epoch,
-                sender: { senderType: Framing.SenderType.MEMBER, leafIndex: senderLeafIndex },
-                authenticatedData: pm.authenticatedData,
-                contentType: pm.contentType,
-                payload: out.content.payloadBytes,
-            };
-            const sigOk = await PublicMessage.verifyFramedContent(
-                sigPub,
-                MLSMessage.WireFormat.MLS_PRIVATE_MESSAGE,
-                content,
-                this._buildGroupContextStruct(),
-                out.content.auth.signature,
+            const baseChainStates = this._chainStates;
+            const ratchetTx = this._beginReceiveRatchetTransaction(
+                baseChainStates, this.epochSecrets.encryptionSecret, this.nLeaves,
             );
-            if (!sigOk) {
-                throw new Error('group: application message signature invalid');
+            try {
+                const out = await PrivateMessage.decryptPrivateMessage({
+                    pm,
+                    senderDataSecret: this.epochSecrets.senderDataSecret,
+                    encryptionSecret: this.epochSecrets.encryptionSecret,
+                    nLeaves: this.nLeaves,
+                    keyNonceProvider: ratchetTx.keyNonceProvider,
+                });
+
+                const senderLeafIndex = out.senderData.leafIndex;
+                const generation = out.senderData.generation;
+                // Defense-in-depth bounds check before tree lookup. Even
+                // though leafFor returns falsy for OOB, an explicit guard
+                // makes a future port (e.g. typed-array-backed RatchetTree)
+                // memory-safe by construction.
+                if (!Number.isInteger(senderLeafIndex) || senderLeafIndex < 0
+                    || senderLeafIndex >= this.nLeaves) {
+                    throw new Error(
+                        `group: sender leaf_index ${senderLeafIndex} out of range [0,${this.nLeaves})`,
+                    );
+                }
+                // Replay protection: reject (leafIndex, generation) duplicates
+                // within the current epoch. Reset on every epoch transition.
+                // The legitimate sender increments senderRatchetGeneration once
+                // per send, so seeing the same (leaf, gen) twice means either
+                // a relay-level retransmission or an attacker replaying a
+                // captured ciphertext — both must be dropped to preserve
+                // AES-GCM nonce uniqueness guarantees.
+                if (this._isGenerationConsumed(senderLeafIndex, generation)) {
+                    throw new Error(
+                        `group: replayed application message (leaf=${senderLeafIndex}, gen=${generation})`,
+                    );
+                }
+
+                const senderLeaf = RatchetTree.leafFor(this.ratchetTree, senderLeafIndex);
+                if (!senderLeaf) {
+                    throw new Error(`group: unknown sender leaf_index ${senderLeafIndex}`);
+                }
+
+                const sigPub = await Signature.importPublicKey(senderLeaf.signatureKey);
+                const content = {
+                    groupId: pm.groupId,
+                    epoch: pm.epoch,
+                    sender: { senderType: Framing.SenderType.MEMBER, leafIndex: senderLeafIndex },
+                    authenticatedData: pm.authenticatedData,
+                    contentType: pm.contentType,
+                    payload: out.content.payloadBytes,
+                };
+                const sigOk = await PublicMessage.verifyFramedContent(
+                    sigPub,
+                    MLSMessage.WireFormat.MLS_PRIVATE_MESSAGE,
+                    content,
+                    this._buildGroupContextStruct(),
+                    out.content.auth.signature,
+                );
+                if (!sigOk) {
+                    throw new Error('group: application message signature invalid');
+                }
+
+                // No asynchronous or fallible validation follows this point.
+                // Swap the staged chain in one step, then destroy the
+                // superseded representation and record replay acceptance.
+                if (this._chainStates !== baseChainStates) {
+                    throw new Error('group: concurrent receive-ratchet mutation');
+                }
+                const acceptedChainStates = ratchetTx.commit();
+                this._chainStates = acceptedChainStates;
+                this._markGenerationConsumed(senderLeafIndex, generation);
+
+                return { plaintext: out.content.payloadBytes, senderLeafIndex };
+            } catch (err) {
+                ratchetTx.rollback();
+                throw err;
             }
-
-            this._markGenerationConsumed(senderLeafIndex, generation);
-
-            return { plaintext: out.content.payloadBytes, senderLeafIndex };
         }
 
         /**
@@ -682,62 +792,74 @@
                 throw new Error('group: previous-epoch grace window expired');
             }
 
-            const out = await PrivateMessage.decryptPrivateMessage({
-                pm,
-                senderDataSecret: pe.senderDataSecret,
-                encryptionSecret: pe.encryptionSecret,
-                nLeaves: pe.nLeaves,
-                keyNonceProvider: (li, which, gen) => this._chainKeyNonceIn(
-                    pe.chainStates, pe.encryptionSecret, pe.nLeaves, li, which, gen,
-                ),
-            });
-
-            const senderLeafIndex = out.senderData.leafIndex;
-            const generation = out.senderData.generation;
-            if (!Number.isInteger(senderLeafIndex) || senderLeafIndex < 0
-                || senderLeafIndex >= pe.nLeaves) {
-                throw new Error(
-                    `group: sender leaf_index ${senderLeafIndex} out of range [0,${pe.nLeaves}) (prev epoch)`,
-                );
-            }
-            let consumedSet = pe.consumedByLeaf.get(senderLeafIndex);
-            if (consumedSet && consumedSet.has(generation)) {
-                throw new Error(
-                    `group: replayed application message (leaf=${senderLeafIndex}, gen=${generation}, prev epoch)`,
-                );
-            }
-
-            const senderLeaf = RatchetTree.leafFor(pe.ratchetTree, senderLeafIndex);
-            if (!senderLeaf) {
-                throw new Error(`group: unknown sender leaf_index ${senderLeafIndex} (prev epoch)`);
-            }
-            const sigPub = await Signature.importPublicKey(senderLeaf.signatureKey);
-            const content = {
-                groupId: pm.groupId,
-                epoch: pm.epoch,
-                sender: { senderType: Framing.SenderType.MEMBER, leafIndex: senderLeafIndex },
-                authenticatedData: pm.authenticatedData,
-                contentType: pm.contentType,
-                payload: out.content.payloadBytes,
-            };
-            const sigOk = await PublicMessage.verifyFramedContent(
-                sigPub,
-                MLSMessage.WireFormat.MLS_PRIVATE_MESSAGE,
-                content,
-                pe.groupContext,
-                out.content.auth.signature,
+            const baseChainStates = pe.chainStates;
+            const ratchetTx = this._beginReceiveRatchetTransaction(
+                baseChainStates, pe.encryptionSecret, pe.nLeaves,
             );
-            if (!sigOk) {
-                throw new Error('group: application message signature invalid (prev epoch)');
-            }
+            try {
+                const out = await PrivateMessage.decryptPrivateMessage({
+                    pm,
+                    senderDataSecret: pe.senderDataSecret,
+                    encryptionSecret: pe.encryptionSecret,
+                    nLeaves: pe.nLeaves,
+                    keyNonceProvider: ratchetTx.keyNonceProvider,
+                });
 
-            if (!consumedSet) {
-                consumedSet = new Set();
-                pe.consumedByLeaf.set(senderLeafIndex, consumedSet);
-            }
-            consumedSet.add(generation);
+                const senderLeafIndex = out.senderData.leafIndex;
+                const generation = out.senderData.generation;
+                if (!Number.isInteger(senderLeafIndex) || senderLeafIndex < 0
+                    || senderLeafIndex >= pe.nLeaves) {
+                    throw new Error(
+                        `group: sender leaf_index ${senderLeafIndex} out of range [0,${pe.nLeaves}) (prev epoch)`,
+                    );
+                }
+                let consumedSet = pe.consumedByLeaf.get(senderLeafIndex);
+                if (consumedSet && consumedSet.has(generation)) {
+                    throw new Error(
+                        `group: replayed application message (leaf=${senderLeafIndex}, gen=${generation}, prev epoch)`,
+                    );
+                }
 
-            return { plaintext: out.content.payloadBytes, senderLeafIndex };
+                const senderLeaf = RatchetTree.leafFor(pe.ratchetTree, senderLeafIndex);
+                if (!senderLeaf) {
+                    throw new Error(`group: unknown sender leaf_index ${senderLeafIndex} (prev epoch)`);
+                }
+                const sigPub = await Signature.importPublicKey(senderLeaf.signatureKey);
+                const content = {
+                    groupId: pm.groupId,
+                    epoch: pm.epoch,
+                    sender: { senderType: Framing.SenderType.MEMBER, leafIndex: senderLeafIndex },
+                    authenticatedData: pm.authenticatedData,
+                    contentType: pm.contentType,
+                    payload: out.content.payloadBytes,
+                };
+                const sigOk = await PublicMessage.verifyFramedContent(
+                    sigPub,
+                    MLSMessage.WireFormat.MLS_PRIVATE_MESSAGE,
+                    content,
+                    pe.groupContext,
+                    out.content.auth.signature,
+                );
+                if (!sigOk) {
+                    throw new Error('group: application message signature invalid (prev epoch)');
+                }
+
+                if (this._prevEpoch !== pe || pe.chainStates !== baseChainStates) {
+                    throw new Error('group: concurrent previous-epoch receive-ratchet mutation');
+                }
+                const acceptedChainStates = ratchetTx.commit();
+                pe.chainStates = acceptedChainStates;
+                if (!consumedSet) {
+                    consumedSet = new Set();
+                    pe.consumedByLeaf.set(senderLeafIndex, consumedSet);
+                }
+                consumedSet.add(generation);
+
+                return { plaintext: out.content.payloadBytes, senderLeafIndex };
+            } catch (err) {
+                ratchetTx.rollback();
+                throw err;
+            }
         }
     }
 

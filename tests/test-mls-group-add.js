@@ -45,6 +45,31 @@ function assert(cond, name, detail) {
     }
 }
 
+function hex(u8) { return Buffer.from(u8).toString('hex'); }
+
+function previousEpochReceiveSnapshot(previousEpoch) {
+    const chains = [...previousEpoch.chainStates.entries()]
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([id, st]) => ({
+            id,
+            nextGeneration: st.nextGeneration,
+            secret: hex(st.secret),
+            skipped: [...st.skipped.entries()]
+                .sort(([a], [b]) => a - b)
+                .map(([generation, value]) => ({
+                    generation,
+                    key: hex(value.key),
+                    nonce: hex(value.nonce),
+                })),
+        }));
+    const consumed = [...previousEpoch.consumedByLeaf.entries()]
+        .sort(([a], [b]) => a - b)
+        .map(([leafIndex, generations]) => [
+            leafIndex, [...generations].sort((a, b) => a - b),
+        ]);
+    return JSON.stringify({ chains, consumed });
+}
+
 async function freshIdentity() {
     const kp = await Signature.generateKeyPair();
     return {
@@ -182,6 +207,27 @@ async function main() {
     const { commitMessage: updCommit2 } = await alice.commitUpdate();  // alice -> epoch 3
     assert(alice.epoch === 3n && bobGroup.epoch === 2n,
         'alice at epoch 3, bob still at epoch 2 (commit in flight)');
+
+    const tamperedInFlight = Uint8Array.from(inFlight);
+    tamperedInFlight[tamperedInFlight.length - 5] ^= 0x01;
+    const previousEpochRef = alice._prevEpoch;
+    const previousChainsRef = previousEpochRef.chainStates;
+    const previousConsumedRef = previousEpochRef.consumedByLeaf;
+    const previousBefore = previousEpochReceiveSnapshot(previousEpochRef);
+    let tamperedOldEpochRejected = false;
+    try {
+        await alice.decryptApplicationMessage(tamperedInFlight);
+    } catch (_err) {
+        tamperedOldEpochRejected = true;
+    }
+    assert(tamperedOldEpochRejected,
+        'tampered previous-epoch ciphertext is rejected');
+    assert(alice._prevEpoch === previousEpochRef
+        && previousEpochRef.chainStates === previousChainsRef
+        && previousEpochRef.consumedByLeaf === previousConsumedRef
+        && previousEpochReceiveSnapshot(previousEpochRef) === previousBefore,
+    'previous-epoch AEAD failure leaves grace ratchet and replay state unchanged');
+
     const late = await alice.decryptApplicationMessage(inFlight);
     assert(new TextDecoder().decode(late.plaintext) === 'sent at epoch 2',
         'in-flight epoch-2 message decrypts via the grace window');

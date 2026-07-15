@@ -51,6 +51,29 @@ function assert(cond, name, detail) {
 
 function hex(u8) { return Buffer.from(u8).toString('hex'); }
 
+function receiveStateSnapshot(group) {
+    const chains = [...group._chainStates.entries()]
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([id, st]) => ({
+            id,
+            nextGeneration: st.nextGeneration,
+            secret: hex(st.secret),
+            skipped: [...st.skipped.entries()]
+                .sort(([a], [b]) => a - b)
+                .map(([generation, value]) => ({
+                    generation,
+                    key: hex(value.key),
+                    nonce: hex(value.nonce),
+                })),
+        }));
+    const consumed = [...group.consumedByLeaf.entries()]
+        .sort(([a], [b]) => a - b)
+        .map(([leafIndex, generations]) => [
+            leafIndex, [...generations].sort((a, b) => a - b),
+        ]);
+    return JSON.stringify({ chains, consumed });
+}
+
 async function freshIdentity() {
     const kp = await Signature.generateKeyPair();
     return {
@@ -229,6 +252,85 @@ async function main() {
         const res3 = await bob.decryptApplicationMessage(w3);
         assert(res3.senderLeafIndex === alice.myLeafIndex,
             'decrypt surfaces the authenticated sender leaf index');
+    }
+
+    console.log('# Group: receive ratchet advances only after full authentication');
+    {
+        const { alice, bob } = await buildSynthetic2LeafGroup();
+        const delayed0 = await alice.encryptApplicationMessage('delayed zero');
+        const delayed1 = await alice.encryptApplicationMessage('delayed one');
+        const valid = await alice.encryptApplicationMessage('valid generation two');
+        const tampered = Uint8Array.from(valid);
+        // The tail is within the encrypted content (well beyond the
+        // sender-data sample), so sender_data and the generation key are
+        // derived before content AEAD authentication rejects this frame.
+        // Generation 2 also forces the tentative ratchet to derive and
+        // cache generations 0 and 1; none of that staged work may leak into
+        // the live state on failure.
+        tampered[tampered.length - 5] ^= 0x01;
+
+        const chainRef = bob._chainStates;
+        const consumedRef = bob.consumedByLeaf;
+        const before = receiveStateSnapshot(bob);
+        let aeadRejected = false;
+        try {
+            await bob.decryptApplicationMessage(tampered);
+        } catch (_err) {
+            aeadRejected = true;
+        }
+        assert(aeadRejected, 'tampered content AEAD is rejected');
+        assert(bob._chainStates === chainRef
+            && bob.consumedByLeaf === consumedRef
+            && receiveStateSnapshot(bob) === before,
+        'AEAD failure leaves ratchet and replay state byte-for-byte unchanged');
+        const recovered = await bob.decryptApplicationMessage(valid);
+        assert(new TextDecoder().decode(recovered.plaintext) === 'valid generation two',
+            'original jumped generation still decrypts after tampered ciphertext');
+        assert(new TextDecoder().decode(
+            (await bob.decryptApplicationMessage(delayed0)).plaintext,
+        ) === 'delayed zero', 'rollback preserves later out-of-order generation 0');
+        assert(new TextDecoder().decode(
+            (await bob.decryptApplicationMessage(delayed1)).plaintext,
+        ) === 'delayed one', 'rollback preserves later out-of-order generation 1');
+    }
+    {
+        const { alice, bob } = await buildSynthetic2LeafGroup();
+        // Create two independent send candidates at the same generation.
+        // The malicious one has the epoch keys (so AEAD is valid) but signs
+        // with a key that does not match leaf 0. The honest candidate must
+        // remain decryptable after that inner-signature rejection.
+        const maliciousAlice = alice.forkForPendingCommit();
+        const wrongIdentity = await freshIdentity();
+        maliciousAlice.identity = {
+            ...maliciousAlice.identity,
+            signaturePrivateKey: wrongIdentity.signaturePrivateKey,
+        };
+        const invalidSignature = await maliciousAlice.encryptApplicationMessage(
+            'AEAD valid, signature invalid',
+        );
+        const valid = await alice.encryptApplicationMessage('valid after bad signature');
+
+        const chainRef = bob._chainStates;
+        const consumedRef = bob.consumedByLeaf;
+        const before = receiveStateSnapshot(bob);
+        let signatureRejected = false;
+        let signatureError = '';
+        try {
+            await bob.decryptApplicationMessage(invalidSignature);
+        } catch (err) {
+            signatureRejected = true;
+            signatureError = err.message;
+        }
+        assert(signatureRejected && signatureError.includes('signature invalid'),
+            'AEAD-valid message with wrong FramedContent signature is rejected',
+            signatureError);
+        assert(bob._chainStates === chainRef
+            && bob.consumedByLeaf === consumedRef
+            && receiveStateSnapshot(bob) === before,
+        'signature failure leaves ratchet and replay state byte-for-byte unchanged');
+        const recovered = await bob.decryptApplicationMessage(valid);
+        assert(new TextDecoder().decode(recovered.plaintext) === 'valid after bad signature',
+            'same generation remains usable after signature rejection');
     }
 
     console.log('');
