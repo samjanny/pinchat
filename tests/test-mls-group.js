@@ -88,7 +88,7 @@ async function buildSynthetic2LeafGroup() {
     const bobId = await freshIdentity();
     const bobEncKp = await HPKE.generateKeyPair();
 
-    const alice = await Group.Group.create({ identity: aliceId });
+    const initialAlice = await Group.Group.create({ identity: aliceId });
 
     // Build Bob's LeafNode and insert it at node index 2 (leaf 1 in a
     // 2-leaf tree). We need a parent node at index 1 to make the tree
@@ -105,13 +105,13 @@ async function buildSynthetic2LeafGroup() {
     );
 
     // Grow Alice's tree: width goes from 1 → 3 (leaf 0, parent 1, leaf 2).
-    alice.ratchetTree = [
-        alice.ratchetTree[0],        // leaf 0 — Alice
+    initialAlice.ratchetTree = [
+        initialAlice.ratchetTree[0], // leaf 0 — Alice
         null,                        // parent 1 — blank (would be set by Commit)
         { nodeType: Nodes.NodeType.LEAF, leaf: bobLeaf },
     ];
-    alice.nLeaves = 2;
-    alice.treeHash = await TreeHash.hashRoot(alice.ratchetTree);
+    initialAlice.nLeaves = 2;
+    initialAlice.treeHash = await TreeHash.hashRoot(initialAlice.ratchetTree);
 
     // Re-derive epoch 0 with the new group_context (tree_hash changed).
     // init_secret, commit_secret, psk_secret are all zero here — the
@@ -122,28 +122,49 @@ async function buildSynthetic2LeafGroup() {
         initSecretPrev: initSecretSeed,
         commitSecret: new Uint8Array(HPKE.Nh),
         pskSecret: new Uint8Array(HPKE.Nh),
-        groupContext: alice._groupContextBytes(),
+        groupContext: initialAlice._groupContextBytes(),
     });
-    alice.epochSecrets = epochOut;
+
+    const commonState = {
+        cipherSuite: initialAlice.cipherSuite,
+        groupId: initialAlice.groupId,
+        epoch: initialAlice.epoch,
+        ratchetTree: initialAlice.ratchetTree,
+        nLeaves: initialAlice.nLeaves,
+        interimTranscriptHash: initialAlice.interimTranscriptHash,
+        confirmedTranscriptHash: initialAlice.confirmedTranscriptHash,
+        treeHash: initialAlice.treeHash,
+        epochSecrets: epochOut,
+        pskSecret: initialAlice.pskSecret,
+    };
+
+    const alice = await Group.Group.fromState({
+        ...commonState,
+        myLeafIndex: 0,
+        identity: aliceId,
+        leafKeyPair: initialAlice.leafKeyPair,
+        parentKeyPairs: initialAlice.parentKeyPairs,
+        senderRatchetGeneration: 0,
+    });
 
     // Bob gets the mirror state. Bob's view differs from Alice's in
     // identity / leafKeyPair / myLeafIndex / senderRatchetGeneration,
     // but shares ratchetTree + epochSecrets + groupId + epoch.
-    const bob = Group.Group.fromState({
-        cipherSuite: alice.cipherSuite,
-        groupId: alice.groupId,
-        epoch: alice.epoch,
-        ratchetTree: alice.ratchetTree,
-        nLeaves: alice.nLeaves,
+    const bob = await Group.Group.fromState({
+        ...commonState,
         myLeafIndex: 1,
         identity: bobId,
         leafKeyPair: bobEncKp,
+        parentKeyPairs: new Map(),
         senderRatchetGeneration: 0,
-        interimTranscriptHash: alice.interimTranscriptHash,
-        confirmedTranscriptHash: alice.confirmedTranscriptHash,
-        treeHash: alice.treeHash,
-        epochSecrets: alice.epochSecrets,
     });
+
+    // fromState clones the schedule before consuming it, so explicitly
+    // erase the raw fixture and the superseded one-leaf Group state too.
+    for (const value of Object.values(epochOut)) {
+        if (value instanceof Uint8Array) value.fill(0);
+    }
+    initialAlice.destroySecrets();
 
     return { alice, bob };
 }
@@ -158,18 +179,30 @@ async function main() {
         assert(group.epoch === 0n, 'fresh group is at epoch 0');
         assert(group.groupId instanceof Uint8Array && group.groupId.length === 32,
             'groupId defaulted to 32 random bytes');
+        assert(group.epochSecrets.epochAuthenticator.length === 32,
+            'epoch 0 steady-state secrets derived');
         assert(
-            group.epochSecrets && group.epochSecrets.encryptionSecret.length === 32,
-            'epoch 0 secrets derived'
+            ['joinerSecret', 'welcomeSecret', 'epochSecret',
+                'encryptionSecret', 'confirmationKey']
+                .every((name) => group.epochSecrets[name] === undefined),
+            'one-shot epoch secrets are not retained',
         );
+        assert(group._chainStates.size === 2
+            && group._chainStates.has('0:application')
+            && group._chainStates.has('0:handshake'),
+        'SecretTree roots are pre-derived for the live leaf');
         // A single-member group can still encrypt to itself (loopback).
         // With the stateful forward-secret chains the SENDER consumes its
         // own generation at encrypt time, so self-decrypt on the same
         // instance is (correctly) rejected as a replay. Decrypt through a
         // state clone, which re-roots its own chains.
+        const receiver = await Group.Group.fromState({ ...group });
+        const consumedChainSecret = group._chainStates.get('0:application').secret;
         const ct = await group.encryptApplicationMessage('hello self');
         assert(ct instanceof Uint8Array && ct.length > 0, 'encrypt returns bytes');
-        const receiver = Group.Group.fromState({ ...group });
+        assert(consumedChainSecret.every((byte) => byte === 0)
+            && group._chainStates.get('0:application').secret !== consumedChainSecret,
+        'sending erases the superseded generation secret');
         const pt = (await receiver.decryptApplicationMessage(ct)).plaintext;
         assert(
             new TextDecoder().decode(pt) === 'hello self',
@@ -182,9 +215,9 @@ async function main() {
         const { alice, bob } = await buildSynthetic2LeafGroup();
 
         assert(
-            hex(alice.epochSecrets.encryptionSecret)
-                === hex(bob.epochSecrets.encryptionSecret),
-            'Alice and Bob share encryption_secret'
+            hex(alice.epochSecrets.epochAuthenticator)
+                === hex(bob.epochSecrets.epochAuthenticator),
+            'Alice and Bob share epoch_authenticator'
         );
 
         // Alice → Bob

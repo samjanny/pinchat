@@ -184,8 +184,8 @@ async function main() {
     assert(carolGroup.epoch === alice.epoch,
         'recipient advances on creator Commit');
     assert(equalBytes(
-        carolGroup.epochSecrets.encryptionSecret,
-        alice.epochSecrets.encryptionSecret,
+        carolGroup.epochSecrets.epochAuthenticator,
+        alice.epochSecrets.epochAuthenticator,
     ), 'creator and recipient converge after authorized Commit');
 
     console.log('');

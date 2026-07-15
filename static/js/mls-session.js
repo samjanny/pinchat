@@ -339,6 +339,7 @@
                 );
             } catch (err) {
                 if (this._pendingCommit === pending) this._pendingCommit = null;
+                candidateGroup.destroySecrets();
                 this.onEvent({ kind: 'error', reason: err.message });
                 return false;
             }
@@ -353,7 +354,14 @@
             // candidate twice. Everything below is local bookkeeping or a
             // post-acceptance Welcome; the MLS state swap itself is atomic.
             this._pendingCommit = null;
+            const supersededGroup = this.group;
             this.group = pending.candidateGroup;
+            if (supersededGroup && supersededGroup !== this.group) {
+                // The accepted candidate owns an independent clone of the
+                // outgoing epoch for its bounded grace window. The former
+                // live Group must not retain a second complete copy.
+                supersededGroup.destroySecrets();
+            }
 
             if (pending.kind === 'add') {
                 this._leafBySenderId.set(pending.senderId, pending.addedLeafIndex);
@@ -537,8 +545,9 @@
             }
             this._localCommitBusy = true;
             let staged = false;
+            let candidateGroup = null;
             try {
-                const candidateGroup = this.group.forkForPendingCommit();
+                candidateGroup = this.group.forkForPendingCommit();
                 const { commitMessage, welcomeMessage } =
                     await candidateGroup.commitAddMember({
                     keyPackageBytes: kpBytes,
@@ -564,6 +573,7 @@
                     welcomeEnvelope,
                 });
             } catch (err) {
+                if (candidateGroup && !staged) candidateGroup.destroySecrets();
                 console.error('[MLS] commitAddMember failed:', err);
                 this.onEvent({ kind: 'error', reason: `commitAddMember failed: ${err.message}` });
             } finally {
@@ -856,8 +866,9 @@
             }
             this._localCommitBusy = true;
             let staged = false;
+            let candidateGroup = null;
             try {
-                const candidateGroup = this.group.forkForPendingCommit();
+                candidateGroup = this.group.forkForPendingCommit();
                 const { commitMessage } = await candidateGroup.commitUpdate({
                     updateProposals,
                 });
@@ -869,6 +880,7 @@
                     foldedUpdates: updateProposals.length,
                 });
             } catch (err) {
+                if (candidateGroup && !staged) candidateGroup.destroySecrets();
                 console.error('[MLS] commitUpdate failed:', err);
                 this.onEvent({ kind: 'error',
                     reason: `commitUpdate failed: ${err.message}` });
@@ -928,8 +940,9 @@
             const leafIndex = this._leafBySenderId.get(senderId);
             this._localCommitBusy = true;
             let staged = false;
+            let candidateGroup = null;
             try {
-                const candidateGroup = this.group.forkForPendingCommit();
+                candidateGroup = this.group.forkForPendingCommit();
                 const { commitMessage } = await candidateGroup.commitRemoveMember({
                     removedLeafIndex: leafIndex,
                 });
@@ -941,6 +954,7 @@
                     removedLeafIndex: leafIndex,
                 });
             } catch (err) {
+                if (candidateGroup && !staged) candidateGroup.destroySecrets();
                 console.error('[MLS] commitRemoveMember failed:', err);
                 this.onEvent({ kind: 'error',
                     reason: `commitRemoveMember failed: ${err.message}` });

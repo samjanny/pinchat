@@ -108,15 +108,26 @@
         path.reverse(); // root-first
 
         let secret = encryptionSecret;
-        for (let i = 0; i < path.length - 1; i += 1) {
-            const parent = path[i];
-            const child = path[i + 1];
-            const isLeft = child === TreeMath.left(parent);
-            secret = await KeySchedule.expandWithLabel(
-                secret, 'tree', isLeft ? LEFT_BYTES : RIGHT_BYTES, HPKE.Nh,
-            );
+        let ownsSecret = false;
+        try {
+            for (let i = 0; i < path.length - 1; i += 1) {
+                const parent = path[i];
+                const child = path[i + 1];
+                const isLeft = child === TreeMath.left(parent);
+                const next = await KeySchedule.expandWithLabel(
+                    secret, 'tree', isLeft ? LEFT_BYTES : RIGHT_BYTES, HPKE.Nh,
+                );
+                if (ownsSecret) secret.fill(0);
+                secret = next;
+                ownsSecret = true;
+            }
+            // Ownership of the final derived leaf secret transfers to the
+            // caller. The input encryption_secret is never modified here.
+            ownsSecret = false;
+            return secret;
+        } finally {
+            if (ownsSecret) secret.fill(0);
         }
-        return secret;
     }
 
     /**
@@ -132,6 +143,90 @@
     }
 
     /**
+     * Consume one epoch's encryption_secret into independent application
+     * and handshake ratchet roots for every leaf.
+     *
+     * Unlike buildSecretTree(), this function never returns the root or an
+     * intermediate tree-node secret. Each parent is erased as soon as both
+     * children have been derived, and each leaf secret is erased after its
+     * two ratchet roots have been produced. The caller-provided
+     * encryptionSecret is therefore zeroed before this function resolves.
+     *
+     * Returns Array<{ application, handshake }> indexed by leaf index.
+     * Every returned root remains unconsumed at generation 0; callers own
+     * it and must erase it as its ratchet advances or the epoch expires.
+     */
+    async function consumeEncryptionSecret(encryptionSecret, nLeaves) {
+        if (!(encryptionSecret instanceof Uint8Array)
+            || encryptionSecret.length !== HPKE.Nh) {
+            throw new Error(
+                `secret-tree: encryption_secret must be ${HPKE.Nh} bytes`,
+            );
+        }
+        if (!Number.isInteger(nLeaves) || nLeaves < 1) {
+            throw new Error('secret-tree: nLeaves must be a positive integer');
+        }
+
+        const ratchetRoots = new Array(nLeaves);
+
+        async function visit(nodeIndex, nodeSecret) {
+            if (TreeMath.level(nodeIndex) === 0) {
+                let application = null;
+                let handshake = null;
+                try {
+                    application = await leafChainRoot(nodeSecret, 'application');
+                    handshake = await leafChainRoot(nodeSecret, 'handshake');
+                    ratchetRoots[TreeMath.nodeToLeaf(nodeIndex)] = {
+                        application,
+                        handshake,
+                    };
+                    application = null;
+                    handshake = null;
+                } finally {
+                    nodeSecret.fill(0);
+                    if (application) application.fill(0);
+                    if (handshake) handshake.fill(0);
+                }
+                return;
+            }
+
+            let leftSecret = null;
+            let rightSecret = null;
+            try {
+                leftSecret = await KeySchedule.expandWithLabel(
+                    nodeSecret, 'tree', LEFT_BYTES, HPKE.Nh,
+                );
+                rightSecret = await KeySchedule.expandWithLabel(
+                    nodeSecret, 'tree', RIGHT_BYTES, HPKE.Nh,
+                );
+                // Both descendants are now independent of their parent.
+                nodeSecret.fill(0);
+                await visit(TreeMath.left(nodeIndex), leftSecret);
+                await visit(TreeMath.right(nodeIndex, nLeaves), rightSecret);
+            } finally {
+                // Idempotent on successful recursion; essential if a KDF or
+                // descendant operation throws part-way through the tree.
+                nodeSecret.fill(0);
+                if (leftSecret) leftSecret.fill(0);
+                if (rightSecret) rightSecret.fill(0);
+            }
+        }
+
+        try {
+            await visit(TreeMath.root(nLeaves), encryptionSecret);
+            return ratchetRoots;
+        } catch (err) {
+            encryptionSecret.fill(0);
+            for (const roots of ratchetRoots) {
+                if (!roots) continue;
+                roots.application.fill(0);
+                roots.handshake.fill(0);
+            }
+            throw err;
+        }
+    }
+
+    /**
      * Advance the per-generation chain to the given generation and derive
      * the AEAD key + nonce at that generation. Used once per AEAD slot.
      *
@@ -142,16 +237,32 @@
     async function keyNonceAtGeneration(chainRoot, generation) {
         if (generation < 0) throw new Error('secret-tree: generation must be >= 0');
         let secret = chainRoot;
-        for (let g = 0; g < generation; g += 1) {
-            // Advance chain: secret_{g+1} = DeriveTreeSecret(secret_g, "secret", g, Nh)
-            secret = await KeySchedule.expandWithLabel(secret, 'secret', u32be(g), HPKE.Nh);
+        let ownsSecret = false;
+        try {
+            for (let g = 0; g < generation; g += 1) {
+                // Advance chain: secret_{g+1} = DeriveTreeSecret(secret_g, "secret", g, Nh)
+                const next = await KeySchedule.expandWithLabel(
+                    secret, 'secret', u32be(g), HPKE.Nh,
+                );
+                if (ownsSecret) secret.fill(0);
+                secret = next;
+                ownsSecret = true;
+            }
+            const key = await KeySchedule.expandWithLabel(
+                secret, 'key', u32be(generation), HPKE.Nk,
+            );
+            const nonce = await KeySchedule.expandWithLabel(
+                secret, 'nonce', u32be(generation), HPKE.Nn,
+            );
+            const nextSecret = await KeySchedule.expandWithLabel(
+                secret, 'secret', u32be(generation), HPKE.Nh,
+            );
+            return { key, nonce, nextSecret };
+        } finally {
+            // At generation 0 `secret` aliases the caller-owned root. For a
+            // later generation it is a temporary walk result.
+            if (ownsSecret) secret.fill(0);
         }
-        const key   = await KeySchedule.expandWithLabel(secret, 'key',   u32be(generation), HPKE.Nk);
-        const nonce = await KeySchedule.expandWithLabel(secret, 'nonce', u32be(generation), HPKE.Nn);
-        const nextSecret = await KeySchedule.expandWithLabel(
-            secret, 'secret', u32be(generation), HPKE.Nh,
-        );
-        return { key, nonce, nextSecret };
     }
 
     /**
@@ -191,6 +302,7 @@
         buildSecretTree,
         leafSecret,
         leafChainRoot,
+        consumeEncryptionSecret,
         keyNonceAtGeneration,
         keyNonceStep,
         senderDataKeyNonce,

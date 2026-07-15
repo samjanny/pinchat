@@ -51,6 +51,17 @@ async function main() {
         const encSecret = hexDecode(v.encryption_secret);
         const nLeaves = v.leaves.length;
 
+        // Stateful epoch initialization derives every per-leaf ratchet root
+        // once, then destroys the encryption_secret and all intermediate
+        // tree-node secrets. Its retained roots must be byte-identical to
+        // the established stateless derivation used by the IETF vectors.
+        const consumedRoot = Uint8Array.from(encSecret);
+        const retainedRoots = await ST.consumeEncryptionSecret(
+            consumedRoot, nLeaves,
+        );
+        assert(consumedRoot.every((byte) => byte === 0),
+            `entry ${ei} consumed encryption_secret is zeroed`);
+
         // Sender data
         {
             const sds = hexDecode(v.sender_data.sender_data_secret);
@@ -74,6 +85,10 @@ async function main() {
 
             const appRoot = await ST.leafChainRoot(leafSec, 'application');
             const hsRoot  = await ST.leafChainRoot(leafSec, 'handshake');
+            assert(hex(retainedRoots[leafIdx].application) === hex(appRoot),
+                `entry ${ei} leaf ${leafIdx} retained application root`);
+            assert(hex(retainedRoots[leafIdx].handshake) === hex(hsRoot),
+                `entry ${ei} leaf ${leafIdx} retained handshake root`);
 
             for (const genKey of Object.keys(leafVectors)) {
                 const expect = leafVectors[genKey];

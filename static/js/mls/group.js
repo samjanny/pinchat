@@ -34,9 +34,11 @@
  *   senderRatchetGeneration
  *                       : next app-message generation to send, per
  *                         "application" chain
- *   epochSecrets        : { encryptionSecret, senderDataSecret,
- *                           membershipKey, confirmationKey,
- *                           initSecret, epochAuthenticator, ... }
+ *   epochSecrets        : retained steady-state secrets only
+ *                         ({ senderDataSecret, membershipKey, initSecret,
+ *                            epochAuthenticator, ... }); one-shot schedule
+ *                         values and the SecretTree root are consumed and
+ *                         erased before the Group becomes usable
  *   groupContext        : serialized bytes for signature domain
  *                         separation (recomputed on every epoch change)
  *   interimTranscriptHash
@@ -171,6 +173,112 @@
         return copy;
     }
 
+    function wipeBytes(value) {
+        if (value instanceof Uint8Array) value.fill(0);
+    }
+
+    function wipeTreeKemSecrets(leafSecret, leafNodePair, chain) {
+        wipeBytes(leafSecret);
+        if (leafNodePair) wipeBytes(leafNodePair.pathSecret);
+        if (!Array.isArray(chain)) return;
+        for (const entry of chain) {
+            if (!entry) continue;
+            wipeBytes(entry.pathSecret);
+            wipeBytes(entry.nodeSecret); // Backward-compatible shape.
+        }
+    }
+
+    const CONSUMED_EPOCH_SECRETS = new Set([
+        'joinerSecret',
+        'welcomeSecret',
+        'epochSecret',
+        'encryptionSecret',
+        // confirmation_key authenticates the transition into this epoch and
+        // has no steady-state use once that transition has been accepted.
+        'confirmationKey',
+    ]);
+
+    /**
+     * Convert the full key-schedule output into the minimum state retained
+     * by an active Group. The encryption_secret is consumed into generation-0
+     * application/handshake roots for every live leaf; root/intermediate
+     * SecretTree material and one-shot epoch-transition secrets are erased.
+     */
+    async function prepareEpochSecretsForStorage(
+        epochSecrets, ratchetTree, nLeaves,
+    ) {
+        if (!epochSecrets || typeof epochSecrets !== 'object') {
+            throw new Error('group: missing epoch secret schedule');
+        }
+        const encryptionSecret = epochSecrets.encryptionSecret;
+        let leafRatchetRoots;
+        try {
+            leafRatchetRoots = await SecretTree.consumeEncryptionSecret(
+                encryptionSecret, nLeaves,
+            );
+        } catch (err) {
+            // A partially-derived schedule must never survive a failed
+            // SecretTree initialization.
+            for (const value of Object.values(epochSecrets)) wipeBytes(value);
+            throw err;
+        }
+        const chainStates = new Map();
+
+        try {
+            for (let leafIndex = 0; leafIndex < nLeaves; leafIndex += 1) {
+                const roots = leafRatchetRoots[leafIndex];
+                if (!roots) {
+                    throw new Error(
+                        `group: SecretTree did not derive roots for leaf ${leafIndex}`,
+                    );
+                }
+                if (!RatchetTree.leafFor(ratchetTree, leafIndex)) {
+                    // Blank ratchet-tree leaves cannot authenticate epoch
+                    // traffic, so retaining their symmetric roots only
+                    // broadens compromise impact.
+                    roots.application.fill(0);
+                    roots.handshake.fill(0);
+                    continue;
+                }
+                chainStates.set(`${leafIndex}:application`, {
+                    nextGeneration: 0,
+                    secret: roots.application,
+                    skipped: new Map(),
+                });
+                chainStates.set(`${leafIndex}:handshake`, {
+                    nextGeneration: 0,
+                    secret: roots.handshake,
+                    skipped: new Map(),
+                });
+            }
+        } catch (err) {
+            for (const st of chainStates.values()) {
+                wipeBytes(st.secret);
+                for (const value of st.skipped.values()) {
+                    wipeBytes(value.key);
+                    wipeBytes(value.nonce);
+                }
+            }
+            for (const roots of leafRatchetRoots) {
+                if (!roots) continue;
+                wipeBytes(roots.application);
+                wipeBytes(roots.handshake);
+            }
+            for (const value of Object.values(epochSecrets)) wipeBytes(value);
+            throw err;
+        }
+
+        const retainedEpochSecrets = {};
+        for (const [name, value] of Object.entries(epochSecrets)) {
+            if (CONSUMED_EPOCH_SECRETS.has(name)) {
+                wipeBytes(value);
+                continue;
+            }
+            retainedEpochSecrets[name] = value;
+        }
+        return { epochSecrets: retainedEpochSecrets, chainStates };
+    }
+
     // Out-of-order tolerance bounds for the stateful secret-tree chains.
     // A forward jump larger than MAX_GENERATION_SKIP is rejected (DoS
     // bound on chain derivations); at most MAX_SKIPPED_PER_CHAIN cached
@@ -258,8 +366,8 @@
 
         /**
          * Zero and drop all stateful chain material. Called on every
-         * epoch transition: the next epoch's chains re-root from the new
-         * encryption_secret on first use.
+         * epoch transition. The next epoch installs pre-derived generation-0
+         * roots before it becomes active.
          */
         _resetChainStates() {
             if (!this._chainStates) {
@@ -280,19 +388,24 @@
          */
         _snapshotPrevEpoch() {
             this._dropPrevEpoch();
+            const outgoingEpochSecrets = this.epochSecrets;
             this._prevEpoch = {
                 epoch: this.epoch,
                 nLeaves: this.nLeaves,
                 ratchetTree: this.ratchetTree,
                 groupContext: this._buildGroupContextStruct(),
-                senderDataSecret: this.epochSecrets.senderDataSecret,
-                encryptionSecret: this.epochSecrets.encryptionSecret,
+                senderDataSecret: outgoingEpochSecrets.senderDataSecret,
                 chainStates: this._chainStates,
                 consumedByLeaf: this.consumedByLeaf,
                 expiresAt: Date.now() + PREV_EPOCH_GRACE_MS,
             };
+            // sender_data_secret remains owned by the bounded grace context.
+            // Everything else from the outgoing epoch has no remaining use.
+            for (const [name, value] of Object.entries(outgoingEpochSecrets)) {
+                if (name !== 'senderDataSecret') wipeBytes(value);
+            }
             // Chain-state ownership moved into the snapshot; the new
-            // epoch starts fresh (re-rooted on first use).
+            // epoch installs its already-derived roots after this snapshot.
             this._chainStates = new Map();
         }
 
@@ -301,8 +414,29 @@
          */
         _dropPrevEpoch() {
             if (!this._prevEpoch) return;
+            wipeBytes(this._prevEpoch.senderDataSecret);
             this._wipeChainStateMap(this._prevEpoch.chainStates);
             this._prevEpoch = null;
+        }
+
+        /**
+         * Best-effort destruction of all extractable symmetric state owned
+         * by this Group. Used when a speculative PendingCommit is abandoned
+         * and when an accepted candidate supersedes the old live Group.
+         * WebCrypto private-key handles are intentionally non-extractable and
+         * cannot be overwritten from JavaScript.
+         */
+        destroySecrets() {
+            if (this.epochSecrets && typeof this.epochSecrets === 'object') {
+                for (const value of Object.values(this.epochSecrets)) wipeBytes(value);
+                this.epochSecrets = {};
+            }
+            this._wipeChainStateMap(this._chainStates);
+            this._chainStates = new Map();
+            this._dropPrevEpoch();
+            wipeBytes(this.pskSecret);
+            this.pskSecret = null;
+            if (this.consumedByLeaf instanceof Map) this.consumedByLeaf.clear();
         }
 
         /**
@@ -316,9 +450,7 @@
          * deep copy and make the caller explicitly commit only after every
          * authentication and replay check succeeds.
          */
-        _beginReceiveRatchetTransaction(
-            chainStates, encryptionSecret, nLeaves,
-        ) {
+        _beginReceiveRatchetTransaction(chainStates, nLeaves) {
             // Copy the map container, then detach only the single sender
             // chain selected by decrypted sender_data. Cloning every other
             // sender's skipped-key cache for each message would turn the
@@ -345,8 +477,8 @@
                     let keyNonce;
                     try {
                         keyNonce = await this._chainKeyNonceIn(
-                            stagedChainStates, encryptionSecret,
-                            nLeaves, leafIndex, which, generation,
+                            stagedChainStates, nLeaves,
+                            leafIndex, which, generation,
                         );
                     } finally {
                         stagedChainState = stagedChainStates.get(touchedChainId) || null;
@@ -408,21 +540,19 @@
          */
         async _chainKeyNonce(leafIndex, which, generation) {
             return this._chainKeyNonceIn(
-                this._chainStates, this.epochSecrets.encryptionSecret,
-                this.nLeaves, leafIndex, which, generation,
+                this._chainStates, this.nLeaves,
+                leafIndex, which, generation,
             );
         }
 
-        async _chainKeyNonceIn(chainStates, encryptionSecret, nLeaves, leafIndex, which, generation) {
+        async _chainKeyNonceIn(chainStates, nLeaves, leafIndex, which, generation) {
             const id = `${leafIndex}:${which}`;
             let st = chainStates.get(id);
             if (!st) {
-                const leafSec = await SecretTree.leafSecret(
-                    encryptionSecret, leafIndex, nLeaves,
+                throw new Error(
+                    `group: no ${which} SecretTree ratchet for leaf ${leafIndex} `
+                    + `(nLeaves=${nLeaves})`,
                 );
-                const chainRoot = await SecretTree.leafChainRoot(leafSec, which);
-                st = { nextGeneration: 0, secret: chainRoot, skipped: new Map() };
-                chainStates.set(id, st);
             }
             if (generation < st.nextGeneration) {
                 const cached = st.skipped.get(generation);
@@ -499,7 +629,11 @@
             // derive it from the URL fragment so an attacker without the
             // invite cannot craft a valid Welcome or Commit even with a
             // compromised relay.
-            const psk = pskSecret || new Uint8Array(HPKE.Nh);
+            // The Group owns and eventually erases this copy; never alias a
+            // session/bootstrap buffer that another component may still use.
+            const psk = pskSecret
+                ? Uint8Array.from(pskSecret)
+                : new Uint8Array(HPKE.Nh);
             if (psk.length !== HPKE.Nh) {
                 throw new Error(`group: pskSecret must be ${HPKE.Nh} bytes (got ${psk.length})`);
             }
@@ -525,11 +659,18 @@
             // initial epoch (no UpdatePath has run yet); init_secret_[-1]
             // is freshly random as §12.3 prescribes. psk_secret carries
             // the URL-fragment binding when set.
-            await group._deriveEpoch({
-                initSecretPrev: initSecret,
-                commitSecret: new Uint8Array(HPKE.Nh),
-                pskSecret: psk,
-            });
+            const initialCommitSecret = new Uint8Array(HPKE.Nh);
+            try {
+                await group._deriveEpoch({
+                    initSecretPrev: initSecret,
+                    commitSecret: initialCommitSecret,
+                    pskSecret: psk,
+                });
+            } finally {
+                // Both inputs are consumed by the epoch-0 key schedule.
+                initSecret.fill(0);
+                initialCommitSecret.fill(0);
+            }
             return group;
         }
 
@@ -540,8 +681,33 @@
          * two synchronised members without going through a full
          * Commit+Welcome round-trip.
          */
-        static fromState(state) {
-            return new Group(state);
+        static async fromState(state) {
+            const copied = cloneMutableState(state);
+            const suppliedChainStates = copied._chainStates;
+            const suppliedConsumed = copied.consumedByLeaf;
+            const suppliedPreviousEpoch = copied._prevEpoch;
+            const group = new Group(copied);
+
+            if (copied.epochSecrets && copied.epochSecrets.encryptionSecret) {
+                const prepared = await prepareEpochSecretsForStorage(
+                    copied.epochSecrets, copied.ratchetTree, copied.nLeaves,
+                );
+                group.epochSecrets = prepared.epochSecrets;
+                group._chainStates = prepared.chainStates;
+            } else if (suppliedChainStates instanceof Map) {
+                // A clone of an already-live Group has no encryption_secret;
+                // its stateful ratchets are the only valid continuation.
+                group._chainStates = suppliedChainStates;
+            } else {
+                throw new Error(
+                    'group.fromState: state has neither encryption_secret nor initialized ratchets',
+                );
+            }
+            if (suppliedConsumed instanceof Map) {
+                group.consumedByLeaf = suppliedConsumed;
+            }
+            if (suppliedPreviousEpoch) group._prevEpoch = suppliedPreviousEpoch;
+            return group;
         }
 
         // ------------------------------------------------------------------
@@ -601,7 +767,11 @@
                 pskSecret,
                 groupContext: groupContextBytes,
             });
-            this.epochSecrets = out;
+            const prepared = await prepareEpochSecretsForStorage(
+                out, this.ratchetTree, this.nLeaves,
+            );
+            this.epochSecrets = prepared.epochSecrets;
+            this._chainStates = prepared.chainStates;
         }
 
         // ------------------------------------------------------------------
@@ -657,7 +827,6 @@
                 senderData,
                 paddingLen: 0,
                 senderDataSecret: this.epochSecrets.senderDataSecret,
-                encryptionSecret: this.epochSecrets.encryptionSecret,
                 nLeaves: this.nLeaves,
                 keyNonceProvider: (li, which, gen) => this._chainKeyNonce(li, which, gen),
             });
@@ -697,13 +866,12 @@
 
             const baseChainStates = this._chainStates;
             const ratchetTx = this._beginReceiveRatchetTransaction(
-                baseChainStates, this.epochSecrets.encryptionSecret, this.nLeaves,
+                baseChainStates, this.nLeaves,
             );
             try {
                 const out = await PrivateMessage.decryptPrivateMessage({
                     pm,
                     senderDataSecret: this.epochSecrets.senderDataSecret,
-                    encryptionSecret: this.epochSecrets.encryptionSecret,
                     nLeaves: this.nLeaves,
                     keyNonceProvider: ratchetTx.keyNonceProvider,
                 });
@@ -794,13 +962,12 @@
 
             const baseChainStates = pe.chainStates;
             const ratchetTx = this._beginReceiveRatchetTransaction(
-                baseChainStates, pe.encryptionSecret, pe.nLeaves,
+                baseChainStates, pe.nLeaves,
             );
             try {
                 const out = await PrivateMessage.decryptPrivateMessage({
                     pm,
                     senderDataSecret: pe.senderDataSecret,
-                    encryptionSecret: pe.encryptionSecret,
                     nLeaves: pe.nLeaves,
                     keyNonceProvider: ratchetTx.keyNonceProvider,
                 });
@@ -1096,12 +1263,18 @@
         const epochGroupContextBytes = GroupContext.groupContextBytes(epochGroupContext);
 
         const rootChainEntry = chain[chain.length - 1];
-        const epochSecrets = await KeySchedule.deriveEpoch({
-            initSecretPrev: this.epochSecrets.initSecret,
-            commitSecret: await TreeKEM.commitSecret(rootChainEntry.pathSecret),
-            pskSecret: this.pskSecret,
-            groupContext: epochGroupContextBytes,
-        });
+        const commitSecretBytes = await TreeKEM.commitSecret(rootChainEntry.pathSecret);
+        let epochSecrets;
+        try {
+            epochSecrets = await KeySchedule.deriveEpoch({
+                initSecretPrev: this.epochSecrets.initSecret,
+                commitSecret: commitSecretBytes,
+                pskSecret: this.pskSecret,
+                groupContext: epochGroupContextBytes,
+            });
+        } finally {
+            commitSecretBytes.fill(0);
+        }
 
         const confirmationTag = await TranscriptHashes.confirmationTag(
             epochSecrets.confirmationKey, newConfirmedTranscriptHash,
@@ -1167,6 +1340,7 @@
         const { kemOutput: gsKem, ciphertext: gsCt } = await Labeled.encryptWithLabel(
             kp.initKey, 'Welcome', encryptedGroupInfo, gsBytes,
         );
+        gsBytes.fill(0);
         const welcomeStruct = {
             cipherSuite: CIPHERSUITE,
             secrets: [{
@@ -1179,6 +1353,14 @@
         const welcomeMessage = MLSMessage.serializeMLSMessage(
             MLSMessage.WireFormat.MLS_WELCOME, welcomeBytes,
         );
+        welcomeSecret.fill(0);
+        wKey.fill(0);
+        wNonce.fill(0);
+
+        const preparedEpoch = await prepareEpochSecretsForStorage(
+            epochSecrets, newTree, newNLeaves,
+        );
+        const previousInitSecret = this.epochSecrets.initSecret;
 
         // ---- 12. Apply commit to local state ----
         // Retain the outgoing epoch's decrypt context first (grace
@@ -1190,7 +1372,9 @@
         this.treeHash = newTreeHash;
         this.confirmedTranscriptHash = newConfirmedTranscriptHash;
         this.interimTranscriptHash = newInterimTranscriptHash;
-        this.epochSecrets = epochSecrets;
+        this.epochSecrets = preparedEpoch.epochSecrets;
+        this._chainStates = preparedEpoch.chainStates;
+        previousInitSecret.fill(0);
         this.senderRatchetGeneration = 0;
         this.leafKeyPair = {
             privateKey: leafNodePair.keyPair.privateKey,
@@ -1210,6 +1394,7 @@
         // chain states now live in the grace-window snapshot; fresh
         // maps start the new epoch.
         this.consumedByLeaf = new Map();
+        wipeTreeKemSecrets(leafSecret, leafNodePair, chain);
 
         return { commitMessage, welcomeMessage };
     };
@@ -1399,12 +1584,18 @@
         const epochGroupContextBytes = GroupContext.groupContextBytes(epochGroupContext);
 
         const rootChainEntry = chain[chain.length - 1];
-        const epochSecrets = await KeySchedule.deriveEpoch({
-            initSecretPrev: this.epochSecrets.initSecret,
-            commitSecret: await TreeKEM.commitSecret(rootChainEntry.pathSecret),
-            pskSecret: this.pskSecret,
-            groupContext: epochGroupContextBytes,
-        });
+        const commitSecretBytes = await TreeKEM.commitSecret(rootChainEntry.pathSecret);
+        let epochSecrets;
+        try {
+            epochSecrets = await KeySchedule.deriveEpoch({
+                initSecretPrev: this.epochSecrets.initSecret,
+                commitSecret: commitSecretBytes,
+                pskSecret: this.pskSecret,
+                groupContext: epochGroupContextBytes,
+            });
+        } finally {
+            commitSecretBytes.fill(0);
+        }
 
         const confirmationTag = await TranscriptHashes.confirmationTag(
             epochSecrets.confirmationKey, newConfirmedTranscriptHash,
@@ -1422,6 +1613,10 @@
         const pm = { content, auth, membershipTag };
         const pmBytes = PublicMessage.publicMessageBytes(pm);
         const commitMessage = MLSMessage.serializeMLSMessage(wireFormat, pmBytes);
+        const preparedEpoch = await prepareEpochSecretsForStorage(
+            epochSecrets, newTree, newNLeaves,
+        );
+        const previousInitSecret = this.epochSecrets.initSecret;
 
         // ---- 11. Apply commit to local state ----
         // Retain the outgoing epoch's decrypt context first (grace
@@ -1432,7 +1627,9 @@
         this.treeHash = newTreeHash;
         this.confirmedTranscriptHash = newConfirmedTranscriptHash;
         this.interimTranscriptHash = newInterimTranscriptHash;
-        this.epochSecrets = epochSecrets;
+        this.epochSecrets = preparedEpoch.epochSecrets;
+        this._chainStates = preparedEpoch.chainStates;
+        previousInitSecret.fill(0);
         this.senderRatchetGeneration = 0;
         this.leafKeyPair = {
             privateKey: leafNodePair.keyPair.privateKey,
@@ -1444,6 +1641,7 @@
             this.parentKeyPairs.set(committerDirectPath[i], chain[i].keyPair);
         }
         this.consumedByLeaf = new Map();
+        wipeTreeKemSecrets(leafSecret, leafNodePair, chain);
 
         return { commitMessage };
     };
@@ -1847,12 +2045,18 @@
         const epochGroupContextBytes = GroupContext.groupContextBytes(epochGroupContext);
 
         const rootChainEntry = chain[chain.length - 1];
-        const epochSecrets = await KeySchedule.deriveEpoch({
-            initSecretPrev: this.epochSecrets.initSecret,
-            commitSecret: await TreeKEM.commitSecret(rootChainEntry.pathSecret),
-            pskSecret: this.pskSecret,
-            groupContext: epochGroupContextBytes,
-        });
+        const commitSecretBytes = await TreeKEM.commitSecret(rootChainEntry.pathSecret);
+        let epochSecrets;
+        try {
+            epochSecrets = await KeySchedule.deriveEpoch({
+                initSecretPrev: this.epochSecrets.initSecret,
+                commitSecret: commitSecretBytes,
+                pskSecret: this.pskSecret,
+                groupContext: epochGroupContextBytes,
+            });
+        } finally {
+            commitSecretBytes.fill(0);
+        }
 
         const confirmationTag = await TranscriptHashes.confirmationTag(
             epochSecrets.confirmationKey, newConfirmedTranscriptHash,
@@ -1870,6 +2074,10 @@
         const pm = { content, auth, membershipTag };
         const pmBytes = PublicMessage.publicMessageBytes(pm);
         const commitMessage = MLSMessage.serializeMLSMessage(wireFormat, pmBytes);
+        const preparedEpoch = await prepareEpochSecretsForStorage(
+            epochSecrets, newTree, newNLeaves,
+        );
+        const previousInitSecret = this.epochSecrets.initSecret;
 
         // ---- 10. Apply commit to local state ----
         // Retain the outgoing epoch's decrypt context first (grace
@@ -1880,7 +2088,9 @@
         this.treeHash = newTreeHash;
         this.confirmedTranscriptHash = newConfirmedTranscriptHash;
         this.interimTranscriptHash = newInterimTranscriptHash;
-        this.epochSecrets = epochSecrets;
+        this.epochSecrets = preparedEpoch.epochSecrets;
+        this._chainStates = preparedEpoch.chainStates;
+        previousInitSecret.fill(0);
         this.senderRatchetGeneration = 0;
         this.leafKeyPair = {
             privateKey: leafNodePair.keyPair.privateKey,
@@ -1892,6 +2102,7 @@
             this.parentKeyPairs.set(committerDirectPath[i], chain[i].keyPair);
         }
         this.consumedByLeaf = new Map();
+        wipeTreeKemSecrets(leafSecret, leafNodePair, chain);
 
         return { commitMessage };
     };
@@ -2231,24 +2442,37 @@
         // lands on one of these nodes.
         const newParentKeyPairs = new Map();
         let cur = lcaPathSecret;
-        for (let i = lcaIdxInPath; i < committerDirectPath.length; i += 1) {
-            if (i > lcaIdxInPath) {
-                cur = await KeySchedule.deriveSecret(cur, 'path');
+        let commitSecretBytes;
+        try {
+            for (let i = lcaIdxInPath; i < committerDirectPath.length; i += 1) {
+                if (i > lcaIdxInPath) {
+                    const next = await KeySchedule.deriveSecret(cur, 'path');
+                    cur.fill(0);
+                    cur = next;
+                }
+                const nodeIdx = committerDirectPath[i];
+                const nodeSecret = await KeySchedule.deriveSecret(cur, 'node');
+                let kpDerived;
+                try {
+                    kpDerived = await HPKE.deriveKeyPair(nodeSecret);
+                } finally {
+                    nodeSecret.fill(0);
+                }
+                const expectedPub = updatePath.nodes[i].encryptionKey;
+                if (!equalBytes(kpDerived.publicKeyBytes, expectedPub)) {
+                    throw new Error(
+                        `processCommit: derived public key mismatch at node ${nodeIdx} (i=${i})`,
+                    );
+                }
+                newParentKeyPairs.set(nodeIdx, kpDerived);
             }
-            const nodeIdx = committerDirectPath[i];
-            const nodeSecret = await KeySchedule.deriveSecret(cur, 'node');
-            const kpDerived = await HPKE.deriveKeyPair(nodeSecret);
-            const expectedPub = updatePath.nodes[i].encryptionKey;
-            if (!equalBytes(kpDerived.publicKeyBytes, expectedPub)) {
-                throw new Error(
-                    `processCommit: derived public key mismatch at node ${nodeIdx} (i=${i})`,
-                );
-            }
-            newParentKeyPairs.set(nodeIdx, kpDerived);
-        }
 
-        // commit_secret = DeriveSecret(path_secret_root, "path")
-        const commitSecretBytes = await TreeKEM.commitSecret(cur);
+            // commit_secret = DeriveSecret(path_secret_root, "path")
+            commitSecretBytes = await TreeKEM.commitSecret(cur);
+        } finally {
+            wipeBytes(cur);
+            wipeBytes(lcaPathSecret);
+        }
 
         // ---- Transcript hashes + new epoch secrets ----
         const cthInput = new Codec.Encoder();
@@ -2264,22 +2488,32 @@
         };
         const epochGroupContextBytes = GroupContext.groupContextBytes(epochGroupContext);
 
-        const newEpochSecrets = await KeySchedule.deriveEpoch({
-            initSecretPrev: this.epochSecrets.initSecret,
-            commitSecret: commitSecretBytes,
-            pskSecret: this.pskSecret,
-            groupContext: epochGroupContextBytes,
-        });
+        let newEpochSecrets;
+        try {
+            newEpochSecrets = await KeySchedule.deriveEpoch({
+                initSecretPrev: this.epochSecrets.initSecret,
+                commitSecret: commitSecretBytes,
+                pskSecret: this.pskSecret,
+                groupContext: epochGroupContextBytes,
+            });
+        } finally {
+            commitSecretBytes.fill(0);
+        }
 
         const expectedConfTag = await TranscriptHashes.confirmationTag(
             newEpochSecrets.confirmationKey, newConfirmedTranscriptHash,
         );
         if (!equalBytes(expectedConfTag, pm.auth.confirmationTag)) {
+            for (const value of Object.values(newEpochSecrets)) wipeBytes(value);
             throw new Error('processCommit: confirmation_tag mismatch');
         }
         const newInterimTranscriptHash = await TranscriptHashes.interimTranscriptHash(
             newConfirmedTranscriptHash, expectedConfTag,
         );
+        const preparedEpoch = await prepareEpochSecretsForStorage(
+            newEpochSecrets, newTree, newNLeaves,
+        );
+        const previousInitSecret = this.epochSecrets.initSecret;
 
         // ---- Commit the new state ----
         // Retain the outgoing epoch's decrypt context first (grace
@@ -2291,7 +2525,9 @@
         this.treeHash = newTreeHash;
         this.confirmedTranscriptHash = newConfirmedTranscriptHash;
         this.interimTranscriptHash = newInterimTranscriptHash;
-        this.epochSecrets = newEpochSecrets;
+        this.epochSecrets = preparedEpoch.epochSecrets;
+        this._chainStates = preparedEpoch.chainStates;
+        previousInitSecret.fill(0);
         this.senderRatchetGeneration = 0;
         // Forward secrecy: keep only entries that are on our direct
         // path in the new tree. Any prior entry not in this set was
@@ -2355,7 +2591,10 @@
         leafEncKeyPair, ratchetTreeBytes, pskSecret,
         expectedSignerLeafIndex, expectedGroupId, expectedCreatorKeyHash,
     }) {
-        const psk = pskSecret || new Uint8Array(HPKE.Nh);
+        // The joined Group owns and eventually erases this copy.
+        const psk = pskSecret
+            ? Uint8Array.from(pskSecret)
+            : new Uint8Array(HPKE.Nh);
         if (psk.length !== HPKE.Nh) {
             throw new Error(`group.join: pskSecret must be ${HPKE.Nh} bytes (got ${psk.length})`);
         }
@@ -2393,7 +2632,16 @@
             gs.joinerSecret, psk,
         );
         const { key: wKey, nonce: wNonce } = await Welcome.welcomeKeyNonce(welcomeSecret);
-        const giBytes = await Welcome.openEncryptedGroupInfo(wKey, wNonce, welcome.encryptedGroupInfo);
+        let giBytes;
+        try {
+            giBytes = await Welcome.openEncryptedGroupInfo(
+                wKey, wNonce, welcome.encryptedGroupInfo,
+            );
+        } finally {
+            welcomeSecret.fill(0);
+            wKey.fill(0);
+            wNonce.fill(0);
+        }
         const groupInfo = GroupInfo.parseGroupInfo(giBytes);
         if (!equalBytes(groupInfo.groupContext.groupId, expectedGroupId)) {
             throw new Error('group.join: group_id does not match invite bootstrap pin');
@@ -2519,21 +2767,33 @@
         }
         const parentKeyPairs = new Map();
         let cur = gs.pathSecret;
-        for (let i = lcaIdx; i < myDirectPath.length; i += 1) {
-            if (i > lcaIdx) {
-                cur = await KeySchedule.deriveSecret(cur, 'path');
+        try {
+            for (let i = lcaIdx; i < myDirectPath.length; i += 1) {
+                if (i > lcaIdx) {
+                    const next = await KeySchedule.deriveSecret(cur, 'path');
+                    cur.fill(0);
+                    cur = next;
+                }
+                const nodeIdx = myDirectPath[i];
+                const nodeSecret = await KeySchedule.deriveSecret(cur, 'node');
+                let kpDerived;
+                try {
+                    kpDerived = await HPKE.deriveKeyPair(nodeSecret);
+                } finally {
+                    nodeSecret.fill(0);
+                }
+                const slot = tree[nodeIdx];
+                if (!slot || slot.nodeType !== Nodes.NodeType.PARENT) {
+                    throw new Error(`group.join: parent node ${nodeIdx} unexpectedly blank/non-parent`);
+                }
+                if (!equalBytes(kpDerived.publicKeyBytes, slot.parent.encryptionKey)) {
+                    throw new Error(`group.join: derived public key mismatch at node ${nodeIdx}`);
+                }
+                parentKeyPairs.set(nodeIdx, kpDerived);
             }
-            const nodeIdx = myDirectPath[i];
-            const nodeSecret = await KeySchedule.deriveSecret(cur, 'node');
-            const kpDerived = await HPKE.deriveKeyPair(nodeSecret);
-            const slot = tree[nodeIdx];
-            if (!slot || slot.nodeType !== Nodes.NodeType.PARENT) {
-                throw new Error(`group.join: parent node ${nodeIdx} unexpectedly blank/non-parent`);
-            }
-            if (!equalBytes(kpDerived.publicKeyBytes, slot.parent.encryptionKey)) {
-                throw new Error(`group.join: derived public key mismatch at node ${nodeIdx}`);
-            }
-            parentKeyPairs.set(nodeIdx, kpDerived);
+        } finally {
+            wipeBytes(cur);
+            wipeBytes(gs.pathSecret);
         }
 
         // Derive epoch secrets using gs.joinerSecret as the joiner_secret.
@@ -2555,6 +2815,7 @@
         const resumptionPsk = await KeySchedule.deriveSecret(epochSecretRaw, 'resumption');
         const epochAuthenticator = await KeySchedule.deriveSecret(epochSecretRaw, 'authentication');
         const initSecret = await KeySchedule.deriveSecret(epochSecretRaw, 'init');
+        memberSecret.fill(0);
 
         const epochSecrets = {
             joinerSecret: gs.joinerSecret,
@@ -2576,8 +2837,15 @@
             confirmationKey, groupInfo.groupContext.confirmedTranscriptHash,
         );
         if (!equalBytes(expectedConfTag, groupInfo.confirmationTag)) {
+            for (const value of Object.values(epochSecrets)) wipeBytes(value);
             throw new Error('group.join: confirmation_tag mismatch');
         }
+        const newInterimTranscriptHash = await TranscriptHashes.interimTranscriptHash(
+            groupInfo.groupContext.confirmedTranscriptHash, expectedConfTag,
+        );
+        const preparedEpoch = await prepareEpochSecretsForStorage(
+            epochSecrets, tree, nLeaves,
+        );
 
         const state = {
             cipherSuite: CIPHERSUITE,
@@ -2590,15 +2858,15 @@
             leafKeyPair: leafEncKeyPair,
             parentKeyPairs,
             senderRatchetGeneration: 0,
-            interimTranscriptHash: await TranscriptHashes.interimTranscriptHash(
-                groupInfo.groupContext.confirmedTranscriptHash, expectedConfTag,
-            ),
+            interimTranscriptHash: newInterimTranscriptHash,
             confirmedTranscriptHash: groupInfo.groupContext.confirmedTranscriptHash,
             treeHash: groupInfo.groupContext.treeHash,
-            epochSecrets,
+            epochSecrets: preparedEpoch.epochSecrets,
             pskSecret: psk,
         };
-        return new Group(state);
+        const group = new Group(state);
+        group._chainStates = preparedEpoch.chainStates;
+        return group;
     };
 
     // --- Internal helpers ------------------------------------------------

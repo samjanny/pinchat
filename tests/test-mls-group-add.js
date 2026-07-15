@@ -157,15 +157,20 @@ async function main() {
     assert(bobGroup.epoch === 1n, 'Bob at epoch 1');
     assert(bobGroup.myLeafIndex === 1, 'Bob is leaf 1');
     assert(
-        Buffer.from(bobGroup.epochSecrets.encryptionSecret).toString('hex')
-        === Buffer.from(alice.epochSecrets.encryptionSecret).toString('hex'),
-        'Bob and Alice share encryption_secret at epoch 1'
+        Buffer.from(bobGroup.epochSecrets.epochAuthenticator).toString('hex')
+        === Buffer.from(alice.epochSecrets.epochAuthenticator).toString('hex'),
+        'Bob and Alice share epoch_authenticator at epoch 1'
     );
-    assert(
-        Buffer.from(bobGroup.epochSecrets.confirmationKey).toString('hex')
-        === Buffer.from(alice.epochSecrets.confirmationKey).toString('hex'),
-        'Bob and Alice share confirmation_key at epoch 1'
-    );
+    for (const member of [alice, bobGroup]) {
+        assert(
+            ['joinerSecret', 'welcomeSecret', 'epochSecret',
+                'encryptionSecret', 'confirmationKey']
+                .every((name) => member.epochSecrets[name] === undefined),
+            `leaf ${member.myLeafIndex} does not retain one-shot epoch secrets`,
+        );
+        assert(member._chainStates.size === 4,
+            `leaf ${member.myLeafIndex} retains only two chains per live leaf`);
+    }
 
     // 5. Exchange application messages at epoch 1.
     const wire1 = await alice.encryptApplicationMessage('ciao bob, eccoci');
@@ -179,20 +184,26 @@ async function main() {
         'Bob → Alice application message at epoch 1 decrypts');
 
     // 6. Path-only Update commit: PCS rotation without membership change.
-    const secretBefore = Buffer.from(alice.epochSecrets.encryptionSecret).toString('hex');
+    const authenticatorBefore = Buffer.from(
+        alice.epochSecrets.epochAuthenticator,
+    ).toString('hex');
+    const oldAliceInitSecret = alice.epochSecrets.initSecret;
     const { commitMessage: updCommit } = await alice.commitUpdate();
     await bobGroup.processCommit(updCommit);
     assert(alice.epoch === 2n && bobGroup.epoch === 2n,
         'Update commit advances both members to epoch 2');
     assert(
-        Buffer.from(alice.epochSecrets.encryptionSecret).toString('hex')
-            === Buffer.from(bobGroup.epochSecrets.encryptionSecret).toString('hex'),
-        'epoch 2 encryption_secret converges after Update commit'
+        Buffer.from(alice.epochSecrets.epochAuthenticator).toString('hex')
+            === Buffer.from(bobGroup.epochSecrets.epochAuthenticator).toString('hex'),
+        'epoch 2 epoch_authenticator converges after Update commit'
     );
     assert(
-        Buffer.from(alice.epochSecrets.encryptionSecret).toString('hex') !== secretBefore,
-        'Update commit rotates the encryption_secret'
+        Buffer.from(alice.epochSecrets.epochAuthenticator).toString('hex')
+            !== authenticatorBefore,
+        'Update commit rotates the epoch_authenticator'
     );
+    assert(oldAliceInitSecret.every((byte) => byte === 0),
+        'accepted Update erases the superseded init_secret');
     const wireU1 = await alice.encryptApplicationMessage('post-update alice');
     assert(new TextDecoder().decode((await bobGroup.decryptApplicationMessage(wireU1)).plaintext)
         === 'post-update alice', 'Alice -> Bob message at epoch 2 decrypts');
@@ -302,9 +313,9 @@ async function main() {
         assert(res.selfUpdated === true, 'processCommit reports Bob self-updated');
         assert(bobGroup.epoch === alice.epoch, 'Bob converges after folded Update');
         assert(
-            Buffer.from(bobGroup.epochSecrets.encryptionSecret).toString('hex')
-                === Buffer.from(alice.epochSecrets.encryptionSecret).toString('hex'),
-            'encryption_secret converges after member Update'
+            Buffer.from(bobGroup.epochSecrets.epochAuthenticator).toString('hex')
+                === Buffer.from(alice.epochSecrets.epochAuthenticator).toString('hex'),
+            'epoch_authenticator converges after member Update'
         );
         assert(Buffer.from(bobGroup.leafKeyPair.publicKeyBytes).toString('hex')
             === Buffer.from(pendingLeafKeyPair.publicKeyBytes).toString('hex'),

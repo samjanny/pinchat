@@ -1,8 +1,8 @@
 {
   "data": {
     "version": "1.2.0",
-    "sequence": 50,
-    "generated": "2026-07-15T10:10:37.393Z",
+    "sequence": 52,
+    "generated": "2026-07-15T10:29:57.240Z",
     "site": "https://pinchat.io",
     "files": [
       {
@@ -107,7 +107,7 @@
       },
       {
         "path": "/static/js/mls/key-schedule.js",
-        "hash": "775ffa72976b05309aaa3901b1d62b45afc53330dae076c8919811ef1c255dc7"
+        "hash": "3bde1ab50c5eeb464debc074a63ef6efccbd241def080f09c26305aa98047fb2"
       },
       {
         "path": "/static/js/mls/transcript-hashes.js",
@@ -131,7 +131,7 @@
       },
       {
         "path": "/static/js/mls/tree-kem.js",
-        "hash": "55523cb0d40a5aa19e8ffa05d3b3962ca1e9c149eaea45949e36c33c2adc0703"
+        "hash": "4b66d94a37bbcfe204382b681ae356fa86650503a61f8705b295e0bf63c224b9"
       },
       {
         "path": "/static/js/mls/group-context.js",
@@ -171,19 +171,19 @@
       },
       {
         "path": "/static/js/mls/secret-tree.js",
-        "hash": "b20333cd2943bb7ca503947c35f19f69838042c1f97b1c2b1c5594bd0345d03f"
+        "hash": "5ec6327467ef0596297bea70ebf9c1dbb51d640282539c7a1c557cdd8049f97c"
       },
       {
         "path": "/static/js/mls/private-message.js",
-        "hash": "79abafc059e14f912ac8439dd1cc9757987733169dcd3c7e57885700950d5afb"
+        "hash": "06c306b0e07387c44f75f4267dabb99b3056822a18e63cbbccf3264614995e80"
       },
       {
         "path": "/static/js/mls/group.js",
-        "hash": "a9d2651637c190dfe421aa382cad3d2dd415647dbe9d945a0d11d1f2b7bc5209"
+        "hash": "c2c5b0533451183428470d972744a36aca12698760b5da78c73954bb2601396b"
       },
       {
         "path": "/static/js/mls-session.js",
-        "hash": "b8133412f2d0ff1221a0a0c93d1d5ae0e079cdc34c975bac44c128bfc1be6954"
+        "hash": "533e93d50fd313928ae5f257085c4f6c42f4750aa52724f571dd58904bfd5412"
       },
       {
         "path": "/static/index.html",
@@ -195,7 +195,7 @@
       },
       {
         "path": "/static/chat.html",
-        "hash": "d8a0446cf7586d9ec534fafb49b83c15fca8d9fa07f206d5a97872256ebfa545"
+        "hash": "3b58ffb54734056acd193dc7b0f22578287dfa7ba7b93d31c0aa2f88a66c6542"
       },
       {
         "path": "/static/terms.html",
@@ -211,5 +211,5 @@
       }
     ]
   },
-  "signature": "MEQCIF85gJDVQJcRzMQNUs2hdGGfVHG1gJ69iSYCVz3GNzUOAiBS35I8E/jeMl9zq8+7U4TcVjpuaqnZqoSMIDtCVTw9Zw=="
+  "signature": "MEQCICzrEwC4nUDHV8FrGoKyQTSyngRHqKqgg9Wj4jcFHVb1AiAX/DpCSL/oaSNLLevgw1H5x7F7BjuI1u0kCDmKouxMOw=="
 }

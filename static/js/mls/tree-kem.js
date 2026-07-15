@@ -41,7 +41,7 @@
      *
      * Returns an array of entries, one per node on the direct path from
      * the leaf up to and including the root. Each entry carries:
-     *   { nodeIndex, pathSecret, nodeSecret, keyPair }
+     *   { nodeIndex, pathSecret, keyPair }
      * where keyPair comes from HPKE.deriveKeyPair.
      *
      * The leaf itself is NOT included in the returned array — the leaf's
@@ -57,8 +57,15 @@
             // Advance one step up the direct path.
             pathSecret = await KeySchedule.deriveSecret(pathSecret, 'path');
             const nodeSecret = await KeySchedule.deriveSecret(pathSecret, 'node');
-            const keyPair = await HPKE.deriveKeyPair(nodeSecret);
-            chain.push({ nodeIndex, pathSecret, nodeSecret, keyPair });
+            let keyPair;
+            try {
+                keyPair = await HPKE.deriveKeyPair(nodeSecret);
+            } finally {
+                // node_secret is a one-shot KEM derivation input; the
+                // resulting non-extractable CryptoKey pair is sufficient.
+                nodeSecret.fill(0);
+            }
+            chain.push({ nodeIndex, pathSecret, keyPair });
         }
         return chain;
     }
@@ -73,11 +80,15 @@
      */
     async function leafKeyPairFromSecret(leafSecret, leafIndex) {
         const nodeSecret = await KeySchedule.deriveSecret(leafSecret, 'node');
-        const keyPair = await HPKE.deriveKeyPair(nodeSecret);
+        let keyPair;
+        try {
+            keyPair = await HPKE.deriveKeyPair(nodeSecret);
+        } finally {
+            nodeSecret.fill(0);
+        }
         return {
             nodeIndex: TreeMath.leafToNode(leafIndex),
             pathSecret: leafSecret,
-            nodeSecret,
             keyPair,
         };
     }

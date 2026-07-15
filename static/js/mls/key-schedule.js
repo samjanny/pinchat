@@ -99,42 +99,75 @@
         if (pskSecret.length !== Nh) throw new Error('key-schedule: pskSecret wrong length');
         if (!(groupContext instanceof Uint8Array)) throw new Error('key-schedule: groupContext must be Uint8Array');
 
-        // Step 1: join key material
-        const joinerExtract = await HPKE.hkdfExtract(initSecretPrev, commitSecret);
-        const joinerSecret = await expandWithLabel(joinerExtract, 'joiner', groupContext, Nh);
+        let joinerExtract = null;
+        let memberSecret = null;
+        const derivedOutputs = [];
+        let complete = false;
+        try {
+            // Step 1: join key material
+            joinerExtract = await HPKE.hkdfExtract(initSecretPrev, commitSecret);
+            const joinerSecret = await expandWithLabel(
+                joinerExtract, 'joiner', groupContext, Nh,
+            );
+            derivedOutputs.push(joinerSecret);
 
-        // Step 2: combine PSK
-        const memberSecret = await HPKE.hkdfExtract(joinerSecret, pskSecret);
+            // Step 2: combine PSK
+            memberSecret = await HPKE.hkdfExtract(joinerSecret, pskSecret);
 
-        // Step 3: welcome (context is empty) + epoch (context is group_context)
-        const welcomeSecret = await expandWithLabel(memberSecret, 'welcome', new Uint8Array(0), Nh);
-        const epochSecret = await expandWithLabel(memberSecret, 'epoch', groupContext, Nh);
+            // Step 3: welcome (context is empty) + epoch (context is group_context)
+            const welcomeSecret = await expandWithLabel(
+                memberSecret, 'welcome', new Uint8Array(0), Nh,
+            );
+            derivedOutputs.push(welcomeSecret);
+            const epochSecret = await expandWithLabel(
+                memberSecret, 'epoch', groupContext, Nh,
+            );
+            derivedOutputs.push(epochSecret);
 
-        // Step 4: epoch-derived secrets
-        const senderDataSecret    = await deriveSecret(epochSecret, 'sender data');
-        const encryptionSecret    = await deriveSecret(epochSecret, 'encryption');
-        const exporterSecret      = await deriveSecret(epochSecret, 'exporter');
-        const externalSecret      = await deriveSecret(epochSecret, 'external');
-        const confirmationKey     = await deriveSecret(epochSecret, 'confirm');
-        const membershipKey       = await deriveSecret(epochSecret, 'membership');
-        const resumptionPsk       = await deriveSecret(epochSecret, 'resumption');
-        const epochAuthenticator  = await deriveSecret(epochSecret, 'authentication');
-        const initSecret          = await deriveSecret(epochSecret, 'init');
+            // Step 4: epoch-derived secrets
+            const senderDataSecret    = await deriveSecret(epochSecret, 'sender data');
+            derivedOutputs.push(senderDataSecret);
+            const encryptionSecret    = await deriveSecret(epochSecret, 'encryption');
+            derivedOutputs.push(encryptionSecret);
+            const exporterSecret      = await deriveSecret(epochSecret, 'exporter');
+            derivedOutputs.push(exporterSecret);
+            const externalSecret      = await deriveSecret(epochSecret, 'external');
+            derivedOutputs.push(externalSecret);
+            const confirmationKey     = await deriveSecret(epochSecret, 'confirm');
+            derivedOutputs.push(confirmationKey);
+            const membershipKey       = await deriveSecret(epochSecret, 'membership');
+            derivedOutputs.push(membershipKey);
+            const resumptionPsk       = await deriveSecret(epochSecret, 'resumption');
+            derivedOutputs.push(resumptionPsk);
+            const epochAuthenticator  = await deriveSecret(epochSecret, 'authentication');
+            derivedOutputs.push(epochAuthenticator);
+            const initSecret          = await deriveSecret(epochSecret, 'init');
+            derivedOutputs.push(initSecret);
 
-        return {
-            joinerSecret,
-            welcomeSecret,
-            epochSecret,
-            senderDataSecret,
-            encryptionSecret,
-            exporterSecret,
-            externalSecret,
-            confirmationKey,
-            membershipKey,
-            resumptionPsk,
-            epochAuthenticator,
-            initSecret,
-        };
+            complete = true;
+            return {
+                joinerSecret,
+                welcomeSecret,
+                epochSecret,
+                senderDataSecret,
+                encryptionSecret,
+                exporterSecret,
+                externalSecret,
+                confirmationKey,
+                membershipKey,
+                resumptionPsk,
+                epochAuthenticator,
+                initSecret,
+            };
+        } finally {
+            // These HKDF intermediates are never part of persistent epoch
+            // state. Outputs above are independent Uint8Arrays.
+            if (joinerExtract) joinerExtract.fill(0);
+            if (memberSecret) memberSecret.fill(0);
+            if (!complete) {
+                for (const value of derivedOutputs) value.fill(0);
+            }
+        }
     }
 
     /**
@@ -152,7 +185,11 @@
      */
     async function mlsExporter(exporterSecret, label, contextHash, length) {
         const derived = await deriveSecret(exporterSecret, label);
-        return expandWithLabel(derived, 'exported', contextHash, length);
+        try {
+            return await expandWithLabel(derived, 'exported', contextHash, length);
+        } finally {
+            derived.fill(0);
+        }
     }
 
     return Object.freeze({

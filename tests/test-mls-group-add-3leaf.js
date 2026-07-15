@@ -144,12 +144,12 @@ async function main() {
         'Carol joined into 3-leaf tree at epoch 2');
     assert(carolGroup.myLeafIndex === 2, 'Carol is leaf 2');
 
-    // All three share encryption_secret at epoch 2.
-    const aHex = hex(alice.epochSecrets.encryptionSecret);
-    const bHex = hex(bobGroup.epochSecrets.encryptionSecret);
-    const cHex = hex(carolGroup.epochSecrets.encryptionSecret);
+    // All three share the authenticated epoch state at epoch 2.
+    const aHex = hex(alice.epochSecrets.epochAuthenticator);
+    const bHex = hex(bobGroup.epochSecrets.epochAuthenticator);
+    const cHex = hex(carolGroup.epochSecrets.epochAuthenticator);
     assert(aHex === bHex && bHex === cHex,
-        'Alice, Bob, Carol share encryption_secret at epoch 2',
+        'Alice, Bob, Carol share epoch_authenticator at epoch 2',
         aHex !== bHex ? `A=${aHex.slice(0, 16)} B=${bHex.slice(0, 16)} C=${cHex.slice(0, 16)}` : null);
 
     // Pairwise application messages at epoch 2.
@@ -203,12 +203,12 @@ async function main() {
         'Dave joined into 4-leaf tree at epoch 3');
 
     // All four converge.
-    const aHex3 = hex(alice.epochSecrets.encryptionSecret);
-    const bHex3 = hex(bobGroup.epochSecrets.encryptionSecret);
-    const cHex3 = hex(carolGroup.epochSecrets.encryptionSecret);
-    const dHex3 = hex(daveGroup.epochSecrets.encryptionSecret);
+    const aHex3 = hex(alice.epochSecrets.epochAuthenticator);
+    const bHex3 = hex(bobGroup.epochSecrets.epochAuthenticator);
+    const cHex3 = hex(carolGroup.epochSecrets.epochAuthenticator);
+    const dHex3 = hex(daveGroup.epochSecrets.epochAuthenticator);
     assert(aHex3 === bHex3 && bHex3 === cHex3 && cHex3 === dHex3,
-        'A/B/C/D share encryption_secret at epoch 3');
+        'A/B/C/D share epoch_authenticator at epoch 3');
 
     // Round-trip every pair Alice ↔ {Bob, Carol, Dave}.
     for (const [from, to, name] of [

@@ -139,8 +139,11 @@ async function main() {
     const carolResult = await carolGroup.processCommit(rmRes.commitMessage);
     assert(carolResult.removedLeafIndex === 1, 'Carol observed removedLeafIndex=1');
     assert(carolGroup.epoch === 3n, 'Carol advanced to epoch 3');
-    assert(hex(alice.epochSecrets.encryptionSecret) === hex(carolGroup.epochSecrets.encryptionSecret),
-        'Alice and Carol share encryption_secret at epoch 3');
+    assert(hex(alice.epochSecrets.epochAuthenticator)
+        === hex(carolGroup.epochSecrets.epochAuthenticator),
+    'Alice and Carol share epoch_authenticator at epoch 3');
+    assert(alice._chainStates.size === 4 && carolGroup._chainStates.size === 4,
+        'removed blank leaf has no retained application or handshake roots');
 
     // Bob's leaf in both trees is now blank.
     const bobLeafNode = 2; // leafToNode(1) = 2

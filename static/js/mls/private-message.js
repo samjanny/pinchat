@@ -276,12 +276,24 @@
         pm, senderDataSecret, encryptionSecret, nLeaves, keyNonceProvider,
     }) {
         // 1. Decrypt sender_data.
-        const { key: sdKey, nonce: sdNonce } = await SecretTree.senderDataKeyNonce(
-            senderDataSecret, pm.ciphertext
-        );
-        const sdAad = senderDataAadBytes(pm.groupId, pm.epoch, pm.contentType);
-        const sdPlain = await aesGcmDecrypt(sdKey, sdNonce, sdAad, pm.encryptedSenderData);
-        const senderData = parseSenderData(sdPlain);
+        let sdKey = null;
+        let sdNonce = null;
+        let sdPlain = null;
+        let senderData;
+        try {
+            ({ key: sdKey, nonce: sdNonce } = await SecretTree.senderDataKeyNonce(
+                senderDataSecret, pm.ciphertext,
+            ));
+            const sdAad = senderDataAadBytes(pm.groupId, pm.epoch, pm.contentType);
+            sdPlain = await aesGcmDecrypt(
+                sdKey, sdNonce, sdAad, pm.encryptedSenderData,
+            );
+            senderData = parseSenderData(sdPlain);
+        } finally {
+            if (sdKey) sdKey.fill(0);
+            if (sdNonce) sdNonce.fill(0);
+            if (sdPlain) sdPlain.fill(0);
+        }
 
         // 2. Derive the per-leaf ratchet key/nonce. When the caller
         // supplies a keyNonceProvider (Group's stateful forward-secret
@@ -290,28 +302,46 @@
         // root and is retained for the IETF vector tests.
         const which = (pm.contentType === Framing.ContentType.APPLICATION)
             ? 'application' : 'handshake';
-        let key;
-        let baseNonce;
-        if (keyNonceProvider) {
-            ({ key, nonce: baseNonce } = await keyNonceProvider(
-                senderData.leafIndex, which, senderData.generation,
-            ));
-        } else {
-            const leafSec = await SecretTree.leafSecret(encryptionSecret, senderData.leafIndex, nLeaves);
-            const chainRoot = await SecretTree.leafChainRoot(leafSec, which);
-            ({ key, nonce: baseNonce } = await SecretTree.keyNonceAtGeneration(
-                chainRoot, senderData.generation
-            ));
-        }
-        const nonce = applyReuseGuard(baseNonce, senderData.reuseGuard);
+        let key = null;
+        let baseNonce = null;
+        let nonce = null;
+        let leafSec = null;
+        let chainRoot = null;
+        let plaintext = null;
+        try {
+            if (keyNonceProvider) {
+                ({ key, nonce: baseNonce } = await keyNonceProvider(
+                    senderData.leafIndex, which, senderData.generation,
+                ));
+            } else {
+                leafSec = await SecretTree.leafSecret(
+                    encryptionSecret, senderData.leafIndex, nLeaves,
+                );
+                chainRoot = await SecretTree.leafChainRoot(leafSec, which);
+                const derived = await SecretTree.keyNonceAtGeneration(
+                    chainRoot, senderData.generation,
+                );
+                key = derived.key;
+                baseNonce = derived.nonce;
+                derived.nextSecret.fill(0);
+            }
+            nonce = applyReuseGuard(baseNonce, senderData.reuseGuard);
 
-        // 3. Decrypt the ciphertext.
-        const aad = privateContentAadBytes(
-            pm.groupId, pm.epoch, pm.contentType, pm.authenticatedData
-        );
-        const plaintext = await aesGcmDecrypt(key, nonce, aad, pm.ciphertext);
-        const content = parsePrivateMessageContent(plaintext, pm.contentType);
-        return { senderData, content };
+            // 3. Decrypt the ciphertext.
+            const aad = privateContentAadBytes(
+                pm.groupId, pm.epoch, pm.contentType, pm.authenticatedData,
+            );
+            plaintext = await aesGcmDecrypt(key, nonce, aad, pm.ciphertext);
+            const content = parsePrivateMessageContent(plaintext, pm.contentType);
+            return { senderData, content };
+        } finally {
+            if (key) key.fill(0);
+            if (baseNonce) baseNonce.fill(0);
+            if (nonce) nonce.fill(0);
+            if (plaintext) plaintext.fill(0);
+            if (chainRoot) chainRoot.fill(0);
+            if (leafSec && leafSec !== encryptionSecret) leafSec.fill(0);
+        }
     }
 
     /**
@@ -333,40 +363,67 @@
         // the IETF vector tests.
         const which = (contentType === Framing.ContentType.APPLICATION)
             ? 'application' : 'handshake';
-        let key;
-        let baseNonce;
-        if (keyNonceProvider) {
-            ({ key, nonce: baseNonce } = await keyNonceProvider(
-                senderData.leafIndex, which, senderData.generation,
-            ));
-        } else {
-            const leafSec = await SecretTree.leafSecret(
-                encryptionSecret, senderData.leafIndex, nLeaves
+        let key = null;
+        let baseNonce = null;
+        let nonce = null;
+        let leafSec = null;
+        let chainRoot = null;
+        let plaintext = null;
+        let senderDataPlain = null;
+        let sdKey = null;
+        let sdNonce = null;
+        try {
+            if (keyNonceProvider) {
+                ({ key, nonce: baseNonce } = await keyNonceProvider(
+                    senderData.leafIndex, which, senderData.generation,
+                ));
+            } else {
+                leafSec = await SecretTree.leafSecret(
+                    encryptionSecret, senderData.leafIndex, nLeaves,
+                );
+                chainRoot = await SecretTree.leafChainRoot(leafSec, which);
+                const derived = await SecretTree.keyNonceAtGeneration(
+                    chainRoot, senderData.generation,
+                );
+                key = derived.key;
+                baseNonce = derived.nonce;
+                derived.nextSecret.fill(0);
+            }
+            nonce = applyReuseGuard(baseNonce, senderData.reuseGuard);
+
+            plaintext = privateMessageContentBytes(
+                contentType, payloadBytes, auth, paddingLen,
             );
-            const chainRoot = await SecretTree.leafChainRoot(leafSec, which);
-            ({ key, nonce: baseNonce } = await SecretTree.keyNonceAtGeneration(
-                chainRoot, senderData.generation
+            const aad = privateContentAadBytes(
+                groupId, epoch, contentType, authenticatedData,
+            );
+            const ciphertext = await aesGcmEncrypt(key, nonce, aad, plaintext);
+
+            // Encrypt sender_data.
+            ({ key: sdKey, nonce: sdNonce } = await SecretTree.senderDataKeyNonce(
+                senderDataSecret, ciphertext,
             ));
+            const sdAad = senderDataAadBytes(groupId, epoch, contentType);
+            senderDataPlain = senderDataBytes(senderData);
+            const encryptedSenderData = await aesGcmEncrypt(
+                sdKey, sdNonce, sdAad, senderDataPlain,
+            );
+
+            return {
+                groupId, epoch, contentType, authenticatedData,
+                encryptedSenderData, ciphertext,
+            };
+        } finally {
+            if (key) key.fill(0);
+            if (baseNonce) baseNonce.fill(0);
+            if (nonce) nonce.fill(0);
+            if (leafSec && leafSec !== encryptionSecret) leafSec.fill(0);
+            if (chainRoot) chainRoot.fill(0);
+            if (plaintext) plaintext.fill(0);
+            if (senderDataPlain) senderDataPlain.fill(0);
+            if (sdKey) sdKey.fill(0);
+            if (sdNonce) sdNonce.fill(0);
         }
-        const nonce = applyReuseGuard(baseNonce, senderData.reuseGuard);
-
-        const plaintext = privateMessageContentBytes(contentType, payloadBytes, auth, paddingLen);
-        const aad = privateContentAadBytes(groupId, epoch, contentType, authenticatedData);
-        const ciphertext = await aesGcmEncrypt(key, nonce, aad, plaintext);
-
-        // Encrypt sender_data.
-        const { key: sdKey, nonce: sdNonce } = await SecretTree.senderDataKeyNonce(
-            senderDataSecret, ciphertext
-        );
-        const sdAad = senderDataAadBytes(groupId, epoch, contentType);
-        const encryptedSenderData = await aesGcmEncrypt(
-            sdKey, sdNonce, sdAad, senderDataBytes(senderData)
-        );
-
-        return {
-            groupId, epoch, contentType, authenticatedData,
-            encryptedSenderData, ciphertext,
-        };
     }
 
     return Object.freeze({

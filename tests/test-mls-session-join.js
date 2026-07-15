@@ -201,7 +201,7 @@ async function createExchange({ acceptCommit = true, creatorSend = null } = {}) 
         role: 'creator',
         send: (envelope) => {
             creatorOut.push(envelope);
-            return creatorSend ? creatorSend(envelope) : true;
+            return creatorSend ? creatorSend(envelope, creator) : true;
         },
         onEvent: (event) => creatorEvents.push(event),
     });
@@ -269,6 +269,11 @@ async function main() {
         ...exchange.commit, payload: mismatchedPayload, sender_id: 'creator-self',
     }), 'non-matching own PublicMessage is not accepted as Commit ACK');
 
+    const supersededGroup = exchange.beforeAdd.reference;
+    const supersededSecretRefs = [
+        ...Object.values(supersededGroup.epochSecrets),
+        ...[...supersededGroup._chainStates.values()].map((state) => state.secret),
+    ].filter((value) => value instanceof Uint8Array);
     await echoPendingCommit(exchange.creator, exchange.commit);
     exchange.welcome = exchange.creatorOut.find(
         (envelope) => envelope.wire_format === WireFormat.MLS_WELCOME,
@@ -278,15 +283,33 @@ async function main() {
         'Commit echo atomically clears PendingCommit');
     assert(exchange.creator.group.epoch === exchange.beforeAdd.epoch + 1n,
         'Commit echo atomically installs candidate epoch');
+    assert(Object.keys(supersededGroup.epochSecrets).length === 0
+        && supersededGroup._chainStates.size === 0
+        && supersededSecretRefs.every((bytes) => bytes.every((byte) => byte === 0)),
+    'accepted PendingCommit erases the superseded Group secret copy');
 
     // WebSocketManager reports a synchronous send rejection with `false`.
     // The candidate must be discarded without changing the live Group or
     // consuming the sender-to-leaf binding.
+    let rejectedCandidate = null;
+    let rejectedCandidateSecretRefs = [];
     const sendFailure = await createExchange({
         acceptCommit: false,
-        creatorSend: (envelope) => (
-            envelope.wire_format === WireFormat.MLS_PUBLIC_MESSAGE ? false : true
-        ),
+        creatorSend: (envelope, creator) => {
+            if (envelope.wire_format !== WireFormat.MLS_PUBLIC_MESSAGE) return true;
+            rejectedCandidate = creator._pendingCommit.candidateGroup;
+            rejectedCandidateSecretRefs = [
+                ...Object.values(rejectedCandidate.epochSecrets),
+                ...[...rejectedCandidate._chainStates.values()]
+                    .map((state) => state.secret),
+                ...(rejectedCandidate._prevEpoch
+                    ? [rejectedCandidate._prevEpoch.senderDataSecret,
+                        ...[...rejectedCandidate._prevEpoch.chainStates.values()]
+                            .map((state) => state.secret)]
+                    : []),
+            ].filter((value) => value instanceof Uint8Array);
+            return false;
+        },
     });
     assert(Boolean(sendFailure.commit) && !sendFailure.welcome,
         'transport-rejected Add emits neither an accepted Commit nor Welcome');
@@ -295,6 +318,14 @@ async function main() {
     assert(sendFailure.creator._pendingCommit === null
         && sendFailure.creator._leafBySenderId.size === 0,
     'transport-rejected Add clears candidate and preserves membership maps');
+    assert(rejectedCandidate
+        && Object.keys(rejectedCandidate.epochSecrets).length === 0
+        && rejectedCandidate._chainStates.size === 0
+        && rejectedCandidate._prevEpoch === null
+        && rejectedCandidateSecretRefs.every(
+            (bytes) => bytes.every((byte) => byte === 0),
+        ),
+    'transport rejection erases all speculative candidate secrets');
     const sendFailureError = sendFailure.creatorEvents.find(
         (event) => event.kind === 'error'
             && event.reason.includes('transport rejected envelope'),
@@ -341,9 +372,9 @@ async function main() {
     assert(exchange.joiner.group.epoch === exchange.creator.group.epoch,
         'creator and joiner are in the same epoch');
     assert(equalBytes(
-        exchange.joiner.group.epochSecrets.encryptionSecret,
-        exchange.creator.group.epochSecrets.encryptionSecret,
-    ), 'creator and joiner share encryption_secret');
+        exchange.joiner.group.epochSecrets.epochAuthenticator,
+        exchange.creator.group.epochSecrets.epochAuthenticator,
+    ), 'creator and joiner share epoch_authenticator');
     assert(exchange.joinerEvents.some((event) => event.kind === 'joined'),
         'joiner emits authenticated joined event');
 
@@ -394,9 +425,9 @@ async function main() {
     assert(exchange.joiner.group.epoch === exchange.creator.group.epoch,
         'joiner applies steady-state Commit through MLSSession');
     assert(equalBytes(
-        exchange.joiner.group.epochSecrets.encryptionSecret,
-        exchange.creator.group.epochSecrets.encryptionSecret,
-    ), 'steady-state Commit keeps creator and joiner secrets aligned');
+        exchange.joiner.group.epochSecrets.epochAuthenticator,
+        exchange.creator.group.epochSecrets.epochAuthenticator,
+    ), 'steady-state Commit keeps creator and joiner epoch state aligned');
     assert(exchange.joinerEvents.some((event) => event.kind === 'commit-applied'),
         'joiner emits commit-applied for post-join Commit');
 
@@ -539,9 +570,9 @@ async function main() {
     assert(exchange.joiner.group.epoch === exchange.creator.group.epoch,
         'joiner applies Commit containing its Update proposal');
     assert(equalBytes(
-        exchange.joiner.group.epochSecrets.encryptionSecret,
-        exchange.creator.group.epochSecrets.encryptionSecret,
-    ), 'folded Update keeps creator and joiner secrets aligned');
+        exchange.joiner.group.epochSecrets.epochAuthenticator,
+        exchange.creator.group.epochSecrets.epochAuthenticator,
+    ), 'folded Update keeps creator and joiner epoch state aligned');
     assert(exchange.joiner._pendingSelfUpdate === null,
         'joiner activates and clears pending self-update after Commit');
 
