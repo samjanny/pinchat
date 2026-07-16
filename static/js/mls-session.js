@@ -23,6 +23,9 @@
  * ------------------
  * The `send(envelope)` callback must broadcast to the room relay and may
  * return `false` to report a synchronous transport rejection; the
+ * optional `cancelPendingControl(envelope)` callback removes an exact
+ * locally-queued control which ordered relay state has made permanently
+ * ineligible for acceptance.
  * envelope is `{ type: 'mls', payload, wire_format, ratchet_tree?,
  * key_package_ref?, commit_ref? }` (the optional references correlate an
  * Add Commit with its Welcome). This is the same shape the Rust server's
@@ -325,13 +328,14 @@
          * @param {Object} opts
          * @param {'creator' | 'joiner'} opts.role
          * @param {(envelope: object) => void} opts.send
+         * @param {(envelope: object) => boolean} [opts.cancelPendingControl]
          * @param {(event: object) => void} opts.onEvent
          * @param {Uint8Array} opts.expectedGroupId
          * @param {Uint8Array} opts.expectedCreatorKeyHash
          * @param {string} opts.relaySenderId
          */
         constructor({
-            role, send, onEvent, pskSecret,
+            role, send, cancelPendingControl, onEvent, pskSecret,
             expectedGroupId, expectedCreatorKeyHash, relaySenderId,
         }) {
             if (role !== 'creator' && role !== 'joiner') {
@@ -339,6 +343,9 @@
             }
             this.role = role;
             this.send = send;
+            this.cancelPendingControl =
+                typeof cancelPendingControl === 'function'
+                    ? cancelPendingControl : (() => false);
             this.onEvent = onEvent || (() => {});
             this.group = null;
             this.identity = null;
@@ -835,6 +842,68 @@
         }
 
         /**
+         * Destroy a speculative local Commit without touching the live Group.
+         * The exact transport envelope is cancelled first so reconnect replay
+         * cannot keep resending a Commit which the ordered relay state has
+         * made permanently ineligible for acceptance.
+         *
+         * Cancellation is advisory cleanup rather than a precondition for
+         * erasing the candidate: once the relay has conclusively rejected a
+         * Commit (or finalized its Add target's departure), retaining the
+         * candidate would deadlock all future MLS work. A transport cleanup
+         * failure is surfaced separately while protocol state still aborts.
+         */
+        async _abortPendingCommit(pending, reason) {
+            if (!pending || this._pendingCommit !== pending) return false;
+
+            let cancellationError = null;
+            try {
+                const cancelled = await this.cancelPendingControl(
+                    pending.commitEnvelope,
+                );
+                if (cancelled === false) {
+                    cancellationError = new Error(
+                        'transport did not retain the pending control',
+                    );
+                }
+            } catch (err) {
+                cancellationError = err;
+            }
+
+            // Re-check after the callback in case a custom synchronous
+            // transport accepted the candidate while cancellation ran.
+            if (this._pendingCommit !== pending) return false;
+            if (pending.retryTimer) clearTimeout(pending.retryTimer);
+            this._pendingCommit = null;
+            pending.candidateGroup.destroySecrets();
+
+            if (pending.kind === 'add') {
+                const deferredKeyPackage =
+                    this._deferredKeyPackages.get(pending.senderId);
+                if (deferredKeyPackage) {
+                    this._deferredKeyPackages.delete(pending.senderId);
+                    this._deferredKeyPackageBytes = Math.max(
+                        0,
+                        this._deferredKeyPackageBytes
+                            - deferredKeyPackage.encodedBytes,
+                    );
+                }
+                this._deferredRemovals.delete(pending.senderId);
+                this._departedSenderIds.delete(pending.senderId);
+            }
+
+            this.onEvent({ kind: 'error', reason });
+            if (cancellationError) {
+                this.onEvent({
+                    kind: 'error',
+                    reason: `Pending MLS control cancellation failed after `
+                        + `candidate abort: ${cancellationError.message}`,
+                });
+            }
+            return true;
+        }
+
+        /**
          * The application normally filters relay echoes carrying our own
          * sender_id. The sole exception is the exact Commit currently in
          * PendingCommit: its echo is the relay-acceptance signal that makes
@@ -1176,15 +1245,56 @@
         }
 
         async _onTransportRejection(rejection) {
+            const retryableReasons = new Set([
+                'commit_rate_limited',
+                'room_rate_limited',
+            ]);
+            const permanentReasons = new Set([
+                'unknown_key_package_ref',
+                'not_group_creator',
+                'commit_correlation_conflict',
+                'welcome_not_correlated',
+            ]);
             if (!rejection || rejection.type !== 'mlsrejected'
-                || (rejection.reason !== 'commit_rate_limited'
-                    && rejection.reason !== 'room_rate_limited')
-                || typeof rejection.commit_ref !== 'string') {
+                || (!retryableReasons.has(rejection.reason)
+                    && !permanentReasons.has(rejection.reason))
+                || typeof rejection.commit_ref !== 'string'
+                || (permanentReasons.has(rejection.reason)
+                    && rejection.retry_after_secs !== 0)) {
                 throw new Error('mls-session: malformed transport rejection');
             }
+            if (rejection.reason === 'welcome_not_correlated') {
+                this.onEvent({
+                    kind: 'error',
+                    reason: 'relay permanently rejected Welcome because its accepted Add correlation is unavailable; the joiner must publish a fresh KeyPackage',
+                });
+                return true;
+            }
             const pending = this._pendingCommit;
+            if (rejection.reason === 'not_group_creator') {
+                const explanation =
+                    'relay permanently rejected MLS control because this connection is not the group creator';
+                if (pending && pending.commitRef === rejection.commit_ref) {
+                    await this._abortPendingCommit(pending, explanation);
+                }
+                this._transitionToDesynced(explanation);
+                const fatal = new Error(explanation);
+                fatal.mlsFatalState = true;
+                throw fatal;
+            }
             if (!pending || pending.commitRef !== rejection.commit_ref) {
                 return false;
+            }
+            if (permanentReasons.has(rejection.reason)) {
+                const explanation = rejection.reason
+                    === 'unknown_key_package_ref'
+                    ? 'relay permanently rejected Add Commit because its KeyPackageRef is no longer available'
+                    : 'relay permanently rejected Add Commit because its Commit/KeyPackage correlation conflicts with retained state';
+                const aborted = await this._abortPendingCommit(
+                    pending, explanation,
+                );
+                if (aborted) await this._drainDeferredEnvelopes();
+                return aborted;
             }
             const retryAfter = Number.isSafeInteger(rejection.retry_after_secs)
                 && rejection.retry_after_secs > 0
@@ -2241,12 +2351,25 @@
             }
             // Record the final relay departure only when there is actual MLS
             // admission state which a delayed operation could resurrect.
-            this._departedSenderIds.add(senderId);
-            if (pendingRemove) return;
-            if (pendingAdd) {
-                this._deferredRemovals.add(senderId);
+            if (pendingRemove) {
+                this._departedSenderIds.add(senderId);
                 return;
             }
+            if (pendingAdd) {
+                // The relay sequences Add acceptance and UserLeft in one
+                // total order. If this final departure is visible while the
+                // Add is still unaccepted, the relay has already discarded
+                // that route's one-shot KeyPackageRef; the Commit can never
+                // be accepted later. Abort the isolated candidate instead of
+                // installing a phantom leaf merely to Remove it next.
+                await this._abortPendingCommit(
+                    this._pendingCommit,
+                    'pending Add cancelled because its relay participant departed before Commit acceptance',
+                );
+                await this._drainDeferredEnvelopes();
+                return;
+            }
+            this._departedSenderIds.add(senderId);
             if (hasDeferredKeyPackage && !hasLiveLeaf) return;
             if (this._state !== 'joined') return;
             if (!hasLiveLeaf) return;

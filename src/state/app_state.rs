@@ -310,6 +310,7 @@ pub enum MlsControlAppendError {
     SerializationFailed,
     CapacityExceeded,
     BroadcastCapacity,
+    UnauthorizedGroupCreatorControl,
     DuplicateKeyPackage,
     CommitCorrelationConflict,
     WelcomeNotCorrelated,
@@ -324,6 +325,9 @@ pub enum MlsControlAppendError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MlsControlAdmission {
     Ordinary,
+    Commit {
+        sender_id: Uuid,
+    },
     KeyPackage {
         sender_id: Uuid,
         key_package_ref: String,
@@ -1104,6 +1108,27 @@ impl AppState {
     where
         F: FnOnce(u64) -> Option<String>,
     {
+        // The current group architecture has one permanent administrator:
+        // MLS leaf 0, whose stable relay identity is allocated at room
+        // creation. This relay-side gate is deliberately only an anti-DoS
+        // filter; clients still authenticate the Commit/GroupInfo signatures
+        // and pin leaf 0 cryptographically. Proposals and KeyPackages remain
+        // valid from every admitted participant.
+        let creator_connection_id = self
+            .rooms
+            .get(room_id)
+            .map(|room| room.creator_connection_id())
+            .ok_or(MlsControlAppendError::MissingRoom)?;
+        let creator_only_sender = match &admission {
+            MlsControlAdmission::Commit { sender_id }
+            | MlsControlAdmission::AddCommit { sender_id, .. }
+            | MlsControlAdmission::Welcome { sender_id, .. } => Some(*sender_id),
+            MlsControlAdmission::Ordinary | MlsControlAdmission::KeyPackage { .. } => None,
+        };
+        if creator_only_sender.is_some() && creator_only_sender != creator_connection_id {
+            return Err(MlsControlAppendError::UnauthorizedGroupCreatorControl);
+        }
+
         let tx = self
             .broadcast_channels
             .get(room_id)
@@ -1116,7 +1141,7 @@ impl AppState {
         let mut log = log.lock().unwrap();
 
         match &admission {
-            MlsControlAdmission::Ordinary => {}
+            MlsControlAdmission::Ordinary | MlsControlAdmission::Commit { .. } => {}
             MlsControlAdmission::KeyPackage {
                 sender_id,
                 key_package_ref,
@@ -1211,7 +1236,7 @@ impl AppState {
         });
 
         match admission {
-            MlsControlAdmission::Ordinary => {}
+            MlsControlAdmission::Ordinary | MlsControlAdmission::Commit { .. } => {}
             MlsControlAdmission::KeyPackage {
                 sender_id,
                 key_package_ref,
@@ -1267,10 +1292,11 @@ impl AppState {
     /// control sequence and prune entries acknowledged by every current
     /// participant.
     pub fn acknowledge_mls_control(&self, room_id: &Uuid, connection_id: Uuid, seq: u64) -> bool {
-        let participant_ids: Vec<Uuid> = match self.rooms.get(room_id) {
-            Some(room) if room.participant_ids.contains(&connection_id) => {
-                room.participant_ids.iter().copied().collect()
-            }
+        let (participant_ids, is_creator): (Vec<Uuid>, bool) = match self.rooms.get(room_id) {
+            Some(room) if room.participant_ids.contains(&connection_id) => (
+                room.participant_ids.iter().copied().collect(),
+                room.creator_connection_id() == Some(connection_id),
+            ),
             _ => return false,
         };
         let Some(log) = self.mls_control_logs.get(room_id) else {
@@ -1294,7 +1320,49 @@ impl AppState {
             }
         }
         Self::prune_acknowledged_mls_controls(&mut log, &participant_ids);
+        drop(log);
+        if is_creator
+            && seq > 0
+            && let Some(mut room) = self.rooms.get_mut(room_id)
+            && room.participant_ids.contains(&connection_id)
+            && room.creator_connection_id() == Some(connection_id)
+        {
+            room.consume_creator_bootstrap();
+        }
         true
+    }
+
+    /// Return the server-authoritative MLS cursor for one currently reserved
+    /// participant identity.
+    ///
+    /// Creator-bootstrap reconnects use this instead of accepting a cursor
+    /// from the bearer-capability holder. The participant reservation is
+    /// checked both before and after reading the log so a concurrent final
+    /// departure cannot mint a resume JWT from stale acknowledgement state.
+    pub fn acknowledged_mls_control_cursor(
+        &self,
+        room_id: &Uuid,
+        connection_id: Uuid,
+    ) -> Option<u64> {
+        if !self
+            .rooms
+            .get(room_id)
+            .map(|room| room.participant_ids.contains(&connection_id))
+            .unwrap_or(false)
+        {
+            return None;
+        }
+        let cursor = self.mls_control_logs.get(room_id).and_then(|log| {
+            log.lock()
+                .ok()?
+                .acknowledged
+                .get(&connection_id)
+                .map(|ack| ack.seq)
+        })?;
+        self.rooms
+            .get(room_id)
+            .filter(|room| room.participant_ids.contains(&connection_id))
+            .map(|_| cursor)
     }
 
     /// Return current participants whose cumulative ACK is too far behind the

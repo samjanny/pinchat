@@ -153,7 +153,12 @@ document.addEventListener('alpine:init', () => {
             // creator signal. Note: we capture unconditionally because
             // `this.roomType` is set later by the server's 'connected'
             // message; checking it here would always see null.
-            this.mlsRole = sessionStorage.getItem(`ws_token_${this.roomId}`)
+            this.mlsRole = (
+                sessionStorage.getItem(`ws_token_${this.roomId}`)
+                || sessionStorage.getItem(
+                    `ws_creator_bootstrap_${this.roomId}`,
+                )
+            )
                 ? 'creator' : 'joiner';
             debugLog('[MLS] Role captured at init:', this.mlsRole);
 
@@ -227,6 +232,17 @@ document.addEventListener('alpine:init', () => {
                 // no auto-reconnect, user must refresh.
                 if (msg === 'PROTOCOL_OR_AUTH_FAILURE' || msg === 'PROTOCOL_MISMATCH') {
                     this.error = '⚠️ PinChat has been updated. Please refresh the page.';
+                    return;
+                }
+                if (msg === 'CREATOR_BOOTSTRAP_INVALID'
+                    || msg === 'CREATOR_BOOTSTRAP_REJECTED'
+                    || msg === 'CREATOR_IDENTITY_MISMATCH'
+                    || msg === 'CREATOR_BOOTSTRAP_CURSOR_INVALID') {
+                    this.mlsTransportSynced = false;
+                    this.mlsReady = false;
+                    this._stopMlsUpdateTimer();
+                    this.error = '⚠️ The group creator identity could not be recovered safely. '
+                        + 'This tab stopped; refresh and create a new room.';
                     return;
                 }
                 // Transient transport failure after N retries: distinct message
@@ -902,6 +918,8 @@ document.addEventListener('alpine:init', () => {
             const session = new window.MLSSession({
                 role,
                 send: (envelope) => self.wsManager.send(envelope),
+                cancelPendingControl: (envelope) =>
+                    self.wsManager.cancelPendingMlsControl(envelope),
                 onEvent: (event) => self._handleMlsEvent(event),
                 pskSecret,
                 expectedGroupId,

@@ -16,6 +16,7 @@ use uuid::Uuid;
 use crate::jwt::{WsResumeTokenClaims, sign_resume_token, verify_token};
 use crate::models::message::MessageHeader;
 use crate::models::{IncomingMessage, Message, RoomType};
+use crate::state::app_state::MlsControlAppendError;
 use crate::state::{AppState, ConnectionAdmission, MlsControlAdmission};
 
 /// Maximum allowed size for ECDH public key payload (8KB)
@@ -59,6 +60,27 @@ struct ValidatedMlsEnvelope {
     payload_bytes: Vec<u8>,
     ratchet_tree_bytes: Option<Vec<u8>>,
     public_kind: Option<PublicMessageKind>,
+}
+
+/// Convert permanent, sender-correctable MLS admission failures into a direct
+/// typed response. Capacity/rate/transient failures retain their existing
+/// retry-or-close handling.
+fn permanent_mls_append_rejection(
+    error: MlsControlAppendError,
+    commit_ref: Option<String>,
+) -> Option<Message> {
+    let reason = match error {
+        MlsControlAppendError::UnknownKeyPackageRef => "unknown_key_package_ref",
+        MlsControlAppendError::UnauthorizedGroupCreatorControl => "not_group_creator",
+        MlsControlAppendError::CommitCorrelationConflict => "commit_correlation_conflict",
+        MlsControlAppendError::WelcomeNotCorrelated => "welcome_not_correlated",
+        _ => return None,
+    };
+    Some(Message::MlsRejected {
+        commit_ref,
+        reason: reason.to_string(),
+        retry_after_secs: 0,
+    })
 }
 
 /// Decode unpadded Base64url and reject alternate/non-canonical spellings.
@@ -1692,8 +1714,14 @@ async fn handle_socket(
                                                 .expect("guarded by is_some"),
                                         }
                                     }
+                                    WIRE_PUBLIC_MESSAGE if is_commit => {
+                                        MlsControlAdmission::Commit {
+                                            sender_id: connection_id,
+                                        }
+                                    }
                                     _ => MlsControlAdmission::Ordinary,
                                 };
+                                let submitted_commit_ref = commit_ref.clone();
                                 let append_result = state_clone.append_and_broadcast_mls_envelope(
                                     &room_id,
                                     admission,
@@ -1718,6 +1746,19 @@ async fn handle_socket(
                                         room_id,
                                         error
                                     );
+                                    if let Some(rejection) =
+                                        permanent_mls_append_rejection(error, submitted_commit_ref)
+                                    {
+                                        if let Ok(json) = serde_json::to_string(&rejection) {
+                                            if recv_direct_tx.try_send(json).is_ok() {
+                                                continue;
+                                            }
+                                        }
+                                        tracing::warn!(
+                                            "Unable to deliver permanent MLS rejection to connection {}; closing for retry",
+                                            connection_id
+                                        );
+                                    }
                                     break;
                                 }
                                 evict_lagging_group_participants(&state_clone, room_id);
@@ -1974,6 +2015,41 @@ mod tests {
         assert!(!valid_mls_correlation_ref(&("A".repeat(42) + "=")));
         assert!(!valid_mls_correlation_ref(&("A".repeat(42) + "/")));
         assert!(!valid_mls_correlation_ref(&("A".repeat(42) + "B")));
+    }
+
+    #[test]
+    fn permanent_mls_append_errors_have_typed_zero_retry_rejections() {
+        for (error, expected_reason) in [
+            (
+                MlsControlAppendError::UnknownKeyPackageRef,
+                "unknown_key_package_ref",
+            ),
+            (
+                MlsControlAppendError::UnauthorizedGroupCreatorControl,
+                "not_group_creator",
+            ),
+            (
+                MlsControlAppendError::CommitCorrelationConflict,
+                "commit_correlation_conflict",
+            ),
+            (
+                MlsControlAppendError::WelcomeNotCorrelated,
+                "welcome_not_correlated",
+            ),
+        ] {
+            let rejection = permanent_mls_append_rejection(error, Some("C".repeat(43)))
+                .expect("permanent admission error must produce a typed rejection");
+            let json = serde_json::to_value(rejection).unwrap();
+            assert_eq!(json["type"], "mlsrejected");
+            assert_eq!(json["reason"], expected_reason);
+            assert_eq!(json["retry_after_secs"], 0);
+            assert_eq!(json["commit_ref"], "C".repeat(43));
+        }
+        assert!(
+            permanent_mls_append_rejection(MlsControlAppendError::CapacityExceeded, None,)
+                .is_none(),
+            "capacity pressure is not a permanent semantic rejection"
+        );
     }
 
     fn synthetic_public_message(content_type: u8) -> Vec<u8> {
@@ -2559,8 +2635,10 @@ mod tests {
             max_participants: 4,
         });
         let room_id = room.id;
+        let connection_id = room
+            .creator_connection_id()
+            .expect("group room has creator identity");
         state.try_create_room(room).unwrap();
-        let connection_id = Uuid::new_v4();
 
         assert_eq!(
             state.add_connection(connection_id, room_id, false),
@@ -2631,8 +2709,10 @@ mod tests {
             max_participants: 4,
         });
         let room_id = room.id;
+        let alice = room
+            .creator_connection_id()
+            .expect("group room has creator identity");
         state.try_create_room(room).unwrap();
-        let alice = Uuid::new_v4();
         let bob = Uuid::new_v4();
 
         assert_eq!(
@@ -2768,8 +2848,10 @@ mod tests {
             max_participants: 4,
         });
         let room_id = room.id;
+        let alice = room
+            .creator_connection_id()
+            .expect("group room has creator identity");
         state.try_create_room(room).unwrap();
-        let alice = Uuid::new_v4();
         let stalled = Uuid::new_v4();
 
         assert_eq!(
@@ -2843,8 +2925,10 @@ mod tests {
             max_participants: 4,
         });
         let room_id = room.id;
+        let alice = room
+            .creator_connection_id()
+            .expect("group room has creator identity");
         state.try_create_room(room).unwrap();
-        let alice = Uuid::new_v4();
         let bob = Uuid::new_v4();
 
         for participant in [alice, bob] {
@@ -2906,8 +2990,10 @@ mod tests {
             max_participants: 4,
         });
         let room_id = room.id;
+        let alice = room
+            .creator_connection_id()
+            .expect("group room has creator identity");
         state.try_create_room(room).unwrap();
-        let alice = Uuid::new_v4();
         let bob = Uuid::new_v4();
         assert_eq!(
             state.add_connection(alice, room_id, false),
@@ -3016,6 +3102,80 @@ mod tests {
     }
 
     #[test]
+    fn creator_slot_and_bootstrap_resume_cursor_preserve_stable_identity() {
+        let state = AppState::new(1000, test_config());
+        let (room, creator_bootstrap) = Room::new_with_creator_bootstrap(RoomConfig {
+            room_type: RoomType::Group,
+            ttl_minutes: 60,
+            max_participants: 2,
+        });
+        let room_id = room.id;
+        let creator = room
+            .creator_connection_id()
+            .expect("group room has stable creator identity");
+        let creator_bootstrap =
+            creator_bootstrap.expect("group room exposes creator bootstrap capability");
+        assert!(room.verify_creator_bootstrap(&creator_bootstrap));
+        state.try_create_room(room).unwrap();
+
+        let first_noncreator = Uuid::new_v4();
+        let second_noncreator = Uuid::new_v4();
+        assert_eq!(
+            state.add_connection(first_noncreator, room_id, false),
+            None,
+            "ordinary admission waits until the creator opens the room"
+        );
+        assert_eq!(
+            state.add_connection(creator, room_id, false),
+            Some(ConnectionAdmission::New),
+            "creator consumes its own reserved slot atomically"
+        );
+        assert_eq!(
+            state.add_connection(first_noncreator, room_id, false),
+            Some(ConnectionAdmission::New),
+            "ordinary admission opens only after creator admission"
+        );
+        assert_eq!(
+            state.add_connection(second_noncreator, room_id, false),
+            None,
+            "ordinary admission cannot exceed the physical room cap"
+        );
+
+        let (_creator_rx, creator_stream) = state
+            .open_mls_control_stream(&room_id, creator, None)
+            .expect("creator opens initial MLS stream");
+        assert_eq!(creator_stream.cursor, 0);
+        assert_eq!(
+            state
+                .append_and_broadcast_mls_control(&room_id, |seq| {
+                    Some(format!(r#"{{"type":"test","control_seq":{seq}}}"#))
+                })
+                .expect("append control"),
+            1
+        );
+        assert!(state.acknowledge_mls_control(&room_id, creator, 1));
+        assert!(
+            !state
+                .rooms
+                .get(&room_id)
+                .expect("room remains live")
+                .verify_creator_bootstrap(&creator_bootstrap),
+            "the creator's first authenticated MLS ACK revokes bootstrap recovery"
+        );
+        assert_eq!(state.detach_connection(&creator), Some(room_id));
+        let cursor = state
+            .acknowledged_mls_control_cursor(&room_id, creator)
+            .expect("grace-reserved creator has server-authoritative cursor");
+        assert_eq!(cursor, 1);
+
+        let claims =
+            WsTokenClaims::for_resume(room_id, creator, 30, &state.config.jwt_issuer, Some(cursor));
+        assert_eq!(claims.connection_id, creator);
+        assert!(claims.resume);
+        assert_eq!(claims.mls_control_cursor, Some(1));
+    }
+
+    #[test]
     fn relay_correlates_welcome_and_limits_keypackage_per_admission() {
         use crate::state::app_state::MlsControlAppendError;
 
@@ -3026,25 +3186,31 @@ mod tests {
             max_participants: 4,
         });
         let room_id = room.id;
+        let creator = room
+            .creator_connection_id()
+            .expect("group room has creator binding");
         state.try_create_room(room).unwrap();
-        let creator = Uuid::new_v4();
         let joiner = Uuid::new_v4();
+        let noncreator = Uuid::new_v4();
         let key_package_ref = mls_key_package_ref(b"accepted-key-package").unwrap();
         assert_eq!(
             key_package_ref, "RS0flmwTqm9bsvjt1GZttoE7EkV1iO5FP3xaZxOqNGE",
             "relay RefHash matches the MLS client implementation",
         );
 
-        state
-            .append_and_broadcast_mls_envelope(
-                &room_id,
-                MlsControlAdmission::KeyPackage {
-                    sender_id: joiner,
-                    key_package_ref: key_package_ref.clone(),
-                },
-                |seq| Some(format!(r#"{{"type":"kp","control_seq":{seq}}}"#)),
-            )
-            .expect("first KeyPackage for stable admission");
+        assert_eq!(
+            state
+                .append_and_broadcast_mls_envelope(
+                    &room_id,
+                    MlsControlAdmission::KeyPackage {
+                        sender_id: joiner,
+                        key_package_ref: key_package_ref.clone(),
+                    },
+                    |seq| Some(format!(r#"{{"type":"kp","control_seq":{seq}}}"#)),
+                )
+                .expect("first KeyPackage for stable admission"),
+            1
+        );
         assert!(matches!(
             state.append_and_broadcast_mls_envelope(
                 &room_id,
@@ -3056,6 +3222,36 @@ mod tests {
             ),
             Err(MlsControlAppendError::DuplicateKeyPackage),
         ));
+
+        let serialized = std::cell::Cell::new(false);
+        assert_eq!(
+            state.append_and_broadcast_mls_envelope(
+                &room_id,
+                MlsControlAdmission::Commit {
+                    sender_id: noncreator,
+                },
+                |seq| {
+                    serialized.set(true);
+                    Some(format!(r#"{{"type":"commit-bad","control_seq":{seq}}}"#))
+                },
+            ),
+            Err(MlsControlAppendError::UnauthorizedGroupCreatorControl),
+        );
+        assert!(
+            !serialized.get(),
+            "unauthorized Commit is rejected before sequence allocation/serialization"
+        );
+        assert_eq!(
+            state
+                .append_and_broadcast_mls_envelope(
+                    &room_id,
+                    MlsControlAdmission::Commit { sender_id: creator },
+                    |seq| Some(format!(r#"{{"type":"commit-ok","control_seq":{seq}}}"#)),
+                )
+                .expect("creator ordinary Commit is accepted"),
+            2,
+            "rejected non-creator Commit did not consume a sequence"
+        );
 
         let commit_ref = "C".repeat(43);
         assert!(matches!(
@@ -3070,17 +3266,34 @@ mod tests {
             ),
             Err(MlsControlAppendError::UnknownKeyPackageRef),
         ));
-        state
-            .append_and_broadcast_mls_envelope(
+        assert_eq!(
+            state.append_and_broadcast_mls_envelope(
                 &room_id,
                 MlsControlAdmission::AddCommit {
-                    sender_id: creator,
+                    sender_id: noncreator,
                     commit_ref: commit_ref.clone(),
                     key_package_ref: key_package_ref.clone(),
                 },
-                |seq| Some(format!(r#"{{"type":"commit","control_seq":{seq}}}"#)),
-            )
-            .expect("Add Commit registers one pending Welcome");
+                |seq| Some(format!(r#"{{"type":"commit-bad","control_seq":{seq}}}"#)),
+            ),
+            Err(MlsControlAppendError::UnauthorizedGroupCreatorControl),
+            "a non-creator cannot consume a valid KeyPackageRef"
+        );
+        assert_eq!(
+            state
+                .append_and_broadcast_mls_envelope(
+                    &room_id,
+                    MlsControlAdmission::AddCommit {
+                        sender_id: creator,
+                        commit_ref: commit_ref.clone(),
+                        key_package_ref: key_package_ref.clone(),
+                    },
+                    |seq| Some(format!(r#"{{"type":"commit","control_seq":{seq}}}"#)),
+                )
+                .expect("creator Add Commit registers one pending Welcome"),
+            3,
+            "rejected Add Commits consumed neither sequence nor KeyPackageRef"
+        );
         assert!(matches!(
             state.append_and_broadcast_mls_envelope(
                 &room_id,
@@ -3093,29 +3306,46 @@ mod tests {
             Err(MlsControlAppendError::DuplicateKeyPackageRef),
         ));
 
-        assert!(matches!(
+        assert_eq!(
             state.append_and_broadcast_mls_envelope(
                 &room_id,
                 MlsControlAdmission::Welcome {
-                    sender_id: Uuid::new_v4(),
+                    sender_id: noncreator,
                     commit_ref: commit_ref.clone(),
                     key_package_ref: key_package_ref.clone(),
                 },
                 |seq| Some(format!(r#"{{"type":"welcome","control_seq":{seq}}}"#)),
             ),
-            Err(MlsControlAppendError::WelcomeNotCorrelated),
-        ));
-        state
-            .append_and_broadcast_mls_envelope(
+            Err(MlsControlAppendError::UnauthorizedGroupCreatorControl),
+            "a non-creator cannot consume the creator's pending Welcome correlation"
+        );
+        assert!(matches!(
+            state.append_and_broadcast_mls_envelope(
                 &room_id,
                 MlsControlAdmission::Welcome {
                     sender_id: creator,
-                    commit_ref: commit_ref.clone(),
+                    commit_ref: "M".repeat(43),
                     key_package_ref: key_package_ref.clone(),
                 },
-                |seq| Some(format!(r#"{{"type":"welcome","control_seq":{seq}}}"#)),
-            )
-            .expect("matching Welcome consumes the correlation");
+                |seq| Some(format!(r#"{{"type":"welcome-bad","control_seq":{seq}}}"#)),
+            ),
+            Err(MlsControlAppendError::WelcomeNotCorrelated),
+        ));
+        assert_eq!(
+            state
+                .append_and_broadcast_mls_envelope(
+                    &room_id,
+                    MlsControlAdmission::Welcome {
+                        sender_id: creator,
+                        commit_ref: commit_ref.clone(),
+                        key_package_ref: key_package_ref.clone(),
+                    },
+                    |seq| Some(format!(r#"{{"type":"welcome","control_seq":{seq}}}"#)),
+                )
+                .expect("matching creator Welcome consumes the correlation"),
+            4,
+            "rejected Welcome controls consumed neither sequence nor correlation"
+        );
         assert!(matches!(
             state.append_and_broadcast_mls_envelope(
                 &room_id,

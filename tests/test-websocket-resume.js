@@ -77,13 +77,14 @@ function response(status, body) {
     };
 }
 
-function successToken(token) {
+function successToken(token, overrides = {}) {
     return response(200, {
         token,
         connection_id: 'relay-id',
         expires_in: 30,
         protocol_version: 1,
         supported_subprotocols: ['pinchat.v1'],
+        ...overrides,
     });
 }
 
@@ -115,6 +116,42 @@ function deferred() {
 
 async function main() {
     console.log('# WebSocket stable-identity resume');
+
+    queuedResponses = [
+        response(200, { csrf_token: csrfToken }),
+        successToken('single-flight-upgrade-token'),
+    ];
+    fetchCalls = [];
+    const socketsBeforeSingleFlight = FakeWebSocket.instances.length;
+    const singleFlightManager =
+        new WebSocketManager('single-flight-room');
+    await Promise.all([
+        singleFlightManager.connect(),
+        singleFlightManager.connect(),
+    ]);
+    check(
+        fetchCalls.length === 2
+        && FakeWebSocket.instances.length
+            === socketsBeforeSingleFlight + 1,
+        'concurrent connect calls share one token request and one socket',
+    );
+
+    queuedResponses = [];
+    fetchCalls = [];
+    const connectingGuardManager =
+        new WebSocketManager('connecting-guard-room');
+    connectingGuardManager.ws = {
+        readyState: FakeWebSocket.CONNECTING,
+    };
+    const socketsBeforeConnectingGuard =
+        FakeWebSocket.instances.length;
+    await connectingGuardManager.connect();
+    check(
+        fetchCalls.length === 0
+        && FakeWebSocket.instances.length
+            === socketsBeforeConnectingGuard,
+        'an existing CONNECTING socket suppresses a duplicate admission',
+    );
 
     queuedResponses = [
         response(200, { csrf_token: csrfToken }),
@@ -164,6 +201,276 @@ async function main() {
     check(fetchCalls[1].options.headers['X-PinChat-MLS-Control-Seq'] === '0',
         'group resume token binds the highest applied MLS control sequence');
 
+    const creatorBootstrap = 'A'.repeat(43);
+    const creatorConnectionId =
+        '11111111-1111-4111-8111-111111111111';
+
+    const oneToOneCreatorRoom = 'onetoone-creator-room';
+    storage.set(
+        `ws_token_${oneToOneCreatorRoom}`,
+        'onetoone-preissued-upgrade-token',
+    );
+    storage.set(
+        `ws_connection_${oneToOneCreatorRoom}`,
+        creatorConnectionId,
+    );
+    storage.set(`ws_room_type_${oneToOneCreatorRoom}`, 'onetoone');
+    storage.set(`ws_protocol_version_${oneToOneCreatorRoom}`, '1');
+    storage.set(
+        `ws_subprotocols_${oneToOneCreatorRoom}`,
+        JSON.stringify(['pinchat.v1']),
+    );
+    queuedResponses = [];
+    fetchCalls = [];
+    const oneToOneCreator = new WebSocketManager(oneToOneCreatorRoom);
+    await oneToOneCreator.connect();
+    const oneToOneCreatorSocket = FakeWebSocket.instances.at(-1);
+    check(
+        oneToOneCreatorSocket.protocols.includes(
+            'pinchat.v1.jwt.onetoone-preissued-upgrade-token',
+        )
+        && fetchCalls.length === 0
+        && !oneToOneCreator._fatalAuthFailure,
+        '1:1 creator accepts its pre-issued identity without an MLS bootstrap capability',
+    );
+    check(
+        !storage.has(`ws_connection_${oneToOneCreatorRoom}`)
+        && !storage.has(`ws_room_type_${oneToOneCreatorRoom}`),
+        '1:1 creator preallocation is erased after copying the one-shot JWT',
+    );
+
+    storage.set(
+        'ws_creator_bootstrap_creator-recovery-room',
+        creatorBootstrap,
+    );
+    storage.set(
+        'ws_connection_creator-recovery-room',
+        creatorConnectionId,
+    );
+    storage.set('ws_room_type_creator-recovery-room', 'group');
+    queuedResponses = [
+        response(200, { csrf_token: csrfToken }),
+        successToken('creator-recovery-upgrade-token', {
+            connection_id: creatorConnectionId,
+            mls_control_cursor: 0,
+        }),
+    ];
+    fetchCalls = [];
+    const creatorRecovery =
+        new WebSocketManager('creator-recovery-room');
+    await creatorRecovery.connect();
+    const creatorRecoverySocket = FakeWebSocket.instances.at(-1);
+    check(fetchCalls[1].options.headers[
+        'X-PinChat-Creator-Bootstrap'
+    ] === creatorBootstrap
+        && creatorRecovery.expectedCreatorConnectionId
+            === creatorConnectionId
+        && creatorRecovery.lastMlsControlSeq === 0,
+    'pre-Connected creator recovery re-mints the same relay identity and cursor');
+    check(storage.get(
+        'ws_creator_bootstrap_creator-recovery-room',
+    ) === creatorBootstrap,
+    'creator bootstrap bearer remains tab-scoped until Connected is authenticated');
+    creatorRecoverySocket.onopen();
+    creatorRecoverySocket.onmessage({
+        data: JSON.stringify({
+            type: 'connected',
+            user_id: creatorConnectionId,
+            room_type: 'group',
+            resumed: true,
+            resume_token: resumeToken,
+            mls_control_cursor: 0,
+        }),
+    });
+    await creatorRecovery._inboundQueue;
+    check(creatorRecovery.resumeToken === resumeToken
+        && creatorRecovery.creatorBootstrapToken === null
+        && !storage.has(
+            'ws_creator_bootstrap_creator-recovery-room',
+        )
+        && !storage.has('ws_connection_creator-recovery-room')
+        && !storage.has('ws_room_type_creator-recovery-room'),
+    'first Connected replaces and erases the creator bootstrap credential');
+
+    const mismatchedCreatorRoom = 'creator-mismatch-room';
+    storage.set(
+        `ws_creator_bootstrap_${mismatchedCreatorRoom}`,
+        creatorBootstrap,
+    );
+    storage.set(
+        `ws_connection_${mismatchedCreatorRoom}`,
+        creatorConnectionId,
+    );
+    storage.set(`ws_room_type_${mismatchedCreatorRoom}`, 'group');
+    queuedResponses = [
+        response(200, { csrf_token: csrfToken }),
+        successToken('mismatched-creator-token', {
+            connection_id:
+                '22222222-2222-4222-8222-222222222222',
+        }),
+    ];
+    fetchCalls = [];
+    const socketsBeforeCreatorMismatch = FakeWebSocket.instances.length;
+    const mismatchedCreator =
+        new WebSocketManager(mismatchedCreatorRoom);
+    let creatorMismatchError = null;
+    mismatchedCreator.onError = (error) => {
+        creatorMismatchError = error.message;
+    };
+    await mismatchedCreator.connect();
+    check(mismatchedCreator._fatalAuthFailure
+        && creatorMismatchError === 'CREATOR_IDENTITY_MISMATCH'
+        && FakeWebSocket.instances.length
+            === socketsBeforeCreatorMismatch
+        && !storage.has(
+            `ws_creator_bootstrap_${mismatchedCreatorRoom}`,
+        )
+        && !storage.has(`ws_connection_${mismatchedCreatorRoom}`)
+        && !storage.has(`ws_room_type_${mismatchedCreatorRoom}`),
+    'creator identity mismatch fails closed and erases bootstrap metadata');
+
+    const advancedCreatorRoom = 'creator-advanced-cursor-room';
+    storage.set(
+        `ws_creator_bootstrap_${advancedCreatorRoom}`,
+        creatorBootstrap,
+    );
+    storage.set(
+        `ws_connection_${advancedCreatorRoom}`,
+        creatorConnectionId,
+    );
+    storage.set(`ws_room_type_${advancedCreatorRoom}`, 'group');
+    queuedResponses = [
+        response(200, { csrf_token: csrfToken }),
+        successToken('advanced-creator-token', {
+            connection_id: creatorConnectionId,
+            mls_control_cursor: 1,
+        }),
+    ];
+    fetchCalls = [];
+    const socketsBeforeAdvancedCursor = FakeWebSocket.instances.length;
+    const advancedCreator = new WebSocketManager(advancedCreatorRoom);
+    let advancedCursorError = null;
+    advancedCreator.onError = (error) => {
+        advancedCursorError = error.message;
+    };
+    await advancedCreator.connect();
+    check(
+        advancedCreator._fatalAuthFailure
+        && advancedCursorError === 'CREATOR_BOOTSTRAP_CURSOR_INVALID'
+        && FakeWebSocket.instances.length === socketsBeforeAdvancedCursor
+        && !storage.has(
+            `ws_creator_bootstrap_${advancedCreatorRoom}`,
+        )
+        && !storage.has(`ws_connection_${advancedCreatorRoom}`)
+        && !storage.has(`ws_room_type_${advancedCreatorRoom}`),
+        'creator bootstrap cannot skip already-confirmed MLS control history',
+    );
+
+    const connectedCreatorMismatchRoom =
+        'creator-connected-mismatch-room';
+    storage.set(
+        `ws_token_${connectedCreatorMismatchRoom}`,
+        'creator-connected-mismatch-token',
+    );
+    storage.set(
+        `ws_creator_bootstrap_${connectedCreatorMismatchRoom}`,
+        creatorBootstrap,
+    );
+    storage.set(
+        `ws_connection_${connectedCreatorMismatchRoom}`,
+        creatorConnectionId,
+    );
+    storage.set(
+        `ws_room_type_${connectedCreatorMismatchRoom}`,
+        'group',
+    );
+    storage.set(
+        `ws_protocol_version_${connectedCreatorMismatchRoom}`,
+        '1',
+    );
+    storage.set(
+        `ws_subprotocols_${connectedCreatorMismatchRoom}`,
+        JSON.stringify(['pinchat.v1']),
+    );
+    queuedResponses = [];
+    fetchCalls = [];
+    const connectedCreatorMismatch =
+        new WebSocketManager(connectedCreatorMismatchRoom);
+    let connectedCreatorMismatchError = null;
+    connectedCreatorMismatch.onError = (error) => {
+        connectedCreatorMismatchError = error.message;
+    };
+    await connectedCreatorMismatch.connect();
+    const connectedCreatorMismatchSocket =
+        FakeWebSocket.instances.at(-1);
+    connectedCreatorMismatchSocket.onopen();
+    connectedCreatorMismatchSocket.onmessage({
+        data: JSON.stringify({
+            type: 'connected',
+            user_id:
+                '22222222-2222-4222-8222-222222222222',
+            room_type: 'group',
+            resumed: false,
+            resume_token: resumeToken,
+            mls_control_cursor: 0,
+        }),
+    });
+    await connectedCreatorMismatch._inboundQueue;
+    check(
+        connectedCreatorMismatch._fatalAuthFailure
+        && connectedCreatorMismatchError
+            === 'ROOM_PROTOCOL_VIOLATION'
+        && connectedCreatorMismatchSocket.closedWith?.code === 1008
+        && !storage.has(
+            `ws_creator_bootstrap_${connectedCreatorMismatchRoom}`,
+        )
+        && !storage.has(
+            `ws_connection_${connectedCreatorMismatchRoom}`,
+        )
+        && !storage.has(
+            `ws_room_type_${connectedCreatorMismatchRoom}`,
+        ),
+        'Connected creator identity mismatch erases bootstrap metadata before shutdown',
+    );
+
+    const rejectedCreatorRoom = 'creator-bootstrap-rejected-room';
+    storage.set(
+        `ws_creator_bootstrap_${rejectedCreatorRoom}`,
+        creatorBootstrap,
+    );
+    storage.set(
+        `ws_connection_${rejectedCreatorRoom}`,
+        creatorConnectionId,
+    );
+    storage.set(`ws_room_type_${rejectedCreatorRoom}`, 'group');
+    queuedResponses = [
+        response(200, { csrf_token: csrfToken }),
+        response(409, {
+            code: 'CREATOR_BOOTSTRAP_REJECTED',
+            error: 'invalid creator capability',
+        }),
+    ];
+    fetchCalls = [];
+    const socketsBeforeCreatorRejection = FakeWebSocket.instances.length;
+    const rejectedCreator = new WebSocketManager(rejectedCreatorRoom);
+    let creatorRejectionError = null;
+    rejectedCreator.onError = (error) => {
+        creatorRejectionError = error.message;
+    };
+    await rejectedCreator.connect();
+    check(
+        rejectedCreator._fatalAuthFailure
+        && creatorRejectionError === 'CREATOR_BOOTSTRAP_REJECTED'
+        && FakeWebSocket.instances.length
+            === socketsBeforeCreatorRejection
+        && !storage.has(
+            `ws_creator_bootstrap_${rejectedCreatorRoom}`,
+        )
+        && !storage.has(`ws_connection_${rejectedCreatorRoom}`)
+        && !storage.has(`ws_room_type_${rejectedCreatorRoom}`),
+        'permanently rejected creator bootstrap is erased and fails closed',
+    );
+
     queuedResponses = [
         response(200, { csrf_token: csrfToken }),
         successToken('ordered-control-token'),
@@ -197,6 +504,147 @@ async function main() {
     await orderedManager._inboundQueue;
     check(orderedTypes.join(',') === 'connected,mlssync',
         'group application startup waits behind the replay-complete marker');
+
+    queuedResponses = [
+        response(200, { csrf_token: csrfToken }),
+        successToken('replay-gated-control-token'),
+    ];
+    const replayGateManager =
+        new WebSocketManager('replay-gated-control-room');
+    replayGateManager.roomType = 'group';
+    const replayedOwnAddCommit = {
+        type: 'mls',
+        payload: 'accepted-add-awaiting-own-echo',
+        wire_format: 1,
+        commit_ref: 'R'.repeat(43),
+        key_package_ref: 'K'.repeat(43),
+    };
+    check(replayGateManager.send(replayedOwnAddCommit)
+        && replayGateManager._pendingMlsControls.size === 1,
+    'an Add Commit sent before disconnect remains tracked for replay');
+    const addGeneratedDuringReplay = {
+        type: 'mls',
+        payload: 'add-generated-from-replayed-key-package',
+        wire_format: 1,
+        commit_ref: 'A'.repeat(43),
+        key_package_ref: 'J'.repeat(43),
+    };
+    const removeGeneratedDuringReplay = {
+        type: 'mls',
+        payload: 'remove-generated-from-replayed-user-left',
+        wire_format: 1,
+        commit_ref: 'D'.repeat(43),
+    };
+    const welcomeGeneratedDuringReplay = {
+        type: 'mls',
+        payload: 'welcome-generated-from-replayed-own-add',
+        wire_format: 3,
+        ratchet_tree: 'accepted-ratchet-tree',
+        commit_ref: replayedOwnAddCommit.commit_ref,
+        key_package_ref: replayedOwnAddCommit.key_package_ref,
+    };
+    const replayGeneratedAccepted = [];
+    replayGateManager.onMessage = async (message) => {
+        if (message.type === 'mls' && message.wire_format === 5) {
+            replayGeneratedAccepted.push(
+                replayGateManager.send(addGeneratedDuringReplay),
+            );
+        }
+        if (message.type === 'userleft') {
+            replayGeneratedAccepted.push(
+                replayGateManager.send(removeGeneratedDuringReplay),
+            );
+        }
+        if (message.type === 'mls'
+            && message.payload === replayedOwnAddCommit.payload) {
+            replayGeneratedAccepted.push(
+                replayGateManager.send(welcomeGeneratedDuringReplay),
+            );
+        }
+    };
+    await replayGateManager.connect();
+    const replayGateSocket = FakeWebSocket.instances.at(-1);
+    replayGateSocket.onopen();
+    replayGateSocket.onmessage({
+        data: JSON.stringify({
+            type: 'connected',
+            user_id: 'replay-gated-relay-id',
+            room_type: 'group',
+            resumed: false,
+            resume_token: resumeToken,
+            mls_control_cursor: 0,
+        }),
+    });
+    await replayGateManager._inboundQueue;
+    replayGateSocket.onmessage({
+        data: JSON.stringify({
+            type: 'mls',
+            payload: 'replayed-joiner-key-package',
+            wire_format: 5,
+            sender_id: 'joining-peer',
+            control_seq: 1,
+        }),
+    });
+    replayGateSocket.onmessage({
+        data: JSON.stringify({
+            type: 'userleft',
+            user_id: 'departed-during-replay',
+            participant_count: 1,
+            control_seq: 2,
+        }),
+    });
+    replayGateSocket.onmessage({
+        data: JSON.stringify({
+            ...replayedOwnAddCommit,
+            sender_id: 'replay-gated-relay-id',
+            control_seq: 3,
+        }),
+    });
+    await replayGateManager._inboundQueue;
+    const replayOnlyFrames =
+        replayGateSocket.sent.map((raw) => JSON.parse(raw));
+    const replayGeneratedPayloads = [
+        addGeneratedDuringReplay.payload,
+        removeGeneratedDuringReplay.payload,
+        welcomeGeneratedDuringReplay.payload,
+    ];
+    check(replayGeneratedAccepted.length === 3
+        && replayGeneratedAccepted.every(Boolean)
+        && replayGateManager._pendingMlsControls.size === 3
+        && !replayOnlyFrames.some((frame) =>
+            replayGeneratedPayloads.includes(frame.payload))
+        && !replayOnlyFrames.some((frame) =>
+            frame.payload === replayedOwnAddCommit.payload),
+    'KeyPackage/Add, UserLeft/Remove, and own-Commit/Welcome controls stay queued during replay');
+    check(replayOnlyFrames.length === 3
+        && replayOnlyFrames.every((frame) => frame.type === 'mlsack')
+        && replayOnlyFrames.map((frame) => frame.control_seq).join(',')
+            === '1,2,3',
+    'only cumulative MLS ACKs are emitted before replay completes');
+
+    replayGateSocket.onmessage({
+        data: JSON.stringify({
+            type: 'mlssync',
+            through_seq: 3,
+        }),
+    });
+    await replayGateManager._inboundQueue;
+    const replayCompletedFrames =
+        replayGateSocket.sent.map((raw) => JSON.parse(raw));
+    check(!replayGateManager._mlsControlSyncing
+        && replayGeneratedPayloads.every((payload) =>
+            replayCompletedFrames.some((frame) => frame.payload === payload))
+        && !replayCompletedFrames.some((frame) =>
+            frame.payload === replayedOwnAddCommit.payload),
+    'authenticated mlssync releases only controls still pending after replay');
+    check(replayGateManager.cancelPendingMlsControl(
+        removeGeneratedDuringReplay,
+    )
+        && replayGateManager._pendingMlsControls.size === 2
+        && !replayGateManager.cancelPendingMlsControl(
+            removeGeneratedDuringReplay,
+        ),
+    'exact pending MLS controls can be cancelled once and only once');
 
     const keyPackageEnvelope = {
         type: 'mls',
@@ -271,6 +719,32 @@ async function main() {
     await orderedManager._inboundQueue;
     check(orderedManager._pendingMlsControls.size === 1,
         'rate-limited Commit stays tracked for retry instead of being lost');
+
+    const rejectedWelcomeEnvelope = {
+        type: 'mls',
+        payload: 'welcome-with-lost-correlation',
+        wire_format: 3,
+        ratchet_tree: 'welcome-tree',
+        key_package_ref: 'W'.repeat(43),
+        commit_ref: 'E'.repeat(43),
+    };
+    check(orderedManager.send(rejectedWelcomeEnvelope)
+        && orderedManager._pendingMlsControls.size === 2,
+    'post-acceptance Welcome is tracked while awaiting its own relay echo');
+    orderedSocket.onmessage({
+        data: JSON.stringify({
+            type: 'mlsrejected',
+            commit_ref: rejectedWelcomeEnvelope.commit_ref,
+            reason: 'welcome_not_correlated',
+            retry_after_secs: 0,
+        }),
+    });
+    await orderedManager._inboundQueue;
+    check(orderedManager._pendingMlsControls.size === 1
+        && !orderedManager.cancelPendingMlsControl(
+            rejectedWelcomeEnvelope,
+        ),
+    'permanently non-correlated Welcome is removed from transport retry state');
 
     const offlineWelcomeManager = new WebSocketManager(
         'offline-welcome-room',
@@ -489,6 +963,15 @@ async function main() {
         }),
     });
     await terminalManager._inboundQueue;
+    check(terminalManager.send({
+        type: 'mls',
+        payload: 'earlier-welcome-awaiting-echo',
+        wire_format: 3,
+        ratchet_tree: 'terminal-tree',
+        key_package_ref: 'T'.repeat(43),
+        commit_ref: 'U'.repeat(43),
+    }) && terminalManager._pendingMlsControls.size === 1,
+    'terminal-state fixture retains an unrelated pending MLS control');
     terminalSocket.onmessage({
         data: JSON.stringify({
             type: 'mls',
@@ -516,8 +999,9 @@ async function main() {
         && !terminalFrames.some((frame) =>
             frame.type === 'mlsack' && frame.control_seq === 1)
         && terminalSocket.closedWith?.code === 1008
+        && terminalManager._pendingMlsControls.size === 0
         && terminalError === 'MLS_STATE_DESYNC',
-    'terminal MLS application failure neither advances nor ACKs its control');
+    'terminal MLS failure clears retries and neither advances nor ACKs its control');
 
     queuedResponses = [
         response(200, { csrf_token: csrfToken }),

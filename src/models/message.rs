@@ -173,9 +173,10 @@ pub enum Message {
     /// ordered broadcast stream.
     MlsSync { through_seq: u64 },
 
-    /// Direct, non-broadcast rejection of a locally submitted MLS Commit.
-    /// This lets the browser destroy its staged candidate instead of waiting
-    /// forever for an acceptance echo that the relay deliberately rejected.
+    /// Direct, non-broadcast rejection of a locally submitted MLS control.
+    /// This lets the browser destroy or cancel the exact pending control
+    /// instead of waiting forever for an acceptance echo that the relay
+    /// deliberately rejected.
     MlsRejected {
         #[serde(skip_serializing_if = "Option::is_none")]
         commit_ref: Option<String>,

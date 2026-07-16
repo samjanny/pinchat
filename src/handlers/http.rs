@@ -196,42 +196,63 @@ pub async fn create_room(
 
     // Layer 3: Atomic room creation with capacity check
     // Uses mutex to prevent race condition where concurrent requests exceed max_rooms
-    let room = Room::new(config);
+    let (room, creator_bootstrap_token) = Room::new_with_creator_bootstrap(config);
     let room_id = room.id;
     let room_type = room.room_type;
     let ttl_minutes = room.ttl_minutes;
     let max_participants = room.max_participants;
+    let creator_connection_id = room.creator_connection_id();
+
+    // Allocate and sign the creator's WebSocket identity before publishing
+    // the room. Group rooms fail closed here: inserting a room without a
+    // usable token for its stored creator identity would permanently strand
+    // the creator-only MLS administration invariant. One-to-one rooms retain
+    // the legacy fallback where a later PoW-minted WebSocket token can be used.
+    let ws_claims = match creator_connection_id {
+        Some(connection_id) => WsTokenClaims::new_for_connection(
+            room_id,
+            connection_id,
+            state.config.jwt_token_ttl_secs,
+            &state.config.jwt_issuer,
+        ),
+        None => WsTokenClaims::new(
+            room_id,
+            state.config.jwt_token_ttl_secs,
+            &state.config.jwt_issuer,
+        ),
+    };
+    let connection_id = ws_claims.connection_id;
+    let ws_token = match sign_token(&ws_claims, &state.jwt_secret) {
+        Ok(token) => Some(token),
+        Err(error) if creator_connection_id.is_some() => {
+            tracing::error!(
+                "Failed to generate required WebSocket token for group creator: {}",
+                error
+            );
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "Unable to establish group creator identity" })),
+            )
+                .into_response());
+        }
+        Err(error) => {
+            tracing::error!("Failed to generate WebSocket token for creator: {}", error);
+            None
+        }
+    };
 
     // Atomic check+insert (prevents concurrent requests from exceeding capacity)
     match state.try_create_room(room) {
         Ok(created_room_id) => {
             tracing::info!("Created room id={}…", short_room_id(&created_room_id));
 
-            // Generate WebSocket token for room creator to avoid second PoW
-            // This improves UX by eliminating the second challenge
-            let ws_claims = WsTokenClaims::new(
-                room_id,
-                state.config.jwt_token_ttl_secs,
-                &state.config.jwt_issuer,
-            );
-            let connection_id = ws_claims.connection_id;
-
-            let ws_token = match sign_token(&ws_claims, &state.jwt_secret) {
-                Ok(token) => {
-                    tracing::info!(
-                        "Generated WebSocket token for room creator (room: {}, connection: {})",
-                        room_id,
-                        connection_id
-                    );
-                    Some(token)
-                }
-                Err(e) => {
-                    // Log error but don't fail room creation
-                    // Creator will just need to solve PoW for WebSocket like others
-                    tracing::error!("Failed to generate WebSocket token for creator: {}", e);
-                    None
-                }
-            };
+            if ws_token.is_some() {
+                tracing::info!(
+                    "Generated WebSocket token for room creator (room: {}, connection: {})",
+                    room_id,
+                    connection_id
+                );
+            }
 
             let response = CreateRoomResponse {
                 room_id,
@@ -240,6 +261,7 @@ pub async fn create_room(
                 max_participants,
                 connection_id: ws_token.as_ref().map(|_| connection_id),
                 ws_token,
+                creator_bootstrap_token,
                 // Always advertise protocol version so clients can gate even on
                 // the creator-optimization path (where they would otherwise skip
                 // /api/ws-token and miss the shape check).
@@ -480,6 +502,38 @@ mod tests {
         assert!(
             state.rooms.contains_key(&room_id),
             "live room must NOT be removed"
+        );
+    }
+
+    #[tokio::test]
+    async fn group_room_page_stays_visible_for_reserved_creator_slot() {
+        let state = AppState::new(1000, test_config());
+        let room = Room::new(RoomConfig {
+            room_type: RoomType::Group,
+            ttl_minutes: 60,
+            max_participants: 2,
+        });
+        let room_id = room.id;
+        state.try_create_room(room).unwrap();
+        assert!(
+            state
+                .add_connection(Uuid::new_v4(), room_id, false)
+                .is_none(),
+            "non-creator admission waits for the creator's stream boundary"
+        );
+        {
+            let room = state.rooms.get(&room_id).unwrap();
+            assert!(room.is_full_for_non_creator());
+            assert!(
+                !room.is_full(),
+                "the creator's physical slot remains available"
+            );
+        }
+
+        let result = room_page(State(state), Path(room_id)).await;
+        assert!(
+            result.is_ok(),
+            "room_page must not hide the reserved creator slot"
         );
     }
 }

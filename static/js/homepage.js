@@ -69,8 +69,32 @@ document.addEventListener('alpine:init', () => {
                 // fresh tokens from /api/ws-token (otherwise a v0 server that
                 // omits these fields could still reach the upgrade attempt).
                 if (roomData.ws_token && roomData.connection_id) {
+                    if (roomData.room_type === 'group'
+                        && (typeof roomData.creator_bootstrap_token !== 'string'
+                            || !/^[A-Za-z0-9_-]{43}$/.test(
+                                roomData.creator_bootstrap_token,
+                            ))) {
+                        throw new Error(
+                            'Server did not provide a valid group creator bootstrap credential',
+                        );
+                    }
                     sessionStorage.setItem(`ws_token_${roomData.room_id}`, roomData.ws_token);
                     sessionStorage.setItem(`ws_connection_${roomData.room_id}`, roomData.connection_id);
+                    sessionStorage.setItem(
+                        `ws_room_type_${roomData.room_id}`,
+                        roomData.room_type,
+                    );
+                    if (roomData.creator_bootstrap_token) {
+                        // Separate from the 30-second, single-use upgrade JWT.
+                        // websocket.js retains this tab-scoped bearer only
+                        // until the first authenticated Connected frame, so a
+                        // slow navigation or pre-Connected transport failure
+                        // can re-mint the same stable creator relay identity.
+                        sessionStorage.setItem(
+                            `ws_creator_bootstrap_${roomData.room_id}`,
+                            roomData.creator_bootstrap_token,
+                        );
+                    }
                     if (roomData.protocol_version !== undefined) {
                         sessionStorage.setItem(
                             `ws_protocol_version_${roomData.room_id}`,
@@ -83,19 +107,24 @@ document.addEventListener('alpine:init', () => {
                             JSON.stringify(roomData.supported_subprotocols)
                         );
                     }
-                    // Safety-net cleanup: the JWT TTL is 30s server-side and the
-                    // happy-path consumer (websocket.js connect()) already calls
-                    // clearCreatorMetadata() on success/failure. If the user
-                    // never navigates (or stays on the homepage), the token
-                    // would otherwise sit in sessionStorage until the tab
-                    // closes, exposing it to any same-origin script that runs
-                    // in the meantime. Clear it after the JWT has unconditionally
-                    // expired (60s ≫ 30s TTL, with margin).
+                    // Safety-net cleanup for the short-lived upgrade JWT and
+                    // protocol metadata. Keep the separate creator bootstrap
+                    // credential + expected connection ID until chat receives
+                    // Connected; deleting those on the JWT timer would recreate
+                    // the pre-Connected lockout this credential is designed to
+                    // prevent.
                     setTimeout(() => {
                         sessionStorage.removeItem(`ws_token_${roomData.room_id}`);
-                        sessionStorage.removeItem(`ws_connection_${roomData.room_id}`);
                         sessionStorage.removeItem(`ws_protocol_version_${roomData.room_id}`);
                         sessionStorage.removeItem(`ws_subprotocols_${roomData.room_id}`);
+                        if (roomData.room_type !== 'group') {
+                            sessionStorage.removeItem(
+                                `ws_connection_${roomData.room_id}`,
+                            );
+                            sessionStorage.removeItem(
+                                `ws_room_type_${roomData.room_id}`,
+                            );
+                        }
                     }, 60000);
                     console.log('✅ WebSocket token saved for room creator (no second PoW needed)');
                 }

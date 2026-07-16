@@ -111,6 +111,47 @@
     const MAX_GROUP_LEAVES = 20;
     const MAX_KEY_PACKAGE_LIFETIME_SECONDS = 24n * 60n * 60n;
 
+    function validateKeyPackageLifetimeProfile(
+        lifetime, errorPrefix, requireCurrentlyValid,
+    ) {
+        if (!lifetime || typeof lifetime.notBefore !== 'bigint'
+            || typeof lifetime.notAfter !== 'bigint') {
+            throw new Error(`${errorPrefix}: missing or malformed Lifetime`);
+        }
+        if (lifetime.notBefore >= lifetime.notAfter) {
+            throw new Error(`${errorPrefix}: malformed Lifetime range`);
+        }
+        if (lifetime.notAfter - lifetime.notBefore
+            > MAX_KEY_PACKAGE_LIFETIME_SECONDS) {
+            throw new Error(
+                `${errorPrefix}: Lifetime exceeds the 24-hour profile maximum`,
+            );
+        }
+        const nowSecs = BigInt(Math.floor(Date.now() / 1000));
+        if (nowSecs < lifetime.notBefore) {
+            throw new Error(
+                `${errorPrefix}: Lifetime not yet valid `
+                + `(now=${nowSecs} < notBefore=${lifetime.notBefore})`,
+            );
+        }
+        if (!requireCurrentlyValid) return;
+        if (nowSecs >= lifetime.notAfter) {
+            throw new Error(
+                `${errorPrefix}: Lifetime expired `
+                + `(now=${nowSecs} >= notAfter=${lifetime.notAfter})`,
+            );
+        }
+    }
+
+    function requireJoinNhLength(value, fieldName) {
+        const length = value instanceof Uint8Array ? value.length : 'invalid';
+        if (!(value instanceof Uint8Array) || value.length !== HPKE.Nh) {
+            throw new Error(
+                `group.join: ${fieldName} must be ${HPKE.Nh} bytes (got ${length})`,
+            );
+        }
+    }
+
     function getCrypto() {
         if (typeof globalThis !== 'undefined' && globalThis.crypto) return globalThis.crypto;
         // eslint-disable-next-line global-require
@@ -3174,6 +3215,10 @@
         );
         trackSecret(gs.joinerSecret);
         trackSecret(gs.pathSecret);
+        requireJoinNhLength(gs.joinerSecret, 'joiner_secret');
+        if (gs.pathSecret !== null && gs.pathSecret !== undefined) {
+            requireJoinNhLength(gs.pathSecret, 'path_secret');
+        }
         if (!Array.isArray(gs.psks) || gs.psks.length !== 0) {
             throw new Error(
                 'group.join: MLS PSK identifiers are unsupported by the PinChat profile',
@@ -3209,6 +3254,11 @@
                 'group.join: GroupContext cipher_suite does not match KeyPackage',
             );
         }
+        requireJoinNhLength(
+            groupInfo.groupContext.confirmedTranscriptHash,
+            'confirmed_transcript_hash',
+        );
+        requireJoinNhLength(groupInfo.confirmationTag, 'confirmation_tag');
         if (!Array.isArray(groupInfo.groupContext.extensions)
             || groupInfo.groupContext.extensions.length !== 0) {
             throw new Error(
@@ -3569,29 +3619,9 @@
         // RFC §7.2.3: enforce now ∈ [notBefore, notAfter). Rejects
         // replayed KeyPackages from a former member trying to rejoin
         // off a captured invite.
-        const lt = kp.leafNode.lifetime;
-        if (!lt || typeof lt.notBefore !== 'bigint' || typeof lt.notAfter !== 'bigint') {
-            throw new Error(`${errorPrefix}: missing or malformed Lifetime`);
-        }
-        if (lt.notBefore >= lt.notAfter) {
-            throw new Error(`${errorPrefix}: malformed Lifetime range`);
-        }
-        if (lt.notAfter - lt.notBefore > MAX_KEY_PACKAGE_LIFETIME_SECONDS) {
-            throw new Error(
-                `${errorPrefix}: Lifetime exceeds the 24-hour profile maximum`,
-            );
-        }
-        const nowSecs = BigInt(Math.floor(Date.now() / 1000));
-        if (nowSecs < lt.notBefore) {
-            throw new Error(
-                `${errorPrefix}: Lifetime not yet valid (now=${nowSecs} < notBefore=${lt.notBefore})`,
-            );
-        }
-        if (nowSecs >= lt.notAfter) {
-            throw new Error(
-                `${errorPrefix}: Lifetime expired (now=${nowSecs} >= notAfter=${lt.notAfter})`,
-            );
-        }
+        validateKeyPackageLifetimeProfile(
+            kp.leafNode.lifetime, errorPrefix, true,
+        );
         const sigPub = await validateLeafNodeProfile(
             kp.leafNode, 'KeyPackage leaf', errorPrefix,
         );
@@ -4037,14 +4067,13 @@
         const encoder = new Codec.Encoder();
         Nodes.writeLeafNodeTbs(encoder, leaf);
         if (leaf.leafNodeSource === Nodes.LeafNodeSource.KEY_PACKAGE) {
-            const lt = leaf.lifetime;
-            if (!lt || typeof lt.notBefore !== 'bigint'
-                || typeof lt.notAfter !== 'bigint'
-                || lt.notBefore >= lt.notAfter) {
-                throw new Error(
-                    `imported-tree: leaf ${leafIndex} has malformed Lifetime`,
-                );
-            }
+            // Historical KeyPackage-source leaves remain part of the
+            // authenticated tree after their admission Lifetime expires.
+            // Enforce the same bounded profile as a fresh Add without
+            // incorrectly requiring the old interval to include "now".
+            validateKeyPackageLifetimeProfile(
+                leaf.lifetime, `imported-tree: leaf ${leafIndex}`, false,
+            );
         } else if (leaf.leafNodeSource === Nodes.LeafNodeSource.UPDATE
             || leaf.leafNodeSource === Nodes.LeafNodeSource.COMMIT) {
             encoder.writeOpaque(groupId);
@@ -4260,6 +4289,22 @@
             if (!isLeafPosition && slot.nodeType !== Nodes.NodeType.PARENT) {
                 throw new Error(
                     `imported-tree: leaf node encoded at parent position ${nodeIndex}`,
+                );
+            }
+        }
+
+        // A raw byte string can be unique yet still fail to represent a
+        // ciphersuite HPKE public key. Import every live parent key here,
+        // including off-path historical parents that this joiner will not
+        // otherwise touch while deriving its own direct-path keypairs.
+        for (let nodeIndex = 0; nodeIndex < tree.length; nodeIndex += 1) {
+            const slot = tree[nodeIndex];
+            if (!slot || slot.nodeType !== Nodes.NodeType.PARENT) continue;
+            try {
+                await HPKE.deserializePublicKey(slot.parent.encryptionKey);
+            } catch (err) {
+                throw new Error(
+                    `imported-tree: parent ${nodeIndex} encryption_key invalid: ${err.message}`,
                 );
             }
         }

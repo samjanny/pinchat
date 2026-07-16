@@ -20,6 +20,9 @@ const Commit = require(path.join(__dirname, '..', 'static', 'js', 'mls', 'commit
 const Framing = require(path.join(__dirname, '..', 'static', 'js', 'mls', 'framing.js'));
 const MLSMessage = require(path.join(__dirname, '..', 'static', 'js', 'mls', 'mls-message.js'));
 const PublicMessage = require(path.join(__dirname, '..', 'static', 'js', 'mls', 'public-message.js'));
+const Welcome = require(path.join(__dirname, '..', 'static', 'js', 'mls', 'welcome.js'));
+const GroupInfo = require(path.join(__dirname, '..', 'static', 'js', 'mls', 'group-info.js'));
+const TreeHash = require(path.join(__dirname, '..', 'static', 'js', 'mls', 'tree-hash.js'));
 
 let passed = 0;
 let failed = 0;
@@ -87,6 +90,18 @@ async function expectReject(promise, expectedText, name) {
         message = err.message;
     }
     assert(message.includes(expectedText), name, message || 'did not reject');
+}
+
+async function expectJoinReject(args, expectedText, name) {
+    let message = '';
+    let joined = null;
+    try {
+        joined = await Group.Group.joinFromWelcomeWithTree(args);
+    } catch (err) {
+        message = err.message;
+    }
+    assert(message.includes(expectedText), name, message || 'did not reject');
+    assert(joined === null, `${name} creates no joined Group state`);
 }
 
 async function freshIdentity() {
@@ -301,11 +316,94 @@ async function tamperCommitConfirmationTag(commitMessage, recipientGroup) {
     );
 }
 
-async function joinFrom(
-    committer, result, joiner,
+async function rewriteWelcome({
+    result,
+    joiner,
+    signerIdentity,
+    mutateGroupSecrets = async () => {},
+    mutateGroupInfo = async () => {},
+}) {
+    const frame = MLSMessage.parseMLSMessage(result.welcomeMessage);
+    const welcome = Welcome.parseWelcome(frame.body);
+    if (welcome.secrets.length !== 1) {
+        throw new Error(`test: expected one Welcome secret, got ${welcome.secrets.length}`);
+    }
+
+    const entry = welcome.secrets[0];
+    const groupSecrets = await Welcome.decryptGroupSecrets(
+        entry.encryptedGroupSecrets,
+        joiner.initKp.privateKey,
+        joiner.keyPackage.initKey,
+        welcome.encryptedGroupInfo,
+    );
+    const pskSecret = new Uint8Array(HPKE.Nh);
+    const originalWelcomeSecret = await Welcome.deriveWelcomeSecret(
+        groupSecrets.joinerSecret, pskSecret,
+    );
+    const originalKeyNonce = await Welcome.welcomeKeyNonce(originalWelcomeSecret);
+    const originalGroupInfoBytes = await Welcome.openEncryptedGroupInfo(
+        originalKeyNonce.key,
+        originalKeyNonce.nonce,
+        welcome.encryptedGroupInfo,
+    );
+    const groupInfo = GroupInfo.parseGroupInfo(originalGroupInfoBytes);
+    originalWelcomeSecret.fill(0);
+    originalKeyNonce.key.fill(0);
+    originalKeyNonce.nonce.fill(0);
+    originalGroupInfoBytes.fill(0);
+
+    await mutateGroupInfo(groupInfo);
+    groupInfo.signature = await Labeled.signWithLabel(
+        signerIdentity.signaturePrivateKey,
+        'GroupInfoTBS',
+        GroupInfo.groupInfoTbsBytes(groupInfo),
+    );
+    await mutateGroupSecrets(groupSecrets);
+
+    const rewrittenWelcomeSecret = await Welcome.deriveWelcomeSecret(
+        groupSecrets.joinerSecret, pskSecret,
+    );
+    const rewrittenKeyNonce = await Welcome.welcomeKeyNonce(rewrittenWelcomeSecret);
+    const rewrittenGroupInfoBytes = GroupInfo.groupInfoBytes(groupInfo);
+    const encryptedGroupInfo = await Welcome.sealEncryptedGroupInfo(
+        rewrittenKeyNonce.key,
+        rewrittenKeyNonce.nonce,
+        rewrittenGroupInfoBytes,
+    );
+    const groupSecretsBytes = Welcome.groupSecretsBytes(groupSecrets);
+    const encryptedGroupSecrets = await Labeled.encryptWithLabel(
+        joiner.keyPackage.initKey,
+        'Welcome',
+        encryptedGroupInfo,
+        groupSecretsBytes,
+    );
+    rewrittenWelcomeSecret.fill(0);
+    rewrittenKeyNonce.key.fill(0);
+    rewrittenKeyNonce.nonce.fill(0);
+    rewrittenGroupInfoBytes.fill(0);
+    groupSecretsBytes.fill(0);
+
+    const rewritten = {
+        cipherSuite: welcome.cipherSuite,
+        secrets: [{
+            newMember: Uint8Array.from(entry.newMember),
+            encryptedGroupSecrets,
+        }],
+        encryptedGroupInfo,
+    };
+    return MLSMessage.serializeMLSMessage(
+        MLSMessage.WireFormat.MLS_WELCOME,
+        Welcome.welcomeBytes(rewritten),
+    );
+}
+
+async function joinArguments(
+    committer,
+    result,
+    joiner,
     expectedSignerLeafIndex = committer.myLeafIndex,
 ) {
-    return Group.Group.joinFromWelcomeWithTree({
+    return {
         welcomeMessage: result.welcomeMessage,
         keyPackageBytes: joiner.keyPackageBytes,
         initPrivateKey: joiner.initKp.privateKey,
@@ -314,7 +412,16 @@ async function joinFrom(
         ratchetTreeBytes: Nodes.ratchetTreeBytes(committer.ratchetTree),
         expectedSignerLeafIndex,
         ...await bootstrapPins(committer),
-    });
+    };
+}
+
+async function joinFrom(
+    committer, result, joiner,
+    expectedSignerLeafIndex = committer.myLeafIndex,
+) {
+    return Group.Group.joinFromWelcomeWithTree(
+        await joinArguments(committer, result, joiner, expectedSignerLeafIndex),
+    );
 }
 
 async function addAndJoin(committer, joiner, existingMembers = []) {
@@ -424,6 +531,107 @@ async function main() {
         );
     }
 
+    // ---- Welcome/imported-tree ciphersuite profile strictness ----------
+    {
+        const alice = await Group.Group.create({ identity: await freshIdentity() });
+        const bob = await buildKeyPackage();
+        const result = await alice.commitAddMember({
+            keyPackageBytes: bob.keyPackageBytes,
+        });
+        const baseArgs = await joinArguments(alice, result, bob);
+        const malformedSecretCases = [
+            {
+                expected: 'joiner_secret must be 32 bytes',
+                name: 'Welcome with a non-Nh joiner_secret is rejected',
+                mutateGroupSecrets: async (groupSecrets) => {
+                    groupSecrets.joinerSecret = new Uint8Array(HPKE.Nh - 1);
+                },
+            },
+            {
+                expected: 'path_secret must be 32 bytes',
+                name: 'Welcome with a non-Nh path_secret is rejected',
+                mutateGroupSecrets: async (groupSecrets) => {
+                    groupSecrets.pathSecret = new Uint8Array(HPKE.Nh - 1);
+                },
+            },
+            {
+                expected: 'confirmed_transcript_hash must be 32 bytes',
+                name: 'Welcome with a non-Nh confirmed transcript hash is rejected',
+                mutateGroupInfo: async (groupInfo) => {
+                    groupInfo.groupContext.confirmedTranscriptHash =
+                        new Uint8Array(HPKE.Nh - 1);
+                },
+            },
+            {
+                expected: 'confirmation_tag must be 32 bytes',
+                name: 'Welcome with a non-Nh confirmation tag is rejected',
+                mutateGroupInfo: async (groupInfo) => {
+                    groupInfo.confirmationTag = new Uint8Array(HPKE.Nh - 1);
+                },
+            },
+        ];
+
+        for (const testCase of malformedSecretCases) {
+            const welcomeMessage = await rewriteWelcome({
+                result,
+                joiner: bob,
+                signerIdentity: alice.identity,
+                mutateGroupSecrets: testCase.mutateGroupSecrets,
+                mutateGroupInfo: testCase.mutateGroupInfo,
+            });
+            await expectJoinReject(
+                { ...baseArgs, welcomeMessage },
+                testCase.expected,
+                testCase.name,
+            );
+        }
+
+        // Exercise a historical parent outside the new joiner's direct path.
+        // A path-only validator would never import this key. Use a
+        // correctly-prefixed but off-curve P-256 point so rejection also
+        // depends on ciphersuite key deserialization, not merely byte length.
+        const aliceFour = await Group.Group.create({
+            identity: await freshIdentity(),
+        });
+        const bobFour = await buildKeyPackage();
+        const { joined: bobFourGroup } =
+            await addAndJoin(aliceFour, bobFour);
+        const carolFour = await buildKeyPackage();
+        await addAndJoin(aliceFour, carolFour, [bobFourGroup]);
+        const daveFour = await buildKeyPackage();
+        const resultFour = await aliceFour.commitAddMember({
+            keyPackageBytes: daveFour.keyPackageBytes,
+        });
+        const baseArgsFour =
+            await joinArguments(aliceFour, resultFour, daveFour);
+        const malformedTree = Nodes.parseRatchetTree(
+            Nodes.ratchetTreeBytes(aliceFour.ratchetTree),
+        );
+        const parentIndex = 1;
+        const invalidOffCurvePoint = new Uint8Array(65);
+        invalidOffCurvePoint[0] = 0x04;
+        malformedTree[parentIndex].parent.encryptionKey =
+            invalidOffCurvePoint;
+        const invalidParentWelcome = await rewriteWelcome({
+            result: resultFour,
+            joiner: daveFour,
+            signerIdentity: aliceFour.identity,
+            mutateGroupInfo: async (groupInfo) => {
+                groupInfo.groupContext.treeHash =
+                    await TreeHash.hashRoot(malformedTree);
+            },
+        });
+        await expectJoinReject(
+            {
+                ...baseArgsFour,
+                welcomeMessage: invalidParentWelcome,
+                ratchetTreeBytes: Nodes.ratchetTreeBytes(malformedTree),
+            },
+            `parent ${parentIndex} encryption_key invalid`,
+            'Welcome with an invalid parent HPKE public key is rejected',
+        );
+    }
+
     // ---- RFC §§7.3/10.1: complete KeyPackage semantic validation -------
     // Every sample below is re-signed after mutation. The rejection must
     // therefore come from the semantic KeyPackage gate, not from a damaged
@@ -506,6 +714,83 @@ async function main() {
             },
             'Lifetime exceeds the 24-hour profile maximum',
             'overlong KeyPackage lifetime is rejected',
+        );
+    }
+
+    // Imported historical KeyPackage leaves keep the bounded PinChat
+    // Lifetime profile, but are not required to remain current forever.
+    {
+        const alice = await Group.Group.create({ identity: await freshIdentity() });
+        const bob = await buildKeyPackage();
+        await addAndJoin(alice, bob);
+        const bobLeaf = alice.ratchetTree[2].leaf;
+        const now = BigInt(Math.floor(Date.now() / 1000));
+        bobLeaf.lifetime = {
+            notBefore: now - 1n,
+            notAfter: now + 86400n,
+        };
+        bobLeaf.signature = await Group.signLeafNodeForKeyPackage(
+            bob.identity.signaturePrivateKey, bobLeaf,
+        );
+
+        const carol = await buildKeyPackage();
+        const result = await alice.commitAddMember({
+            keyPackageBytes: carol.keyPackageBytes,
+        });
+        await expectJoinReject(
+            await joinArguments(alice, result, carol),
+            'Lifetime exceeds the 24-hour profile maximum',
+            'overlong historical KeyPackage Lifetime is rejected on import',
+        );
+    }
+
+    {
+        const alice = await Group.Group.create({ identity: await freshIdentity() });
+        const bob = await buildKeyPackage();
+        await addAndJoin(alice, bob);
+        const bobLeaf = alice.ratchetTree[2].leaf;
+        const now = BigInt(Math.floor(Date.now() / 1000));
+        bobLeaf.lifetime = {
+            notBefore: now - 100n,
+            notAfter: now - 1n,
+        };
+        bobLeaf.signature = await Group.signLeafNodeForKeyPackage(
+            bob.identity.signaturePrivateKey, bobLeaf,
+        );
+
+        const carol = await buildKeyPackage();
+        const result = await alice.commitAddMember({
+            keyPackageBytes: carol.keyPackageBytes,
+        });
+        const joined = await joinFrom(alice, result, carol);
+        assert(
+            joined.epoch === alice.epoch,
+            'expired historical KeyPackage Lifetime remains valid on tree import',
+        );
+    }
+
+    {
+        const alice = await Group.Group.create({ identity: await freshIdentity() });
+        const bob = await buildKeyPackage();
+        await addAndJoin(alice, bob);
+        const bobLeaf = alice.ratchetTree[2].leaf;
+        const now = BigInt(Math.floor(Date.now() / 1000));
+        bobLeaf.lifetime = {
+            notBefore: now + 100n,
+            notAfter: now + 200n,
+        };
+        bobLeaf.signature = await Group.signLeafNodeForKeyPackage(
+            bob.identity.signaturePrivateKey, bobLeaf,
+        );
+
+        const carol = await buildKeyPackage();
+        const result = await alice.commitAddMember({
+            keyPackageBytes: carol.keyPackageBytes,
+        });
+        await expectJoinReject(
+            await joinArguments(alice, result, carol),
+            'Lifetime not yet valid',
+            'future-dated historical KeyPackage Lifetime is rejected on import',
         );
     }
 

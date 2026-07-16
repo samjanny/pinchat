@@ -90,6 +90,19 @@ impl WsTokenClaims {
     /// * `issuer`   - Issuer string this deployment stamps on tokens
     ///   (`Config::jwt_issuer`). Becomes the `iss` claim.
     pub fn new(room_id: Uuid, ttl_secs: u64, issuer: &str) -> Self {
+        Self::new_for_connection(room_id, Uuid::new_v4(), ttl_secs, issuer)
+    }
+
+    /// Create claims for a pre-allocated relay identity.
+    ///
+    /// Group-room creation uses this to bind the creator's signed WebSocket
+    /// token to the creator identity already stored atomically with the room.
+    pub fn new_for_connection(
+        room_id: Uuid,
+        connection_id: Uuid,
+        ttl_secs: u64,
+        issuer: &str,
+    ) -> Self {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("Time went backwards")
@@ -97,7 +110,7 @@ impl WsTokenClaims {
 
         Self {
             room_id,
-            connection_id: Uuid::new_v4(),
+            connection_id,
             exp: now + ttl_secs,
             jti: Uuid::new_v4(),
             aud: WS_TOKEN_AUDIENCE.to_string(),
@@ -262,6 +275,17 @@ mod tests {
         assert_eq!(decoded.iss, TEST_ISS);
         assert!(!decoded.resume);
         assert_eq!(decoded.mls_control_cursor, None);
+    }
+
+    #[test]
+    fn new_connection_token_preserves_preallocated_identity() {
+        let room_id = Uuid::new_v4();
+        let connection_id = Uuid::new_v4();
+        let claims = WsTokenClaims::new_for_connection(room_id, connection_id, 30, TEST_ISS);
+        assert_eq!(claims.room_id, room_id);
+        assert_eq!(claims.connection_id, connection_id);
+        assert!(!claims.resume);
+        assert_eq!(claims.mls_control_cursor, None);
     }
 
     #[test]

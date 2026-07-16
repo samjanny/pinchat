@@ -130,8 +130,10 @@ string. The token therefore never appears in proxy/referrer/middlebox logs.
 ```
 Client                                    Server
    |                                         |
-   |-------- GET /api/ws-token/{room} ------>|
+   |-------- POST /api/ws-token/{room} ----->|
    |         Cookie: session=...             |
+   |         X-CSRF-Token: ...               |
+   |         X-Pow-Nonce: ...                |
    |                                         |
    |<------- 200 OK -------------------------|
    |         {token, connection_id,          |
@@ -173,10 +175,21 @@ optional `ws_token` so the creator-optimization path can gate identically:
   "max_participants": 2,
   "ws_token": "...",
   "connection_id": "...",
+  "creator_bootstrap_token": "...",
   "protocol_version": 1,
   "supported_subprotocols": ["pinchat.v1"]
 }
 ```
+
+`creator_bootstrap_token` is present only for group rooms. It is a
+tab-scoped relay capability, separate from the MLS invitation secrets, used
+only to re-mint the same preallocated creator `connection_id` if the initial
+short-lived WebSocket JWT expires or the transport fails before `Connected`.
+The server retains only its SHA-256 digest, reserves the creator's participant
+slot, refuses non-creator admission until the creator has established the
+first ordered-control boundary, and permanently revokes the capability when
+the creator first ACKs an ordered MLS control. Subsequent reconnects use the
+longer-lived resume token delivered inside the direct `Connected` frame.
 
 ---
 

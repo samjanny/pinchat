@@ -25,6 +25,18 @@ function _isValidWsResumeToken(value) {
         && /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(value);
 }
 
+function _isValidCreatorBootstrapToken(value) {
+    return typeof value === 'string'
+        && /^[A-Za-z0-9_-]{43}$/.test(value)
+        && /[AEIMQUYcgkosw048]$/.test(value);
+}
+
+function _isValidRelayConnectionId(value) {
+    return typeof value === 'string'
+        && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+            .test(value);
+}
+
 const _COMMON_RELAY_MESSAGE_TYPES = new Set([
     'connected', 'userjoined', 'userleft', 'error',
 ]);
@@ -65,6 +77,7 @@ class WebSocketManager {
         //                    → user-initiated reconnect gets a fresh budget.
         this._fatalAuthFailure = false;
         this._connectionExhausted = false;
+        this._connectPromise = null;
 
         // C-01: serial dispatch queue for inbound messages. The DoubleRatchet
         // has its own internal mutex, but app.js#handleWebSocketMessage also
@@ -82,6 +95,13 @@ class WebSocketManager {
         // in page memory only: persisting it across a reload would preserve a
         // relay identity while the corresponding in-memory MLS state is gone.
         this.resumeToken = null;
+        // A group creator receives a separate tab-scoped bootstrap bearer at
+        // room creation. Unlike the short, single-use upgrade JWT, it can
+        // re-mint that room's preallocated creator connection ID if navigation
+        // is slow or the first transport dies before Connected supplies the
+        // normal resume credential. It is erased immediately on Connected.
+        this.creatorBootstrapToken = null;
+        this.expectedCreatorConnectionId = null;
         // Stable relay identity and ordered MLS-control cursor. The cursor is
         // kept in page memory with the MLS state and is bound into every
         // resume JWT. It advances only after application processing succeeds.
@@ -138,6 +158,10 @@ class WebSocketManager {
         console.error('[WS] Room protocol violation:', reason);
         this._fatalAuthFailure = true;
         this.resumeToken = null;
+        if (this.creatorBootstrapToken !== null
+            || this.expectedCreatorConnectionId !== null) {
+            this._clearCreatorBootstrapState();
+        }
         try {
             if (this.ws) this.ws.close(1008, 'Room protocol violation');
         } catch (_) { /* ignore close races */ }
@@ -156,6 +180,8 @@ class WebSocketManager {
         console.error('[WS] Terminal MLS state failure:', reason);
         this._fatalAuthFailure = true;
         this.resumeToken = null;
+        this._pendingMlsControls.clear();
+        this._mlsControlRetryAttempts.clear();
         try {
             if (this.ws) this.ws.close(1008, 'MLS state desynchronized');
         } catch (_) { /* ignore close races */ }
@@ -182,6 +208,16 @@ class WebSocketManager {
                 console.error('[WS] onError failed during queue shutdown:', error);
             }
         }
+    }
+
+    _clearCreatorBootstrapState() {
+        this.creatorBootstrapToken = null;
+        this.expectedCreatorConnectionId = null;
+        sessionStorage.removeItem(
+            `ws_creator_bootstrap_${this.roomId}`,
+        );
+        sessionStorage.removeItem(`ws_connection_${this.roomId}`);
+        sessionStorage.removeItem(`ws_room_type_${this.roomId}`);
     }
 
     _isMlsControlEnvelope(message) {
@@ -214,6 +250,35 @@ class WebSocketManager {
         this._pendingMlsControls.delete(this._mlsControlKey(message));
     }
 
+    /**
+     * Stop retrying one exact locally-generated MLS control envelope.
+     *
+     * This is intentionally keyed by the complete immutable correlation
+     * material used for store-and-retry, rather than by only CommitRef or
+     * KeyPackageRef. Callers can therefore abandon a candidate control
+     * without accidentally cancelling another concurrent admission.
+     *
+     * @param {object} message
+     * @returns {boolean} True only when a pending exact envelope was removed
+     */
+    cancelPendingMlsControl(message) {
+        if (!this._isMlsControlEnvelope(message)) return false;
+        return this._pendingMlsControls.delete(this._mlsControlKey(message));
+    }
+
+    _cancelPendingWelcomeByCommitRef(commitRef) {
+        if (typeof commitRef !== 'string') return 0;
+        let removed = 0;
+        for (const [key, entry] of this._pendingMlsControls) {
+            if (entry.envelope.wire_format === 3
+                && entry.envelope.commit_ref === commitRef) {
+                this._pendingMlsControls.delete(key);
+                removed += 1;
+            }
+        }
+        return removed;
+    }
+
     _sendMlsControlAck(seq) {
         if (!Number.isSafeInteger(seq) || seq <= 0
             || !this.ws || this.ws.readyState !== WebSocket.OPEN) return;
@@ -230,7 +295,8 @@ class WebSocketManager {
     }
 
     _retryPendingMlsControls() {
-        if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+        if (this._mlsControlSyncing
+            || !this.ws || this.ws.readyState !== WebSocket.OPEN) return;
         for (const entry of this._pendingMlsControls.values()) {
             if (entry.lastSentGeneration >= this._connectionGeneration) continue;
             try {
@@ -279,6 +345,19 @@ class WebSocketManager {
                         headers['X-PinChat-MLS-Control-Seq']
                             = String(this.lastMlsControlSeq);
                     }
+                } else if (this.creatorBootstrapToken) {
+                    if (!_isValidCreatorBootstrapToken(
+                        this.creatorBootstrapToken,
+                    )
+                        || !_isValidRelayConnectionId(
+                            this.expectedCreatorConnectionId,
+                        )) {
+                        throw new Error(
+                            'Stored group creator bootstrap credential is malformed',
+                        );
+                    }
+                    headers['X-PinChat-Creator-Bootstrap']
+                        = this.creatorBootstrapToken;
                 }
                 return headers;
             };
@@ -287,12 +366,25 @@ class WebSocketManager {
                 if (response.status !== 409) return { handled: false, token: null };
                 let body = null;
                 try { body = await response.json(); } catch (_) { /* malformed error */ }
+                if (body?.code === 'CREATOR_BOOTSTRAP_REJECTED') {
+                    this._clearCreatorBootstrapState();
+                    this._fatalAuthFailure = true;
+                    if (this.onError) {
+                        this.onError(new Error(
+                            'CREATOR_BOOTSTRAP_REJECTED',
+                        ));
+                    }
+                    return { handled: true, token: null };
+                }
                 if (!body || (body.code !== 'RESUME_REJECTED'
                     && body.code !== 'MLS_CONTROL_RESYNC_REQUIRED')) {
                     return { handled: false, token: null };
                 }
                 this.resumeToken = null;
                 if (body.code === 'MLS_CONTROL_RESYNC_REQUIRED') {
+                    if (this.creatorBootstrapToken !== null) {
+                        this._clearCreatorBootstrapState();
+                    }
                     this._fatalAuthFailure = true;
                     if (this.onError) {
                         this.onError(new Error('MLS_CONTROL_RESYNC_REQUIRED'));
@@ -449,6 +541,44 @@ class WebSocketManager {
                 return null;
             }
 
+            if (this.creatorBootstrapToken) {
+                if (data.connection_id
+                        !== this.expectedCreatorConnectionId) {
+                    console.error(
+                        '[WS] Creator bootstrap returned a different relay identity',
+                    );
+                    this._clearCreatorBootstrapState();
+                    this._fatalAuthFailure = true;
+                    if (this.onError) {
+                        this.onError(new Error('CREATOR_IDENTITY_MISMATCH'));
+                    }
+                    return null;
+                }
+                if (data.mls_control_cursor !== undefined) {
+                    if (!Number.isSafeInteger(data.mls_control_cursor)
+                        || data.mls_control_cursor !== 0
+                        || this.connectionId !== null) {
+                        console.error(
+                            '[WS] Creator bootstrap returned an invalid MLS cursor',
+                        );
+                        this._clearCreatorBootstrapState();
+                        this._fatalAuthFailure = true;
+                        if (this.onError) {
+                            this.onError(new Error(
+                                'CREATOR_BOOTSTRAP_CURSOR_INVALID',
+                            ));
+                        }
+                        return null;
+                    }
+                    // No Connected frame has ever been received in this tab.
+                    // The server cursor is the fresh-admission boundary it
+                    // recorded before the lost Connected, so adopting it does
+                    // not skip any MLS state this browser had authenticated.
+                    this.lastMlsControlSeq = data.mls_control_cursor;
+                }
+                this.roomType = 'group';
+            }
+
             // Cache token and expiration for reconnection
             // Use 29s instead of 30s to provide safety margin
             this.cachedToken = data.token;
@@ -474,6 +604,29 @@ class WebSocketManager {
      * to avoid solving PoW on every reconnection attempt.
      */
     async connect() {
+        if (this._fatalAuthFailure) {
+            console.error('[WS] connect() blocked: session is in fatal auth/protocol failure — page refresh required');
+            return;
+        }
+        if (this._connectPromise) return this._connectPromise;
+        if (this.ws && (this.ws.readyState === WebSocket.CONNECTING
+            || this.ws.readyState === WebSocket.OPEN)) {
+            console.warn('WebSocket connection already active');
+            return;
+        }
+
+        const attempt = this._connectOnce();
+        this._connectPromise = attempt;
+        try {
+            return await attempt;
+        } finally {
+            if (this._connectPromise === attempt) {
+                this._connectPromise = null;
+            }
+        }
+    }
+
+    async _connectOnce() {
         // Enforcement gate: once we've detected a terminal auth/protocol failure
         // (v1 gate mismatch, SIGNATURE_INVALID, subprotocol mismatch on onopen),
         // refuse to attempt a new connection. The user must refresh the page.
@@ -482,20 +635,20 @@ class WebSocketManager {
             return;
         }
 
-        if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-            console.warn('WebSocket already connected');
+        if (this.ws && (this.ws.readyState === WebSocket.CONNECTING
+            || this.ws.readyState === WebSocket.OPEN)) {
+            console.warn('WebSocket connection already active');
             return;
         }
 
         this.isManuallyDisconnected = false;
 
-        // Helper: drop every creator-optimization entry atomically. Must clear
-        // ALL four keys (token, connection_id, protocol_version, subprotocols)
-        // so a later connect() can't re-trigger the same fatal path by reading
-        // stale v0 metadata.
-        const clearCreatorMetadata = () => {
+        // Drop the short-lived, single-use creator upgrade material after it
+        // is copied into this attempt. The stable connection ID and separate
+        // bootstrap bearer remain until Connected establishes a normal resume
+        // credential.
+        const clearCreatorOneShotMetadata = () => {
             sessionStorage.removeItem(`ws_token_${this.roomId}`);
-            sessionStorage.removeItem(`ws_connection_${this.roomId}`);
             sessionStorage.removeItem(`ws_protocol_version_${this.roomId}`);
             sessionStorage.removeItem(`ws_subprotocols_${this.roomId}`);
         };
@@ -505,8 +658,43 @@ class WebSocketManager {
         // PATH 1: Creator optimization — token was pre-issued by /api/rooms.
         const creatorToken = sessionStorage.getItem(`ws_token_${this.roomId}`);
         const creatorConnectionId = sessionStorage.getItem(`ws_connection_${this.roomId}`);
+        const creatorBootstrapToken = sessionStorage.getItem(
+            `ws_creator_bootstrap_${this.roomId}`,
+        );
+        const creatorRoomType = sessionStorage.getItem(
+            `ws_room_type_${this.roomId}`,
+        );
         const creatorProtoVersion = sessionStorage.getItem(`ws_protocol_version_${this.roomId}`);
         const creatorSubprotocols = sessionStorage.getItem(`ws_subprotocols_${this.roomId}`);
+
+        const clearAllCreatorMetadata = () => {
+            clearCreatorOneShotMetadata();
+            this._clearCreatorBootstrapState();
+        };
+
+        if (creatorConnectionId || creatorBootstrapToken || creatorRoomType) {
+            const validConnectionId =
+                _isValidRelayConnectionId(creatorConnectionId);
+            const validRoomType = creatorRoomType === 'group'
+                || creatorRoomType === 'onetoone';
+            const validGroupBootstrap = creatorRoomType === 'group'
+                && _isValidCreatorBootstrapToken(creatorBootstrapToken);
+            const validOneToOneMetadata = creatorRoomType === 'onetoone'
+                && creatorBootstrapToken === null;
+            if (!validConnectionId || !validRoomType
+                || (!validGroupBootstrap && !validOneToOneMetadata)) {
+                clearAllCreatorMetadata();
+                this._fatalAuthFailure = true;
+                if (this.onError) {
+                    this.onError(new Error('CREATOR_BOOTSTRAP_INVALID'));
+                }
+                return;
+            }
+            if (creatorRoomType === 'group') {
+                this.expectedCreatorConnectionId = creatorConnectionId;
+                this.creatorBootstrapToken = creatorBootstrapToken;
+            }
+        }
 
         if (creatorToken && creatorConnectionId) {
             // Same v1 gate as the /api/ws-token path so a v0 server can't slip
@@ -527,7 +715,7 @@ class WebSocketManager {
                 // Clear invalid metadata BEFORE surfacing the error; otherwise a
                 // manual reconnect would read the same stale entries and emit
                 // PROTOCOL_OR_AUTH_FAILURE forever without progress.
-                clearCreatorMetadata();
+                clearCreatorOneShotMetadata();
                 console.error('[WS] Creator metadata failed v1 gate; cleared and aborting');
                 this._fatalAuthFailure = true;
                 if (this.onError) this.onError(new Error('PROTOCOL_OR_AUTH_FAILURE'));
@@ -538,11 +726,29 @@ class WebSocketManager {
             token = creatorToken;
             this.cachedToken = creatorToken;
             this.tokenExpiresAt = Date.now() + 29000;
-            clearCreatorMetadata();  // success path: single-use
-        } else if (creatorToken || creatorConnectionId) {
-            // Partial/corrupt creator metadata (one key missing): clean up before
-            // falling through to the token-request path.
-            clearCreatorMetadata();
+            clearCreatorOneShotMetadata();  // success path: single-use
+            if (creatorRoomType === 'onetoone') {
+                sessionStorage.removeItem(`ws_connection_${this.roomId}`);
+                sessionStorage.removeItem(`ws_room_type_${this.roomId}`);
+            }
+        } else if (creatorToken) {
+            // A connection ID paired with a valid bootstrap token is a
+            // complete recovery path even after the one-shot JWT expires.
+            // Reaching this branch means that pair was absent, so an orphaned
+            // one-shot value must fail closed instead of silently creating a
+            // random non-creator relay identity.
+            clearAllCreatorMetadata();
+            this._fatalAuthFailure = true;
+            if (this.onError) {
+                this.onError(new Error('CREATOR_BOOTSTRAP_INVALID'));
+            }
+            return;
+        } else if (creatorRoomType === 'onetoone') {
+            // A 1:1 creator identity is only an optimization for the initial
+            // one-shot JWT. If that JWT expired before navigation, discard the
+            // preallocation and use the ordinary PoW token path.
+            sessionStorage.removeItem(`ws_connection_${this.roomId}`);
+            sessionStorage.removeItem(`ws_room_type_${this.roomId}`);
         }
 
         if (!token) {
@@ -693,6 +899,10 @@ class WebSocketManager {
                         if (!_isValidWsResumeToken(message.resume_token)) {
                             this._fatalAuthFailure = true;
                             this.resumeToken = null;
+                            if (this.creatorBootstrapToken !== null
+                                || this.expectedCreatorConnectionId !== null) {
+                                this._clearCreatorBootstrapState();
+                            }
                             try { this.ws.close(1008, 'Invalid resume credential'); } catch (_) {}
                             if (this.onError) this.onError(new Error('RESUME_TOKEN_INVALID'));
                             return;
@@ -731,6 +941,15 @@ class WebSocketManager {
                             );
                             return;
                         }
+                        if (this.expectedCreatorConnectionId !== null
+                            && message.user_id
+                                !== this.expectedCreatorConnectionId) {
+                            this._clearCreatorBootstrapState();
+                            this._failRoomProtocol(
+                                'creator bootstrap relay identity changed',
+                            );
+                            return;
+                        }
                         if (this.connectionId !== null
                             && message.user_id !== this.connectionId
                             && (message.room_type === 'group'
@@ -743,6 +962,9 @@ class WebSocketManager {
                         this.connectionId = message.user_id;
                         this.roomType = message.room_type;
                         this.resumeToken = message.resume_token;
+                        if (this.creatorBootstrapToken !== null) {
+                            this._clearCreatorBootstrapState();
+                        }
                         delete message.resume_token;
                         connectedFrameSeen = true;
                     } else if (!connectedFrameSeen
@@ -883,6 +1105,14 @@ class WebSocketManager {
 
                             if (this.onMessage) {
                                 await this.onMessage(message);
+                            }
+                            if (message.type === 'mlsrejected'
+                                && message.reason
+                                    === 'welcome_not_correlated'
+                                && message.retry_after_secs === 0) {
+                                this._cancelPendingWelcomeByCommitRef(
+                                    message.commit_ref,
+                                );
                             }
                         })
                         .catch((err) => {
@@ -1052,6 +1282,29 @@ class WebSocketManager {
         } catch (error) {
             if (insertedTracking) this._pendingMlsControls.delete(trackedKey);
             console.error('Failed to serialize WebSocket message:', error);
+            return false;
+        }
+
+        // While the relay is replaying the ordered group-control log it
+        // accepts only cumulative ACKs. Application handlers may generate a
+        // new Commit, Proposal, KeyPackage, or Welcome while processing that
+        // replay; retain exact MLS controls for the post-mlssync retry, but do
+        // not write any application frame into the replay-only transport.
+        if (this.roomType === 'group'
+            && this._mlsControlSyncing
+            && message.type !== 'mlsack') {
+            if (trackedKey !== null
+                && !this._fatalAuthFailure
+                && !this.isManuallyDisconnected) {
+                console.warn(
+                    'MLS replay in progress; queued MLS control for post-sync retry',
+                );
+                return true;
+            }
+            if (insertedTracking) this._pendingMlsControls.delete(trackedKey);
+            console.error(
+                'MLS replay in progress; application frame was not sent',
+            );
             return false;
         }
 

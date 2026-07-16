@@ -351,6 +351,7 @@ async function completeExchangeJoin(exchange, senderId = 'creator-test') {
 async function createExchange({
     acceptCommit = true,
     creatorSend = null,
+    creatorCancelPendingControl = null,
     pskSecret = DEFAULT_PSK,
     expectKeyPackageError = false,
 } = {}) {
@@ -364,6 +365,7 @@ async function createExchange({
             creatorOut.push(envelope);
             return creatorSend ? creatorSend(envelope, creator) : true;
         },
+        cancelPendingControl: creatorCancelPendingControl || (() => true),
         onEvent: (event) => creatorEvents.push(event),
         pskSecret,
         relaySenderId: 'creator-self',
@@ -678,6 +680,139 @@ async function main() {
             && event.reason.includes('retrying after 1 seconds')),
     'aggregate room rejection retains the exact Commit candidate for retry');
 
+    // Correlation and creator-role failures are permanent relay decisions,
+    // not retry windows. They must cancel the byte-identical queued control,
+    // destroy the candidate, and leave the accepted epoch untouched.
+    for (const [reason, marker, pskByte] of [
+        ['unknown_key_package_ref', 'KeyPackageRef', 0x60],
+        ['commit_correlation_conflict', 'correlation conflicts', 0x62],
+    ]) {
+        const cancelledControls = [];
+        const permanentlyRejected = await createExchange({
+            acceptCommit: false,
+            pskSecret: new Uint8Array(32).fill(pskByte),
+            creatorCancelPendingControl: (envelope) => {
+                cancelledControls.push(envelope);
+                return true;
+            },
+        });
+        const rejectedCandidate =
+            permanentlyRejected.creator._pendingCommit.candidateGroup;
+        const rejectedSecretRefs =
+            collectGroupSecretRefs(rejectedCandidate);
+        const consumedPermanentRejection =
+            await permanentlyRejected.creator.onTransportRejection({
+                type: 'mlsrejected',
+                commit_ref: permanentlyRejected.commit.commit_ref,
+                reason,
+                retry_after_secs: 0,
+            });
+        assert(consumedPermanentRejection
+            && permanentlyRejected.creator._pendingCommit === null
+            && liveGroupMatches(
+                permanentlyRejected.creator,
+                permanentlyRejected.beforeAdd,
+            )
+            && cancelledControls.length === 1
+            && cancelledControls[0] === permanentlyRejected.commit,
+        `permanent ${reason} rejection cancels exact control without epoch advance`);
+        assert(Object.keys(rejectedCandidate.epochSecrets).length === 0
+            && rejectedCandidate._chainStates.size === 0
+            && rejectedCandidate._prevEpoch === null
+            && rejectedSecretRefs.every(
+                (bytes) => bytes.every((byte) => byte === 0),
+            )
+            && permanentlyRejected.creatorEvents.some((event) =>
+                event.kind === 'error'
+                    && event.reason.includes(marker)),
+        `permanent ${reason} rejection erases candidate secrets and reports cause`);
+    }
+
+    const creatorBindingRejected = await createExchange({
+        acceptCommit: false,
+        pskSecret: new Uint8Array(32).fill(0x61),
+        creatorCancelPendingControl: () => true,
+    });
+    const rejectedCreatorCandidate =
+        creatorBindingRejected.creator._pendingCommit.candidateGroup;
+    const rejectedCreatorCandidateSecrets =
+        collectGroupSecretRefs(rejectedCreatorCandidate);
+    const rejectedCreatorLiveGroup = creatorBindingRejected.creator.group;
+    const rejectedCreatorLiveSecrets =
+        collectGroupSecretRefs(rejectedCreatorLiveGroup);
+    let creatorBindingError = null;
+    try {
+        await creatorBindingRejected.creator.onTransportRejection({
+            type: 'mlsrejected',
+            commit_ref: creatorBindingRejected.commit.commit_ref,
+            reason: 'not_group_creator',
+            retry_after_secs: 0,
+        });
+    } catch (err) {
+        creatorBindingError = err;
+    }
+    assert(
+        creatorBindingError?.mlsFatalState === true
+        && creatorBindingRejected.creator.state === 'desynced'
+        && creatorBindingRejected.creator.group === null
+        && creatorBindingRejected.creator._pendingCommit === null
+        && creatorBindingRejected.creatorEvents.some((event) =>
+            event.kind === 'desynced'
+            && event.reason.includes('not the group creator')),
+        'creator-binding rejection terminates the locally misbound MLS session',
+    );
+    assert(
+        Object.keys(rejectedCreatorCandidate.epochSecrets).length === 0
+        && rejectedCreatorCandidateSecrets.every(
+            (bytes) => bytes.every((byte) => byte === 0),
+        )
+        && Object.keys(rejectedCreatorLiveGroup.epochSecrets).length === 0
+        && rejectedCreatorLiveSecrets.every(
+            (bytes) => bytes.every((byte) => byte === 0),
+        ),
+        'creator-binding rejection wipes candidate and accepted epoch secrets',
+    );
+
+    const postAcceptanceCreatorBinding = await createExchange();
+    await completeExchangeJoin(
+        postAcceptanceCreatorBinding,
+        'creator-post-acceptance-role-reject',
+    );
+    let postAcceptanceCreatorError = null;
+    try {
+        await postAcceptanceCreatorBinding.creator.onTransportRejection({
+            type: 'mlsrejected',
+            commit_ref: postAcceptanceCreatorBinding.commit.commit_ref,
+            reason: 'not_group_creator',
+            retry_after_secs: 0,
+        });
+    } catch (err) {
+        postAcceptanceCreatorError = err;
+    }
+    assert(
+        postAcceptanceCreatorError?.mlsFatalState === true
+        && postAcceptanceCreatorBinding.creator.state === 'desynced'
+        && postAcceptanceCreatorBinding.creator.group === null
+        && postAcceptanceCreatorBinding.creator._pendingCommit === null,
+        'creator-binding rejection is terminal even after Commit acceptance',
+    );
+
+    const rejectedWelcome = await createExchange();
+    await completeExchangeJoin(rejectedWelcome, 'creator-welcome-reject');
+    const welcomeRejectionHandled =
+        await rejectedWelcome.creator.onTransportRejection({
+            type: 'mlsrejected',
+            commit_ref: rejectedWelcome.commit.commit_ref,
+            reason: 'welcome_not_correlated',
+            retry_after_secs: 0,
+        });
+    assert(welcomeRejectionHandled
+        && rejectedWelcome.creator._pendingCommit === null
+        && rejectedWelcome.creatorEvents.some((event) =>
+            event.kind === 'error'
+                && event.reason.includes('fresh KeyPackage')),
+    'permanently rejected post-acceptance Welcome is surfaced without rolling back the epoch');
+
     // KeyPackages are one-shot beyond the lifetime of the leaf they admitted.
     // Removing that leaf must not make the old init key eligible for another
     // Welcome, even when the former client still knows the invite PSK and can
@@ -967,44 +1102,47 @@ async function main() {
     assert(!removalRace.creator._leafBySenderId.has('joiner-1'),
         'deferred Remove applies after its own relay echo');
 
-    // A final relay departure can be sequenced before an in-flight Add earns
-    // its acceptance echo. The creator must retain that departure even though
-    // the live sender→leaf map does not exist yet. If the Add is subsequently
-    // accepted, install it for consistency, suppress the Welcome, and
-    // immediately author a Remove.
-    const pendingAddDeparture = await createExchange({ acceptCommit: false });
+    // Add acceptance and final departure share one relay order. Observing
+    // UserLeft while the Add remains unaccepted proves its KeyPackageRef was
+    // discarded before the Commit could be sequenced, so a later manual echo
+    // is impossible. Abort and erase the isolated candidate, cancel the exact
+    // queued transport envelope, and leave the live Group unchanged.
+    const cancelledPendingAddControls = [];
+    const pendingAddDeparture = await createExchange({
+        acceptCommit: false,
+        creatorCancelPendingControl: (envelope) => {
+            cancelledPendingAddControls.push(envelope);
+            return true;
+        },
+    });
+    const pendingAddCandidate =
+        pendingAddDeparture.creator._pendingCommit.candidateGroup;
+    const pendingAddCandidateSecrets =
+        collectGroupSecretRefs(pendingAddCandidate);
     await pendingAddDeparture.creator.removeMemberBySenderId('joiner-1');
-    assert(pendingAddDeparture.creator._departedSenderIds.has('joiner-1')
-        && pendingAddDeparture.creator._deferredRemovals.has('joiner-1')
-        && pendingAddDeparture.creator._leafBySenderId.size === 0,
-    'departure during Pending Add is retained before a leaf mapping exists');
-    await echoPendingCommit(
-        pendingAddDeparture.creator,
-        pendingAddDeparture.commit,
-        'creator-add-race-self',
-    );
-    const addRacePublicMessages = pendingAddDeparture.creatorOut.filter(
-        (envelope) => envelope.wire_format === WireFormat.MLS_PUBLIC_MESSAGE,
-    );
-    const addRaceRemove = addRacePublicMessages[1];
-    assert(Boolean(addRaceRemove)
-        && pendingAddDeparture.creator._pendingCommit?.kind === 'remove'
+    assert(pendingAddDeparture.creator._pendingCommit === null
+        && liveGroupMatches(
+            pendingAddDeparture.creator, pendingAddDeparture.beforeAdd,
+        )
+        && pendingAddDeparture.creator.state === 'awaiting-keypackage'
+        && !pendingAddDeparture.creator._leafBySenderId.has('joiner-1')
+        && !pendingAddDeparture.creator._departedSenderIds.has('joiner-1')
+        && !pendingAddDeparture.creator._deferredRemovals.has('joiner-1')
+        && !pendingAddDeparture.creator._deferredKeyPackages.has('joiner-1'),
+    'ordered departure aborts Pending Add without mutating live MLS state');
+    assert(cancelledPendingAddControls.length === 1
+        && cancelledPendingAddControls[0] === pendingAddDeparture.commit
         && !pendingAddDeparture.creatorOut.some(
             (envelope) => envelope.wire_format === WireFormat.MLS_WELCOME,
         ),
-    'accepted Add for a departed route suppresses Welcome and stages Remove');
-    await echoPendingCommit(
-        pendingAddDeparture.creator,
-        addRaceRemove,
-        'creator-add-race-self',
-    );
-    assert(pendingAddDeparture.creator._pendingCommit === null
-        && !pendingAddDeparture.creator._leafBySenderId.has('joiner-1')
-        && !pendingAddDeparture.creator._departedSenderIds.has('joiner-1')
-        && global.MLS.RatchetTree.leafFor(
-            pendingAddDeparture.creator.group.ratchetTree, 1,
-        ) === null,
-    'Remove acceptance erases the phantom leaf and its departure tombstone');
+    'Pending Add departure cancels the exact Commit and never emits Welcome');
+    assert(Object.keys(pendingAddCandidate.epochSecrets).length === 0
+        && pendingAddCandidate._chainStates.size === 0
+        && pendingAddCandidate._prevEpoch === null
+        && pendingAddCandidateSecrets.every(
+            (bytes) => bytes.every((byte) => byte === 0),
+        ),
+    'Pending Add departure erases all speculative candidate secrets');
 
     // Local Remove construction failure must not consume the lifecycle
     // request. It remains retryable across the operation mutex / reconnect
