@@ -48,6 +48,7 @@ require(path.join(__dirname, '..', 'static', 'js', 'mls-session.js'));
 
 const { MLSSession } = global;
 const { WireFormat } = global.MLS.MLSMessage;
+const DEFAULT_PSK = new Uint8Array(32).fill(0x3c);
 
 let passed = 0;
 let failed = 0;
@@ -239,6 +240,20 @@ function wrapPublicEnvelope(envelope) {
     );
 }
 
+function proposalEnvelope(proposed) {
+    const frame = global.MLS.MLSMessage.parseMLSMessage(
+        proposed.proposalMessage,
+    );
+    if (frame.wireFormat !== WireFormat.MLS_PUBLIC_MESSAGE) {
+        throw new Error('expected wrapped MLS PublicMessage proposal');
+    }
+    return {
+        type: 'mls',
+        payload: global.MLS.Codec.bytesToBase64Url(frame.body),
+        wire_format: WireFormat.MLS_PUBLIC_MESSAGE,
+    };
+}
+
 async function mutatePreWelcomeCandidate(envelope, mask) {
     const pm = parseCommitEnvelope(envelope);
     pm.auth.signature = Uint8Array.from(pm.auth.signature);
@@ -316,7 +331,7 @@ async function completeExchangeJoin(exchange, senderId = 'creator-test') {
 async function createExchange({
     acceptCommit = true,
     creatorSend = null,
-    pskSecret = null,
+    pskSecret = DEFAULT_PSK,
     expectKeyPackageError = false,
 } = {}) {
     const creatorOut = [];
@@ -331,6 +346,7 @@ async function createExchange({
         },
         onEvent: (event) => creatorEvents.push(event),
         pskSecret,
+        relaySenderId: 'creator-self',
     });
     await creator.start();
     const beforeAdd = captureLiveGroup(creator);
@@ -342,6 +358,7 @@ async function createExchange({
         pskSecret,
         expectedGroupId: pins.groupId,
         expectedCreatorKeyHash: pins.creatorKeyHash,
+        relaySenderId: 'joiner-1',
     });
 
     await joiner.start();
@@ -384,6 +401,56 @@ async function createExchange({
 
 async function main() {
     console.log('# MLS session — Welcome join orchestration');
+
+    const proofPsk = new Uint8Array(32).fill(0x91);
+    const proofCreatorOut = [];
+    const proofCreatorEvents = [];
+    const proofCreator = new MLSSession({
+        role: 'creator',
+        send: (envelope) => proofCreatorOut.push(envelope),
+        onEvent: (event) => proofCreatorEvents.push(event),
+        pskSecret: proofPsk,
+        relaySenderId: 'proof-creator',
+    });
+    await proofCreator.start();
+    const proofPins = proofCreator.bootstrapPins;
+    const proofJoinerOut = [];
+    const proofJoiner = new MLSSession({
+        role: 'joiner',
+        send: (envelope) => proofJoinerOut.push(envelope),
+        onEvent: () => {},
+        pskSecret: proofPsk,
+        expectedGroupId: proofPins.groupId,
+        expectedCreatorKeyHash: proofPins.creatorKeyHash,
+        relaySenderId: 'proof-joiner',
+    });
+    await proofJoiner.start();
+    const proofKeyPackage = proofJoinerOut.find(
+        (envelope) => envelope.wire_format === WireFormat.MLS_KEY_PACKAGE,
+    );
+    assert(typeof proofKeyPackage.bootstrap_proof === 'string'
+        && proofKeyPackage.bootstrap_proof.length === 43,
+    'joiner KeyPackage carries a canonical invite-secret possession proof');
+    await proofCreator.onRelayEnvelope({
+        ...proofKeyPackage,
+        bootstrap_proof: Buffer.alloc(32, 0x44).toString('base64url'),
+        sender_id: 'proof-joiner',
+    });
+    assert(proofCreator.group.epoch === 0n
+        && proofCreator._pendingCommit === null
+        && proofCreatorOut.length === 0
+        && proofCreatorEvents.some((event) =>
+            event.kind === 'error'
+                && event.reason.includes('bootstrap proof is invalid')),
+    'creator rejects a structurally valid KeyPackage without PSK proof before building Add');
+    await proofCreator.onRelayEnvelope({
+        ...proofKeyPackage,
+        sender_id: 'proof-joiner',
+    });
+    assert(proofCreator._pendingCommit?.kind === 'add'
+        && proofCreatorOut.some((envelope) =>
+            envelope.wire_format === WireFormat.MLS_PUBLIC_MESSAGE),
+    'creator accepts the same KeyPackage when its PSK proof is valid');
 
     // A locally-authored Add is only a candidate until the relay echoes the
     // exact Commit. Before that ACK, neither the live epoch nor membership
@@ -490,17 +557,22 @@ async function main() {
     // ordered KeyPackage from the unchanged relay cursor.
     const retryCreatorOut = [];
     const retryJoinerOut = [];
+    const retryPsk = new Uint8Array(32).fill(0x27);
     const retryCreator = new MLSSession({
         role: 'creator',
         send: (envelope) => retryCreatorOut.push(envelope),
+        pskSecret: retryPsk,
+        relaySenderId: 'creator-retry',
     });
     await retryCreator.start();
     const retryPins = retryCreator.bootstrapPins;
     const retryJoiner = new MLSSession({
         role: 'joiner',
         send: (envelope) => retryJoinerOut.push(envelope),
+        pskSecret: retryPsk,
         expectedGroupId: retryPins.groupId,
         expectedCreatorKeyHash: retryPins.creatorKeyHash,
+        relaySenderId: 'joiner-retry',
     });
     await retryJoiner.start();
     const retryKeyPackage = retryJoinerOut.find(
@@ -691,16 +763,14 @@ async function main() {
 
     const proposalQuotaExchange = await createExchange();
     await completeExchangeJoin(proposalQuotaExchange, 'creator-quota');
-    const quotaProposals = [];
     const quotaReferenceKeys = [];
-    for (let index = 0; index < 3; index += 1) {
+    for (let index = 0; index < 2; index += 1) {
         const before = proposalQuotaExchange.joinerOut.length;
         await proposalQuotaExchange.joiner.proposeUpdate();
         const proposal = proposalQuotaExchange.joinerOut
             .slice(before)
             .find((envelope) =>
                 envelope.wire_format === WireFormat.MLS_PUBLIC_MESSAGE);
-        quotaProposals.push(proposal);
         quotaReferenceKeys.push(
             proposalQuotaExchange.joiner._pendingSelfUpdate.referenceKey,
         );
@@ -709,18 +779,33 @@ async function main() {
             sender_id: 'joiner-1',
         });
     }
+    const localQuotaOutBefore = proposalQuotaExchange.joinerOut.length;
+    const localQuotaPendingBefore =
+        proposalQuotaExchange.joiner._pendingSelfUpdate;
+    await proposalQuotaExchange.joiner.proposeUpdate();
     assert(proposalQuotaExchange.creator._proposalStore.size === 2
         && proposalQuotaExchange.joiner._proposalStore.size === 2
         && proposalQuotaExchange.creator._proposalRefsBySender
-            .get(1).length === 2,
-    'one member retains at most two current-epoch ProposalRefs');
-    assert(!proposalQuotaExchange.creator._proposalStore
+            .get(1).length === 2
+        && proposalQuotaExchange.joinerOut.length === localQuotaOutBefore
+        && proposalQuotaExchange.joiner._pendingSelfUpdate
+            === localQuotaPendingBefore,
+    'honest member rejects a third Proposal without changing retained state');
+    const maliciousThird =
+        await proposalQuotaExchange.joiner.group.proposeUpdate();
+    const maliciousThirdReferenceKey =
+        global.MLS.Group.proposalReferenceKey(maliciousThird.reference);
+    await proposalQuotaExchange.creator.onRelayEnvelope({
+        ...proposalEnvelope(maliciousThird),
+        sender_id: 'joiner-1',
+    });
+    assert(proposalQuotaExchange.creator._proposalStore
         .has(quotaReferenceKeys[0])
         && proposalQuotaExchange.creator._proposalStore
             .has(quotaReferenceKeys[1])
-        && proposalQuotaExchange.creator._proposalStore
-            .has(quotaReferenceKeys[2]),
-    'per-sender quota evicts only the oldest ProposalRef deterministically');
+        && !proposalQuotaExchange.creator._proposalStore
+            .has(maliciousThirdReferenceKey),
+    'malicious excess Proposal is rejected without evicting earlier ProposalRefs');
 
     const unrelatedRef = global.MLS.Codec.bytesToBase64Url(
         new Uint8Array(32).fill(0x5a),
@@ -1427,10 +1512,13 @@ async function main() {
     // The creator serializes the Commits, while each awaiting joiner must
     // retain only the Commit/Welcome pair addressed to its own KeyPackageRef.
     const multiCreatorOut = [];
+    const multiPsk = new Uint8Array(32).fill(0x68);
     const multiCreator = new MLSSession({
         role: 'creator',
         send: (envelope) => multiCreatorOut.push(envelope),
         onEvent: () => {},
+        pskSecret: multiPsk,
+        relaySenderId: 'multi-creator',
     });
     await multiCreator.start();
     const multiPins = multiCreator.bootstrapPins;
@@ -1440,15 +1528,19 @@ async function main() {
         role: 'joiner',
         send: (envelope) => multiAOut.push(envelope),
         onEvent: () => {},
+        pskSecret: multiPsk,
         expectedGroupId: multiPins.groupId,
         expectedCreatorKeyHash: multiPins.creatorKeyHash,
+        relaySenderId: 'multi-a',
     });
     const multiB = new MLSSession({
         role: 'joiner',
         send: (envelope) => multiBOut.push(envelope),
         onEvent: () => {},
+        pskSecret: multiPsk,
         expectedGroupId: multiPins.groupId,
         expectedCreatorKeyHash: multiPins.creatorKeyHash,
+        relaySenderId: 'multi-b',
     });
     await multiA.start();
     await multiB.start();
@@ -1554,6 +1646,37 @@ async function main() {
     const multiReferenceCommit = multiCreatorOut
         .slice(multiCreatorOutBeforeUpdate)
         .find((envelope) => envelope.wire_format === WireFormat.MLS_PUBLIC_MESSAGE);
+    const racingProposalB = await multiA.group.proposeUpdate();
+    const racingProposalC = await multiA.group.proposeUpdate();
+    const racingEnvelopeB = proposalEnvelope(racingProposalB);
+    const racingEnvelopeC = proposalEnvelope(racingProposalC);
+    await multiCreator.onRelayEnvelope({
+        ...racingEnvelopeB,
+        sender_id: 'multi-a',
+    });
+    await multiB.onRelayEnvelope({
+        ...racingEnvelopeB,
+        sender_id: 'multi-a',
+    });
+    await multiCreator.onRelayEnvelope({
+        ...racingEnvelopeC,
+        sender_id: 'multi-a',
+    });
+    await multiB.onRelayEnvelope({
+        ...racingEnvelopeC,
+        sender_id: 'multi-a',
+    });
+    const racingReferenceB =
+        global.MLS.Group.proposalReferenceKey(racingProposalB.reference);
+    const racingReferenceC =
+        global.MLS.Group.proposalReferenceKey(racingProposalC.reference);
+    assert(multiCreator._proposalStore.has(multiReferenceKey)
+        && multiB._proposalStore.has(multiReferenceKey)
+        && multiCreator._proposalStore.has(racingReferenceB)
+        && multiB._proposalStore.has(racingReferenceB)
+        && !multiCreator._proposalStore.has(racingReferenceC)
+        && !multiB._proposalStore.has(racingReferenceC),
+    'Proposal race preserves every reference that a staged Commit may use');
     await echoPendingCommit(multiCreator, multiReferenceCommit, 'multi-creator');
     await multiA.onRelayEnvelope({
         ...multiReferenceCommit,
@@ -1839,15 +1962,14 @@ async function main() {
         && rollbackProposal.joiner._pendingSelfUpdates.size === 1,
     'operation mutex recovers after rejection and accepts the next proposal');
 
-    await rollbackProposal.joiner.proposeUpdate();
-    const storeBeforeEvictingFailure =
+    const storeBeforeTransportFailure =
         [...rollbackProposal.joiner._proposalStore.entries()];
-    const refsBeforeEvictingFailure = [
+    const refsBeforeTransportFailure = [
         ...rollbackProposal.joiner._proposalRefsBySender.entries(),
     ].map(([leafIndex, references]) => [leafIndex, [...references]]);
-    const keysBeforeEvictingFailure =
+    const keysBeforeTransportFailure =
         [...rollbackProposal.joiner._pendingSelfUpdates.entries()];
-    const latestBeforeEvictingFailure =
+    const latestBeforeTransportFailure =
         rollbackProposal.joiner._pendingSelfUpdate;
     rollbackProposal.joiner.send = (envelope) => {
         if (envelope.wire_format === WireFormat.MLS_PUBLIC_MESSAGE) {
@@ -1857,20 +1979,20 @@ async function main() {
     };
     await rollbackProposal.joiner.proposeUpdate();
     assert(
-        storeBeforeEvictingFailure.every(([key, value]) =>
+        storeBeforeTransportFailure.every(([key, value]) =>
             rollbackProposal.joiner._proposalStore.get(key) === value)
         && rollbackProposal.joiner._proposalStore.size
-            === storeBeforeEvictingFailure.length
+            === storeBeforeTransportFailure.length
         && JSON.stringify([
             ...rollbackProposal.joiner._proposalRefsBySender.entries(),
-        ]) === JSON.stringify(refsBeforeEvictingFailure)
-        && keysBeforeEvictingFailure.every(([key, value]) =>
+        ]) === JSON.stringify(refsBeforeTransportFailure)
+        && keysBeforeTransportFailure.every(([key, value]) =>
             rollbackProposal.joiner._pendingSelfUpdates.get(key) === value)
         && rollbackProposal.joiner._pendingSelfUpdates.size
-            === keysBeforeEvictingFailure.length
+            === keysBeforeTransportFailure.length
         && rollbackProposal.joiner._pendingSelfUpdate
-            === latestBeforeEvictingFailure,
-    'transport failure after quota eviction restores the exact prior ProposalRef state');
+            === latestBeforeTransportFailure,
+    'transport failure after bounded insertion restores the exact prior ProposalRef state');
 
     const noCommitExchange = await createExchange();
     let noCommitError = '';
@@ -1909,9 +2031,11 @@ async function main() {
         role: 'joiner',
         send: (envelope) => targetOut.push(envelope),
         onEvent: (event) => targetEvents.push(event),
+        pskSecret: DEFAULT_PSK,
         expectedGroupId: unauthorizedExchange.creator.bootstrapPins.groupId,
         expectedCreatorKeyHash:
             unauthorizedExchange.creator.bootstrapPins.creatorKeyHash,
+        relaySenderId: 'target-1',
     });
     await target.start();
     const unauthorized = await unauthorizedExchange.joiner.group.commitAddMember({
@@ -1952,6 +2076,8 @@ async function main() {
         role: 'joiner',
         send: (envelope) => unpinnedOut.push(envelope),
         onEvent: () => {},
+        pskSecret: DEFAULT_PSK,
+        relaySenderId: 'unpinned',
     });
     let missingPinsError = '';
     try {
@@ -1968,15 +2094,21 @@ async function main() {
     // itself as leaf 0. The Commit and Welcome are internally valid and pass
     // the creator-only index rule, but the trusted creator's group_id pin must
     // keep the victim out of the alternative group.
+    const alternativePsk = new Uint8Array(32).fill(0x7a);
     const trustedCreator = new MLSSession({
         role: 'creator', send: () => {}, onEvent: () => {},
+        pskSecret: alternativePsk,
+        relaySenderId: 'trusted-creator',
     });
     await trustedCreator.start();
     const attackerOut = [];
+    const alternateEvents = [];
     const alternateCreator = new MLSSession({
         role: 'creator',
         send: (envelope) => attackerOut.push(envelope),
-        onEvent: () => {},
+        onEvent: (event) => alternateEvents.push(event),
+        pskSecret: alternativePsk,
+        relaySenderId: 'alternate-creator',
     });
     await alternateCreator.start();
     const victimOut = [];
@@ -1984,8 +2116,10 @@ async function main() {
         role: 'joiner',
         send: (envelope) => victimOut.push(envelope),
         onEvent: () => {},
+        pskSecret: alternativePsk,
         expectedGroupId: trustedCreator.bootstrapPins.groupId,
         expectedCreatorKeyHash: trustedCreator.bootstrapPins.creatorKeyHash,
+        relaySenderId: 'victim-route',
     });
     await victim.start();
     const victimKeyPackage = victimOut.find(
@@ -1993,14 +2127,31 @@ async function main() {
     );
     await alternateCreator.onRelayEnvelope({
         ...victimKeyPackage,
-        sender_id: 'alternate-creator',
+        sender_id: 'victim-route',
     });
-    const alternateCommit = attackerOut.find(
-        (envelope) => envelope.wire_format === WireFormat.MLS_PUBLIC_MESSAGE,
-    );
-    await echoPendingCommit(
-        alternateCreator, alternateCommit, 'alternate-creator-self',
-    );
+    assert(alternateCreator._pendingCommit === null
+        && attackerOut.length === 0
+        && alternateEvents.some((event) =>
+            event.reason?.includes('bootstrap proof is invalid')),
+    'KeyPackage proof is bound to the intended group and creator pins');
+
+    // Construct the alternative-group Add below the MLSSession admission
+    // layer so the pre-Welcome group_id pin remains independently covered.
+    const alternate = await alternateCreator.group.commitAddMember({
+        keyPackageBytes: victim.keyPackageBundle.keyPackageBytes,
+    });
+    const alternateCommitBody = global.MLS.MLSMessage.parseMLSMessage(
+        alternate.commitMessage,
+    ).body;
+    const alternateCommit = {
+        type: 'mls',
+        payload: global.MLS.Codec.bytesToBase64Url(alternateCommitBody),
+        wire_format: WireFormat.MLS_PUBLIC_MESSAGE,
+        key_package_ref: victim._keyPackageRef,
+        commit_ref: global.MLS.Codec.bytesToBase64Url(
+            await global.MLS.Labeled.sha256(alternateCommitBody),
+        ),
+    };
     let alternateGroupError = '';
     try {
         await victim.onRelayEnvelope({

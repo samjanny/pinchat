@@ -905,6 +905,7 @@ document.addEventListener('alpine:init', () => {
                 pskSecret,
                 expectedGroupId,
                 expectedCreatorKeyHash,
+                relaySenderId: this.userId,
             });
             try {
                 await session.start();

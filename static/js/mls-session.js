@@ -60,6 +60,7 @@
     const PAYLOAD_IMAGE = 0x02;
     const CREATOR_LEAF_INDEX = 0;
     const BOOTSTRAP_PIN_BYTES = 32;
+    const BOOTSTRAP_PROOF_BYTES = 32;
     const CORRELATION_REF_BYTES = 32;
     const MAX_GROUP_LEAVES = MLS.Group.MAX_GROUP_LEAVES || 20;
     const MAX_PENDING_WELCOME_SENDERS = MAX_GROUP_LEAVES;
@@ -106,7 +107,7 @@
         let total = 256;
         for (const name of [
             'payload', 'ratchet_tree', 'key_package_ref', 'commit_ref',
-            'sender_id',
+            'bootstrap_proof', 'sender_id',
         ]) {
             if (typeof envelope[name] === 'string') {
                 total += envelope[name].length;
@@ -143,6 +144,42 @@
             );
         }
         return Uint8Array.from(value);
+    }
+
+    async function keyPackageBootstrapProof({
+        pskSecret,
+        expectedGroupId,
+        expectedCreatorKeyHash,
+        relaySenderId,
+        keyPackageBytes,
+    }) {
+        if (!(pskSecret instanceof Uint8Array)
+            || pskSecret.length !== BOOTSTRAP_PROOF_BYTES) {
+            throw new Error('mls-session: bootstrap proof requires a 32-byte PSK');
+        }
+        if (!(expectedGroupId instanceof Uint8Array)
+            || expectedGroupId.length !== BOOTSTRAP_PIN_BYTES
+            || !(expectedCreatorKeyHash instanceof Uint8Array)
+            || expectedCreatorKeyHash.length !== BOOTSTRAP_PIN_BYTES) {
+            throw new Error('mls-session: bootstrap proof requires authenticated invite pins');
+        }
+        if (typeof relaySenderId !== 'string'
+            || relaySenderId.length === 0 || relaySenderId.length > 128) {
+            throw new Error('mls-session: bootstrap proof requires a stable relay sender_id');
+        }
+        if (!(keyPackageBytes instanceof Uint8Array)
+            || keyPackageBytes.length === 0) {
+            throw new Error('mls-session: bootstrap proof requires KeyPackage bytes');
+        }
+        const encoder = new MLS.Codec.Encoder();
+        encoder.writeOpaque(new TextEncoder().encode(
+            'pinchat-mls-key-package-bootstrap-proof-v1',
+        ));
+        encoder.writeOpaque(expectedGroupId);
+        encoder.writeOpaque(expectedCreatorKeyHash);
+        encoder.writeOpaque(new TextEncoder().encode(relaySenderId));
+        encoder.writeOpaque(keyPackageBytes);
+        return MLS.HPKE.hmacSha256(pskSecret, encoder.bytes());
     }
 
     function encodeTextPayload(text) {
@@ -240,10 +277,11 @@
          * @param {(event: object) => void} opts.onEvent
          * @param {Uint8Array} opts.expectedGroupId
          * @param {Uint8Array} opts.expectedCreatorKeyHash
+         * @param {string} opts.relaySenderId
          */
         constructor({
             role, send, onEvent, pskSecret,
-            expectedGroupId, expectedCreatorKeyHash,
+            expectedGroupId, expectedCreatorKeyHash, relaySenderId,
         }) {
             if (role !== 'creator' && role !== 'joiner') {
                 throw new Error(`mls-session: invalid role "${role}"`);
@@ -263,7 +301,13 @@
             // The session owns this copy and can erase it on authenticated
             // removal without mutating the invite/bootstrap buffer held by
             // the application.
-            this.pskSecret = pskSecret ? Uint8Array.from(pskSecret) : null;
+            if (!(pskSecret instanceof Uint8Array)
+                || pskSecret.length !== BOOTSTRAP_PROOF_BYTES) {
+                throw new Error(
+                    'mls-session: a 32-byte invite PSK is required',
+                );
+            }
+            this.pskSecret = Uint8Array.from(pskSecret);
             // End-to-end bootstrap pins carried in the URL fragment. The PSK
             // proves possession of the invite secret; these pins additionally
             // identify the exact group and its permanent creator at leaf 0.
@@ -275,6 +319,8 @@
             this.expectedCreatorKeyHash = copyBootstrapPin(
                 expectedCreatorKeyHash, 'expectedCreatorKeyHash',
             );
+            this.relaySenderId = typeof relaySenderId === 'string'
+                ? relaySenderId : null;
             // Join correlation state. KeyPackageRef identifies which
             // broadcast Add/Welcome is addressed to this joiner; commit_ref
             // is PinChat transport metadata equal to SHA-256 over the exact
@@ -408,6 +454,11 @@
                         + 'group_id / creator-key pins',
                     );
                 }
+                if (!this.relaySenderId) {
+                    throw new Error(
+                        'mls-session: joiner is missing its stable relay sender_id',
+                    );
+                }
                 const bundle = await buildKeyPackage();
                 this.identity = bundle.identity;
                 this.keyPackageBundle = bundle;
@@ -415,11 +466,21 @@
                     bundle.keyPackageBytes,
                 );
                 this._keyPackageRef = base64UrlEncode(this._keyPackageRefBytes);
+                const keyPackageEnvelope = envelopeFromMlsMessage(
+                    MLS.MLSMessage.WireFormat.MLS_KEY_PACKAGE,
+                    bundle.keyPackageBytes,
+                );
+                keyPackageEnvelope.bootstrap_proof = base64UrlEncode(
+                    await keyPackageBootstrapProof({
+                        pskSecret: this.pskSecret,
+                        expectedGroupId: this.expectedGroupId,
+                        expectedCreatorKeyHash: this.expectedCreatorKeyHash,
+                        relaySenderId: this.relaySenderId,
+                        keyPackageBytes: bundle.keyPackageBytes,
+                    }),
+                );
                 await this._sendEnvelopeOrThrow(
-                    envelopeFromMlsMessage(
-                        MLS.MLSMessage.WireFormat.MLS_KEY_PACKAGE,
-                        bundle.keyPackageBytes,
-                    ),
+                    keyPackageEnvelope,
                     'KeyPackage broadcast failed',
                 );
                 this.onEvent({ kind: 'keypackage-published' });
@@ -433,6 +494,26 @@
                 signaturePrivateKey: kp.privateKey,
                 signaturePublicKeyBytes: kp.publicKeyBytes,
             };
+        }
+
+        async _verifyKeyPackageBootstrapProof(
+            keyPackageBytes, senderId, encodedProof,
+        ) {
+            const supplied = decodeCorrelationRef(
+                encodedProof, 'bootstrap_proof',
+            );
+            const expected = await keyPackageBootstrapProof({
+                pskSecret: this.pskSecret,
+                expectedGroupId: this.expectedGroupId,
+                expectedCreatorKeyHash: this.expectedCreatorKeyHash,
+                relaySenderId: senderId,
+                keyPackageBytes,
+            });
+            if (!equalBytes(supplied, expected)) {
+                throw new Error(
+                    'mls-session: KeyPackage bootstrap proof is invalid',
+                );
+            }
         }
 
         /**
@@ -520,34 +601,30 @@
             }
             let senderReferences =
                 this._proposalRefsBySender.get(senderLeafIndex);
-            if (!senderReferences) {
-                senderReferences = [];
-                this._proposalRefsBySender.set(
-                    senderLeafIndex, senderReferences,
+            if (senderReferences
+                && senderReferences.length >= MAX_PROPOSALS_PER_SENDER) {
+                // A Commit may already have been constructed with any
+                // authenticated ProposalRef retained for this epoch. Evicting
+                // an older entry to admit a newer one would make that Commit
+                // unresolvable on recipients that observed the newer
+                // Proposals first. Keep admission monotonic: once the bounded
+                // per-sender set is full, reject additional Proposals and
+                // retain every previously accepted reference until the epoch
+                // changes.
+                throw new Error(
+                    `mls-session: proposal quota exhausted for sender leaf `
+                    + `${senderLeafIndex}; earlier ProposalRefs retained`,
                 );
-            }
-            let evicted = null;
-            if (senderReferences.length >= MAX_PROPOSALS_PER_SENDER) {
-                const evictedReferenceKey = senderReferences.shift();
-                evicted = this._proposalStore.get(evictedReferenceKey) || null;
-                this._proposalStore.delete(evictedReferenceKey);
-                this._pendingSelfUpdates.delete(evictedReferenceKey);
-                if (this._pendingSelfUpdate?.referenceKey
-                    === evictedReferenceKey) {
-                    this._pendingSelfUpdate = null;
-                }
-                const selected = this._pendingUpdateProposals.get(
-                    senderLeafIndex,
-                );
-                if (selected && MLS.Group.proposalReferenceKey(
-                    selected.reference,
-                ) === evictedReferenceKey) {
-                    this._pendingUpdateProposals.delete(senderLeafIndex);
-                }
             }
             if (this._proposalStore.size >= MAX_PROPOSALS_PER_EPOCH) {
                 throw new Error(
                     'mls-session: authenticated proposal store invariant exceeded',
+                );
+            }
+            if (!senderReferences) {
+                senderReferences = [];
+                this._proposalRefsBySender.set(
+                    senderLeafIndex, senderReferences,
                 );
             }
             const entry = Object.freeze({
@@ -559,7 +636,7 @@
             });
             this._proposalStore.set(referenceKey, entry);
             senderReferences.push(referenceKey);
-            return { entry, isNew: true, evicted };
+            return { entry, isNew: true };
         }
 
         _clearEpochProposalState() {
@@ -1065,6 +1142,9 @@
                         || this._deferredKeyPackages.has(senderId)) {
                         return;
                     }
+                    await this._verifyKeyPackageBootstrapProof(
+                        payload, senderId, envelope.bootstrap_proof,
+                    );
                     // Validate all deterministic admission properties before
                     // treating this ordered control as durably accepted.
                     await this.group.validateKeyPackageForAdd(payload);
@@ -1126,6 +1206,9 @@
                     return;
                 }
                 try {
+                    await this._verifyKeyPackageBootstrapProof(
+                        payload, senderId, envelope.bootstrap_proof,
+                    );
                     await this.group.validateKeyPackageForAdd(payload);
                 } catch (err) {
                     this.onEvent({
@@ -1837,9 +1920,9 @@
                 return;
             }
             let proposed;
-            // Insertion may evict the oldest per-sender entry. Snapshot every
-            // bounded bookkeeping map first: a transport rejection must
-            // restore any displaced ProposalRef/private key exactly.
+            // Snapshot every bounded bookkeeping map first: a transport
+            // rejection must remove the unaccepted ProposalRef/private key
+            // without disturbing any earlier resolvable proposal.
             const proposalStoreBefore = new Map(this._proposalStore);
             const proposalRefsBefore = new Map(
                 [...this._proposalRefsBySender].map(
@@ -1879,7 +1962,7 @@
                 }, 'Update proposal broadcast failed');
             } catch (err) {
                 // A locally-created proposal that never reached the relay
-                // must not occupy the store, evict an older resolvable
+                // must not occupy the store, disturb an older resolvable
                 // ProposalRef, or leave an unselectable private key.
                 this._proposalStore.clear();
                 for (const [key, value] of proposalStoreBefore) {

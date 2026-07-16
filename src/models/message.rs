@@ -153,6 +153,11 @@ pub enum Message {
         /// exact mls_public_message body paired with this envelope.
         #[serde(skip_serializing_if = "Option::is_none", default)]
         commit_ref: Option<String>,
+        /// HMAC-SHA256 proof that a KeyPackage publisher knows the room's
+        /// URL-fragment invite secret. Present only on KeyPackage envelopes;
+        /// verified end-to-end by the creator before constructing an Add.
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        bootstrap_proof: Option<String>,
         /// Server-assigned total-order sequence for group control envelopes.
         /// Present for KeyPackage, Proposal, Commit, and Welcome; absent for
         /// ephemeral MLS PrivateMessages. Group lifecycle events share this
@@ -202,6 +207,9 @@ pub struct IncomingMessage {
     /// Optional SHA-256 Commit correlation metadata.
     #[serde(default)]
     pub commit_ref: Option<String>,
+    /// Optional invite-secret possession proof for an MLS KeyPackage.
+    #[serde(default)]
+    pub bootstrap_proof: Option<String>,
     /// Highest consecutively applied server MLS-control sequence. Used only
     /// by group-room `mlsack` frames.
     #[serde(default)]
@@ -255,6 +263,7 @@ mod tests {
             "ratchet_tree": "AA",
             "key_package_ref": reference,
             "commit_ref": reference,
+            "bootstrap_proof": reference,
         }))
         .unwrap();
         assert_eq!(
@@ -262,6 +271,10 @@ mod tests {
             Some(reference.as_str())
         );
         assert_eq!(incoming.commit_ref.as_deref(), Some(reference.as_str()));
+        assert_eq!(
+            incoming.bootstrap_proof.as_deref(),
+            Some(reference.as_str())
+        );
 
         let outgoing = Message::Mls {
             payload: "AA".to_string(),
@@ -269,12 +282,14 @@ mod tests {
             ratchet_tree: Some("AA".to_string()),
             key_package_ref: Some(reference.clone()),
             commit_ref: Some(reference.clone()),
+            bootstrap_proof: Some(reference.clone()),
             control_seq: Some(7),
             sender_id: Uuid::nil(),
         };
         let encoded = serde_json::to_value(outgoing).unwrap();
         assert_eq!(encoded["key_package_ref"], reference);
         assert_eq!(encoded["commit_ref"], reference);
+        assert_eq!(encoded["bootstrap_proof"], reference);
         assert_eq!(encoded["control_seq"], 7);
     }
 }

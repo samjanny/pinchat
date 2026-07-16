@@ -80,13 +80,22 @@ The browser-facing flow runs entirely over MLS for group rooms:
 - **Bootstrap-key binding via PSK.** The URL fragment is HKDF-derived
   into a 32-byte PSK that's injected into every epoch transition
   (`KeySchedule.deriveEpoch.pskSecret` and `Welcome.deriveWelcomeSecret`).
-  A joiner without the URL key fails the Welcome AEAD tag and never
-  reaches GroupInfo, so the relay cannot bootstrap an attacker-only
-  group inside a victim's room.
+  Before the creator constructs an Add, the publisher must also attach
+  an HMAC-SHA256 possession proof over the exact KeyPackage, authenticated
+  group/creator pins, and stable relay sender ID. A peer without the URL
+  key therefore cannot consume an MLS leaf/epoch merely by publishing a
+  structurally valid KeyPackage; a wrong-key joiner also fails the Welcome
+  AEAD tag before reaching GroupInfo.
 - The orchestrator (`mls-session.js`) tags every application payload with
   one byte (`0x01` text / `0x02` image), so images travel the same MLS
   path as text without falling back to the 1:1 Double Ratchet. KeyPackages
-  are bound to the relay's `sender_id` (one leaf per WebSocket sender).
+  are proof-bound to the relay's `sender_id` (one leaf per WebSocket sender).
+- **Ordered-control recovery is ACK-bounded.** The relay retains a bounded
+  total order for lifecycle, KeyPackage, Proposal, Commit, and Welcome
+  controls. Resume cursors are monotonic; replay is delivered in 16-entry
+  windows and each window must be applied and cumulatively ACKed before the
+  next is released. A member that stalls for 60 seconds or 64 controls is
+  removed from the pruning quorum, so it cannot freeze the room's log.
 - **Forward secrecy within the epoch.** Application AEAD keys come from
   stateful per-sender chains (`Group._chainKeyNonce`): only the current
   chain position's secret is kept (overwritten as the chain advances),

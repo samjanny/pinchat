@@ -196,6 +196,7 @@ class WebSocketManager {
             message.ratchet_tree || '',
             message.key_package_ref || '',
             message.commit_ref || '',
+            message.bootstrap_proof || '',
         ]);
     }
 

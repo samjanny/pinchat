@@ -9,7 +9,7 @@ use rand::RngCore;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
@@ -254,19 +254,33 @@ struct MlsControlEntry {
     json: MlsControlPayload,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct MlsControlAcknowledgement {
+    seq: u64,
+    last_progress: Instant,
+}
+
 #[derive(Debug, Default)]
 struct MlsControlLog {
     head_seq: u64,
     retained_bytes: usize,
     entries: VecDeque<MlsControlEntry>,
-    acknowledged: HashMap<Uuid, u64>,
+    acknowledged: HashMap<Uuid, MlsControlAcknowledgement>,
+}
+
+/// One retained ordered MLS-control entry. Replays expose the sequence
+/// separately so the WebSocket layer can send bounded windows and require a
+/// cumulative ACK before releasing the next window.
+pub struct MlsControlReplayEntry {
+    pub seq: u64,
+    pub json: MlsControlPayload,
 }
 
 /// A stable participant's ordered MLS-control replay window.
 pub struct MlsControlStream {
     pub cursor: u64,
     pub through_seq: u64,
-    pub replay: Vec<MlsControlPayload>,
+    pub replay: Vec<MlsControlReplayEntry>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -274,6 +288,7 @@ pub enum MlsControlCursorError {
     MissingRoom,
     CursorAhead,
     CursorExpired,
+    CursorRegressed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -665,6 +680,51 @@ impl AppState {
         Some(room_id)
     }
 
+    /// Immediately and atomically evict a stable participant whether its
+    /// socket is active or currently grace-reserved. Holding the connection
+    /// map entry across room removal prevents a resume from reclaiming the ID
+    /// between those two state changes.
+    pub fn evict_participant(&self, connection_id: &Uuid, expected_room_id: Uuid) -> Option<usize> {
+        match self.connections.entry(*connection_id) {
+            Entry::Occupied(active) => {
+                if *active.get() != expected_room_id {
+                    return None;
+                }
+                let participant_count =
+                    self.remove_participant_state(connection_id, expected_room_id)?;
+                active.remove();
+                Some(participant_count)
+            }
+            Entry::Vacant(_reservation) => {
+                self.remove_participant_state(connection_id, expected_room_id)
+            }
+        }
+    }
+
+    fn remove_participant_state(
+        &self,
+        connection_id: &Uuid,
+        expected_room_id: Uuid,
+    ) -> Option<usize> {
+        let mut room = self.rooms.get_mut(&expected_room_id)?;
+        if !room.remove_participant(connection_id) {
+            return None;
+        }
+        room.update_activity();
+        let participant_count = room.participant_count();
+        drop(room);
+
+        self.connection_message_timestamps.remove(connection_id);
+        self.connection_commit_timestamps.remove(connection_id);
+        self.connection_proposal_timestamps.remove(connection_id);
+        self.connection_frame_timestamps.remove(connection_id);
+        self.connection_protocol_errors.remove(connection_id);
+        self.connection_ecdh_timestamps.remove(connection_id);
+        self.forget_mls_control_participant(expected_room_id, connection_id);
+
+        Some(participant_count)
+    }
+
     /// Gets the number of participants in a room
     pub fn get_participant_count(&self, room_id: &Uuid) -> usize {
         self.rooms
@@ -840,18 +900,56 @@ impl AppState {
             .mls_control_logs
             .get(room_id)
             .ok_or(MlsControlCursorError::MissingRoom)?;
+        let participant_ids: Vec<Uuid> = self
+            .rooms
+            .get(room_id)
+            .filter(|room| room.participant_ids.contains(&connection_id))
+            .map(|room| room.participant_ids.iter().copied().collect())
+            .ok_or(MlsControlCursorError::MissingRoom)?;
         let mut log = log.lock().unwrap();
         let receiver = tx.subscribe();
         let cursor = resume_cursor.unwrap_or(log.head_seq);
+        if log
+            .acknowledged
+            .get(&connection_id)
+            .map(|previous| cursor < previous.seq)
+            .unwrap_or(false)
+        {
+            return Err(MlsControlCursorError::CursorRegressed);
+        }
         Self::validate_mls_cursor_locked(&log, cursor)?;
+        let now = Instant::now();
+        match log.acknowledged.get_mut(&connection_id) {
+            Some(previous) if cursor > previous.seq => {
+                previous.seq = cursor;
+                previous.last_progress = now;
+            }
+            Some(_) => {
+                // Reopening a transport at the same cursor is not ACK
+                // progress. Preserve the original deadline so reconnect
+                // cycling cannot pin the room's control history forever.
+            }
+            None => {
+                log.acknowledged.insert(
+                    connection_id,
+                    MlsControlAcknowledgement {
+                        seq: cursor,
+                        last_progress: now,
+                    },
+                );
+            }
+        }
+        Self::prune_acknowledged_mls_controls(&mut log, &participant_ids);
         let through_seq = log.head_seq;
         let replay = log
             .entries
             .iter()
             .filter(|entry| entry.seq > cursor)
-            .map(|entry| entry.json.clone())
+            .map(|entry| MlsControlReplayEntry {
+                seq: entry.seq,
+                json: entry.json.clone(),
+            })
             .collect();
-        log.acknowledged.insert(connection_id, cursor);
         Ok((
             receiver,
             MlsControlStream {
@@ -937,13 +1035,72 @@ impl AppState {
         if seq > log.head_seq {
             return false;
         }
-        let previous = log.acknowledged.get(&connection_id).copied().unwrap_or(0);
-        if seq < previous {
-            return false;
+        let now = Instant::now();
+        match log.acknowledged.get_mut(&connection_id) {
+            Some(previous) if seq < previous.seq => return false,
+            Some(previous) if seq > previous.seq => {
+                previous.seq = seq;
+                previous.last_progress = now;
+            }
+            Some(_) => {
+                // Duplicate cumulative ACKs are valid but do not refresh the
+                // progress deadline.
+            }
+            None => {
+                log.acknowledged.insert(
+                    connection_id,
+                    MlsControlAcknowledgement {
+                        seq,
+                        last_progress: now,
+                    },
+                );
+            }
         }
-        log.acknowledged.insert(connection_id, seq);
         Self::prune_acknowledged_mls_controls(&mut log, &participant_ids);
         true
+    }
+
+    /// Return current participants whose cumulative ACK is too far behind the
+    /// room head, or whose outstanding backlog has made no progress before
+    /// the deadline. Callers remove these participants before appending more
+    /// controls so one modified or stalled client cannot freeze the room.
+    pub fn lagging_mls_control_participants(
+        &self,
+        room_id: &Uuid,
+        max_unacknowledged: u64,
+        max_stall: Duration,
+    ) -> Vec<Uuid> {
+        let participant_ids: Vec<Uuid> = self
+            .rooms
+            .get(room_id)
+            .map(|room| room.participant_ids.iter().copied().collect())
+            .unwrap_or_default();
+        let Some(log) = self.mls_control_logs.get(room_id) else {
+            return Vec::new();
+        };
+        let log = log.lock().unwrap();
+        let now = Instant::now();
+        participant_ids
+            .into_iter()
+            .filter(|participant_id| {
+                let Some(ack) = log.acknowledged.get(participant_id) else {
+                    return log.head_seq > 0;
+                };
+                let outstanding = log.head_seq.saturating_sub(ack.seq);
+                outstanding > 0
+                    && (outstanding >= max_unacknowledged
+                        || now.saturating_duration_since(ack.last_progress) >= max_stall)
+            })
+            .collect()
+    }
+
+    /// True only while this exact stable participant currently owns the
+    /// active socket slot for the room.
+    pub fn connection_is_active(&self, room_id: &Uuid, connection_id: &Uuid) -> bool {
+        self.connections
+            .get(connection_id)
+            .map(|mapped_room| *mapped_room == *room_id)
+            .unwrap_or(false)
     }
 
     fn forget_mls_control_participant(&self, room_id: Uuid, connection_id: &Uuid) {
@@ -961,9 +1118,14 @@ impl AppState {
     }
 
     fn prune_acknowledged_mls_controls(log: &mut MlsControlLog, participants: &[Uuid]) {
+        if participants.is_empty() {
+            log.entries.clear();
+            log.retained_bytes = 0;
+            return;
+        }
         let Some(prune_through) = participants
             .iter()
-            .map(|id| log.acknowledged.get(id).copied())
+            .map(|id| log.acknowledged.get(id).map(|ack| ack.seq))
             .collect::<Option<Vec<_>>>()
             .and_then(|acks| acks.into_iter().min())
         else {
