@@ -318,6 +318,13 @@
             // being rolled back when the candidate is installed.
             this._deferredEnvelopes = [];
             this._deferredRemovals = new Set();
+            // Relay lifecycle departures are ordered with MLS controls, but
+            // they can still arrive while the corresponding Add is staged or
+            // while an earlier local Commit awaits acceptance. Retain a
+            // tombstone immediately so a delayed KeyPackage cannot resurrect
+            // the departed route. If its Add is later accepted, suppress the
+            // Welcome and commit an immediate Remove.
+            this._departedSenderIds = new Set();
             this._drainingDeferredEnvelopes = false;
         }
 
@@ -373,10 +380,13 @@
                     bundle.keyPackageBytes,
                 );
                 this._keyPackageRef = base64UrlEncode(this._keyPackageRefBytes);
-                this.send(envelopeFromMlsMessage(
-                    MLS.MLSMessage.WireFormat.MLS_KEY_PACKAGE,
-                    bundle.keyPackageBytes,
-                ));
+                await this._sendEnvelopeOrThrow(
+                    envelopeFromMlsMessage(
+                        MLS.MLSMessage.WireFormat.MLS_KEY_PACKAGE,
+                        bundle.keyPackageBytes,
+                    ),
+                    'KeyPackage broadcast failed',
+                );
                 this.onEvent({ kind: 'keypackage-published' });
                 this._state = 'awaiting-welcome';
             }
@@ -493,7 +503,11 @@
             }
 
             const liveGroup = this.group;
-            const candidateGroup = this._pendingCommit?.candidateGroup || null;
+            const pendingCommit = this._pendingCommit;
+            const candidateGroup = pendingCommit?.candidateGroup || null;
+            if (pendingCommit?.retryTimer) {
+                clearTimeout(pendingCommit.retryTimer);
+            }
             if (candidateGroup && candidateGroup !== liveGroup) {
                 candidateGroup.destroySecrets();
             }
@@ -504,6 +518,7 @@
             this._pendingWelcomeCommits.clear();
             this._deferredEnvelopes.length = 0;
             this._deferredRemovals.clear();
+            this._departedSenderIds.clear();
             this._leafBySenderId.clear();
             this._senderIdByLeaf.clear();
             this._identityBySignatureKey.clear();
@@ -652,6 +667,7 @@
             // Clear first so a duplicate echo cannot install or announce the
             // candidate twice. Everything below is local bookkeeping or a
             // post-acceptance Welcome; the MLS state swap itself is atomic.
+            if (pending.retryTimer) clearTimeout(pending.retryTimer);
             this._pendingCommit = null;
             const supersededGroup = this.group;
             this.group = pending.candidateGroup;
@@ -672,19 +688,28 @@
                 this._leafBySenderId.set(pending.senderId, pending.addedLeafIndex);
                 this._senderIdByLeaf.set(pending.addedLeafIndex, pending.senderId);
                 this._state = 'joined';
-                try {
-                    // A Welcome describes the now-accepted epoch and must
-                    // never precede acceptance of the Commit that created it.
-                    await this._sendEnvelopeOrThrow(
-                        pending.welcomeEnvelope,
-                        'Welcome broadcast failed after Commit acceptance',
-                    );
-                    this.onEvent({ kind: 'welcome-sent' });
-                } catch (err) {
-                    // The Commit was already accepted, so rolling back here
-                    // would fork existing members. Keep the accepted epoch and
-                    // report that the intended joiner needs a fresh retry.
-                    this.onEvent({ kind: 'error', reason: err.message });
+                if (this._departedSenderIds.has(pending.senderId)) {
+                    // The relay ordered a final departure before this Add's
+                    // acceptance echo. We must still install the accepted Add
+                    // to remain in sync with other members, but the departed
+                    // peer must receive neither its Welcome nor lasting roster
+                    // membership.
+                    this._deferredRemovals.add(pending.senderId);
+                } else {
+                    try {
+                        // A Welcome describes the now-accepted epoch and must
+                        // never precede acceptance of the Commit that created it.
+                        await this._sendEnvelopeOrThrow(
+                            pending.welcomeEnvelope,
+                            'Welcome broadcast failed after Commit acceptance',
+                        );
+                        this.onEvent({ kind: 'welcome-sent' });
+                    } catch (err) {
+                        // The Commit was already accepted, so rolling back here
+                        // would fork existing members. Keep the accepted epoch and
+                        // report that the intended joiner needs a fresh retry.
+                        this.onEvent({ kind: 'error', reason: err.message });
+                    }
                 }
             } else if (pending.kind === 'update') {
                 this.onEvent({
@@ -701,6 +726,7 @@
                     === pending.senderId) {
                     this._senderIdByLeaf.delete(pending.removedLeafIndex);
                 }
+                this._departedSenderIds.delete(pending.senderId);
                 this.onEvent({
                     kind: 'remove-committed',
                     removedLeafIndex: pending.removedLeafIndex,
@@ -763,6 +789,63 @@
             );
         }
 
+        /**
+         * Consume a direct relay rejection for a locally staged Commit. The
+         * live Group has not advanced yet. A quota rejection retains that
+         * isolated candidate and retries the exact bytes after the server's
+         * advertised window; rebuilding would lose Add context and could
+         * create a different Commit.
+         */
+        async onTransportRejection(rejection) {
+            const snapshot = { ...rejection };
+            return this._serializeOperation(
+                () => this._onTransportRejection(snapshot),
+            );
+        }
+
+        async _onTransportRejection(rejection) {
+            if (!rejection || rejection.type !== 'mlsrejected'
+                || rejection.reason !== 'commit_rate_limited'
+                || typeof rejection.commit_ref !== 'string') {
+                throw new Error('mls-session: malformed transport rejection');
+            }
+            const pending = this._pendingCommit;
+            if (!pending || pending.commitRef !== rejection.commit_ref) {
+                return false;
+            }
+            const retryAfter = Number.isSafeInteger(rejection.retry_after_secs)
+                && rejection.retry_after_secs > 0
+                ? Math.min(rejection.retry_after_secs, 3600) : 60;
+            this.onEvent({
+                kind: 'error',
+                reason: `MLS Commit was rate-limited by the relay; retrying after `
+                    + `${retryAfter} seconds`,
+            });
+            if (!pending.retryTimer) {
+                pending.retryTimer = setTimeout(() => {
+                    pending.retryTimer = null;
+                    void this._serializeOperation(async () => {
+                        if (this._pendingCommit !== pending
+                            || this._state === 'removed') return;
+                        try {
+                            await this._sendEnvelopeOrThrow(
+                                pending.commitEnvelope,
+                                'Commit retry failed before acceptance',
+                            );
+                        } catch (err) {
+                            this.onEvent({ kind: 'error', reason: err.message });
+                        }
+                    });
+                }, retryAfter * 1000);
+                // Node regression tests should not stay alive solely for a
+                // browser-style retry timer.
+                if (typeof pending.retryTimer?.unref === 'function') {
+                    pending.retryTimer.unref();
+                }
+            }
+            return true;
+        }
+
         async _onRelayEnvelope(envelope) {
             if (this.shouldHandleOwnEnvelope(envelope)) {
                 await this._acceptPendingCommit();
@@ -800,6 +883,12 @@
                 if (!senderId) {
                     this.onEvent({ kind: 'error',
                         reason: 'KeyPackage envelope missing sender_id' });
+                    return;
+                }
+                if (this._departedSenderIds.has(senderId)) {
+                    // A replay-delayed KeyPackage from a route whose final
+                    // departure was already ordered must not create a phantom
+                    // MLS member.
                     return;
                 }
                 if (this._leafBySenderId.has(senderId)) {
@@ -1051,6 +1140,7 @@
             // rides as a separate envelope field, so the bytes are NOT wrapped
             // in MLSMessage framing. Pass them straight to commitAddMember
             // which calls KeyPackage.parseKeyPackage internally.
+            if (this._departedSenderIds.has(senderId)) return;
             if (this._localCommitBusy || this._pendingCommit) {
                 throw new Error('mls-session: cannot build Add while another Commit is pending');
             }
@@ -1535,9 +1625,9 @@
         /**
          * Creator-only: emit a Remove commit for a peer that left the
          * room. Bound to a sender_id from the relay so we can map the
-         * disconnected peer to their leaf index. Silently no-ops if we
-         * never saw a KeyPackage from this sender (the peer was the
-         * creator's own previous tab, or never published a KP).
+         * disconnected peer to their leaf index. If no leaf exists yet,
+         * retain a tombstone so a queued KeyPackage/Add cannot create a
+         * phantom member after the final relay departure.
          */
         async removeMemberBySenderId(senderId) {
             return this._serializeOperation(
@@ -1545,8 +1635,32 @@
             );
         }
 
+        /**
+         * Retry lifecycle work durably retained while an earlier Commit was
+         * pending or after a transient local Remove-construction failure.
+         * Called at replay completion before application sending is enabled.
+         */
+        async flushDeferredMembershipChanges() {
+            return this._serializeOperation(
+                () => this._drainDeferredEnvelopes(),
+            );
+        }
+
         async _removeMemberBySenderId(senderId) {
             if (this.role !== 'creator') return;
+            if (typeof senderId !== 'string' || senderId.length === 0) return;
+            // Record the final relay departure before inspecting current MLS
+            // state. In particular, the peer may have a KeyPackage queued or
+            // an Add awaiting acceptance but no live leaf mapping yet.
+            this._departedSenderIds.add(senderId);
+            if (this._state === 'removed') return;
+            if (this._pendingCommit?.kind === 'remove'
+                && this._pendingCommit.senderId === senderId) return;
+            if (this._pendingCommit?.kind === 'add'
+                && this._pendingCommit.senderId === senderId) {
+                this._deferredRemovals.add(senderId);
+                return;
+            }
             if (this._state !== 'joined') return;
             if (!this._leafBySenderId.has(senderId)) return;
             if (this._localCommitBusy || this._pendingCommit) {
@@ -1571,9 +1685,14 @@
                 });
             } catch (err) {
                 if (candidateGroup && !staged) candidateGroup.destroySecrets();
+                // Preserve the revocation request and propagate failure so the
+                // ordered lifecycle event (or replay sync marker) is not
+                // treated as successfully applied.
+                this._deferredRemovals.add(senderId);
                 console.error('[MLS] commitRemoveMember failed:', err);
                 this.onEvent({ kind: 'error',
                     reason: `commitRemoveMember failed: ${err.message}` });
+                throw err;
             } finally {
                 this._localCommitBusy = false;
             }

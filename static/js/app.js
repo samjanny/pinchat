@@ -75,6 +75,14 @@ document.addEventListener('alpine:init', () => {
         // bundle and dispatches incoming `mls` envelopes.
         mlsSession: null,
         mlsReady: false,   // true once we've joined (creator after commit, joiner after welcome)
+        // Ordered group departures received before MLSSession startup. The
+        // control cursor may advance once they are durably retained here; the
+        // creator drains them into session tombstones at `mlssync`.
+        mlsPendingDepartures: [],
+        // True only after the server's ordered MLS control replay reaches its
+        // authenticated resume cursor. Crypto state may exist while false,
+        // but application sending remains disabled.
+        mlsTransportSynced: false,
         mlsRosterValid: false,
         // Our own authenticated ratchet-tree identity. Null while a joiner is
         // only connected to the relay but not yet admitted by a Welcome.
@@ -180,6 +188,10 @@ document.addEventListener('alpine:init', () => {
             this.wsManager.onDisconnected = () => {
                 this.connected = false;
                 this.connecting = false;
+                if (this.roomType === 'group') {
+                    this.mlsTransportSynced = false;
+                    this.mlsReady = false;
+                }
 
                 // Warn user about potential message loss if PFS is active
                 // Messages sent during disconnection will be lost (ephemeral design)
@@ -214,6 +226,13 @@ document.addEventListener('alpine:init', () => {
                     this.error = this.roomType === 'group'
                         ? '⚠️ Secure group reconnect window expired. Refresh to request a fresh MLS join; the original creator must create a new room.'
                         : '⚠️ Secure reconnect expired. Please refresh to establish a new session.';
+                    return;
+                }
+                if (msg === 'MLS_CONTROL_RESYNC_REQUIRED') {
+                    this.mlsTransportSynced = false;
+                    this.mlsReady = false;
+                    this.error = '⚠️ Secure group replay history is no longer available. '
+                        + 'This tab cannot safely continue; refresh and create a new room.';
                     return;
                 }
                 if (msg === 'RESUME_TOKEN_INVALID') {
@@ -267,6 +286,10 @@ document.addEventListener('alpine:init', () => {
                         }
                         return;
                     }
+                    if (message.room_type === 'group') {
+                        this.mlsTransportSynced = false;
+                        this.mlsReady = false;
+                    }
                     this.userId = message.user_id;
                     this.myNickname = generateNickname(message.user_id).display;  // Generate user's own nickname
                     this.participantCount = message.participant_count;
@@ -312,13 +335,10 @@ document.addEventListener('alpine:init', () => {
                     }
                     this.transportReconnectPending = false;
 
-                    // Group room: spin up an MLS session. The creator
-                    // starts immediately so it is listening for the
-                    // joiner's KeyPackage; the joiner waits until the
-                    // creator is visible in the room.
-                    if (this.roomType === 'group') {
-                        await this._ensureMlsSession();
-                    }
+                    // Group MLSSession startup is deliberately deferred to
+                    // the ordered `mlssync` marker. On resume, every missed
+                    // Proposal/Commit/Welcome must be applied before this tab
+                    // is allowed to publish new control or application data.
 
                     // Use the validated room type for ECDH logic
                     if (this.roomType === 'onetoone' && this.participantCount === 2) {
@@ -347,15 +367,45 @@ document.addEventListener('alpine:init', () => {
                     // epoch and (for Add) releases its Welcome.
                     if (this.mlsSession) {
                         const isOwnEnvelope = message.sender_id === this.userId;
-                        const isPendingCommitAck = isOwnEnvelope
-                            && this.mlsSession.shouldHandleOwnEnvelope(message);
+                        const isPendingCommitAck
+                            = this.mlsSession.shouldHandleOwnEnvelope(message);
                         if (isOwnEnvelope && !isPendingCommitAck) break;
                         try {
                             await this.mlsSession.onRelayEnvelope(message);
                         } catch (err) {
                             console.error('[MLS] Failed to process envelope:', err);
                             this.error = '⚠️ Group crypto error: ' + err.message;
+                            // The WebSocket control cursor must not advance
+                            // past a failed exact PendingCommit acceptance.
+                            if (isPendingCommitAck) throw err;
                         }
+                    }
+                    break;
+
+                case 'mlssync':
+                    if (this.roomType !== 'group') break;
+                    await this._ensureMlsSession();
+                    while (this.mlsSession
+                        && this.mlsPendingDepartures.length > 0) {
+                        const senderId = this.mlsPendingDepartures[0];
+                        await this.mlsSession.removeMemberBySenderId(senderId);
+                        this.mlsPendingDepartures.shift();
+                    }
+                    if (this.mlsSession) {
+                        await this.mlsSession.flushDeferredMembershipChanges();
+                    }
+                    this.mlsTransportSynced = true;
+                    this.mlsReady = Boolean(
+                        this.mlsSession
+                        && this.mlsSession.state === 'joined'
+                        && this.mlsRosterValid,
+                    );
+                    if (this.mlsReady) this._startMlsUpdateTimer();
+                    break;
+
+                case 'mlsrejected':
+                    if (this.mlsSession) {
+                        await this.mlsSession.onTransportRejection(message);
                     }
                     break;
 
@@ -377,9 +427,11 @@ document.addEventListener('alpine:init', () => {
 
                 case 'userjoined':
                     this.participantCount = message.participant_count;
-                    this.addSystemMessage(this.roomType === 'group'
-                        ? '👋 A relay participant connected; waiting for MLS authentication'
-                        : '👋 A participant joined the chat');
+                    if (message.user_id !== this.userId) {
+                        this.addSystemMessage(this.roomType === 'group'
+                            ? '👋 A relay participant connected; waiting for MLS authentication'
+                            : '👋 A participant joined the chat');
+                    }
 
                     // In 1:1 rooms the relay identifier is bound into the
                     // authenticated handshake and remains the UI nickname
@@ -408,7 +460,9 @@ document.addEventListener('alpine:init', () => {
                     // Group rooms: spin up / announce presence once the
                     // session exists. Joiner publishes its KeyPackage on
                     // first start; creator starts listening at connect.
-                    if (this.roomType === 'group') {
+                    if (this.roomType === 'group'
+                        && this.mlsTransportSynced
+                        && message.user_id !== this.userId) {
                         await this._ensureMlsSession();
                     }
                     break;
@@ -429,14 +483,17 @@ document.addEventListener('alpine:init', () => {
                     if (this.roomType === 'group' && message.user_id) {
                         // Creator-only: emit an MLS Remove commit so the
                         // departing peer's epoch keys are invalidated.
-                        // The session ignores the call when we never had
-                        // a leaf for this sender, when we're the joiner,
-                        // or when we haven't joined yet.
+                        // Await durable tombstone/removal staging so the
+                        // ordered relay cursor cannot ACK and forget this
+                        // lifecycle event first.
                         if (this.mlsSession) {
-                            this.mlsSession.removeMemberBySenderId(message.user_id)
-                                .catch((err) => console.error(
-                                    '[MLS] removeMemberBySenderId failed:', err,
-                                ));
+                            await this.mlsSession.removeMemberBySenderId(
+                                message.user_id,
+                            );
+                        } else if (!this.mlsPendingDepartures.includes(
+                            message.user_id,
+                        )) {
+                            this.mlsPendingDepartures.push(message.user_id);
                         }
                     }
 
@@ -713,7 +770,8 @@ document.addEventListener('alpine:init', () => {
             const jitter = () => BASE_MS + Math.floor(Math.random() * 60 * 1000);
             const self = this;
             const tick = () => {
-                if (self.mlsSession && self.connected) {
+                if (self.mlsSession && self.connected
+                    && self.mlsTransportSynced && self.mlsReady) {
                     if (self.mlsSession.role === 'creator') {
                         void self.mlsSession.commitUpdate();
                     } else {
@@ -778,11 +836,13 @@ document.addEventListener('alpine:init', () => {
                     this.addSystemMessage('🔑 KeyPackage published; waiting for Welcome…');
                     break;
                 case 'welcome-sent':
-                    this.mlsReady = this.mlsRosterValid;
-                    if (!this.mlsReady) {
+                    if (!this.mlsRosterValid) {
+                        this.mlsReady = false;
                         this.error = '⚠️ Secure group established without an authenticated roster';
                         break;
                     }
+                    this.mlsReady = this.mlsTransportSynced;
+                    if (!this.mlsReady) break;
                     this.addSystemMessage('✅ Secure group established');
                     this._startMlsUpdateTimer();
                     break;
@@ -792,11 +852,13 @@ document.addEventListener('alpine:init', () => {
                     debugLog('[MLS] Path re-keyed (Update commit), epoch', event.epoch);
                     break;
                 case 'joined':
-                    this.mlsReady = this.mlsRosterValid;
-                    if (!this.mlsReady) {
+                    if (!this.mlsRosterValid) {
+                        this.mlsReady = false;
                         this.error = '⚠️ Joined group without an authenticated roster';
                         break;
                     }
+                    this.mlsReady = this.mlsTransportSynced;
+                    if (!this.mlsReady) break;
                     this.addSystemMessage('✅ Joined secure group');
                     this._startMlsUpdateTimer();
                     break;

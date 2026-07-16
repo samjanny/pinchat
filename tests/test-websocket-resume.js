@@ -46,6 +46,7 @@ class FakeWebSocket {
         this.protocol = 'pinchat.v1';
         this.readyState = FakeWebSocket.OPEN;
         this.closedWith = null;
+        this.sent = [];
         FakeWebSocket.instances.push(this);
     }
 
@@ -54,7 +55,9 @@ class FakeWebSocket {
         this.readyState = FakeWebSocket.CLOSED;
     }
 
-    send() {}
+    send(payload) {
+        this.sent.push(payload);
+    }
 }
 
 global.WebSocket = FakeWebSocket;
@@ -130,6 +133,7 @@ async function main() {
             room_type: 'group',
             resumed: false,
             resume_token: resumeToken,
+            mls_control_cursor: 0,
         }),
     });
     await manager._inboundQueue;
@@ -151,6 +155,125 @@ async function main() {
         'resume credential obtains a fresh single-use upgrade token');
     check(fetchCalls[1].options.headers['X-PinChat-Resume-Token'] === resumeToken,
         'token refresh sends the resume credential only in its dedicated header');
+    check(fetchCalls[1].options.headers['X-PinChat-MLS-Control-Seq'] === '0',
+        'group resume token binds the highest applied MLS control sequence');
+
+    queuedResponses = [
+        response(200, { csrf_token: csrfToken }),
+        successToken('ordered-control-token'),
+    ];
+    const orderedManager = new WebSocketManager('ordered-control-room');
+    const orderedTypes = [];
+    let orderedError = null;
+    orderedManager.onMessage = async (message) => {
+        orderedTypes.push(message.type);
+    };
+    orderedManager.onError = (error) => { orderedError = error.message; };
+    await orderedManager.connect();
+    const orderedSocket = FakeWebSocket.instances.at(-1);
+    orderedSocket.onopen();
+    orderedSocket.onmessage({
+        data: JSON.stringify({
+            type: 'connected',
+            user_id: 'ordered-relay-id',
+            room_type: 'group',
+            resumed: false,
+            resume_token: resumeToken,
+            mls_control_cursor: 0,
+        }),
+    });
+    orderedSocket.onmessage({
+        data: JSON.stringify({
+            type: 'mlssync',
+            through_seq: 0,
+        }),
+    });
+    await orderedManager._inboundQueue;
+    check(orderedTypes.join(',') === 'connected,mlssync',
+        'group application startup waits behind the replay-complete marker');
+
+    const keyPackageEnvelope = {
+        type: 'mls',
+        payload: 'key-package-body',
+        wire_format: 5,
+    };
+    check(orderedManager.send(keyPackageEnvelope)
+        && orderedManager._pendingMlsControls.size === 1,
+    'locally sent MLS control remains pending until its sequenced own echo');
+    orderedSocket.onmessage({
+        data: JSON.stringify({
+            ...keyPackageEnvelope,
+            sender_id: 'ordered-relay-id',
+            control_seq: 1,
+        }),
+    });
+    await orderedManager._inboundQueue;
+    const sentFrames = orderedSocket.sent.map((raw) => JSON.parse(raw));
+    check(orderedManager.lastMlsControlSeq === 1
+        && orderedManager._pendingMlsControls.size === 0
+        && sentFrames.some((frame) =>
+            frame.type === 'mlsack' && frame.control_seq === 1),
+    'control cursor advances and ACKs only after application processing');
+
+    orderedSocket.onmessage({
+        data: JSON.stringify({
+            type: 'userleft',
+            user_id: 'departed-peer',
+            participant_count: 1,
+            control_seq: 2,
+        }),
+    });
+    await orderedManager._inboundQueue;
+    const lifecycleFrames = orderedSocket.sent.map((raw) => JSON.parse(raw));
+    check(orderedManager.lastMlsControlSeq === 2
+        && orderedTypes.at(-1) === 'userleft'
+        && lifecycleFrames.some((frame) =>
+            frame.type === 'mlsack' && frame.control_seq === 2),
+    'group UserLeft shares the ordered replay cursor and is ACKed after handling');
+
+    const retryEnvelope = {
+        type: 'mls',
+        payload: 'commit-awaiting-acceptance',
+        wire_format: 1,
+        commit_ref: 'A'.repeat(43),
+    };
+    check(orderedManager.send(retryEnvelope),
+        'a second local MLS control is accepted by the live socket');
+    const resumedSocket = new FakeWebSocket('wss://pinchat.test/ws/retry', []);
+    orderedManager.ws = resumedSocket;
+    orderedManager._connectionGeneration += 1;
+    orderedManager._retryPendingMlsControls();
+    check(resumedSocket.sent.map((raw) => JSON.parse(raw)).some((frame) =>
+        frame.payload === retryEnvelope.payload),
+    'unconfirmed MLS control is retransmitted after a new connection syncs');
+
+    orderedManager.ws = orderedSocket;
+    orderedSocket.readyState = FakeWebSocket.OPEN;
+    orderedSocket.onmessage({
+        data: JSON.stringify({
+            type: 'mlsrejected',
+            commit_ref: retryEnvelope.commit_ref,
+            reason: 'commit_rate_limited',
+            retry_after_secs: 60,
+        }),
+    });
+    await orderedManager._inboundQueue;
+    check(orderedManager._pendingMlsControls.size === 1,
+        'rate-limited Commit stays tracked for retry instead of being lost');
+
+    orderedSocket.onmessage({
+        data: JSON.stringify({
+            type: 'mls',
+            payload: 'gap',
+            wire_format: 5,
+            sender_id: 'peer',
+            control_seq: 4,
+        }),
+    });
+    await orderedManager._inboundQueue;
+    check(orderedSocket.closedWith && orderedSocket.closedWith.code === 1008
+        && orderedError === 'ROOM_PROTOCOL_VIOLATION',
+    'a gap in the server MLS control sequence closes the group fail-closed');
 
     manager.onResumeRejected = () => false;
     queuedResponses = [
@@ -220,6 +343,7 @@ async function main() {
             room_type: 'group',
             resumed: false,
             resume_token: resumeToken,
+            mls_control_cursor: 0,
         }),
     });
     await protocolManager._inboundQueue;

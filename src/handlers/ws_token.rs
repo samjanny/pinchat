@@ -24,11 +24,13 @@ use uuid::Uuid;
 use crate::handlers::auth::verify_csrf_for_api;
 use crate::ip_hash::{extract_client_ip_with_proxy, hash_ip};
 use crate::jwt::{WsTokenClaims, sign_token, verify_resume_token};
+use crate::models::RoomType;
 use crate::pow::{PowChallenge, calculate_difficulty};
 use crate::pow_session::{pow_cache_key, resolve_pow_session, should_use_secure_pow_cookies};
 use crate::state::AppState;
 
 const RESUME_TOKEN_HEADER: &str = "x-pinchat-resume-token";
+const MLS_CONTROL_SEQ_HEADER: &str = "x-pinchat-mls-control-seq";
 const MAX_RESUME_TOKEN_LEN: usize = 2048;
 
 fn pow_error_response(
@@ -231,28 +233,50 @@ pub async fn generate_ws_token(
             }
         }
     };
+    let supplied_mls_cursor = match headers.get(MLS_CONTROL_SEQ_HEADER) {
+        None => None,
+        Some(value) => {
+            let parsed = value
+                .to_str()
+                .ok()
+                .filter(|value| !value.is_empty() && value.len() <= 20)
+                .and_then(|value| value.parse::<u64>().ok());
+            match parsed {
+                Some(cursor) => Some(cursor),
+                None => {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({ "error": "Invalid MLS control cursor" })),
+                    )
+                        .into_response());
+                }
+            }
+        }
+    };
 
     // Verify room exists and snapshot whether a valid resume ID is still
     // grace-reserved. This lets a reconnect reclaim its slot even when the
     // room is otherwise full, without letting arbitrary fresh clients bypass
     // the participant cap.
-    let (room_is_expired, room_is_full, resume_is_reserved) = match state.rooms.get(&room_id) {
-        Some(room) => (
-            room.is_expired(),
-            room.is_full(),
-            resume_claims
-                .as_ref()
-                .map(|claims| room.participant_ids.contains(&claims.connection_id))
-                .unwrap_or(false),
-        ),
-        None => {
-            return Err((
-                StatusCode::NOT_FOUND,
-                Json(json!({ "error": "Room not found" })),
-            )
-                .into_response());
-        }
-    };
+    let (room_type, room_is_expired, room_is_full, resume_is_reserved) =
+        match state.rooms.get(&room_id) {
+            Some(room) => (
+                room.room_type,
+                room.is_expired(),
+                room.is_full(),
+                resume_claims
+                    .as_ref()
+                    .map(|claims| room.participant_ids.contains(&claims.connection_id))
+                    .unwrap_or(false),
+            ),
+            None => {
+                return Err((
+                    StatusCode::NOT_FOUND,
+                    Json(json!({ "error": "Room not found" })),
+                )
+                    .into_response());
+            }
+        };
 
     if room_is_expired {
         state.remove_room(&room_id);
@@ -274,6 +298,56 @@ pub async fn generate_ws_token(
             .into_response());
     }
 
+    let mls_control_cursor = match (resume_claims.as_ref(), room_type) {
+        (Some(_), RoomType::Group) => {
+            let Some(cursor) = supplied_mls_cursor else {
+                return Err((
+                    StatusCode::CONFLICT,
+                    Json(json!({
+                        "error": "Secure group reconnect cursor is missing",
+                        "code": "MLS_CONTROL_RESYNC_REQUIRED"
+                    })),
+                )
+                    .into_response());
+            };
+            if state.validate_mls_control_cursor(&room_id, cursor).is_err() {
+                return Err((
+                    StatusCode::CONFLICT,
+                    Json(json!({
+                        "error": "Secure group replay window is unavailable",
+                        "code": "MLS_CONTROL_RESYNC_REQUIRED"
+                    })),
+                )
+                    .into_response());
+            }
+            Some(cursor)
+        }
+        (Some(_), RoomType::OneToOne) => {
+            if supplied_mls_cursor.is_some() {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "error": "MLS control cursor is invalid for this room"
+                    })),
+                )
+                    .into_response());
+            }
+            None
+        }
+        (None, _) => {
+            if supplied_mls_cursor.is_some() {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "error": "MLS control cursor requires secure reconnect"
+                    })),
+                )
+                    .into_response());
+            }
+            None
+        }
+    };
+
     if room_is_full && !resume_is_reserved {
         // Return 404 (same as "not found") to avoid leaking room existence to
         // callers probing UUIDs. See http.rs::room_page for rationale.
@@ -292,6 +366,7 @@ pub async fn generate_ws_token(
             resume.connection_id,
             ttl_secs,
             &state.config.jwt_issuer,
+            mls_control_cursor,
         ),
         None => WsTokenClaims::new(room_id, ttl_secs, &state.config.jwt_issuer),
     };

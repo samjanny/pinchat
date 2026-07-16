@@ -6,9 +6,10 @@ use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
 use rand::RngCore;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
+use tokio::sync::broadcast;
 use uuid::Uuid;
 
 /// Error type for room creation failures
@@ -27,6 +28,44 @@ pub enum ConnectionAdmission {
     Resumed,
 }
 
+const MAX_MLS_CONTROL_LOG_ENTRIES: usize = 1024;
+const MAX_MLS_CONTROL_LOG_BYTES: usize = 16 * 1024 * 1024;
+
+#[derive(Debug, Clone)]
+struct MlsControlEntry {
+    seq: u64,
+    json: String,
+}
+
+#[derive(Debug, Default)]
+struct MlsControlLog {
+    head_seq: u64,
+    retained_bytes: usize,
+    entries: VecDeque<MlsControlEntry>,
+    acknowledged: HashMap<Uuid, u64>,
+}
+
+/// A stable participant's ordered MLS-control replay window.
+pub struct MlsControlStream {
+    pub cursor: u64,
+    pub through_seq: u64,
+    pub replay: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MlsControlCursorError {
+    MissingRoom,
+    CursorAhead,
+    CursorExpired,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MlsControlAppendError {
+    MissingRoom,
+    SequenceExhausted,
+    SerializationFailed,
+}
+
 /// Application state shared across all threads
 #[derive(Clone)]
 pub struct AppState {
@@ -40,6 +79,13 @@ pub struct AppState {
     /// Broadcast channels for each room: room_id -> Sender
     /// Uses tokio::sync::broadcast to distribute messages
     pub broadcast_channels: Arc<DashMap<Uuid, tokio::sync::broadcast::Sender<String>>>,
+
+    /// Ordered, bounded replay log for MLS group-control envelopes
+    /// (UserJoined/UserLeft, KeyPackage, Proposal, Commit, Welcome). MLS
+    /// PrivateMessages deliberately remain ephemeral. Each stable relay
+    /// participant acknowledges the highest sequence it has applied; a
+    /// resumed socket replays from that cursor.
+    mls_control_logs: Arc<DashMap<Uuid, Arc<Mutex<MlsControlLog>>>>,
 
     /// Anti-replay: Cache of seen message hashes per room
     /// room_id -> Set<(payload_hash, timestamp)>
@@ -144,6 +190,7 @@ impl AppState {
             rooms: Arc::new(DashMap::new()),
             connections: Arc::new(DashMap::new()),
             broadcast_channels: Arc::new(DashMap::new()),
+            mls_control_logs: Arc::new(DashMap::new()),
             seen_message_hashes: Arc::new(DashMap::new()),
             connection_message_timestamps: Arc::new(DashMap::new()),
             connection_commit_timestamps: Arc::new(DashMap::new()),
@@ -245,6 +292,8 @@ impl AppState {
 
         self.rooms.insert(room_id, room);
         self.broadcast_channels.insert(room_id, tx);
+        self.mls_control_logs
+            .insert(room_id, Arc::new(Mutex::new(MlsControlLog::default())));
 
         Ok(room_id)
         // Lock released automatically here
@@ -279,6 +328,7 @@ impl AppState {
 
         // Remove the broadcast channel
         self.broadcast_channels.remove(room_id);
+        self.mls_control_logs.remove(room_id);
 
         // Remove the message hash cache (anti-replay)
         self.seen_message_hashes.remove(room_id);
@@ -369,6 +419,7 @@ impl AppState {
                 self.connection_frame_timestamps.remove(connection_id);
                 self.connection_protocol_errors.remove(connection_id);
                 self.connection_ecdh_timestamps.remove(connection_id);
+                self.forget_mls_control_participant(expected_room_id, connection_id);
 
                 Some(participant_count)
             }
@@ -415,5 +466,184 @@ impl AppState {
             return 0;
         }
         (self.rooms.len() * 100) / self.max_rooms
+    }
+
+    /// Validate a resume cursor before minting a short-lived WebSocket token.
+    /// A cursor is usable when every sequence after it is still retained.
+    pub fn validate_mls_control_cursor(
+        &self,
+        room_id: &Uuid,
+        cursor: u64,
+    ) -> Result<(), MlsControlCursorError> {
+        let log = self
+            .mls_control_logs
+            .get(room_id)
+            .ok_or(MlsControlCursorError::MissingRoom)?;
+        let log = log.lock().unwrap();
+        Self::validate_mls_cursor_locked(&log, cursor)
+    }
+
+    fn validate_mls_cursor_locked(
+        log: &MlsControlLog,
+        cursor: u64,
+    ) -> Result<(), MlsControlCursorError> {
+        if cursor > log.head_seq {
+            return Err(MlsControlCursorError::CursorAhead);
+        }
+        if cursor == log.head_seq {
+            return Ok(());
+        }
+        match log.entries.front() {
+            Some(first) if cursor.saturating_add(1) >= first.seq => Ok(()),
+            _ => Err(MlsControlCursorError::CursorExpired),
+        }
+    }
+
+    /// Subscribe to live room traffic and atomically snapshot the MLS group
+    /// control replay window. `append_and_broadcast_mls_control` holds the
+    /// same mutex while broadcasting, so no control sequence can fall between
+    /// the snapshot and the live subscription.
+    pub fn open_mls_control_stream(
+        &self,
+        room_id: &Uuid,
+        connection_id: Uuid,
+        resume_cursor: Option<u64>,
+    ) -> Result<(broadcast::Receiver<String>, MlsControlStream), MlsControlCursorError> {
+        let tx = self
+            .broadcast_channels
+            .get(room_id)
+            .ok_or(MlsControlCursorError::MissingRoom)?;
+        let log = self
+            .mls_control_logs
+            .get(room_id)
+            .ok_or(MlsControlCursorError::MissingRoom)?;
+        let mut log = log.lock().unwrap();
+        let receiver = tx.subscribe();
+        let cursor = resume_cursor.unwrap_or(log.head_seq);
+        Self::validate_mls_cursor_locked(&log, cursor)?;
+        let through_seq = log.head_seq;
+        let replay = log
+            .entries
+            .iter()
+            .filter(|entry| entry.seq > cursor)
+            .map(|entry| entry.json.clone())
+            .collect();
+        log.acknowledged.insert(connection_id, cursor);
+        Ok((
+            receiver,
+            MlsControlStream {
+                cursor,
+                through_seq,
+                replay,
+            },
+        ))
+    }
+
+    /// Assign and broadcast the next room-global MLS group-control sequence
+    /// while holding the log mutex. This preserves the same total order in
+    /// both the durable replay log and the live broadcast channel.
+    pub fn append_and_broadcast_mls_control<F>(
+        &self,
+        room_id: &Uuid,
+        serialize: F,
+    ) -> Result<u64, MlsControlAppendError>
+    where
+        F: FnOnce(u64) -> Option<String>,
+    {
+        let tx = self
+            .broadcast_channels
+            .get(room_id)
+            .ok_or(MlsControlAppendError::MissingRoom)?;
+        let log = self
+            .mls_control_logs
+            .get(room_id)
+            .ok_or(MlsControlAppendError::MissingRoom)?;
+        let mut log = log.lock().unwrap();
+        let seq = log
+            .head_seq
+            .checked_add(1)
+            .ok_or(MlsControlAppendError::SequenceExhausted)?;
+        let json = serialize(seq).ok_or(MlsControlAppendError::SerializationFailed)?;
+        log.head_seq = seq;
+        log.retained_bytes = log.retained_bytes.saturating_add(json.len());
+        log.entries.push_back(MlsControlEntry {
+            seq,
+            json: json.clone(),
+        });
+
+        while log.entries.len() > MAX_MLS_CONTROL_LOG_ENTRIES
+            || log.retained_bytes > MAX_MLS_CONTROL_LOG_BYTES
+        {
+            let Some(expired) = log.entries.pop_front() else {
+                break;
+            };
+            log.retained_bytes = log.retained_bytes.saturating_sub(expired.json.len());
+        }
+
+        // A room with no currently subscribed receivers still retains the
+        // control entry for a participant that resumes within its grace
+        // window. Broadcast failure therefore does not roll the sequence back.
+        let _ = tx.send(json);
+        Ok(seq)
+    }
+
+    /// Record a participant's highest consecutively processed MLS group
+    /// control sequence and prune entries acknowledged by every current
+    /// participant.
+    pub fn acknowledge_mls_control(&self, room_id: &Uuid, connection_id: Uuid, seq: u64) -> bool {
+        let participant_ids: Vec<Uuid> = match self.rooms.get(room_id) {
+            Some(room) if room.participant_ids.contains(&connection_id) => {
+                room.participant_ids.iter().copied().collect()
+            }
+            _ => return false,
+        };
+        let Some(log) = self.mls_control_logs.get(room_id) else {
+            return false;
+        };
+        let mut log = log.lock().unwrap();
+        if seq > log.head_seq {
+            return false;
+        }
+        let previous = log.acknowledged.get(&connection_id).copied().unwrap_or(0);
+        if seq < previous {
+            return false;
+        }
+        log.acknowledged.insert(connection_id, seq);
+        Self::prune_acknowledged_mls_controls(&mut log, &participant_ids);
+        true
+    }
+
+    fn forget_mls_control_participant(&self, room_id: Uuid, connection_id: &Uuid) {
+        let participant_ids: Vec<Uuid> = self
+            .rooms
+            .get(&room_id)
+            .map(|room| room.participant_ids.iter().copied().collect())
+            .unwrap_or_default();
+        let Some(log) = self.mls_control_logs.get(&room_id) else {
+            return;
+        };
+        let mut log = log.lock().unwrap();
+        log.acknowledged.remove(connection_id);
+        Self::prune_acknowledged_mls_controls(&mut log, &participant_ids);
+    }
+
+    fn prune_acknowledged_mls_controls(log: &mut MlsControlLog, participants: &[Uuid]) {
+        let Some(prune_through) = participants
+            .iter()
+            .map(|id| log.acknowledged.get(id).copied())
+            .collect::<Option<Vec<_>>>()
+            .and_then(|acks| acks.into_iter().min())
+        else {
+            return;
+        };
+        while log
+            .entries
+            .front()
+            .map(|entry| entry.seq <= prune_through)
+            .unwrap_or(false)
+        {
+            let acknowledged = log.entries.pop_front().expect("front checked");
+            log.retained_bytes = log.retained_bytes.saturating_sub(acknowledged.json.len());
+        }
     }
 }

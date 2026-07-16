@@ -246,7 +246,7 @@ fn mls_envelope_replay_hash(
 
 fn room_accepts_client_message(room_type: RoomType, msg_type: &str) -> bool {
     match room_type {
-        RoomType::Group => msg_type == "mls",
+        RoomType::Group => matches!(msg_type, "mls" | "mlsack"),
         RoomType::OneToOne => matches!(msg_type, "ecdh_public_key" | "message" | "image"),
     }
 }
@@ -427,6 +427,7 @@ pub async fn ws_handler(
 
     let connection_id = claims.connection_id;
     let resume_requested = claims.resume;
+    let mls_control_cursor = claims.mls_control_cursor;
     let ws_size = max_ws_size(state.config.max_image_size);
 
     // Echo only the base subprotocol back (do NOT echo the jwt.* companion —
@@ -436,7 +437,14 @@ pub async fn ws_handler(
         .max_message_size(ws_size)
         .max_frame_size(ws_size)
         .on_upgrade(move |socket| {
-            handle_socket(socket, state, room_id, connection_id, resume_requested)
+            handle_socket(
+                socket,
+                state,
+                room_id,
+                connection_id,
+                resume_requested,
+                mls_control_cursor,
+            )
         })
 }
 
@@ -478,6 +486,7 @@ async fn handle_socket(
     room_id: Uuid,
     connection_id: Uuid,
     resume_requested: bool,
+    mls_control_cursor: Option<u64>,
 ) {
     // Verify that the room exists AND is not expired.
     // Without the is_expired() gate, a room past its hard TTL can still accept
@@ -551,11 +560,91 @@ async fn handle_socket(
         }
     };
 
-    // Split the socket into sender and receiver only after all fallible setup
-    // that needs ownership of the unsplit socket has completed.
+    // Preserve the legacy one-to-one behavior: announce first admission
+    // before subscribing so that socket does not receive its own transient
+    // join notification. Group joins are sequenced after opening the atomic
+    // control stream below.
+    if admission == ConnectionAdmission::New && room_type == RoomType::OneToOne {
+        let participant_count = state.get_participant_count(&room_id);
+        let join_msg = Message::UserJoined {
+            user_id: connection_id,
+            participant_count,
+            control_seq: None,
+        };
+        if let Ok(json) = serde_json::to_string(&join_msg)
+            && let Some(tx) = state.broadcast_channels.get(&room_id)
+        {
+            let _ = tx.send(json);
+        }
+    }
+
+    // Open the live subscription and MLS replay snapshot atomically with
+    // respect to control-message append+broadcast. Group reconnects replay
+    // strictly after the cursor signed into their one-shot upgrade JWT.
+    // Fresh participants start at the current head and do not consume
+    // pre-admission MLS history.
+    let (mut broadcast_rx, mls_control_stream) = if room_type == RoomType::Group {
+        let resume_cursor = if admission == ConnectionAdmission::Resumed {
+            mls_control_cursor
+        } else {
+            None
+        };
+        match state.open_mls_control_stream(&room_id, connection_id, resume_cursor) {
+            Ok((receiver, stream)) => (receiver, Some(stream)),
+            Err(error) => {
+                tracing::warn!(
+                    "Unable to open MLS control replay for connection {}: {:?}",
+                    connection_id,
+                    error
+                );
+                let _ = state.detach_connection(&connection_id);
+                let _ = send_error(socket, "Secure group replay window is unavailable").await;
+                return;
+            }
+        }
+    } else {
+        match state.broadcast_channels.get(&room_id) {
+            Some(tx) => (tx.subscribe(), None),
+            None => {
+                tracing::error!("Broadcast channel not found for room");
+                state.remove_connection(&connection_id);
+                return;
+            }
+        }
+    };
+
+    // A resumed socket is the same MLS member and relay identity, so it must
+    // not generate a synthetic leave/join cycle. For a fresh group member,
+    // append UserJoined only after the live subscription and replay boundary
+    // have been captured. Any control accepted after admission is then
+    // delivered in sequence instead of being skipped as pre-admission history.
+    if admission == ConnectionAdmission::New && room_type == RoomType::Group {
+        let participant_count = state.get_participant_count(&room_id);
+        let append_result = state.append_and_broadcast_mls_control(&room_id, |control_seq| {
+            serde_json::to_string(&Message::UserJoined {
+                user_id: connection_id,
+                participant_count,
+                control_seq: Some(control_seq),
+            })
+            .ok()
+        });
+        if let Err(error) = append_result {
+            tracing::error!(
+                "Failed to append ordered group join in room {}: {:?}",
+                room_id,
+                error
+            );
+            state.remove_connection(&connection_id);
+            let _ = send_error(socket, "Unable to establish secure group lifecycle").await;
+            return;
+        }
+    }
+
+    // Split the socket only after every fallible setup step that needs the
+    // unsplit value has completed.
     let (mut sender, mut receiver) = socket.split();
 
-    // Send connection confirmation message with validated room config
+    // Send connection confirmation message with validated room config.
     let connected_msg = Message::Connected {
         user_id: connection_id,
         room_id,
@@ -567,38 +656,32 @@ async fn handle_socket(
         created_at,                                  // Room creation timestamp for countdown
         resume_token,
         resumed: admission == ConnectionAdmission::Resumed,
+        mls_control_cursor: mls_control_stream.as_ref().map(|stream| stream.cursor),
     };
 
     if let Ok(json) = serde_json::to_string(&connected_msg) {
         let _ = sender.send(WsMessage::Text(json)).await;
     }
 
-    // A resumed socket is the same MLS member and relay identity, so it must
-    // not generate a synthetic leave/join cycle. Only first admission is
-    // announced to peers.
-    if admission == ConnectionAdmission::New {
-        let join_msg = Message::UserJoined {
-            user_id: connection_id,
-            participant_count: state.get_participant_count(&room_id),
-        };
-
-        if let Ok(json) = serde_json::to_string(&join_msg) {
-            if let Some(tx) = state.broadcast_channels.get(&room_id) {
-                let _ = tx.send(json);
+    // Replay is sent after Connected and before live broadcast forwarding.
+    // Messages appended after the snapshot are already buffered in
+    // broadcast_rx and therefore follow MlsSync without a sequence gap.
+    if let Some(stream) = mls_control_stream {
+        for json in stream.replay {
+            if sender.send(WsMessage::Text(json)).await.is_err() {
+                break;
             }
+        }
+        if let Ok(json) = serde_json::to_string(&Message::MlsSync {
+            through_seq: stream.through_seq,
+        }) {
+            let _ = sender.send(WsMessage::Text(json)).await;
         }
     }
 
-    // Now subscribe to the broadcast channel (after sending UserJoined)
-    // This ensures the client doesn't receive their own join message
-    let mut broadcast_rx = match state.broadcast_channels.get(&room_id) {
-        Some(tx) => tx.subscribe(),
-        None => {
-            tracing::error!("Broadcast channel not found for room");
-            state.remove_connection(&connection_id);
-            return;
-        }
-    };
+    // Direct responses (currently Commit rate-limit rejections) share the
+    // single socket writer with room broadcasts.
+    let (direct_tx, mut direct_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
 
     // Task that receives broadcast messages and forwards them to the client
     // Also sends heartbeat pings every 30 seconds to keep the connection alive,
@@ -612,6 +695,11 @@ async fn handle_socket(
 
         loop {
             tokio::select! {
+                Some(msg) = direct_rx.recv() => {
+                    if sender.send(WsMessage::Text(msg)).await.is_err() {
+                        break;
+                    }
+                }
                 result = broadcast_rx.recv() => {
                     match result {
                         Ok(msg) => {
@@ -662,6 +750,7 @@ async fn handle_socket(
     // against file-descriptor exhaustion from stale TCP sessions.
     const IDLE_TIMEOUT: Duration = Duration::from_secs(90);
     let state_clone = state.clone();
+    let recv_direct_tx = direct_tx.clone();
     let mut recv_task = tokio::spawn(async move {
         while let Ok(Some(Ok(msg))) = tokio::time::timeout(IDLE_TIMEOUT, receiver.next()).await {
             // C-14: classify the frame up front. Close terminates the loop
@@ -766,6 +855,38 @@ async fn handle_socket(
                             );
                             if bump_protocol_error(&state_clone, connection_id) {
                                 break;
+                            }
+                            continue;
+                        }
+
+                        // Ordered MLS-control acknowledgement. ACKs are direct
+                        // transport bookkeeping and are never rebroadcast.
+                        if incoming.msg_type == "mlsack" {
+                            let ack_shape_valid = incoming.payload.is_none()
+                                && incoming.header.is_none()
+                                && incoming.wire_format.is_none()
+                                && incoming.ratchet_tree.is_none()
+                                && incoming.key_package_ref.is_none()
+                                && incoming.commit_ref.is_none();
+                            let acknowledged = incoming
+                                .control_seq
+                                .filter(|seq| *seq > 0)
+                                .map(|seq| {
+                                    state_clone.acknowledge_mls_control(
+                                        &room_id,
+                                        connection_id,
+                                        seq,
+                                    )
+                                })
+                                .unwrap_or(false);
+                            if !ack_shape_valid || !acknowledged {
+                                tracing::warn!(
+                                    "invalid MLS control ACK from connection_id={}",
+                                    connection_id
+                                );
+                                if bump_protocol_error(&state_clone, connection_id) {
+                                    break;
+                                }
                             }
                             continue;
                         }
@@ -883,6 +1004,16 @@ async fn handle_socket(
                         // transport shape and shallow PublicMessage content
                         // type before allocating or rebroadcasting it.
                         else if incoming.msg_type == "mls" {
+                            if incoming.control_seq.is_some() {
+                                tracing::warn!(
+                                    "client attempted to set server MLS control sequence (connection_id={})",
+                                    connection_id
+                                );
+                                if bump_protocol_error(&state_clone, connection_id) {
+                                    break;
+                                }
+                                continue;
+                            }
                             let payload = match incoming.payload {
                                 Some(p) => p,
                                 None => {
@@ -983,13 +1114,19 @@ async fn handle_socket(
                                 commit_ts.retain(|&ts| ts > commit_cutoff);
                                 if commit_ts.len() >= max_commits {
                                     tracing::warn!(
-                                        "Connection {} exceeded MLS commit rate limit ({}/{}s), dropping",
+                                        "Connection {} exceeded MLS commit rate limit ({}/{}s), rejecting",
                                         connection_id,
                                         max_commits,
                                         commit_window
                                     );
-                                    if bump_protocol_error(&state_clone, connection_id) {
-                                        break;
+                                    let rejection = Message::MlsRejected {
+                                        commit_ref: commit_ref.clone(),
+                                        reason: "commit_rate_limited".to_string(),
+                                        retry_after_secs: u64::try_from(commit_window)
+                                            .unwrap_or(60),
+                                    };
+                                    if let Ok(json) = serde_json::to_string(&rejection) {
+                                        let _ = recv_direct_tx.send(json);
                                     }
                                     continue;
                                 }
@@ -1027,17 +1164,44 @@ async fn handle_socket(
                             }
                             seen_hashes.insert((payload_hash, now));
 
-                            let broadcast_msg = Message::Mls {
-                                payload,
-                                wire_format,
-                                ratchet_tree,
-                                key_package_ref,
-                                commit_ref,
-                                sender_id: connection_id,
-                            };
-                            if let Ok(json) = serde_json::to_string(&broadcast_msg) {
-                                if let Some(tx) = state_clone.broadcast_channels.get(&room_id) {
+                            if wire_format == WIRE_PRIVATE_MESSAGE {
+                                let broadcast_msg = Message::Mls {
+                                    payload,
+                                    wire_format,
+                                    ratchet_tree,
+                                    key_package_ref,
+                                    commit_ref,
+                                    control_seq: None,
+                                    sender_id: connection_id,
+                                };
+                                if let Ok(json) = serde_json::to_string(&broadcast_msg)
+                                    && let Some(tx) = state_clone.broadcast_channels.get(&room_id)
+                                {
                                     let _ = tx.send(json);
+                                }
+                            } else {
+                                let append_result = state_clone.append_and_broadcast_mls_control(
+                                    &room_id,
+                                    |control_seq| {
+                                        serde_json::to_string(&Message::Mls {
+                                            payload,
+                                            wire_format,
+                                            ratchet_tree,
+                                            key_package_ref,
+                                            commit_ref,
+                                            control_seq: Some(control_seq),
+                                            sender_id: connection_id,
+                                        })
+                                        .ok()
+                                    },
+                                );
+                                if let Err(error) = append_result {
+                                    tracing::error!(
+                                        "Failed to append MLS control envelope in room {}: {:?}",
+                                        room_id,
+                                        error
+                                    );
+                                    break;
                                 }
                             }
 
@@ -1244,20 +1408,50 @@ async fn handle_socket(
         let grace = Duration::from_secs(state.config.ws_reconnect_grace_secs);
         tokio::spawn(async move {
             tokio::time::sleep(grace).await;
+            let room_type = grace_state
+                .rooms
+                .get(&detached_room_id)
+                .map(|room| room.room_type);
             let Some(participant_count) =
                 grace_state.finalize_disconnection(&connection_id, detached_room_id)
             else {
                 return;
             };
 
-            let leave_msg = Message::UserLeft {
-                user_id: connection_id,
-                participant_count,
-            };
-            if let Ok(json) = serde_json::to_string(&leave_msg)
-                && let Some(tx) = grace_state.broadcast_channels.get(&detached_room_id)
-            {
-                let _ = tx.send(json);
+            match room_type {
+                Some(RoomType::Group) => {
+                    let append_result = grace_state.append_and_broadcast_mls_control(
+                        &detached_room_id,
+                        |control_seq| {
+                            serde_json::to_string(&Message::UserLeft {
+                                user_id: connection_id,
+                                participant_count,
+                                control_seq: Some(control_seq),
+                            })
+                            .ok()
+                        },
+                    );
+                    if let Err(error) = append_result {
+                        tracing::error!(
+                            "Failed to append ordered group departure in room {}: {:?}",
+                            detached_room_id,
+                            error
+                        );
+                    }
+                }
+                Some(RoomType::OneToOne) => {
+                    let leave_msg = Message::UserLeft {
+                        user_id: connection_id,
+                        participant_count,
+                        control_seq: None,
+                    };
+                    if let Ok(json) = serde_json::to_string(&leave_msg)
+                        && let Some(tx) = grace_state.broadcast_channels.get(&detached_room_id)
+                    {
+                        let _ = tx.send(json);
+                    }
+                }
+                None => {}
             }
 
             #[cfg(debug_assertions)]
@@ -1506,6 +1700,7 @@ mod tests {
         );
 
         assert!(room_accepts_client_message(RoomType::Group, "mls"));
+        assert!(room_accepts_client_message(RoomType::Group, "mlsack"));
         assert!(!room_accepts_client_message(RoomType::Group, "message"));
         assert!(!room_accepts_client_message(RoomType::Group, "image"));
         assert!(!room_accepts_client_message(
@@ -1519,6 +1714,7 @@ mod tests {
         assert!(room_accepts_client_message(RoomType::OneToOne, "message"));
         assert!(room_accepts_client_message(RoomType::OneToOne, "image"));
         assert!(!room_accepts_client_message(RoomType::OneToOne, "mls"));
+        assert!(!room_accepts_client_message(RoomType::OneToOne, "mlsack"));
     }
 
     fn test_config() -> Config {
@@ -1719,6 +1915,7 @@ mod tests {
             aud: crate::jwt::WS_TOKEN_AUDIENCE.to_string(),
             iss: state.config.jwt_issuer.clone(),
             resume: false,
+            mls_control_cursor: None,
         };
         let token = sign_token(&expired, &state.jwt_secret).unwrap();
         let sp = format!("pinchat.v1, pinchat.v1.jwt.{}", token);
@@ -1869,6 +2066,130 @@ mod tests {
         assert_eq!(
             state.add_connection(connection_id, room_id, false),
             Some(ConnectionAdmission::New)
+        );
+    }
+
+    #[tokio::test]
+    async fn mls_group_control_log_replays_lifecycle_until_every_participant_acknowledges() {
+        let state = AppState::new(1000, test_config());
+        let room = Room::new(RoomConfig {
+            room_type: RoomType::Group,
+            ttl_minutes: 60,
+            max_participants: 4,
+        });
+        let room_id = room.id;
+        state.try_create_room(room).unwrap();
+        let alice = Uuid::new_v4();
+        let bob = Uuid::new_v4();
+
+        assert_eq!(
+            state.add_connection(alice, room_id, false),
+            Some(ConnectionAdmission::New)
+        );
+        let (_alice_rx, alice_stream) = state
+            .open_mls_control_stream(&room_id, alice, None)
+            .expect("open Alice control stream");
+        assert_eq!(alice_stream.cursor, 0);
+        assert_eq!(alice_stream.through_seq, 0);
+
+        assert_eq!(
+            state.add_connection(bob, room_id, false),
+            Some(ConnectionAdmission::New)
+        );
+        let (mut bob_rx, bob_stream) = state
+            .open_mls_control_stream(&room_id, bob, None)
+            .expect("open Bob control stream");
+        assert_eq!(bob_stream.cursor, 0);
+
+        // Group admission captures the replay boundary first, then appends
+        // UserJoined. The fresh socket therefore receives its own lifecycle
+        // event live instead of skipping controls accepted after admission.
+        let join_seq = state
+            .append_and_broadcast_mls_control(&room_id, |seq| {
+                serde_json::to_string(&Message::UserJoined {
+                    user_id: bob,
+                    participant_count: 2,
+                    control_seq: Some(seq),
+                })
+                .ok()
+            })
+            .expect("append ordered join");
+        assert_eq!(join_seq, 1);
+        let live_join: serde_json::Value = serde_json::from_str(
+            &bob_rx
+                .try_recv()
+                .expect("fresh participant receives live join"),
+        )
+        .expect("live join JSON");
+        assert_eq!(live_join["type"], "userjoined");
+        assert_eq!(live_join["control_seq"], 1);
+        assert!(state.acknowledge_mls_control(&room_id, alice, 1));
+
+        let seq = state
+            .append_and_broadcast_mls_control(&room_id, |seq| {
+                Some(
+                    serde_json::json!({
+                        "type": "mls",
+                        "wire_format": WIRE_KEY_PACKAGE,
+                        "payload": "AA",
+                        "sender_id": alice,
+                        "control_seq": seq,
+                    })
+                    .to_string(),
+                )
+            })
+            .expect("append ordered control");
+        assert_eq!(seq, 2);
+        assert!(state.acknowledge_mls_control(&room_id, alice, 2));
+
+        let departed = Uuid::new_v4();
+        let leave_seq = state
+            .append_and_broadcast_mls_control(&room_id, |seq| {
+                serde_json::to_string(&Message::UserLeft {
+                    user_id: departed,
+                    participant_count: 2,
+                    control_seq: Some(seq),
+                })
+                .ok()
+            })
+            .expect("append ordered lifecycle event");
+        assert_eq!(leave_seq, 3);
+        assert!(state.acknowledge_mls_control(&room_id, alice, 3));
+
+        // Bob's lower cursor keeps both MLS and lifecycle controls retained
+        // throughout a transport drop and grace-reserved resume.
+        assert_eq!(state.detach_connection(&bob), Some(room_id));
+        assert_eq!(
+            state.add_connection(bob, room_id, true),
+            Some(ConnectionAdmission::Resumed)
+        );
+        let (_resumed_rx, replay) = state
+            .open_mls_control_stream(&room_id, bob, Some(0))
+            .expect("replay from Bob's signed cursor");
+        assert_eq!(replay.cursor, 0);
+        assert_eq!(replay.through_seq, 3);
+        assert_eq!(replay.replay.len(), 3);
+        let replayed_join: serde_json::Value =
+            serde_json::from_str(&replay.replay[0]).expect("replayed join JSON");
+        assert_eq!(replayed_join["type"], "userjoined");
+        assert_eq!(replayed_join["control_seq"], 1);
+        let replayed_mls: serde_json::Value =
+            serde_json::from_str(&replay.replay[1]).expect("replayed MLS JSON");
+        assert_eq!(replayed_mls["control_seq"], 2);
+        let replayed_leave: serde_json::Value =
+            serde_json::from_str(&replay.replay[2]).expect("replayed lifecycle JSON");
+        assert_eq!(replayed_leave["type"], "userleft");
+        assert_eq!(replayed_leave["user_id"], departed.to_string());
+        assert_eq!(replayed_leave["control_seq"], 3);
+
+        assert!(state.acknowledge_mls_control(&room_id, bob, 3));
+        assert!(
+            state.validate_mls_control_cursor(&room_id, 3).is_ok(),
+            "current head remains a valid resume cursor after pruning"
+        );
+        assert!(
+            state.validate_mls_control_cursor(&room_id, 0).is_err(),
+            "a cursor older than the fully-acknowledged retained window fails closed"
         );
     }
 }

@@ -72,6 +72,13 @@ pub struct WsTokenClaims {
     /// it will attach to an existing, grace-reserved participant ID.
     #[serde(default)]
     pub resume: bool,
+
+    /// Highest consecutively processed MLS control sequence supplied by a
+    /// group client during secure reconnect. Binding it into the signed,
+    /// single-use upgrade token prevents the cursor from being changed
+    /// between token issuance and WebSocket admission.
+    #[serde(default)]
+    pub mls_control_cursor: Option<u64>,
 }
 
 impl WsTokenClaims {
@@ -96,16 +103,24 @@ impl WsTokenClaims {
             aud: WS_TOKEN_AUDIENCE.to_string(),
             iss: issuer.to_string(),
             resume: false,
+            mls_control_cursor: None,
         }
     }
 
     /// Mint a fresh, single-use WebSocket token for an existing participant.
     /// A new JTI is generated on every attempt while the stable connection ID
     /// remains unchanged.
-    pub fn for_resume(room_id: Uuid, connection_id: Uuid, ttl_secs: u64, issuer: &str) -> Self {
+    pub fn for_resume(
+        room_id: Uuid,
+        connection_id: Uuid,
+        ttl_secs: u64,
+        issuer: &str,
+        mls_control_cursor: Option<u64>,
+    ) -> Self {
         let mut claims = Self::new(room_id, ttl_secs, issuer);
         claims.connection_id = connection_id;
         claims.resume = true;
+        claims.mls_control_cursor = mls_control_cursor;
         claims
     }
 }
@@ -246,6 +261,7 @@ mod tests {
         assert_eq!(decoded.aud, WS_TOKEN_AUDIENCE);
         assert_eq!(decoded.iss, TEST_ISS);
         assert!(!decoded.resume);
+        assert_eq!(decoded.mls_control_cursor, None);
     }
 
     #[test]
@@ -253,12 +269,13 @@ mod tests {
         let secret = [21u8; 32];
         let room_id = Uuid::new_v4();
         let connection_id = Uuid::new_v4();
-        let claims = WsTokenClaims::for_resume(room_id, connection_id, 30, TEST_ISS);
+        let claims = WsTokenClaims::for_resume(room_id, connection_id, 30, TEST_ISS, Some(17));
         let token = sign_token(&claims, &secret).expect("sign resumed upgrade token");
         let decoded = verify_token(&token, &secret, TEST_ISS).expect("verify resumed token");
         assert_eq!(decoded.room_id, room_id);
         assert_eq!(decoded.connection_id, connection_id);
         assert!(decoded.resume);
+        assert_eq!(decoded.mls_control_cursor, Some(17));
     }
 
     #[test]
@@ -308,6 +325,7 @@ mod tests {
             aud: WS_TOKEN_AUDIENCE.to_string(),
             iss: TEST_ISS.to_string(),
             resume: false,
+            mls_control_cursor: None,
         };
 
         let token = sign_token(&expired_claims, &secret).expect("Failed to sign");

@@ -59,12 +59,20 @@ pub enum Message {
     UserJoined {
         user_id: Uuid,
         participant_count: usize,
+        /// Server-assigned total-order sequence for group-room lifecycle
+        /// events. Absent in one-to-one rooms.
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        control_seq: Option<u64>,
     },
 
     /// Notification that a user left the room
     UserLeft {
         user_id: Uuid,
         participant_count: usize,
+        /// Server-assigned total-order sequence for group-room lifecycle
+        /// events. Absent in one-to-one rooms.
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        control_seq: Option<u64>,
     },
 
     /// Generic error
@@ -93,6 +101,12 @@ pub enum Message {
         /// True when this socket reclaimed a grace-reserved participant ID;
         /// false on the participant's first admission.
         resumed: bool,
+        /// Starting cursor for the ordered MLS control stream. Present only
+        /// for group rooms. On resume it equals the cursor bound into the
+        /// single-use WebSocket JWT; on first admission it is the current
+        /// room head, so pre-join history is not replayed.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        mls_control_cursor: Option<u64>,
     },
 
     /// ECDH public key exchange (for Perfect Forward Secrecy)
@@ -139,8 +153,29 @@ pub enum Message {
         /// exact mls_public_message body paired with this envelope.
         #[serde(skip_serializing_if = "Option::is_none", default)]
         commit_ref: Option<String>,
+        /// Server-assigned total-order sequence for group control envelopes.
+        /// Present for KeyPackage, Proposal, Commit, and Welcome; absent for
+        /// ephemeral MLS PrivateMessages. Group lifecycle events share this
+        /// sequence through their own `control_seq` fields.
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        control_seq: Option<u64>,
         /// Connection ID of the sender (same framing as ecdh_public_key).
         sender_id: Uuid,
+    },
+
+    /// Marks completion of the replay snapshot opened for this group socket.
+    /// Live MLS control envelopes after `through_seq` follow on the same
+    /// ordered broadcast stream.
+    MlsSync { through_seq: u64 },
+
+    /// Direct, non-broadcast rejection of a locally submitted MLS Commit.
+    /// This lets the browser destroy its staged candidate instead of waiting
+    /// forever for an acceptance echo that the relay deliberately rejected.
+    MlsRejected {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        commit_ref: Option<String>,
+        reason: String,
+        retry_after_secs: u64,
     },
 }
 
@@ -167,6 +202,10 @@ pub struct IncomingMessage {
     /// Optional SHA-256 Commit correlation metadata.
     #[serde(default)]
     pub commit_ref: Option<String>,
+    /// Highest consecutively applied server MLS-control sequence. Used only
+    /// by group-room `mlsack` frames.
+    #[serde(default)]
+    pub control_seq: Option<u64>,
 }
 
 #[cfg(test)]
@@ -230,10 +269,12 @@ mod tests {
             ratchet_tree: Some("AA".to_string()),
             key_package_ref: Some(reference.clone()),
             commit_ref: Some(reference.clone()),
+            control_seq: Some(7),
             sender_id: Uuid::nil(),
         };
         let encoded = serde_json::to_value(outgoing).unwrap();
         assert_eq!(encoded["key_package_ref"], reference);
         assert_eq!(encoded["commit_ref"], reference);
+        assert_eq!(encoded["control_seq"], 7);
     }
 }

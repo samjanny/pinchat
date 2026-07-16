@@ -447,6 +447,42 @@ async function main() {
     assert(Boolean(sendFailureError),
         'transport-rejected Commit surfaces a fail-closed error');
 
+    // A Commit can pass WebSocket.send yet be refused by a tighter relay
+    // quota. The direct rejection must destroy the same isolated candidate;
+    // waiting forever for an echo would otherwise deadlock all MLS work.
+    const quotaRejected = await createExchange({
+        acceptCommit: false,
+        pskSecret: new Uint8Array(32).fill(0x5e),
+    });
+    const quotaCandidate = quotaRejected.creator._pendingCommit.candidateGroup;
+    const quotaSecretRefs = [
+        ...Object.values(quotaCandidate.epochSecrets),
+        ...[...quotaCandidate._chainStates.values()]
+            .map((state) => state.secret),
+    ].filter((value) => value instanceof Uint8Array);
+    const consumedRejection = await quotaRejected.creator.onTransportRejection({
+        type: 'mlsrejected',
+        commit_ref: quotaRejected.commit.commit_ref,
+        reason: 'commit_rate_limited',
+        retry_after_secs: 3600,
+    });
+    assert(consumedRejection
+        && quotaRejected.creator._pendingCommit?.candidateGroup === quotaCandidate
+        && liveGroupMatches(quotaRejected.creator, quotaRejected.beforeAdd),
+    'relay quota rejection retains PendingCommit without advancing live MLS state');
+    assert(Object.keys(quotaCandidate.epochSecrets).length > 0
+        && quotaSecretRefs.some(
+            (bytes) => bytes.some((byte) => byte !== 0),
+        ),
+    'relay quota rejection retains the exact candidate for byte-identical retry');
+    assert(quotaRejected.creatorEvents.some((event) =>
+        event.kind === 'error' && event.reason.includes('retrying after 3600 seconds')),
+    'relay quota rejection reports an actionable retry interval');
+    await echoPendingCommit(quotaRejected.creator, quotaRejected.commit);
+    assert(quotaRejected.creator._pendingCommit === null
+        && quotaRejected.creator.group === quotaCandidate,
+    'a later acceptance echo installs the retained rate-limited candidate');
+
     // app.js reports userleft without awaiting the Remove promise. If that
     // races an already-pending local Commit, retain the revocation request
     // and stage it immediately after the first Commit is accepted.
@@ -472,6 +508,83 @@ async function main() {
     );
     assert(!removalRace.creator._leafBySenderId.has('joiner-1'),
         'deferred Remove applies after its own relay echo');
+
+    // A final relay departure can be sequenced before an in-flight Add earns
+    // its acceptance echo. The creator must retain that departure even though
+    // the live sender→leaf map does not exist yet. If the Add is subsequently
+    // accepted, install it for consistency, suppress the Welcome, and
+    // immediately author a Remove.
+    const pendingAddDeparture = await createExchange({ acceptCommit: false });
+    await pendingAddDeparture.creator.removeMemberBySenderId('joiner-1');
+    assert(pendingAddDeparture.creator._departedSenderIds.has('joiner-1')
+        && pendingAddDeparture.creator._deferredRemovals.has('joiner-1')
+        && pendingAddDeparture.creator._leafBySenderId.size === 0,
+    'departure during Pending Add is retained before a leaf mapping exists');
+    await echoPendingCommit(
+        pendingAddDeparture.creator,
+        pendingAddDeparture.commit,
+        'creator-add-race-self',
+    );
+    const addRacePublicMessages = pendingAddDeparture.creatorOut.filter(
+        (envelope) => envelope.wire_format === WireFormat.MLS_PUBLIC_MESSAGE,
+    );
+    const addRaceRemove = addRacePublicMessages[1];
+    assert(Boolean(addRaceRemove)
+        && pendingAddDeparture.creator._pendingCommit?.kind === 'remove'
+        && !pendingAddDeparture.creatorOut.some(
+            (envelope) => envelope.wire_format === WireFormat.MLS_WELCOME,
+        ),
+    'accepted Add for a departed route suppresses Welcome and stages Remove');
+    await echoPendingCommit(
+        pendingAddDeparture.creator,
+        addRaceRemove,
+        'creator-add-race-self',
+    );
+    assert(pendingAddDeparture.creator._pendingCommit === null
+        && !pendingAddDeparture.creator._leafBySenderId.has('joiner-1')
+        && !pendingAddDeparture.creator._departedSenderIds.has('joiner-1')
+        && global.MLS.RatchetTree.leafFor(
+            pendingAddDeparture.creator.group.ratchetTree, 1,
+        ) === null,
+    'Remove acceptance erases the phantom leaf and its departure tombstone');
+
+    // Local Remove construction failure must not consume the lifecycle
+    // request. It remains retryable across the operation mutex / reconnect
+    // sync boundary and succeeds once the transient failure clears.
+    const retryRemoval = await createExchange();
+    const originalForkForRemoval =
+        retryRemoval.creator.group.forkForPendingCommit.bind(
+            retryRemoval.creator.group,
+        );
+    retryRemoval.creator.group.forkForPendingCommit = () => {
+        throw new Error('forced transient Remove construction failure');
+    };
+    let retryRemovalError = '';
+    try {
+        await retryRemoval.creator.removeMemberBySenderId('joiner-1');
+    } catch (err) {
+        retryRemovalError = err.message;
+    }
+    assert(retryRemovalError.includes('forced transient')
+        && retryRemoval.creator._departedSenderIds.has('joiner-1')
+        && retryRemoval.creator._deferredRemovals.has('joiner-1')
+        && retryRemoval.creator._leafBySenderId.get('joiner-1') === 1
+        && retryRemoval.creator._pendingCommit === null,
+    'failed Remove construction retains tombstone and rejects lifecycle handling');
+    retryRemoval.creator.group.forkForPendingCommit = originalForkForRemoval;
+    await retryRemoval.creator.flushDeferredMembershipChanges();
+    const retriedRemove = retryRemoval.creatorOut
+        .filter((envelope) =>
+            envelope.wire_format === WireFormat.MLS_PUBLIC_MESSAGE)
+        .at(-1);
+    assert(Boolean(retriedRemove)
+        && retryRemoval.creator._pendingCommit?.kind === 'remove',
+    'replay-sync flush retries the retained Remove after transient failure');
+    await echoPendingCommit(
+        retryRemoval.creator, retriedRemove, 'creator-remove-retry-self',
+    );
+    assert(!retryRemoval.creator._leafBySenderId.has('joiner-1'),
+        'retried lifecycle Remove applies after its acceptance echo');
 
     const unrelatedRef = global.MLS.Codec.bytesToBase64Url(
         new Uint8Array(32).fill(0x5a),

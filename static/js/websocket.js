@@ -31,7 +31,11 @@ const _COMMON_RELAY_MESSAGE_TYPES = new Set([
 
 function _isMessageAllowedForRoom(roomType, messageType) {
     if (_COMMON_RELAY_MESSAGE_TYPES.has(messageType)) return true;
-    if (roomType === 'group') return messageType === 'mls';
+    if (roomType === 'group') {
+        return messageType === 'mls'
+            || messageType === 'mlssync'
+            || messageType === 'mlsrejected';
+    }
     if (roomType === 'onetoone') {
         return messageType === 'ecdh_public_key'
             || messageType === 'message'
@@ -72,6 +76,18 @@ class WebSocketManager {
         // in page memory only: persisting it across a reload would preserve a
         // relay identity while the corresponding in-memory MLS state is gone.
         this.resumeToken = null;
+        // Stable relay identity and ordered MLS-control cursor. The cursor is
+        // kept in page memory with the MLS state and is bound into every
+        // resume JWT. It advances only after application processing succeeds.
+        this.connectionId = null;
+        this.lastMlsControlSeq = 0;
+        this._mlsControlSyncing = false;
+        this._connectionGeneration = 0;
+        // Exact locally-sent KeyPackage/Proposal/Commit/Welcome envelopes
+        // awaiting their server-sequenced own echo. They are retried after a
+        // resumed replay completes if the previous socket died before relay
+        // acceptance.
+        this._pendingMlsControls = new Map();
         // Set from the first server-authenticated Connected frame and pinned
         // for the lifetime of this page. It gates every subsequent relay
         // message before application dispatch.
@@ -123,6 +139,64 @@ class WebSocketManager {
         }
     }
 
+    _isMlsControlEnvelope(message) {
+        return message && message.type === 'mls'
+            && (message.wire_format === 1
+                || message.wire_format === 3
+                || message.wire_format === 5);
+    }
+
+    _isOrderedGroupControl(message) {
+        return this.roomType === 'group' && message
+            && (this._isMlsControlEnvelope(message)
+                || message.type === 'userjoined'
+                || message.type === 'userleft');
+    }
+
+    _mlsControlKey(message) {
+        return JSON.stringify([
+            message.wire_format,
+            message.payload || '',
+            message.ratchet_tree || '',
+            message.key_package_ref || '',
+            message.commit_ref || '',
+        ]);
+    }
+
+    _confirmMlsControl(message) {
+        if (!this._isMlsControlEnvelope(message)) return;
+        this._pendingMlsControls.delete(this._mlsControlKey(message));
+    }
+
+    _sendMlsControlAck(seq) {
+        if (!Number.isSafeInteger(seq) || seq <= 0
+            || !this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+        try {
+            this.ws.send(JSON.stringify({
+                type: 'mlsack',
+                control_seq: seq,
+            }));
+        } catch (error) {
+            // The cursor remains in memory and is bound into the next resume
+            // token, so losing this best-effort ACK cannot roll state back.
+            console.warn('[WS] Failed to send MLS control ACK:', error);
+        }
+    }
+
+    _retryPendingMlsControls() {
+        if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+        for (const entry of this._pendingMlsControls.values()) {
+            if (entry.lastSentGeneration >= this._connectionGeneration) continue;
+            try {
+                this.ws.send(JSON.stringify(entry.envelope));
+                entry.lastSentGeneration = this._connectionGeneration;
+            } catch (error) {
+                console.warn('[WS] Failed to retry pending MLS control:', error);
+                break;
+            }
+        }
+    }
+
     /**
      * Requests WebSocket authentication token
      *
@@ -151,6 +225,14 @@ class WebSocketManager {
                         throw new Error('Stored WebSocket resume credential is malformed');
                     }
                     headers['X-PinChat-Resume-Token'] = this.resumeToken;
+                    if (this.roomType === 'group') {
+                        if (!Number.isSafeInteger(this.lastMlsControlSeq)
+                            || this.lastMlsControlSeq < 0) {
+                            throw new Error('Stored MLS control cursor is malformed');
+                        }
+                        headers['X-PinChat-MLS-Control-Seq']
+                            = String(this.lastMlsControlSeq);
+                    }
                 }
                 return headers;
             };
@@ -159,10 +241,18 @@ class WebSocketManager {
                 if (response.status !== 409) return { handled: false, token: null };
                 let body = null;
                 try { body = await response.json(); } catch (_) { /* malformed error */ }
-                if (!body || body.code !== 'RESUME_REJECTED') {
+                if (!body || (body.code !== 'RESUME_REJECTED'
+                    && body.code !== 'MLS_CONTROL_RESYNC_REQUIRED')) {
                     return { handled: false, token: null };
                 }
                 this.resumeToken = null;
+                if (body.code === 'MLS_CONTROL_RESYNC_REQUIRED') {
+                    this._fatalAuthFailure = true;
+                    if (this.onError) {
+                        this.onError(new Error('MLS_CONTROL_RESYNC_REQUIRED'));
+                    }
+                    return { handled: true, token: null };
+                }
                 const allowFreshIdentity = this.onResumeRejected
                     ? await this.onResumeRejected()
                     : false;
@@ -445,6 +535,7 @@ class WebSocketManager {
 
         try {
             this.ws = new WebSocket(wsUrl, ['pinchat.v1', `pinchat.v1.jwt.${token}`]);
+            this._connectionGeneration += 1;
 
             this.ws.onopen = () => {
                 // Subprotocol sanity: server must echo "pinchat.v1" exactly.
@@ -475,6 +566,9 @@ class WebSocketManager {
 
             this.ws.onclose = (event) => {
                 console.log('WebSocket closed:', event.code, event.reason);
+                if (this.roomType === 'group') {
+                    this._mlsControlSyncing = true;
+                }
 
                 if (this.onDisconnected) {
                     this.onDisconnected();
@@ -528,6 +622,50 @@ class WebSocketManager {
                             if (this.onError) this.onError(new Error('RESUME_TOKEN_INVALID'));
                             return;
                         }
+                        if (message.room_type === 'group') {
+                            if (!Number.isSafeInteger(message.mls_control_cursor)
+                                || message.mls_control_cursor < 0) {
+                                this._failRoomProtocol(
+                                    'Connected carries an invalid MLS control cursor',
+                                );
+                                return;
+                            }
+                            if (message.resumed === true) {
+                                if (message.mls_control_cursor
+                                    !== this.lastMlsControlSeq) {
+                                    this._failRoomProtocol(
+                                        'server resumed from a different MLS control cursor',
+                                    );
+                                    return;
+                                }
+                            } else {
+                                if (this.connectionId !== null
+                                    || this.lastMlsControlSeq !== 0) {
+                                    this._failRoomProtocol(
+                                        'group reconnect was admitted as a fresh control stream',
+                                    );
+                                    return;
+                                }
+                                this.lastMlsControlSeq
+                                    = message.mls_control_cursor;
+                            }
+                            this._mlsControlSyncing = true;
+                        } else if (message.mls_control_cursor !== undefined) {
+                            this._failRoomProtocol(
+                                '1:1 Connected carries group control state',
+                            );
+                            return;
+                        }
+                        if (this.connectionId !== null
+                            && message.user_id !== this.connectionId
+                            && (message.room_type === 'group'
+                                || message.resumed === true)) {
+                            this._failRoomProtocol(
+                                'stable relay identity changed across reconnect',
+                            );
+                            return;
+                        }
+                        this.connectionId = message.user_id;
                         this.roomType = message.room_type;
                         this.resumeToken = message.resume_token;
                         delete message.resume_token;
@@ -538,18 +676,131 @@ class WebSocketManager {
                         return;
                     }
 
-                    if (this.onMessage) {
-                        // C-01: enqueue on the inbound mutex. Each onMessage
-                        // call runs strictly after the previous one settles,
-                        // guaranteeing in-order delivery to app.js. The
-                        // .catch resets the chain so a single handler error
-                        // does not block subsequent messages.
-                        this._inboundQueue = this._inboundQueue
-                            .then(() => this.onMessage(message))
-                            .catch((err) => {
-                                console.error('[WS] Unhandled error in onMessage:', err);
-                            });
+                    const isMlsControl = this._isMlsControlEnvelope(message);
+                    const isOrderedGroupControl =
+                        this._isOrderedGroupControl(message);
+                    if (message.type === 'mls') {
+                        if (isMlsControl) {
+                            if (!Number.isSafeInteger(message.control_seq)
+                                || message.control_seq <= 0) {
+                                this._failRoomProtocol(
+                                    'MLS control envelope is missing its sequence',
+                                );
+                                return;
+                            }
+                        } else if (message.wire_format === 2) {
+                            if (message.control_seq !== undefined) {
+                                this._failRoomProtocol(
+                                    'MLS PrivateMessage carries a control sequence',
+                                );
+                                return;
+                            }
+                        } else {
+                            this._failRoomProtocol(
+                                'relay delivered an unsupported MLS wire format',
+                            );
+                            return;
+                        }
                     }
+                    if (message.type === 'userjoined'
+                        || message.type === 'userleft') {
+                        if (this.roomType === 'group') {
+                            if (!Number.isSafeInteger(message.control_seq)
+                                || message.control_seq <= 0) {
+                                this._failRoomProtocol(
+                                    'group lifecycle event is missing its sequence',
+                                );
+                                return;
+                            }
+                        } else if (message.control_seq !== undefined) {
+                            this._failRoomProtocol(
+                                '1:1 lifecycle event carries a group control sequence',
+                            );
+                            return;
+                        }
+                    }
+                    if (message.type === 'mlssync'
+                        && (!Number.isSafeInteger(message.through_seq)
+                            || message.through_seq < 0)) {
+                        this._failRoomProtocol('MLS sync marker is malformed');
+                        return;
+                    }
+
+                    // C-01 + MLS control ordering: every application handler
+                    // runs serially. The control cursor and ACK advance only
+                    // after the handler settles successfully.
+                    this._inboundQueue = this._inboundQueue
+                        .then(async () => {
+                            if (isOrderedGroupControl) {
+                                const seq = message.control_seq;
+                                if (seq <= this.lastMlsControlSeq) {
+                                    // Harmless retransmission after an ACK race.
+                                    this._confirmMlsControl(message);
+                                    this._sendMlsControlAck(
+                                        this.lastMlsControlSeq,
+                                    );
+                                    return;
+                                }
+                                if (seq !== this.lastMlsControlSeq + 1) {
+                                    this._failRoomProtocol(
+                                        `MLS control sequence gap: expected `
+                                        + `${this.lastMlsControlSeq + 1}, got ${seq}`,
+                                    );
+                                    return;
+                                }
+                                if (this.onMessage) {
+                                    await this.onMessage(message);
+                                }
+                                this.lastMlsControlSeq = seq;
+                                this._confirmMlsControl(message);
+                                this._sendMlsControlAck(seq);
+                                return;
+                            }
+
+                            if (message.type === 'mlssync') {
+                                if (!this._mlsControlSyncing) {
+                                    this._failRoomProtocol(
+                                        'unexpected duplicate MLS sync marker',
+                                    );
+                                    return;
+                                }
+                                if (message.through_seq
+                                    !== this.lastMlsControlSeq) {
+                                    this._failRoomProtocol(
+                                        `MLS replay ended at ${message.through_seq} `
+                                        + `but local cursor is ${this.lastMlsControlSeq}`,
+                                    );
+                                    return;
+                                }
+                                if (this.onMessage) {
+                                    await this.onMessage(message);
+                                }
+                                this._mlsControlSyncing = false;
+                                this._retryPendingMlsControls();
+                                return;
+                            }
+
+                            if (this.onMessage) {
+                                await this.onMessage(message);
+                            }
+                        })
+                        .catch((err) => {
+                            console.error('[WS] Unhandled error in onMessage:', err);
+                            if ((isOrderedGroupControl
+                                || message.type === 'mlssync') && this.ws
+                                && this.ws.readyState === WebSocket.OPEN) {
+                                // Do not acknowledge or skip this sequence.
+                                // Reconnect replays it from the unchanged
+                                // cursor. A failed sync marker also reconnects:
+                                // local deferred membership work must complete
+                                // before this tab may become transport-ready.
+                                try {
+                                    this.ws.close(
+                                        1011, 'MLS control processing failed',
+                                    );
+                                } catch (_) { /* ignore close races */ }
+                            }
+                        });
                 } catch (error) {
                     console.error('Failed to parse WebSocket message:', error);
                     this._failRoomProtocol('malformed relay message');
@@ -612,10 +863,39 @@ class WebSocketManager {
             return false;
         }
 
+        let trackedKey = null;
+        let previousGeneration = null;
+        let insertedTracking = false;
+        if (this.roomType === 'group'
+            && this._isMlsControlEnvelope(message)) {
+            trackedKey = this._mlsControlKey(message);
+            const existing = this._pendingMlsControls.get(trackedKey);
+            if (existing) {
+                previousGeneration = existing.lastSentGeneration;
+                existing.lastSentGeneration = this._connectionGeneration;
+            } else {
+                this._pendingMlsControls.set(trackedKey, {
+                    envelope: { ...message },
+                    lastSentGeneration: this._connectionGeneration,
+                });
+                insertedTracking = true;
+            }
+        }
+
         try {
             this.ws.send(JSON.stringify(message));
             return true;
         } catch (error) {
+            if (trackedKey !== null) {
+                if (insertedTracking) {
+                    this._pendingMlsControls.delete(trackedKey);
+                } else {
+                    const existing = this._pendingMlsControls.get(trackedKey);
+                    if (existing) {
+                        existing.lastSentGeneration = previousGeneration;
+                    }
+                }
+            }
             console.error('Failed to send message:', error);
             return false;
         }
