@@ -106,6 +106,7 @@ async function addAndJoin(creator, joiner, existingMembers = []) {
         leafEncKeyPair: joiner.leafEncKp,
         ratchetTreeBytes: Nodes.ratchetTreeBytes(creator.ratchetTree),
         expectedSignerLeafIndex: 0,
+        expectedCommitEpoch: creator.epoch - 1n,
         ...await bootstrapPins(creator),
     });
 }
@@ -144,6 +145,7 @@ async function main() {
                     nonCreatorGroup.ratchetTree,
                 ),
                 expectedSignerLeafIndex: 1,
+                expectedCommitEpoch: nonCreatorGroup.epoch - 1n,
                 ...await bootstrapPins(nonCreatorGroup),
             }),
             'only creator leaf 0 may sign GroupInfo',

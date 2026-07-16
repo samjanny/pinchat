@@ -36,8 +36,14 @@ document.addEventListener('alpine:init', () => {
             this.loadingMessage = 'Creating...';
             this.powProgress = '';
             this.error = '';
+            const storedKeys = [];
 
             try {
+                const requestedRoomType = this.roomType;
+                const store = (key, value) => {
+                    sessionStorage.setItem(key, value);
+                    storedKeys.push(key);
+                };
                 // Generate the encryption key
                 const key = await crypto.subtle.generateKey(
                     { name: 'AES-GCM', length: 256 },
@@ -58,10 +64,19 @@ document.addEventListener('alpine:init', () => {
 
                 // Call the API to create the room (with PoW retry logic)
                 const roomData = await this.createRoomWithPoW({
-                    room_type: this.roomType,
+                    room_type: requestedRoomType,
                     ttl_minutes: this.ttlMinutes,
                     max_participants: this.maxParticipants
                 });
+                if (!roomData
+                    || roomData.room_type !== requestedRoomType
+                    || typeof roomData.room_id !== 'string'
+                    || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+                        .test(roomData.room_id)) {
+                    throw new Error(
+                        'Server room response does not match the requested room type',
+                    );
+                }
 
                 // Save WebSocket token if provided (creator optimization).
                 // Also persist the v1 protocol metadata alongside the token so
@@ -78,9 +93,9 @@ document.addEventListener('alpine:init', () => {
                             'Server did not provide a valid group creator bootstrap credential',
                         );
                     }
-                    sessionStorage.setItem(`ws_token_${roomData.room_id}`, roomData.ws_token);
-                    sessionStorage.setItem(`ws_connection_${roomData.room_id}`, roomData.connection_id);
-                    sessionStorage.setItem(
+                    store(`ws_token_${roomData.room_id}`, roomData.ws_token);
+                    store(`ws_connection_${roomData.room_id}`, roomData.connection_id);
+                    store(
                         `ws_room_type_${roomData.room_id}`,
                         roomData.room_type,
                     );
@@ -90,19 +105,19 @@ document.addEventListener('alpine:init', () => {
                         // until the first authenticated Connected frame, so a
                         // slow navigation or pre-Connected transport failure
                         // can re-mint the same stable creator relay identity.
-                        sessionStorage.setItem(
+                        store(
                             `ws_creator_bootstrap_${roomData.room_id}`,
                             roomData.creator_bootstrap_token,
                         );
                     }
                     if (roomData.protocol_version !== undefined) {
-                        sessionStorage.setItem(
+                        store(
                             `ws_protocol_version_${roomData.room_id}`,
                             String(roomData.protocol_version)
                         );
                     }
                     if (Array.isArray(roomData.supported_subprotocols)) {
-                        sessionStorage.setItem(
+                        store(
                             `ws_subprotocols_${roomData.room_id}`,
                             JSON.stringify(roomData.supported_subprotocols)
                         );
@@ -138,6 +153,7 @@ document.addEventListener('alpine:init', () => {
                 window.location.href = roomUrl.toString();
 
             } catch (err) {
+                for (const key of storedKeys) sessionStorage.removeItem(key);
                 this.error = err.message;
                 this.loading = false;
                 this.powProgress = '';

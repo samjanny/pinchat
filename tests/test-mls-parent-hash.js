@@ -99,6 +99,7 @@ async function addMember(committer, others) {
         leafEncKeyPair: joiner.leafEncKp,
         ratchetTreeBytes,
         expectedSignerLeafIndex: committer.myLeafIndex,
+        expectedCommitEpoch: committer.epoch - 1n,
         ...await bootstrapPins(committer),
     });
     for (const o of others) await o.processCommit(commitMessage);

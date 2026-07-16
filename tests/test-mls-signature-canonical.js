@@ -170,6 +170,7 @@ async function addAndJoin(creator, joiner) {
         leafEncKeyPair: joiner.leafKeyPair,
         ratchetTreeBytes: Nodes.ratchetTreeBytes(creator.ratchetTree),
         expectedSignerLeafIndex: 0,
+        expectedCommitEpoch: creator.epoch - 1n,
         expectedGroupId: Uint8Array.from(creator.groupId),
         expectedCreatorKeyHash: await Labeled.sha256(
             creator.ratchetTree[0].leaf.signatureKey,

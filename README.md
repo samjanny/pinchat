@@ -65,19 +65,34 @@ PinChat is not recommended for:
 
 PinChat currently supports private one-to-one conversations between two participants.
 
-### Group Chat
+### Experimental Group Chat
 
-Group chat is intentionally disabled.
+This branch includes an experimental, custom MLS group-chat implementation
+based on RFC 9420. It is **disabled by default**: the server rejects group-room
+creation unless the operator explicitly sets `GROUP_CHAT_ENABLED=true`, and the
+default UI does not advertise group creation. Enable it only for controlled,
+low-risk testing.
 
-The previous Bootstrap Key approach is not considered sufficient for robust group key management. Group messaging should not be enabled until the protocol has a proper design for:
+PinChat currently uses a creator-centric MLS profile for groups of up to 20
+members. The permanent creator at leaf 0 is the only member allowed to commit
+membership changes; other members may submit authenticated Update proposals
+for the creator to include. The creator cannot be removed, and transferable or
+multiple administrators are not supported.
 
-- membership changes;
-- sender authentication;
-- transcript consistency;
-- forward secrecy;
-- post-compromise recovery;
-- removed-member exclusion;
-- multi-device behavior, if supported.
+The group bootstrap binds the expected group ID and creator signature-key
+fingerprint into the invitation. A join requires a correlated, relay-accepted
+Add Commit and Welcome; the imported ratchet tree is checked for leaf
+signatures, whole-tree parent-hash validity, key uniqueness, and UpdatePath
+consistency before epoch secrets are installed. Epoch changes are staged until
+the ordered Commit echo is accepted, proposal references are authenticated and
+epoch-scoped, and application-message ratchets advance only after successful
+authentication.
+
+These checks address known implementation failure modes; they are **not** an
+independent audit, formal verification, or proof of RFC conformance. Group chat
+remains experimental and is not suitable for sensitive or high-risk
+communications. See [PROTOCOL.md](PROTOCOL.md) for the wire protocol and
+creator/bootstrap details.
 
 ## Security Model
 
@@ -296,7 +311,7 @@ PinChat should therefore be described as a browser-based encrypted relay with mi
 | Digital signatures | ECDSA P-256 | Authenticate identity keys and ratchet keys |
 | Key derivation | HKDF-SHA256 | Derive root keys, chain keys, and message keys |
 | Chain ratchet | HMAC-SHA256 | One-way message-key progression |
-| SAS generation | HKDF-SHA256, 96-bit output (SAS v3, transcript-bound) | Human-comparable verification codes |
+| SAS generation | HKDF-SHA256, 96-bit output (SAS v4, dual-key transcript-bound) | Human-comparable verification codes |
 
 These primitives are used through browser WebCrypto on the client side.
 
@@ -423,11 +438,12 @@ cargo test                  # Rust server-side tests
 node tests/run-all-tests.js # JavaScript crypto suites
 ```
 
-The JS runner has eight suites. Six (`chain`, `double`, `security`,
-`correctness`, `kat`, `wycheproof`) run without external dependencies.
-Two (`properties`, `fuzz`) require dev-dependencies installed via
-`npm ci` — `fast-check` for randomized property testing, and
-`@jazzer.js/core` for coverage-guided fuzzing of the decrypt path.
+The JS runner covers the 1:1 ratchets and handshake, security invariants,
+known-answer and Wycheproof vectors, property and fuzz testing, and the
+experimental MLS codec, TreeKEM, key schedule, framing, group lifecycle, and
+browser-session orchestration. The `properties` and `fuzz` suites require the
+dev-dependencies installed by `npm ci` — `fast-check` for randomized property
+testing and `@jazzer.js/core` for coverage-guided fuzzing of the decrypt path.
 
 If the dev-deps are not installed (offline clone, restricted npm
 registry, etc.), the runner reports those two suites as `[SKIP]`
@@ -520,6 +536,7 @@ These settings control application behavior only. They do not automatically conf
 | `FORCE_SECURE_COOKIES` | `false` | Force the Secure cookie flag |
 | `CORS_ALLOWED_ORIGINS` | `https://localhost:3000` | Comma-separated origins for CORS and WebSocket Origin checks. Required in production. Must include your public origin or browsers will fail the WebSocket upgrade with 403. Example: `https://your-domain.com,https://www.your-domain.com` |
 | `MAX_TOTAL_ROOMS` | `1000` | Maximum concurrent rooms |
+| `GROUP_CHAT_ENABLED` | `false` | Fail-closed server gate for the experimental MLS group-room API. Enable only for explicit testing; the default UI does not advertise group creation. |
 | `CSP_WS_HOST` | `'self'` | WebSocket CSP origins |
 | `WS_CONN_BURST_SIZE` | `30` | WebSocket connections allowed per period |
 | `WS_CONN_PERIOD_SECS` | `60` | Window for WebSocket connection rate limiting |

@@ -267,6 +267,12 @@ struct MlsControlAcknowledgement {
     seq: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingWelcomeCorrelation {
+    key_package_ref: String,
+    target_sender_id: Uuid,
+}
+
 #[derive(Debug, Default)]
 struct MlsControlLog {
     head_seq: u64,
@@ -276,7 +282,7 @@ struct MlsControlLog {
     key_package_by_sender: HashMap<Uuid, String>,
     key_package_refs: HashMap<String, Uuid>,
     consumed_key_package_refs: HashSet<String>,
-    pending_welcome_by_commit: HashMap<(Uuid, String), String>,
+    pending_welcome_by_commit: HashMap<(Uuid, String), PendingWelcomeCorrelation>,
     pending_welcome_order: VecDeque<(Uuid, String)>,
 }
 
@@ -587,14 +593,15 @@ impl AppState {
 
     /// Removes a room and all its connections
     pub fn remove_room(&self, room_id: &Uuid) {
-        // Remove every connection associated with the room and all of its
-        // per-connection limiter state. The socket tasks may run their final
-        // cleanup after this method; removing the connection mapping first
-        // would otherwise make that cleanup a no-op and leak these entries
-        // forever across room churn.
-        let mut connection_ids: HashSet<Uuid> = self
-            .rooms
-            .get(room_id)
+        // Remove the authoritative room entry first. Once teardown starts,
+        // add_connection() can no longer admit a socket while secondary
+        // indexes are being cleared.
+        let removed_room = self.rooms.remove(room_id).map(|(_, room)| room);
+
+        // Include reserved participants from the removed room so retained
+        // limiter state is erased even if their socket already detached.
+        let mut connection_ids: HashSet<Uuid> = removed_room
+            .as_ref()
             .map(|room| room.participant_ids.iter().copied().collect())
             .unwrap_or_default();
         connection_ids.extend(
@@ -622,9 +629,6 @@ impl AppState {
         self.seen_message_hashes.remove(room_id);
         self.room_traffic_windows.remove(room_id);
 
-        // Remove the room
-        self.rooms.remove(room_id);
-
         #[cfg(debug_assertions)]
         tracing::debug!("Room removed");
     }
@@ -639,10 +643,51 @@ impl AppState {
         room_id: Uuid,
         allow_resume: bool,
     ) -> Option<ConnectionAdmission> {
+        // Trusted in-process callers (currently unit tests and maintenance
+        // paths) may use the convenience API. The network admission path uses
+        // add_connection_with_bootstrap_generation() with the JWT claim.
+        let creator_bootstrap_generation = self.rooms.get(&room_id).and_then(|room| {
+            (room.creator_connection_id() == Some(connection_id)
+                && room
+                    .creator_bootstrap_is_live_at_generation(room.creator_bootstrap_generation()))
+            .then(|| room.creator_bootstrap_generation())
+        });
+        self.add_connection_with_bootstrap_generation(
+            connection_id,
+            room_id,
+            allow_resume,
+            creator_bootstrap_generation,
+        )
+    }
+
+    /// Admission variant used by the WebSocket upgrade. Creator-bootstrap
+    /// generation validation and participant insertion happen under the same
+    /// room guard, so an ACK that revokes bootstrap cannot race a stale JWT
+    /// into the room after a separate pre-check.
+    pub fn add_connection_with_bootstrap_generation(
+        &self,
+        connection_id: Uuid,
+        room_id: Uuid,
+        allow_resume: bool,
+        creator_bootstrap_generation: Option<u64>,
+    ) -> Option<ConnectionAdmission> {
         match self.connections.entry(connection_id) {
             Entry::Occupied(_) => None,
             Entry::Vacant(active_slot) => {
                 let mut room = self.rooms.get_mut(&room_id)?;
+                let is_creator = room.creator_connection_id() == Some(connection_id);
+                if is_creator
+                    && room.creator_bootstrap_is_live_at_generation(
+                        room.creator_bootstrap_generation(),
+                    )
+                {
+                    let supplied = creator_bootstrap_generation?;
+                    if !room.creator_bootstrap_is_live_at_generation(supplied) {
+                        return None;
+                    }
+                } else if creator_bootstrap_generation.is_some() {
+                    return None;
+                }
                 let admission = if allow_resume {
                     // Fail closed if the grace reservation disappeared after
                     // the resume upgrade token was minted but before the
@@ -666,6 +711,28 @@ impl AppState {
                 Some(admission)
             }
         }
+    }
+
+    pub fn creator_bootstrap_claim_is_live(
+        &self,
+        room_id: &Uuid,
+        connection_id: Uuid,
+        generation: u64,
+    ) -> bool {
+        self.rooms
+            .get(room_id)
+            .map(|room| {
+                room.creator_connection_id() == Some(connection_id)
+                    && room.creator_bootstrap_is_live_at_generation(generation)
+            })
+            .unwrap_or(false)
+    }
+
+    pub fn mark_creator_control_ready(&self, room_id: &Uuid, connection_id: Uuid) -> bool {
+        self.rooms
+            .get_mut(room_id)
+            .map(|mut room| room.mark_creator_control_ready(connection_id))
+            .unwrap_or(false)
     }
 
     /// Detach the active socket while retaining its participant reservation.
@@ -1161,16 +1228,18 @@ impl AppState {
                 commit_ref,
                 key_package_ref,
             } => {
-                if !log.key_package_refs.contains_key(key_package_ref) {
-                    return Err(MlsControlAppendError::UnknownKeyPackageRef);
-                }
+                let target_sender_id = *log
+                    .key_package_refs
+                    .get(key_package_ref)
+                    .ok_or(MlsControlAppendError::UnknownKeyPackageRef)?;
                 if log.consumed_key_package_refs.len() >= MAX_CONSUMED_MLS_KEY_PACKAGE_REFS {
                     return Err(MlsControlAppendError::CapacityExceeded);
                 }
                 if let Some(existing) = log
                     .pending_welcome_by_commit
                     .get(&(*sender_id, commit_ref.clone()))
-                    && existing != key_package_ref
+                    && (existing.key_package_ref != *key_package_ref
+                        || existing.target_sender_id != target_sender_id)
                 {
                     return Err(MlsControlAppendError::CommitCorrelationConflict);
                 }
@@ -1183,7 +1252,7 @@ impl AppState {
                 if log
                     .pending_welcome_by_commit
                     .get(&(*sender_id, commit_ref.clone()))
-                    .map(String::as_str)
+                    .map(|correlation| correlation.key_package_ref.as_str())
                     != Some(key_package_ref.as_str())
                 {
                     return Err(MlsControlAppendError::WelcomeNotCorrelated);
@@ -1252,6 +1321,10 @@ impl AppState {
             } => {
                 let correlation_key = (sender_id, commit_ref);
                 let consumed_key_package_ref = key_package_ref.clone();
+                let target_sender_id = *log
+                    .key_package_refs
+                    .get(&consumed_key_package_ref)
+                    .expect("Add admission validated KeyPackageRef ownership");
                 if !log.pending_welcome_by_commit.contains_key(&correlation_key) {
                     while log.pending_welcome_by_commit.len()
                         >= MAX_PENDING_MLS_WELCOME_CORRELATIONS
@@ -1263,8 +1336,13 @@ impl AppState {
                     }
                     log.pending_welcome_order.push_back(correlation_key.clone());
                 }
-                log.pending_welcome_by_commit
-                    .insert(correlation_key, key_package_ref);
+                log.pending_welcome_by_commit.insert(
+                    correlation_key,
+                    PendingWelcomeCorrelation {
+                        key_package_ref,
+                        target_sender_id,
+                    },
+                );
                 log.key_package_refs.remove(&consumed_key_package_ref);
                 log.consumed_key_package_refs
                     .insert(consumed_key_package_ref);
@@ -1463,7 +1541,7 @@ impl AppState {
             .unwrap_or(false)
     }
 
-    fn forget_mls_control_participant(&self, room_id: Uuid, connection_id: &Uuid) {
+    pub(crate) fn forget_mls_control_participant(&self, room_id: Uuid, connection_id: &Uuid) {
         let participant_ids: Vec<Uuid> = self
             .rooms
             .get(&room_id)
@@ -1478,9 +1556,13 @@ impl AppState {
             log.key_package_refs.remove(&key_package_ref);
         }
         log.pending_welcome_by_commit
-            .retain(|(sender_id, _), _| sender_id != connection_id);
+            .retain(|(sender_id, _), correlation| {
+                sender_id != connection_id && correlation.target_sender_id != *connection_id
+            });
+        let retained_correlations: HashSet<(Uuid, String)> =
+            log.pending_welcome_by_commit.keys().cloned().collect();
         log.pending_welcome_order
-            .retain(|(sender_id, _)| sender_id != connection_id);
+            .retain(|correlation_key| retained_correlations.contains(correlation_key));
         Self::prune_acknowledged_mls_controls(&mut log, &participant_ids);
     }
 

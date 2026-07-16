@@ -160,6 +160,9 @@ document.addEventListener('alpine:init', () => {
                 )
             )
                 ? 'creator' : 'joiner';
+            const creatorExpectedRoomType = sessionStorage.getItem(
+                `ws_room_type_${this.roomId}`,
+            );
             debugLog('[MLS] Role captured at init:', this.mlsRole);
 
             // Best-effort cleanup of decrypted image blob URLs when the tab
@@ -190,7 +193,18 @@ document.addEventListener('alpine:init', () => {
             }, 1000);
 
             // Initialize WebSocket
-            this.wsManager = new WebSocketManager(this.roomId);
+            const invitePinsGroup = Boolean(
+                window.cryptoManager.mlsExpectedGroupId
+                && window.cryptoManager.mlsExpectedCreatorKeyHash,
+            );
+            const expectedRoomType = invitePinsGroup
+                ? 'group'
+                : (creatorExpectedRoomType === 'group'
+                    || creatorExpectedRoomType === 'onetoone'
+                    ? creatorExpectedRoomType : null);
+            this.wsManager = new WebSocketManager(this.roomId, {
+                expectedRoomType,
+            });
 
             this.wsManager.onConnected = async () => {
                 // Detect if this is a reconnection (vs initial connection)
@@ -299,6 +313,21 @@ document.addEventListener('alpine:init', () => {
                     return;
                 }
                 this.error = '⚠️ Connection error. Retrying automatically...';
+            };
+
+            this.wsManager.onTerminalSecurityFailure = (reason) => {
+                this.mlsTransportSynced = false;
+                this.mlsReady = false;
+                this.mlsRosterValid = false;
+                this.mlsSelfIdentity = null;
+                this.groupPeers = [];
+                this._stopMlsUpdateTimer();
+                if (this.mlsSession) {
+                    this.mlsSession.destroy(
+                        `terminal relay/transport failure: ${reason}`,
+                    );
+                    this.mlsSession = null;
+                }
             };
 
             this.wsManager.onResumeRejected = () => this.roomType !== 'group';
@@ -428,16 +457,12 @@ document.addEventListener('alpine:init', () => {
                         } catch (err) {
                             console.error('[MLS] Failed to process envelope:', err);
                             this.error = '⚠️ Group crypto error: ' + err.message;
-                            // The WebSocket control cursor must not advance
-                            // past a failed exact PendingCommit acceptance or
-                            // an authenticated creator Commit which could not
-                            // be applied. A validated KeyPackage which failed
-                            // only during local candidate construction is
-                            // likewise replayed from the unchanged cursor.
-                            if (isPendingCommitAck
-                                || err?.mlsFatalState === true
-                                || err?.mlsRetryControl === true
-                                || err?.mlsControlRejected === true) throw err;
+                            // Every ordered MLS failure must reach the
+                            // transport queue. Typed deterministic rejections
+                            // are ACKed there; transient or unexpected errors
+                            // retain the cursor and consume the bounded replay
+                            // budget instead of being silently acknowledged.
+                            throw err;
                         }
                     }
                     break;
@@ -464,6 +489,12 @@ document.addEventListener('alpine:init', () => {
                     break;
 
                 case 'mlsrejected':
+                    if (message.retry_after_secs > 0 && this.wsManager) {
+                        this.wsManager.deferPendingMlsControl(
+                            message.commit_ref,
+                            message.retry_after_secs,
+                        );
+                    }
                     if (this.mlsSession) {
                         await this.mlsSession.onTransportRejection(message);
                     }
@@ -1752,7 +1783,7 @@ document.addEventListener('alpine:init', () => {
 
                 this.wsManager.send({
                     type: 'ecdh_public_key',
-                    payload: payloadJson  // JSON string with {encryptedKey, timestamp, nonce}
+                    payload: payloadJson  // JSON string with {version, encryptedEnvelope, timestamp, nonce}
                 });
 
                 debugLog('[ECDH] Public key sent with AAD binding, waiting for other participant...');
@@ -1894,7 +1925,7 @@ document.addEventListener('alpine:init', () => {
             }
 
             // Guard against receiving key before our own keypair is ready (race condition)
-            if (!this.ecdhManager || !this.ecdhManager.keyPair) {
+            if (!this.ecdhManager || !this.ecdhManager.ratchetKeyPair) {
                 console.warn('[ECDH] Received public key but not ready yet, storing for later processing...');
                 this.pendingECDHKey = message;  // Store full message object (includes sender_id)
                 return;
@@ -1915,24 +1946,26 @@ document.addEventListener('alpine:init', () => {
                     throw new Error('Invalid ECDH message format: payload is not valid JSON');
                 }
 
-                // Extract context from parsed payload
-                const { encryptedKey, timestamp, nonce, identityPublicKey, signature } = payloadData;
+                // Extract context from parsed payload (handshake v2 envelope).
+                // Identity key + signature are now INSIDE the encrypted envelope
+                // (anti-correlation), not on the wire.
+                const { version, encryptedEnvelope, timestamp, nonce } = payloadData;
 
                 // Validate the presence of all fields required for the handshake
-                if (!encryptedKey || !timestamp || !nonce || !identityPublicKey || !signature) {
-                    throw new Error('Invalid ECDH message format: missing encryptedKey, timestamp, nonce, identityPublicKey, or signature');
+                if (typeof version === 'undefined' || !encryptedEnvelope || !timestamp || !nonce) {
+                    throw new Error('Invalid ECDH message format: missing version, encryptedEnvelope, timestamp, or nonce');
                 }
 
-                // Decrypt and validate AAD (roomId, sender_id, timestamp, nonce)
-                // Also verify the signature with the peer's identity key
+                // Decrypt+authenticate the v2 envelope: AAD binding, transcript
+                // signature over both ephemeral keys, and peer identity import.
+                // Fails closed on any non-v2 (legacy) peer.
                 await this.ecdhManager.decryptPublicKey(
-                    encryptedKey,
+                    encryptedEnvelope,
                     this.roomId,        // Expected room ID
                     message.sender_id,  // Sender's connection ID
                     timestamp,          // Timestamp from sender
                     nonce,              // Nonce from sender
-                    identityPublicKey,  // Peer's identity public key
-                    signature           // Signature on ephemeral key
+                    version             // Handshake protocol version
                 );
 
                 // Check if the peer's identity key changed (possible MITM on reconnect)
@@ -1987,16 +2020,20 @@ document.addEventListener('alpine:init', () => {
                 const isInitiator = this.userId < otherUserId;
                 debugLog(`[ECDH] Role determination: ${isInitiator ? 'Initiator' : 'Responder'} (my ID: ${this.userId}, other ID: ${otherUserId})`);
 
-                // Initialize Double Ratchet (PFS + PCS) with identity manager and ECDH keypairs
+                // Initialize Double Ratchet (PFS + PCS) with identity manager and ECDH keypairs.
+                // We hand the RATCHET keypair to the ratchet, never the handshake
+                // keypair that derived S — that one is destroyed below so S cannot
+                // be recomputed from any state the ratchet retains.
                 await window.cryptoManager.initializeDoubleRatchet(
-                    this.identityManager,           // Identity manager for signing ephemeral keys
+                    this.identityManager,                  // Identity manager for signing ephemeral keys
                     sessionKeyMaterial,
                     isInitiator,
-                    this.ecdhManager.keyPair,       // Our ECDH keypair (for DH ratchet)
-                    this.ecdhManager.otherPublicKey // Peer's public key (for DH ratchet)
+                    this.ecdhManager.ratchetKeyPair,       // Our ratchet keypair (becomes DHs)
+                    this.ecdhManager.otherRatchetPublicKey // Peer's ratchet public key (becomes DHr)
                 );
 
-                // Genera SAS per verifica MITM (con context binding: roomId + nonces + timestamps)
+                // Generate the SAS over roomId, both identity keys, and both
+                // handshake+ratchet public-key pairs.
                 // NOTE: Must be called BEFORE destroyEphemeralKeys()
                 this.sas = await this.ecdhManager.generateSAS(this.roomId);
                 this.sasBackup = this.sas;  // Backup for reopening verification

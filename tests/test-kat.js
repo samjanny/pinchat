@@ -17,11 +17,13 @@
  *   2. Initial chain labels   — initiator vs responder receive/send chains
  *   3. Chain ratchet step     — CK_n+1 = HMAC-SHA256(CK_n, "ChainRatchet")
  *   4. Canonical DH header    — tag || u16_be(len) || dh || u32_be(rc)
+ *   5. Handshake v2 transcript— fixed canonical bytes + pinned SHA-256 digest
+ *   6. SAS v4                 — fixed P-256 public inputs + pinned 96-bit output
  *
  * OUT OF SCOPE on purpose:
- *   - Anything that needs a randomly-generated ECDH/ECDSA keypair (those
- *     can't be deterministic without importing private bytes, and importing
- *     a private key bypasses the non-extractable guarantee we test elsewhere).
+ *   - Anything that needs a randomly-generated ECDH/ECDSA private keypair.
+ *     SAS v4 needs only public points, so its KAT imports fixed, valid P-256
+ *     public encodings without ever importing private material.
  *   - Anything that needs to peek inside an AES-GCM `CryptoKey` (those are
  *     intentionally non-extractable from JS).
  *
@@ -211,48 +213,53 @@ async function testChainRatchetStep() {
     pass('chain ratchet CK_1 and CK_5 match HMAC-SHA256(prev, "ChainRatchet") reference');
 }
 
-// ── KAT 5: SAS v3 (HKDF-SHA256, 96 bits, transcript-bound) ──────────────
+// ── KAT 6: SAS v4 (HKDF-SHA256, 96 bits, dual-key transcript-bound) ──────
 
-async function testSasV3() {
-    // SAS v3 derivation per static/js/ecdh.js#generateSAS (audit H1):
+async function testSasV4() {
+    // SAS v4 derivation per static/js/ecdh.js#generateSAS (handshake v2 key
+    // separation):
     //   IKM        = sorted(IK_A_raw || IK_B_raw)
-    //   salt       = roomId || "pinchat-sas-v3"
-    //   transcript = SHA-256( sorted(EPH_A_raw || EPH_B_raw) )
-    //   info       = "SAS-display-v3" || transcript
+    //   salt       = roomId || "pinchat-sas-v4"
+    //   BLOCK_x    = handshakePub_x || ratchetPub_x      (both live ECDH keys)
+    //   transcript = SHA-256( sorted(BLOCK_A, BLOCK_B) )
+    //   info       = "SAS-display-v4" || transcript
     //   bits       = 96  (12 bytes, 16 emoji × 6 bits)
     //
-    // The test pins four properties:
+    // The test pins:
     //   (a) byte-exact HKDF output against an independent Node reference,
-    //   (b) stability - two runs with the SAME identity keys, room id, and
-    //       ephemeral keys produce the same SAS (transcript binding does not
-    //       break determinism for a fixed transcript),
-    //   (c) symmetry - Alice and Bob compute the same SAS regardless of which
-    //       side calls generateSAS (identity AND ephemeral keys cross over),
-    //   (d) transcript sensitivity - changing one ephemeral key changes the SAS
-    //       (proves the live session is actually bound).
+    //   (b) stability for a fixed transcript,
+    //   (c) symmetry - Alice and Bob compute the same SAS,
+    //   (d) transcript sensitivity - changing EITHER the handshake OR the
+    //       ratchet key on either side changes the SAS (proves v4 binds both).
 
-    // Real ECDSA P-256 identity keypairs (synthetic 65-byte buffers are
-    // rejected by importKey('raw', ...) as off-curve). Generated once; their
-    // raw bytes are fixed for the run and fed into both the reference HKDF and
-    // the production generateSAS.
-    const kpA = await webcrypto.subtle.generateKey(
-        { name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify']
+    // Fixed valid uncompressed P-256 points [1]G through [7]G. Only public
+    // material is imported; private-key extractability is tested elsewhere.
+    // Keeping the raw inputs and final output pinned makes this a real KAT,
+    // not merely a differential test over fresh random keys.
+    const fixedPublicHex = [
+        '046b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c2964fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5',
+        '047cf27b188d034f7e8a52380304b51ac3c08969e277f21b35a60b48fc4766997807775510db8ed040293d9ac69f7430dbba7dade63ce982299e04b79d227873d1',
+        '045ecbe4d1a6330a44c8f7ef951d4bf165e6c6b721efada985fb41661bc6e7fd6c8734640c4998ff7e374b06ce1a64a2ecd82ab036384fb83d9a79b127a27d5032',
+        '04e2534a3532d08fbba02dde659ee62bd0031fe2db785596ef509302446b030852e0f1575a4c633cc719dfee5fda862d764efc96c3f30ee0055c42c23f184ed8c6',
+        '0451590b7a515140d2d784c85608668fdfef8c82fd1f5be52421554a0dc3d033ede0c17da8904a727d8ae1bf36bf8a79260d012f00d4d80888d1d0bb44fda16da4',
+        '04b01a172a76a4602c92d3242cb897dde3024c740debb215b4c6b0aae93c2291a9e85c10743237dad56fec0e2dfba703791c00f7701c7e16bdfd7c48538fc77fe2',
+        '048e533b6fa0bf7b4625bb30667c01fb607ef9f8b8a80fef5b300628703187b2a373eb1dbde03318366d069f83a6f5900053c73633cb041b21c55e1a86c1f400b4',
+    ];
+    const fixed = fixedPublicHex.map((v) => new Uint8Array(Buffer.from(v, 'hex')));
+    const [ikA, ikB, hsA, rtA, hsB, rtB, alternateRaw] = fixed;
+    const importIdentity = (raw) => webcrypto.subtle.importKey(
+        'raw', raw, { name: 'ECDSA', namedCurve: 'P-256' }, true, ['verify'],
     );
-    const kpB = await webcrypto.subtle.generateKey(
-        { name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify']
+    const importEcdh = (raw) => webcrypto.subtle.importKey(
+        'raw', raw, { name: 'ECDH', namedCurve: 'P-256' }, true, [],
     );
-    const ikA = new Uint8Array(await webcrypto.subtle.exportKey('raw', kpA.publicKey));
-    const ikB = new Uint8Array(await webcrypto.subtle.exportKey('raw', kpB.publicKey));
-
-    // Live ECDH P-256 ephemeral keypairs for the transcript binding.
-    const ephKpA = await webcrypto.subtle.generateKey(
-        { name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveBits']
-    );
-    const ephKpB = await webcrypto.subtle.generateKey(
-        { name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveBits']
-    );
-    const ephA = new Uint8Array(await webcrypto.subtle.exportKey('raw', ephKpA.publicKey));
-    const ephB = new Uint8Array(await webcrypto.subtle.exportKey('raw', ephKpB.publicKey));
+    const kpA = { publicKey: await importIdentity(ikA) };
+    const kpB = { publicKey: await importIdentity(ikB) };
+    const hsKpA = { publicKey: await importEcdh(hsA) };
+    const rtKpA = { publicKey: await importEcdh(rtA) };
+    const hsKpB = { publicKey: await importEcdh(hsB) };
+    const rtKpB = { publicKey: await importEcdh(rtB) };
+    const alternateKp = { publicKey: await importEcdh(alternateRaw) };
 
     const roomId = '00000000-0000-0000-0000-000000000001';
 
@@ -265,42 +272,50 @@ async function testSasV3() {
     });
 
     // Reference IKM, transcript, salt, info - fully independent of production.
-    function referenceSasBytes(idRawA, idRawB, ephRawA, ephRawB) {
+    function referenceSasBytes(idRawA, idRawB, hsRawA, rtRawA, hsRawB, rtRawB) {
         const idKeys = sortPair(idRawA, idRawB);
         const ikm = new Uint8Array(idKeys[0].length + idKeys[1].length);
         ikm.set(idKeys[0], 0);
         ikm.set(idKeys[1], idKeys[0].length);
 
-        const ek = sortPair(ephRawA, ephRawB);
-        const transcriptInput = Buffer.concat([Buffer.from(ek[0]), Buffer.from(ek[1])]);
+        const blockA = new Uint8Array(Buffer.concat([Buffer.from(hsRawA), Buffer.from(rtRawA)]));
+        const blockB = new Uint8Array(Buffer.concat([Buffer.from(hsRawB), Buffer.from(rtRawB)]));
+        const blocks = sortPair(blockA, blockB);
+        const transcriptInput = Buffer.concat([Buffer.from(blocks[0]), Buffer.from(blocks[1])]);
         const transcript = createHash('sha256').update(transcriptInput).digest();
 
-        const salt = Buffer.concat([Buffer.from(roomId, 'utf8'), Buffer.from('pinchat-sas-v3', 'utf8')]);
-        const info = Buffer.concat([Buffer.from('SAS-display-v3', 'utf8'), transcript]);
+        const salt = Buffer.concat([Buffer.from(roomId, 'utf8'), Buffer.from('pinchat-sas-v4', 'utf8')]);
+        const info = Buffer.concat([Buffer.from('SAS-display-v4', 'utf8'), transcript]);
         return new Uint8Array(hkdfSync('sha256', ikm, salt, info, 12)); // 12 bytes = 96 bits
     }
 
-    const expectedSasBytes = referenceSasBytes(ikA, ikB, ephA, ephB);
+    const expectedSasBytes = referenceSasBytes(ikA, ikB, hsA, rtA, hsB, rtB);
+    const pinnedSasHex = 'ddecf96d49efde6010c14fca';
+    assert.strictEqual(
+        hex(expectedSasBytes),
+        pinnedSasHex,
+        'independent SAS v4 reference drifted from the frozen protocol vector',
+    );
 
-    // Production path: stub the identity manager AND the ECDH ephemeral keys
-    // the SAS code now reads (this.keyPair.publicKey + this.otherPublicKey).
-    async function sasFromPerspective(myIdPubKey, peerIdRaw, myEphPubKey, peerEphPubKey) {
+    // Production path: stub the identity manager AND the dual ECDH ephemeral
+    // keys the SAS code now reads.
+    async function sasFromPerspective(myIdPubKey, peerIdRaw, myHsPub, myRtPub, peerHsPub, peerRtPub) {
         const mgr = new IdentityKeyManager();
         mgr.identityKeyPair = { publicKey: myIdPubKey, privateKey: null };
         mgr.peerIdentityPublicKey = {};  // truthy guard
         mgr.peerIdentityPublicKeyRaw = peerIdRaw;
 
         const ecdh = new ECDHKeyExchange(null, mgr);
-        // Live ephemeral keys for transcript binding.
-        ecdh.keyPair = { publicKey: myEphPubKey, privateKey: null };
-        ecdh.otherPublicKey = peerEphPubKey;
+        ecdh.handshakeKeyPair = { publicKey: myHsPub, privateKey: null };
+        ecdh.ratchetKeyPair = { publicKey: myRtPub, privateKey: null };
+        ecdh.otherHandshakePublicKey = peerHsPub;
+        ecdh.otherRatchetPublicKey = peerRtPub;
         return ecdh.generateSAS(roomId);
     }
 
-    // Alice's view: own id = kpA, peer id = ikB; own eph = ephKpA, peer eph = ephKpB.
-    // Bob's view: the crossed assignment. Both must agree (symmetry).
-    const sasAlice = await sasFromPerspective(kpA.publicKey, ikB, ephKpA.publicKey, ephKpB.publicKey);
-    const sasBob   = await sasFromPerspective(kpB.publicKey, ikA, ephKpB.publicKey, ephKpA.publicKey);
+    // Alice's view vs Bob's crossed view; both must agree (symmetry).
+    const sasAlice = await sasFromPerspective(kpA.publicKey, ikB, hsKpA.publicKey, rtKpA.publicKey, hsKpB.publicKey, rtKpB.publicKey);
+    const sasBob   = await sasFromPerspective(kpB.publicKey, ikA, hsKpB.publicKey, rtKpB.publicKey, hsKpA.publicKey, rtKpA.publicKey);
 
     // (a) Byte-exact match against Node's hkdfSync reference.
     const aliceHexBytes = Buffer.from(sasAlice.hex.replace(/-/g, ''), 'hex');
@@ -310,37 +325,32 @@ async function testSasV3() {
         `SAS bytes mismatch: actual=${hex(aliceHexBytes)} expected=${hex(expectedSasBytes)}`
     );
 
-    // (b) Stability for a fixed transcript: same inputs → same SAS.
-    const sasAliceAgain = await sasFromPerspective(kpA.publicKey, ikB, ephKpA.publicKey, ephKpB.publicKey);
+    // (b) Stability for a fixed transcript.
+    const sasAliceAgain = await sasFromPerspective(kpA.publicKey, ikB, hsKpA.publicKey, rtKpA.publicKey, hsKpB.publicKey, rtKpB.publicKey);
     assert.strictEqual(sasAlice.emoji, sasAliceAgain.emoji, 'SAS must be stable for a fixed transcript');
     assert.strictEqual(sasAlice.hex, sasAliceAgain.hex, 'SAS hex must be stable for a fixed transcript');
 
-    // (c) Symmetry: Alice's and Bob's views must agree.
+    // (c) Symmetry.
     assert.strictEqual(sasAlice.emoji, sasBob.emoji, 'Alice and Bob must compute the same SAS emoji');
     assert.strictEqual(sasAlice.hex, sasBob.hex, 'Alice and Bob must compute the same SAS hex');
 
-    // (d) Transcript sensitivity: swap one ephemeral key for a fresh one and
-    // the SAS MUST change. This is the property that defeats the offline
-    // precompute attack - the displayed code depends on the live session keys.
-    const ephKpC = await webcrypto.subtle.generateKey(
-        { name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveBits']
-    );
-    const sasDifferentEph = await sasFromPerspective(kpA.publicKey, ikB, ephKpA.publicKey, ephKpC.publicKey);
-    assert.notStrictEqual(
-        sasAlice.hex, sasDifferentEph.hex,
-        'SAS must change when an ephemeral key changes (transcript binding active)'
-    );
+    // (d) Transcript sensitivity: changing EITHER key on the peer side changes
+    // the SAS. Both are asserted so v4 provably binds both ephemeral keys.
+    const sasDifferentRatchet = await sasFromPerspective(kpA.publicKey, ikB, hsKpA.publicKey, rtKpA.publicKey, hsKpB.publicKey, alternateKp.publicKey);
+    assert.notStrictEqual(sasAlice.hex, sasDifferentRatchet.hex, 'SAS must change when a ratchet key changes');
+    const sasDifferentHandshake = await sasFromPerspective(kpA.publicKey, ikB, hsKpA.publicKey, rtKpA.publicKey, alternateKp.publicKey, rtKpB.publicKey);
+    assert.notStrictEqual(sasAlice.hex, sasDifferentHandshake.hex, 'SAS must change when a handshake key changes');
 
     // (e) Shape sanity.
     assert.strictEqual(sasAlice.bits, 96, 'SAS must be 96 bits');
-    assert.strictEqual(sasAlice.version, 3, 'SAS object must declare version 3');
+    assert.strictEqual(sasAlice.version, 4, 'SAS object must declare version 4');
     assert.strictEqual(
         Array.from(sasAlice.emoji).length,
         16,
         `SAS emoji must be 16 emoji; got ${Array.from(sasAlice.emoji).length}`
     );
 
-    pass('SAS v3 - HKDF byte-exact vs reference, stable for fixed transcript, symmetric Alice/Bob, transcript-sensitive, 16 emoji');
+    pass('SAS v4 - fixed KAT ddecf96d49efde6010c14fca, symmetric, sensitive to BOTH key families, 16 emoji');
 }
 
 // ── KAT 4: canonical DH-header bytes ────────────────────────────────────
@@ -394,6 +404,52 @@ async function testCanonicalDhHeaderBytes() {
     pass('canonical DH-header bytes byte-exact + tag string pinned');
 }
 
+// ── KAT 5: canonical handshake-v2 transcript ────────────────────────────
+
+async function testCanonicalHandshakeTranscript() {
+    const ecdh = new ECDHKeyExchange(null, null);
+    const roomId = '00000000-0000-0000-0000-000000000001';
+    const senderId = '11111111-1111-1111-1111-111111111111';
+    const timestamp = 1700000000123;
+    const nonce = range(16);
+    const handshakeRaw = new Uint8Array(Buffer.from(
+        '045ecbe4d1a6330a44c8f7ef951d4bf165e6c6b721efada985fb41661bc6e7fd6c8734640c4998ff7e374b06ce1a64a2ecd82ab036384fb83d9a79b127a27d5032',
+        'hex',
+    ));
+    const ratchetRaw = new Uint8Array(Buffer.from(
+        '04e2534a3532d08fbba02dde659ee62bd0031fe2db785596ef509302446b030852e0f1575a4c633cc719dfee5fda862d764efc96c3f30ee0055c42c23f184ed8c6',
+        'hex',
+    ));
+    const actual = ecdh._buildHandshakeTranscript(
+        roomId, senderId, timestamp, nonce, handshakeRaw, ratchetRaw,
+    );
+
+    // Independent length-prefix implementation for the wire-format freeze.
+    const lp = (value) => {
+        const body = Buffer.from(value);
+        const prefix = Buffer.alloc(2);
+        prefix.writeUInt16BE(body.length, 0);
+        return Buffer.concat([prefix, body]);
+    };
+    const expected = Buffer.concat([
+        Buffer.from('pinchat-handshake-v2', 'utf8'),
+        lp(Buffer.from(roomId, 'utf8')),
+        lp(Buffer.from(senderId, 'utf8')),
+        lp(Buffer.from(String(timestamp), 'utf8')),
+        lp(nonce),
+        lp(handshakeRaw),
+        lp(ratchetRaw),
+    ]);
+    assert.strictEqual(hex(actual), expected.toString('hex'),
+        'canonical handshake-v2 transcript bytes mismatch');
+    assert.strictEqual(
+        createHash('sha256').update(actual).digest('hex'),
+        '4abe7a45b48f2e8b248b318c20aa950d6461dd797436a3fd71a84e25a54a98c8',
+        'canonical handshake-v2 transcript digest drifted',
+    );
+    pass('canonical handshake-v2 transcript byte-exact + SHA-256 digest pinned');
+}
+
 // ── runner ──────────────────────────────────────────────────────────────
 
 (async () => {
@@ -403,7 +459,8 @@ async function testCanonicalDhHeaderBytes() {
         await testInitialChainLabels();
         await testChainRatchetStep();
         await testCanonicalDhHeaderBytes();
-        await testSasV3();
+        await testCanonicalHandshakeTranscript();
+        await testSasV4();
         console.log('');
         console.log('All KAT suites PASSED.');
         process.exit(0);

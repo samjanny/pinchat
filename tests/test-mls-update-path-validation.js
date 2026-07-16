@@ -154,6 +154,7 @@ async function addAndJoin(creator, joiner, existingMembers = []) {
         leafEncKeyPair: joiner.leafKeyPair,
         ratchetTreeBytes: Nodes.ratchetTreeBytes(creator.ratchetTree),
         expectedSignerLeafIndex: 0,
+        expectedCommitEpoch: creator.epoch - 1n,
         ...await bootstrapPins(creator),
     });
     return { result, joined };
@@ -267,7 +268,69 @@ async function main() {
         assert(groupStateMatches(bob, beforeExtra),
             'extra-ciphertext rejection leaves recipient state unchanged');
 
+        const invalidPathPublicKey = await rewriteUpdatePath(
+            commitMessage,
+            (updatePath) => {
+                updatePath.nodes[1].encryptionKey = new Uint8Array(HPKE.Npk);
+            },
+            alice,
+            bob,
+        );
+        const beforeBadPathKeyBob = captureGroupState(bob);
+        const beforeBadPathKeyCarol = captureGroupState(carol);
+        await expectReject(
+            bob.processCommit(invalidPathPublicKey),
+            'UpdatePath node 1 encryption_key invalid',
+            'invalid off-recipient UpdatePath public key is rejected by Bob',
+        );
+        await expectReject(
+            carol.processCommit(invalidPathPublicKey),
+            'UpdatePath node 1 encryption_key invalid',
+            'same malformed path key is uniformly rejected by Carol',
+        );
+        assert(groupStateMatches(bob, beforeBadPathKeyBob)
+                && groupStateMatches(carol, beforeBadPathKeyCarol),
+            'off-recipient path-key rejection leaves both recipients unchanged');
+
+        const invalidKemOutput = await rewriteUpdatePath(
+            commitMessage,
+            (updatePath) => {
+                updatePath.nodes[1].encryptedPathSecret[0].kemOutput =
+                    new Uint8Array(HPKE.Npk);
+            },
+            alice,
+            bob,
+        );
+        const beforeBadKem = captureGroupState(bob);
+        await expectReject(
+            bob.processCommit(invalidKemOutput),
+            'ciphertext 0 kem_output invalid',
+            'invalid off-recipient KEM output is rejected',
+        );
+        assert(groupStateMatches(bob, beforeBadKem),
+            'invalid KEM output leaves recipient state unchanged');
+
+        const invalidCiphertextLength = await rewriteUpdatePath(
+            commitMessage,
+            (updatePath) => {
+                updatePath.nodes[1].encryptedPathSecret[0].ciphertext =
+                    updatePath.nodes[1].encryptedPathSecret[0]
+                        .ciphertext.slice(0, -1);
+            },
+            alice,
+            bob,
+        );
+        const beforeBadCiphertext = captureGroupState(bob);
+        await expectReject(
+            bob.processCommit(invalidCiphertextLength),
+            'ciphertext must be 48 bytes',
+            'wrong-length off-recipient HPKE ciphertext is rejected',
+        );
+        assert(groupStateMatches(bob, beforeBadCiphertext),
+            'wrong-length HPKE ciphertext leaves recipient state unchanged');
+
         await bob.processCommit(commitMessage);
+        await carol.processCommit(commitMessage);
         assert(bob.epoch === alice.epoch,
             'untampered UpdatePath still advances the recipient');
     }

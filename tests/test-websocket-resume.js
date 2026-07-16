@@ -153,6 +153,26 @@ async function main() {
         'an existing CONNECTING socket suppresses a duplicate admission',
     );
 
+    const cancelledToken = deferred();
+    const cancelledConnectManager =
+        new WebSocketManager('cancelled-connect-room');
+    cancelledConnectManager.requestWsToken =
+        async () => cancelledToken.promise;
+    const socketsBeforeCancelledConnect =
+        FakeWebSocket.instances.length;
+    const cancelledConnect =
+        cancelledConnectManager.connect();
+    await Promise.resolve();
+    cancelledConnectManager.disconnect();
+    cancelledToken.resolve('must-not-be-used');
+    await cancelledConnect;
+    check(
+        FakeWebSocket.instances.length
+            === socketsBeforeCancelledConnect
+        && cancelledConnectManager.ws === null,
+        'disconnect cancels an in-flight token request before socket creation',
+    );
+
     queuedResponses = [
         response(200, { csrf_token: csrfToken }),
         successToken('initial-upgrade-token'),
@@ -719,6 +739,22 @@ async function main() {
     await orderedManager._inboundQueue;
     check(orderedManager._pendingMlsControls.size === 1,
         'rate-limited Commit stays tracked for retry instead of being lost');
+    const retryTracked = [...orderedManager._pendingMlsControls.values()]
+        .find((entry) =>
+            entry.envelope.commit_ref === retryEnvelope.commit_ref);
+    const sendsBeforeBackoffRetry = orderedSocket.sent.length;
+    check(orderedManager.deferPendingMlsControl(
+        retryEnvelope.commit_ref, 60,
+    ), 'rate-limit response installs a retry-not-before deadline');
+    orderedManager._retryPendingMlsControls();
+    check(orderedSocket.sent.length === sendsBeforeBackoffRetry,
+        'pending Commit is not retransmitted before retry_after elapses');
+    retryTracked.retryNotBefore = 0;
+    orderedManager._retryPendingMlsControls();
+    check(orderedSocket.sent.length === sendsBeforeBackoffRetry + 1
+        && JSON.parse(orderedSocket.sent.at(-1)).payload
+            === retryEnvelope.payload,
+    'pending Commit becomes retransmittable after its backoff deadline');
 
     const rejectedWelcomeEnvelope = {
         type: 'mls',
@@ -937,6 +973,34 @@ async function main() {
 
     queuedResponses = [
         response(200, { csrf_token: csrfToken }),
+        successToken('expected-room-type-token'),
+    ];
+    const roomTypePinnedManager = new WebSocketManager(
+        'room-type-pinned-room', { expectedRoomType: 'group' },
+    );
+    let roomTypePinnedError = null;
+    roomTypePinnedManager.onError = (error) => {
+        roomTypePinnedError = error.message;
+    };
+    await roomTypePinnedManager.connect();
+    const roomTypePinnedSocket = FakeWebSocket.instances.at(-1);
+    roomTypePinnedSocket.onopen();
+    roomTypePinnedSocket.onmessage({
+        data: JSON.stringify({
+            type: 'connected',
+            user_id: 'room-type-pinned-relay-id',
+            room_type: 'onetoone',
+            resumed: false,
+            resume_token: resumeToken,
+        }),
+    });
+    await roomTypePinnedManager._inboundQueue;
+    check(roomTypePinnedSocket.closedWith?.code === 1008
+        && roomTypePinnedError === 'ROOM_PROTOCOL_VIOLATION',
+    'Connected room type must match the authenticated invite/bootstrap expectation');
+
+    queuedResponses = [
+        response(200, { csrf_token: csrfToken }),
         successToken('terminal-mls-state-token'),
     ];
     const terminalManager = new WebSocketManager('terminal-mls-room');
@@ -1015,9 +1079,7 @@ async function main() {
     };
     retryBudgetManager.onMessage = async (message) => {
         if (message.type === 'mls') {
-            const error = new Error('one-shot platform operation failed');
-            error.mlsRetryControl = true;
-            throw error;
+            throw new Error('one-shot platform operation failed');
         }
     };
     await retryBudgetManager.connect();
@@ -1056,7 +1118,7 @@ async function main() {
             frame.type === 'mlsack' && frame.control_seq === 1)
         && retryBudgetSocket.closedWith?.code === 1008
         && retryBudgetError === 'MLS_STATE_DESYNC',
-    'retryable MLS control exhausts a bounded replay budget and fails closed');
+    'untyped ordered MLS failure exhausts a bounded replay budget and fails closed');
 
     queuedResponses = [
         response(200, { csrf_token: csrfToken }),

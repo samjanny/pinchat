@@ -918,7 +918,10 @@
             if (suppliedConsumed instanceof Map) {
                 group.consumedByLeaf = suppliedConsumed;
             }
-            if (suppliedPreviousEpoch) group._prevEpoch = suppliedPreviousEpoch;
+            if (suppliedPreviousEpoch) {
+                group._prevEpoch = suppliedPreviousEpoch;
+                group._schedulePrevEpochExpiry(suppliedPreviousEpoch);
+            }
             return group;
         }
 
@@ -1005,7 +1008,6 @@
             }
             const wireFormat = MLSMessage.WireFormat.MLS_PRIVATE_MESSAGE;
             const generation = this.senderRatchetGeneration;
-            this.senderRatchetGeneration += 1;
 
             const content = {
                 groupId: this.groupId,
@@ -1030,21 +1032,39 @@
                 reuseGuard: randomBytes(4),
             };
 
-            const pm = await PrivateMessage.encryptPrivateMessage({
-                groupId: this.groupId,
-                epoch: this.epoch,
-                contentType: Framing.ContentType.APPLICATION,
-                authenticatedData: new Uint8Array(0),
-                payloadBytes: content.payload,
-                auth,
-                senderData,
-                paddingLen: 0,
-                senderDataSecret: this.epochSecrets.senderDataSecret,
-                nLeaves: this.nLeaves,
-                keyNonceProvider: (li, which, gen) => this._chainKeyNonce(li, which, gen),
-            });
-            const pmBytes = PrivateMessage.privateMessageBytes(pm);
-            return MLSMessage.serializeMLSMessage(wireFormat, pmBytes);
+            const baseChainStates = this._chainStates;
+            const ratchetTx = this._beginReceiveRatchetTransaction(
+                baseChainStates, this.nLeaves,
+            );
+            try {
+                const pm = await PrivateMessage.encryptPrivateMessage({
+                    groupId: this.groupId,
+                    epoch: this.epoch,
+                    contentType: Framing.ContentType.APPLICATION,
+                    authenticatedData: new Uint8Array(0),
+                    payloadBytes: content.payload,
+                    auth,
+                    senderData,
+                    paddingLen: 0,
+                    senderDataSecret: this.epochSecrets.senderDataSecret,
+                    nLeaves: this.nLeaves,
+                    keyNonceProvider: ratchetTx.keyNonceProvider,
+                });
+                const pmBytes = PrivateMessage.privateMessageBytes(pm);
+                const wrapped = MLSMessage.serializeMLSMessage(
+                    wireFormat, pmBytes,
+                );
+                if (this._chainStates !== baseChainStates
+                    || this.senderRatchetGeneration !== generation) {
+                    throw new Error('group: concurrent send-ratchet mutation');
+                }
+                this._chainStates = ratchetTx.commit();
+                this.senderRatchetGeneration = generation + 1;
+                return wrapped;
+            } catch (err) {
+                ratchetTx.rollback();
+                throw err;
+            }
         }
 
         /**
@@ -1542,6 +1562,13 @@
         // generated committer path. This runs before tree_hash, transcripts,
         // epoch-secret derivation, Welcome construction, or local mutation.
         this._verifyFinalTreeKeyUniqueness(newTree, 'commitAddMember');
+        verifyAddedLeafReachability(
+            newTree,
+            newNLeaves,
+            newLeafIndex,
+            this.myLeafIndex,
+            'commitAddMember',
+        );
 
         // ---- 5. Compute new tree hash + provisional GroupContext ----
         const newTreeHash = await TreeHash.hashRoot(newTree);
@@ -2297,6 +2324,11 @@
         if (!Array.isArray(updateProposals)) {
             throw new Error('commitUpdate: updateProposals must be an array');
         }
+        if (this.nLeaves < 2) {
+            throw new Error(
+                'commitUpdate: path-only Commit requires at least two live tree leaves',
+            );
+        }
         const newNLeaves = this.nLeaves;
         const newWidth = TreeMath.nodeWidth(newNLeaves);
         const newTree = Nodes.padRatchetTree(this.ratchetTree.slice(), newWidth);
@@ -2758,7 +2790,7 @@
         const addedLeafNodes = new Set(
             addedLeafIndices.map((leafIndex) => TreeMath.leafToNode(leafIndex)),
         );
-        const pathCopathResolutions = verifyUpdatePathCiphertextLayout(
+        const pathCopathResolutions = await verifyUpdatePathCiphertextLayout(
             newTree,
             newNLeaves,
             senderLeafIndex,
@@ -2823,6 +2855,15 @@
         // here as well so an Add cannot install a colliding key for members
         // that are processing the Commit in steady state.
         this._verifyFinalTreeKeyUniqueness(newTree, 'processCommit');
+        for (const addedLeafIndex of addedLeafIndices) {
+            verifyAddedLeafReachability(
+                newTree,
+                newNLeaves,
+                addedLeafIndex,
+                senderLeafIndex,
+                'processCommit',
+            );
+        }
 
         // Provisional group context for HPKE info string.
         const newTreeHash = await TreeHash.hashRoot(newTree);
@@ -3124,8 +3165,8 @@
      *   expectedSignerLeafIndex : member sender_leaf_index parsed from the
      *                       Commit paired with this Welcome (required)
      *   expectedCommitEpoch : epoch carried by that correlated Commit;
-     *                       when supplied, GroupInfo must describe exactly
-     *                       the following epoch
+     *                       GroupInfo must describe exactly the following
+     *                       epoch (required)
      *   expectedGroupId   : 32-byte group_id pinned in the invite fragment
      *   expectedCreatorKeyHash : SHA-256(signature_key of leaf 0), also
      *                       pinned in the invite fragment
@@ -3268,15 +3309,17 @@
         if (!equalBytes(groupInfo.groupContext.groupId, expectedGroupId)) {
             throw new Error('group.join: group_id does not match invite bootstrap pin');
         }
-        if (expectedCommitEpoch !== undefined && expectedCommitEpoch !== null) {
-            if (typeof expectedCommitEpoch !== 'bigint') {
-                throw new Error('group.join: expectedCommitEpoch must be a uint64 BigInt');
-            }
-            if (groupInfo.groupContext.epoch !== expectedCommitEpoch + 1n) {
-                throw new Error(
-                    'group.join: Welcome epoch does not immediately follow correlated Commit epoch',
-                );
-            }
+        if (typeof expectedCommitEpoch !== 'bigint'
+            || expectedCommitEpoch < 0n
+            || expectedCommitEpoch > 0xffffffffffffffffn) {
+            throw new Error(
+                'group.join: expectedCommitEpoch must be a uint64 BigInt',
+            );
+        }
+        if (groupInfo.groupContext.epoch !== expectedCommitEpoch + 1n) {
+            throw new Error(
+                'group.join: Welcome epoch does not immediately follow correlated Commit epoch',
+            );
         }
 
         // Parse the ratchet tree. The committer always serialises with
@@ -3408,6 +3451,13 @@
         if (lcaIdx === -1) {
             throw new Error('group.join: signer leaf not under any of our ancestors');
         }
+        verifyAddedLeafReachability(
+            tree,
+            nLeaves,
+            myLeafIndex,
+            signerLeafIndex,
+            'group.join',
+        );
         const parentKeyPairs = new Map();
         parentKeyPairsForCleanup = parentKeyPairs;
         let cur = gs.pathSecret;
@@ -3754,7 +3804,7 @@
      *
      * Returns the filtered resolutions for subsequent ciphertext lookup.
      */
-    function verifyUpdatePathCiphertextLayout(
+    async function verifyUpdatePathCiphertextLayout(
         tree,
         nLeaves,
         committerLeafIndex,
@@ -3774,6 +3824,25 @@
                 ? resolution.filter((nodeIndex) => !addedLeafNodes.has(nodeIndex))
                 : resolution;
             const updatePathNode = updatePathNodes[pathIndex];
+            if (!updatePathNode
+                || !(updatePathNode.encryptionKey instanceof Uint8Array)
+                || updatePathNode.encryptionKey.length !== HPKE.Npk) {
+                const actualLength = updatePathNode
+                    && updatePathNode.encryptionKey instanceof Uint8Array
+                    ? updatePathNode.encryptionKey.length : 'invalid';
+                throw new Error(
+                    `${operation}: UpdatePath node ${pathIndex} encryption_key `
+                    + `must be ${HPKE.Npk} bytes (got ${actualLength})`,
+                );
+            }
+            try {
+                await HPKE.deserializePublicKey(updatePathNode.encryptionKey);
+            } catch (err) {
+                throw new Error(
+                    `${operation}: UpdatePath node ${pathIndex} encryption_key invalid: `
+                    + err.message,
+                );
+            }
             const ciphertexts = updatePathNode && updatePathNode.encryptedPathSecret;
             if (!Array.isArray(ciphertexts)) {
                 throw new Error(
@@ -3787,9 +3856,95 @@
                     + `${ciphertexts.length} != filtered copath resolution ${filtered.length}`,
                 );
             }
+            for (let ciphertextIndex = 0;
+                ciphertextIndex < ciphertexts.length;
+                ciphertextIndex += 1) {
+                const encrypted = ciphertexts[ciphertextIndex];
+                if (!encrypted
+                    || !(encrypted.kemOutput instanceof Uint8Array)
+                    || encrypted.kemOutput.length !== HPKE.Npk) {
+                    const actualLength = encrypted
+                        && encrypted.kemOutput instanceof Uint8Array
+                        ? encrypted.kemOutput.length : 'invalid';
+                    throw new Error(
+                        `${operation}: UpdatePath node ${pathIndex} ciphertext `
+                        + `${ciphertextIndex} kem_output must be ${HPKE.Npk} bytes `
+                        + `(got ${actualLength})`,
+                    );
+                }
+                try {
+                    await HPKE.deserializePublicKey(encrypted.kemOutput);
+                } catch (err) {
+                    throw new Error(
+                        `${operation}: UpdatePath node ${pathIndex} ciphertext `
+                        + `${ciphertextIndex} kem_output invalid: ${err.message}`,
+                    );
+                }
+                const expectedCiphertextLength = HPKE.Nh + 16;
+                if (!(encrypted.ciphertext instanceof Uint8Array)
+                    || encrypted.ciphertext.length !== expectedCiphertextLength) {
+                    const actualLength = encrypted
+                        && encrypted.ciphertext instanceof Uint8Array
+                        ? encrypted.ciphertext.length : 'invalid';
+                    throw new Error(
+                        `${operation}: UpdatePath node ${pathIndex} ciphertext `
+                        + `${ciphertextIndex} ciphertext must be `
+                        + `${expectedCiphertextLength} bytes (got ${actualLength})`,
+                    );
+                }
+            }
             resolutions.push(filtered);
         }
         return resolutions;
+    }
+
+    /**
+     * A freshly added leaf does not receive UpdatePath ciphertexts. It learns
+     * the path secret at its LCA with the committer through the Welcome, so
+     * every non-blank parent strictly below that LCA must retain the leaf in
+     * unmerged_leaves. Otherwise the joiner can accept the epoch but will be
+     * absent from that parent's resolution and become unreachable by a later
+     * committer in the sibling subtree.
+     */
+    function verifyAddedLeafReachability(
+        tree,
+        nLeaves,
+        addedLeafIndex,
+        committerLeafIndex,
+        operation,
+    ) {
+        const directPath = TreeMath.directPathWithRoot(
+            TreeMath.leafToNode(addedLeafIndex),
+            nLeaves,
+        );
+        let lcaIndex = -1;
+        for (let i = 0; i < directPath.length; i += 1) {
+            if (TreeMath.leafDescendants(directPath[i], nLeaves)
+                .includes(committerLeafIndex)) {
+                lcaIndex = i;
+                break;
+            }
+        }
+        if (lcaIndex === -1) {
+            throw new Error(
+                `${operation}: added leaf ${addedLeafIndex} has no LCA with `
+                + `committer leaf ${committerLeafIndex}`,
+            );
+        }
+        for (let i = 0; i < lcaIndex; i += 1) {
+            const parentNodeIndex = directPath[i];
+            const slot = tree[parentNodeIndex];
+            if (!slot) continue;
+            if (slot.nodeType !== Nodes.NodeType.PARENT
+                || !Array.isArray(slot.parent.unmergedLeaves)
+                || !slot.parent.unmergedLeaves.includes(addedLeafIndex)) {
+                throw new Error(
+                    `${operation}: added leaf ${addedLeafIndex} is missing from `
+                    + `unmerged_leaves of parent ${parentNodeIndex} below its `
+                    + 'committer LCA',
+                );
+            }
+        }
     }
 
     /**

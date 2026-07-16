@@ -281,6 +281,10 @@ async fn main() {
             header::HeaderName::from_static("x-pow-nonce"),
             header::HeaderName::from_static("x-pow-challenge"),
             header::HeaderName::from_static("x-pow-difficulty"),
+            header::HeaderName::from_static("x-csrf-token"),
+            header::HeaderName::from_static("x-pinchat-resume-token"),
+            header::HeaderName::from_static("x-pinchat-creator-bootstrap"),
+            header::HeaderName::from_static("x-pinchat-mls-control-seq"),
         ]);
 
     // Configure rate limiting for login endpoint (brute force protection)

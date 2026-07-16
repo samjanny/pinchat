@@ -167,6 +167,9 @@ pub struct Config {
     // Used both for the CorsLayer (HTTP responses) and the WebSocket Origin check.
     // Default: "https://localhost:3000"
     pub cors_allowed_origins: Vec<String>,
+
+    // Fail-closed deployment gate for the experimental custom MLS feature.
+    pub group_chat_enabled: bool,
 }
 
 impl Config {
@@ -421,6 +424,10 @@ impl Config {
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
                 .collect(),
+            group_chat_enabled: env::var("GROUP_CHAT_ENABLED")
+                .ok()
+                .map(|v| matches!(v.to_lowercase().as_str(), "true" | "1" | "yes"))
+                .unwrap_or(false),
         };
 
         // Validate configuration
@@ -517,8 +524,8 @@ impl Config {
         if self.challenge_ttl_secs == 0 {
             panic!("CHALLENGE_TTL_SECS must be greater than 0");
         }
-        if self.jwt_token_ttl_secs == 0 {
-            panic!("JWT_TOKEN_TTL_SECS must be greater than 0");
+        if !(1..=300).contains(&self.jwt_token_ttl_secs) {
+            panic!("JWT_TOKEN_TTL_SECS must be between 1 and 300");
         }
         if self.max_ws_connection_age_secs == 0 {
             panic!("MAX_WS_CONNECTION_AGE_SECS must be greater than 0");

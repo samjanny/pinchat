@@ -4,6 +4,63 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Dates are the repository-local commit dates; entries are curated for user-visible impact
 rather than being a 1:1 mirror of `git log`.
 
+## [Unreleased] - target v0.6.0, handshake v2
+
+Breaking E2E handshake change. Wire-incompatible with v1; both endpoints must
+run v2 (a v1 peer is refused fail-closed). The WebSocket subprotocol
+(`pinchat.v1`) is unchanged - the relay stays a blind forwarder.
+
+### Fixed - initial shared secret recomputable after key destruction (PFS)
+
+The ECDH keypair that derived the initial shared secret S was handed to the
+Double Ratchet by reference and stored as its `DHs`. `destroyEphemeralKeys()`
+nulled only the ECDH manager's reference, so the ratchet still held the same
+`CryptoKeyPair`; its private key retained `deriveBits`. `extractable:false`
+blocked exfiltration but not use as an ECDH oracle, so a later client compromise
+(XSS, malicious extension, compromised frontend) could recompute
+`S = ECDH(DHs.privateKey, DHr)`, re-run the initial HKDF, rebuild the initial
+chain keys, and decrypt captured initial-chain ciphertext - violating the stated
+PFS guarantee. Both roles were affected; in a mostly-unidirectional conversation
+the window stays open until the first DH rotation, exposing the whole initial
+chain. Fix: two separate ephemeral keypairs - `handshakeKeyPair` derives S and is
+destroyed, `ratchetKeyPair` becomes `DHs` and cannot reconstruct S. Regression
+guard: `tests/test-pfs-key-separation.js` drives the real handshake in both
+roles, uses the recorded peer handshake public key, asserts all ECDH-manager
+references are cleared, and proves captured ciphertext is not recoverable.
+
+### Changed - handshake envelope encrypts identity + signature (anti-correlation)
+
+The long-term identity public key and the handshake signature now travel INSIDE
+the AES-GCM envelope (encrypted under the bootstrap key), not in cleartext. A
+passive relay no longer sees an identity key it could use to correlate a user
+across rooms. The signature now covers a canonical transcript binding both
+ephemeral public keys plus room/sender/timestamp/nonce, and is verified with a
+temporary key before any peer state is committed (validate-before-mutate).
+Both ECDH points are also imported into temporary `CryptoKey` objects before a
+synchronous final commit of identity, keys, timestamp, and nonce. A validly
+signed off-curve point therefore fails without leaving partial peer state.
+
+### Changed - SAS v4 binds both ephemeral keys
+
+The SAS transcript folds in both the handshake and ratchet public keys per side
+(`BLOCK_x = handshakePub_x || ratchetPub_x`), with `pinchat-sas-v4` /
+`SAS-display-v4` domain tags. Wire-incompatible with v3.
+
+### Testing and release integrity
+
+The SAS v4 KAT now uses fixed valid P-256 public points and pins the expected
+96-bit output (`ddecf96d49efde6010c14fca`); the canonical handshake-v2
+transcript also has a fixed SHA-256 vector. Adversarial tests cover mutations of
+both ephemeral keys, signed off-curve points, malformed nonce/schema, v1
+downgrade, and initiator/responder PFS recovery attempts.
+
+Chrome and Firefox integrity verifiers are prepared for `v0.6.0`: both pin the
+immutable release tag, require signed-manifest sequence 40, and use extension
+version 1.1.0. The security suite checks these values stay aligned. The SRI CI
+gate now also verifies the manifest's ECDSA signature and all 24 signed file
+hashes, preventing an internally consistent HTML/SRI update from passing with a
+stale release manifest.
+
 ## [2026-07-06] - v0.4.1
 
 Maintenance release from an internal 1:1 chat review. No wire-format or

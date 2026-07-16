@@ -61,7 +61,7 @@ function _isMessageAllowedForRoom(roomType, messageType) {
 }
 
 class WebSocketManager {
-    constructor(roomId) {
+    constructor(roomId, { expectedRoomType = null } = {}) {
         this.roomId = roomId;
         this.ws = null;
         this.reconnectAttempts = 0;
@@ -78,6 +78,7 @@ class WebSocketManager {
         this._fatalAuthFailure = false;
         this._connectionExhausted = false;
         this._connectPromise = null;
+        this._connectAttemptGeneration = 0;
 
         // C-01: serial dispatch queue for inbound messages. The DoubleRatchet
         // has its own internal mutex, but app.js#handleWebSocketMessage also
@@ -124,6 +125,12 @@ class WebSocketManager {
         // Set from the first server-authenticated Connected frame and pinned
         // for the lifetime of this page. It gates every subsequent relay
         // message before application dispatch.
+        if (expectedRoomType !== null
+            && expectedRoomType !== 'group'
+            && expectedRoomType !== 'onetoone') {
+            throw new Error('WebSocketManager: invalid expected room type');
+        }
+        this.expectedRoomType = expectedRoomType;
         this.roomType = null;
 
         // Callbacks
@@ -136,6 +143,9 @@ class WebSocketManager {
         // has expired. Group rooms return false because silently doing so
         // would detach sender_id from the still-live MLS leaf.
         this.onResumeRejected = null;
+        // Called before the UI error callback whenever continuing would risk
+        // using MLS secrets after a terminal transport/protocol failure.
+        this.onTerminalSecurityFailure = null;
 
         // Close WebSocket on page unload to prevent rate limit issues on refresh
         this._boundBeforeUnload = () => this._handleBeforeUnload();
@@ -165,6 +175,7 @@ class WebSocketManager {
         try {
             if (this.ws) this.ws.close(1008, 'Room protocol violation');
         } catch (_) { /* ignore close races */ }
+        this._notifyTerminalSecurityFailure(reason);
         if (this.onError) {
             try {
                 this.onError(new Error('ROOM_PROTOCOL_VIOLATION'));
@@ -185,6 +196,7 @@ class WebSocketManager {
         try {
             if (this.ws) this.ws.close(1008, 'MLS state desynchronized');
         } catch (_) { /* ignore close races */ }
+        this._notifyTerminalSecurityFailure(reason);
         if (this.onError) {
             try {
                 this.onError(new Error('MLS_STATE_DESYNC'));
@@ -201,6 +213,7 @@ class WebSocketManager {
         try {
             if (this.ws) this.ws.close(1009, 'Inbound queue capacity exceeded');
         } catch (_) { /* ignore close races */ }
+        this._notifyTerminalSecurityFailure(reason);
         if (this.onError) {
             try {
                 this.onError(new Error('INBOUND_QUEUE_OVERFLOW'));
@@ -218,6 +231,15 @@ class WebSocketManager {
         );
         sessionStorage.removeItem(`ws_connection_${this.roomId}`);
         sessionStorage.removeItem(`ws_room_type_${this.roomId}`);
+    }
+
+    _notifyTerminalSecurityFailure(reason) {
+        if (!this.onTerminalSecurityFailure) return;
+        try {
+            this.onTerminalSecurityFailure(reason);
+        } catch (error) {
+            console.error('[WS] terminal security cleanup failed:', error);
+        }
     }
 
     _isMlsControlEnvelope(message) {
@@ -298,6 +320,7 @@ class WebSocketManager {
         if (this._mlsControlSyncing
             || !this.ws || this.ws.readyState !== WebSocket.OPEN) return;
         for (const entry of this._pendingMlsControls.values()) {
+            if (entry.retryNotBefore > Date.now()) continue;
             if (entry.lastSentGeneration >= this._connectionGeneration) continue;
             try {
                 this.ws.send(JSON.stringify(entry.envelope));
@@ -307,6 +330,35 @@ class WebSocketManager {
                 break;
             }
         }
+    }
+
+    deferPendingMlsControl(commitRef, retryAfterSecs) {
+        if (typeof commitRef !== 'string'
+            || !Number.isSafeInteger(retryAfterSecs)
+            || retryAfterSecs <= 0) return false;
+        const retryNotBefore = Date.now()
+            + Math.min(retryAfterSecs, 3600) * 1000;
+        let matched = false;
+        for (const entry of this._pendingMlsControls.values()) {
+            if (entry.envelope.commit_ref !== commitRef) continue;
+            entry.retryNotBefore = Math.max(
+                entry.retryNotBefore || 0,
+                retryNotBefore,
+            );
+            entry.lastSentGeneration = Math.min(
+                entry.lastSentGeneration,
+                this._connectionGeneration - 1,
+            );
+            matched = true;
+        }
+        if (matched) {
+            const timer = setTimeout(
+                () => this._retryPendingMlsControls(),
+                Math.max(0, retryNotBefore - Date.now()),
+            );
+            if (typeof timer?.unref === 'function') timer.unref();
+        }
+        return matched;
     }
 
     /**
@@ -615,7 +667,8 @@ class WebSocketManager {
             return;
         }
 
-        const attempt = this._connectOnce();
+        const connectAttemptGeneration = ++this._connectAttemptGeneration;
+        const attempt = this._connectOnce(connectAttemptGeneration);
         this._connectPromise = attempt;
         try {
             return await attempt;
@@ -626,7 +679,7 @@ class WebSocketManager {
         }
     }
 
-    async _connectOnce() {
+    async _connectOnce(connectAttemptGeneration) {
         // Enforcement gate: once we've detected a terminal auth/protocol failure
         // (v1 gate mismatch, SIGNATURE_INVALID, subprotocol mismatch on onopen),
         // refuse to attempt a new connection. The user must refresh the page.
@@ -634,6 +687,7 @@ class WebSocketManager {
             console.error('[WS] connect() blocked: session is in fatal auth/protocol failure — page refresh required');
             return;
         }
+        if (connectAttemptGeneration !== this._connectAttemptGeneration) return;
 
         if (this.ws && (this.ws.readyState === WebSocket.CONNECTING
             || this.ws.readyState === WebSocket.OPEN)) {
@@ -758,6 +812,11 @@ class WebSocketManager {
             } else {
                 console.log('Requesting new WebSocket token (requires PoW)...');
                 token = await this.requestWsToken();
+                if (connectAttemptGeneration
+                    !== this._connectAttemptGeneration
+                    || this.isManuallyDisconnected) {
+                    return;
+                }
 
                 if (!token) {
                     // If requestWsToken already set _fatalAuthFailure and emitted
@@ -786,6 +845,10 @@ class WebSocketManager {
         console.log('Connecting to WebSocket (pinchat.v1 subprotocol auth)');
 
         try {
+            if (connectAttemptGeneration !== this._connectAttemptGeneration
+                || this.isManuallyDisconnected) {
+                return;
+            }
             this.ws = new WebSocket(wsUrl, ['pinchat.v1', `pinchat.v1.jwt.${token}`]);
             this._connectionGeneration += 1;
             const socketGeneration = this._connectionGeneration;
@@ -888,6 +951,15 @@ class WebSocketManager {
                             && message.room_type !== 'onetoone') {
                             this._failRoomProtocol(
                                 'Connected carries an unsupported room_type',
+                            );
+                            return;
+                        }
+                        if (this.expectedRoomType !== null
+                            && message.room_type !== this.expectedRoomType) {
+                            this._failRoomProtocol(
+                                `Connected room_type ${message.room_type} `
+                                + `does not match invite/bootstrap expectation `
+                                + this.expectedRoomType,
                             );
                             return;
                         }
@@ -1143,8 +1215,7 @@ class WebSocketManager {
                                 }
                                 return;
                             }
-                            if (isOrderedGroupControl
-                                && err?.mlsRetryControl === true) {
+                            if (isOrderedGroupControl) {
                                 const seq = message.control_seq;
                                 const attempts = (
                                     this._mlsControlRetryAttempts.get(seq) || 0
@@ -1233,7 +1304,9 @@ class WebSocketManager {
         console.log(`Reconnecting in ${delay}ms (attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts})...`);
 
         setTimeout(() => {
-            this.connect();
+            if (!this.isManuallyDisconnected && !this._fatalAuthFailure) {
+                this.connect();
+            }
         }, delay);
     }
 
@@ -1271,6 +1344,7 @@ class WebSocketManager {
                 this._pendingMlsControls.set(trackedKey, {
                     envelope: { ...message },
                     lastSentGeneration: this._connectionGeneration - 1,
+                    retryNotBefore: 0,
                 });
                 insertedTracking = true;
             }
@@ -1320,6 +1394,13 @@ class WebSocketManager {
             return false;
         }
 
+        if (trackedKey !== null) {
+            const tracked = this._pendingMlsControls.get(trackedKey);
+            if (tracked && tracked.retryNotBefore > Date.now()) {
+                return true;
+            }
+        }
+
         try {
             this.ws.send(serialized);
             if (trackedKey !== null) {
@@ -1354,6 +1435,7 @@ class WebSocketManager {
      */
     disconnect() {
         this.isManuallyDisconnected = true;
+        this._connectAttemptGeneration += 1;
 
         // Remove beforeunload listener to prevent memory leaks
         if (this._boundBeforeUnload) {
@@ -1377,6 +1459,10 @@ class WebSocketManager {
     disconnectWithError(code, reason) {
         this.isManuallyDisconnected = true;
         this._fatalAuthFailure = true;
+        this._connectAttemptGeneration += 1;
+        if (this.roomType === 'group') {
+            this._notifyTerminalSecurityFailure(reason);
+        }
         if (this._boundBeforeUnload) {
             window.removeEventListener('beforeunload', this._boundBeforeUnload);
         }

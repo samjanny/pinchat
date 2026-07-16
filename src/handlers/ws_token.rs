@@ -92,7 +92,7 @@ pub async fn generate_ws_token(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Path(room_id): Path<Uuid>,
-) -> Result<Json<WsTokenResponse>, Response> {
+) -> Result<Response, Response> {
     // CSRF: this endpoint hands out a JWT bound to the caller's
     // connection_id; without CSRF it can be forged from any same-site
     // injection context (XSS, sibling subdomain, …) and used to hijack
@@ -306,6 +306,7 @@ pub async fn generate_ws_token(
         creator_connection_id,
         mut creator_is_reserved,
         creator_bootstrap_valid,
+        creator_bootstrap_generation,
     ) = match state.rooms.get(&room_id) {
         Some(room) => {
             let creator_connection_id = creator_bootstrap.as_deref().and_then(|token| {
@@ -326,6 +327,7 @@ pub async fn generate_ws_token(
                     .map(|connection_id| room.participant_ids.contains(&connection_id))
                     .unwrap_or(false),
                 creator_bootstrap.is_none() || creator_connection_id.is_some(),
+                creator_connection_id.map(|_| room.creator_bootstrap_generation()),
             )
         }
         None => {
@@ -511,18 +513,23 @@ pub async fn generate_ws_token(
             &state.config.jwt_issuer,
             mls_control_cursor,
         ),
-        (None, Some(connection_id), true) => WsTokenClaims::for_resume(
+        (None, Some(connection_id), true) => WsTokenClaims::for_creator_bootstrap(
             room_id,
             connection_id,
             ttl_secs,
             &state.config.jwt_issuer,
+            creator_bootstrap_generation.expect("validated creator bootstrap has a generation"),
+            true,
             mls_control_cursor,
         ),
-        (None, Some(connection_id), false) => WsTokenClaims::new_for_connection(
+        (None, Some(connection_id), false) => WsTokenClaims::for_creator_bootstrap(
             room_id,
             connection_id,
             ttl_secs,
             &state.config.jwt_issuer,
+            creator_bootstrap_generation.expect("validated creator bootstrap has a generation"),
+            false,
+            None,
         ),
         (None, None, _) => WsTokenClaims::new(room_id, ttl_secs, &state.config.jwt_issuer),
     };
@@ -545,12 +552,18 @@ pub async fn generate_ws_token(
     );
 
     // Return token response (protocol v1 metadata included for client-side gate).
-    Ok(Json(WsTokenResponse {
+    let mut response = Json(WsTokenResponse {
         token,
         connection_id,
         expires_in: ttl_secs,
         protocol_version: crate::models::PINCHAT_PROTOCOL_VERSION,
         supported_subprotocols: vec!["pinchat.v1".to_string()],
         mls_control_cursor,
-    }))
+    })
+    .into_response();
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        "no-store".parse().expect("static Cache-Control value"),
+    );
+    Ok(response)
 }

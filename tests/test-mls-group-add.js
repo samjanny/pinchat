@@ -159,6 +159,7 @@ async function main() {
         leafEncKeyPair: bob.leafEncKp,
         ratchetTreeBytes,
         expectedSignerLeafIndex: 0,
+        expectedCommitEpoch: alice.epoch - 1n,
         ...await bootstrapPins(alice),
     });
     assert(bobGroup.nLeaves === 2, 'Bob sees 2-leaf tree');

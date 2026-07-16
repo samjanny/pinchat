@@ -333,8 +333,11 @@ async function rewriteCommitEnvelopeProposalList(session, envelope, proposalOrRe
     }));
 }
 
-async function echoPendingCommit(session, envelope, senderId = 'creator-self') {
-    await session.onRelayEnvelope({ ...envelope, sender_id: senderId });
+async function echoPendingCommit(session, envelope, senderId = null) {
+    await session.onRelayEnvelope({
+        ...envelope,
+        sender_id: senderId || session.relaySenderId,
+    });
 }
 
 async function completeExchangeJoin(exchange, senderId = 'creator-test') {
@@ -499,6 +502,9 @@ async function main() {
     assert(exchange.creator.shouldHandleOwnEnvelope({
         ...exchange.commit, sender_id: 'creator-self',
     }), 'only the exact pending Commit is recognized as an own-echo ACK');
+    assert(!exchange.creator.shouldHandleOwnEnvelope({
+        ...exchange.commit, sender_id: 'attacker-route',
+    }), 'matching Commit bytes from a different relay route are not an own-echo ACK');
     const mismatchedPayload = exchange.commit.payload.slice(0, -1)
         + (exchange.commit.payload.endsWith('A') ? 'B' : 'A');
     assert(!exchange.creator.shouldHandleOwnEnvelope({
@@ -807,11 +813,32 @@ async function main() {
             retry_after_secs: 0,
         });
     assert(welcomeRejectionHandled
-        && rejectedWelcome.creator._pendingCommit === null
+        && rejectedWelcome.creator._pendingCommit?.kind === 'remove'
         && rejectedWelcome.creatorEvents.some((event) =>
             event.kind === 'error'
-                && event.reason.includes('fresh KeyPackage')),
-    'permanently rejected post-acceptance Welcome is surfaced without rolling back the epoch');
+                && event.reason.includes('unreachable leaf')),
+    'permanently rejected post-acceptance Welcome stages a compensating Remove');
+    const compensatingRemove =
+        rejectedWelcome.creator._pendingCommit.commitEnvelope;
+    await echoPendingCommit(rejectedWelcome.creator, compensatingRemove);
+    assert(!rejectedWelcome.creator._leafBySenderId.has('joiner-1'),
+        'accepted Add with permanently rejected Welcome cannot leave a phantom member');
+
+    const failedWelcomeHandoff = await createExchange({
+        creatorSend: (envelope) =>
+            envelope.wire_format !== WireFormat.MLS_WELCOME,
+    });
+    assert(failedWelcomeHandoff.creator._pendingCommit?.kind === 'remove'
+        && failedWelcomeHandoff.creator._acceptedWelcomeByCommit.size === 0
+        && failedWelcomeHandoff.creator._leafBySenderId.get('joiner-1') === 1,
+    'failed Welcome transport handoff immediately stages a compensating Remove');
+    const failedHandoffRemove =
+        failedWelcomeHandoff.creator._pendingCommit.commitEnvelope;
+    await echoPendingCommit(
+        failedWelcomeHandoff.creator, failedHandoffRemove,
+    );
+    assert(!failedWelcomeHandoff.creator._leafBySenderId.has('joiner-1'),
+        'failed Welcome handoff cannot leave a permanently unreachable member');
 
     // KeyPackages are one-shot beyond the lifetime of the leaf they admitted.
     // Removing that leaf must not make the old init key eligible for another
@@ -837,11 +864,7 @@ async function main() {
         .filter((envelope) =>
             envelope.wire_format === WireFormat.MLS_PUBLIC_MESSAGE)
         .at(-1);
-    await echoPendingCommit(
-        reusedKeyPackage.creator,
-        keyPackageRemoveCommit,
-        'creator-kp-once',
-    );
+    await echoPendingCommit(reusedKeyPackage.creator, keyPackageRemoveCommit);
     const epochAfterKeyPackageRemove = reusedKeyPackage.creator.group.epoch;
     const replaySenderId = 'joiner-replayed-keypackage';
     const replayBootstrapProof = await bootstrapProofForSender({
@@ -1088,7 +1111,7 @@ async function main() {
     await removalRace.creator.removeMemberBySenderId('joiner-1');
     assert(removalRace.creator._deferredRemovals.has('joiner-1'),
         'Remove racing a PendingCommit is retained rather than dropped');
-    await echoPendingCommit(removalRace.creator, racingUpdate, 'creator-race-self');
+    await echoPendingCommit(removalRace.creator, racingUpdate);
     const racingPublicMessages = removalRace.creatorOut
         .slice(removalRaceOutBefore)
         .filter((envelope) => envelope.wire_format === WireFormat.MLS_PUBLIC_MESSAGE);
@@ -1096,9 +1119,7 @@ async function main() {
     assert(Boolean(deferredRemoveCommit)
         && removalRace.creator._pendingCommit?.kind === 'remove',
     'deferred Remove is staged after preceding Commit acceptance');
-    await echoPendingCommit(
-        removalRace.creator, deferredRemoveCommit, 'creator-race-self',
-    );
+    await echoPendingCommit(removalRace.creator, deferredRemoveCommit);
     assert(!removalRace.creator._leafBySenderId.has('joiner-1'),
         'deferred Remove applies after its own relay echo');
 
@@ -1176,11 +1197,53 @@ async function main() {
     assert(Boolean(retriedRemove)
         && retryRemoval.creator._pendingCommit?.kind === 'remove',
     'replay-sync flush retries the retained Remove after transient failure');
-    await echoPendingCommit(
-        retryRemoval.creator, retriedRemove, 'creator-remove-retry-self',
-    );
+    await echoPendingCommit(retryRemoval.creator, retriedRemove);
     assert(!retryRemoval.creator._leafBySenderId.has('joiner-1'),
         'retried lifecycle Remove applies after its acceptance echo');
+
+    // A transport handoff failure must not install the candidate Remove or
+    // lose the revocation request. The same lifecycle change remains
+    // retryable after the transport becomes writable again.
+    let rejectRemoveHandoff = false;
+    const failedRemoveHandoff = await createExchange({
+        creatorSend: (envelope) => !(
+            rejectRemoveHandoff
+            && envelope.wire_format === WireFormat.MLS_PUBLIC_MESSAGE
+        ),
+    });
+    const beforeFailedRemove = captureLiveGroup(
+        failedRemoveHandoff.creator,
+    );
+    rejectRemoveHandoff = true;
+    let failedRemoveError = null;
+    try {
+        await failedRemoveHandoff.creator.removeMemberBySenderId('joiner-1');
+    } catch (err) {
+        failedRemoveError = err;
+    }
+    assert(failedRemoveError?.mlsRetryControl === true
+        && liveGroupMatches(
+            failedRemoveHandoff.creator, beforeFailedRemove,
+        )
+        && failedRemoveHandoff.creator._pendingCommit === null
+        && failedRemoveHandoff.creator._leafBySenderId.get('joiner-1') === 1
+        && failedRemoveHandoff.creator._departedSenderIds.has('joiner-1')
+        && failedRemoveHandoff.creator._deferredRemovals.has('joiner-1'),
+    'failed Remove transport handoff leaves MLS state unchanged and retains revocation');
+    rejectRemoveHandoff = false;
+    await failedRemoveHandoff.creator.flushDeferredMembershipChanges();
+    const recoveredRemove = failedRemoveHandoff.creatorOut
+        .filter((envelope) =>
+            envelope.wire_format === WireFormat.MLS_PUBLIC_MESSAGE)
+        .at(-1);
+    assert(failedRemoveHandoff.creator._pendingCommit?.kind === 'remove',
+    'retained Remove is staged again after transport recovery');
+    await echoPendingCommit(
+        failedRemoveHandoff.creator, recoveredRemove,
+    );
+    assert(!failedRemoveHandoff.creator._leafBySenderId.has('joiner-1')
+        && !failedRemoveHandoff.creator._deferredRemovals.has('joiner-1'),
+    'retried Remove applies only after its exact relay acceptance echo');
 
     const poisonExchange = await createExchange({ acceptCommit: false });
     const poisonA = await mutatePreWelcomeCandidate(
@@ -2010,8 +2073,7 @@ async function main() {
         'previously validated but now stale Update is not folded');
     assert(queuedExchange.creator._pendingUpdateProposals.size === 1,
         'stale queued Update remains until replacement Commit is accepted');
-    await echoPendingCommit(queuedExchange.creator, staleQueueGuardCommit,
-        'creator-queued-self');
+    await echoPendingCommit(queuedExchange.creator, staleQueueGuardCommit);
     assert(queuedExchange.creator._pendingUpdateProposals.size === 0,
         'stale authenticated Update is removed from the queue');
 
@@ -2290,9 +2352,7 @@ async function main() {
         ...serializedApplication,
         sender_id: 'creator-send-race',
     });
-    await echoPendingCommit(
-        sendRace.creator, serializedCommit, 'creator-send-race-self',
-    );
+    await echoPendingCommit(sendRace.creator, serializedCommit);
     await sendRace.joiner.onRelayEnvelope({
         ...serializedCommit,
         sender_id: 'creator-send-race',
@@ -2378,9 +2438,7 @@ async function main() {
             && event.text === 'consume before snapshot',
     ).length === 1,
     'in-flight message authenticates exactly once before Commit snapshot');
-    await echoPendingCommit(
-        receiveRace.creator, receiveRaceCommit, 'creator-receive-race-self',
-    );
+    await echoPendingCommit(receiveRace.creator, receiveRaceCommit);
     await receiveRace.creator.onRelayEnvelope({
         ...receiveRaceMessage,
         sender_id: 'joiner-1',
@@ -2449,9 +2507,7 @@ async function main() {
         (event) => event.kind === 'error'
             && event.reason.includes('proposeUpdate failed'),
     ), 'serialized proposal/Commit race produces no mixed-epoch proposal error');
-    await echoPendingCommit(
-        proposalRace.creator, proposalRaceCommit, 'creator-proposal-race-self',
-    );
+    await echoPendingCommit(proposalRace.creator, proposalRaceCommit);
 
     // Transport rejection rolls back proposal-store bookkeeping, and the
     // promise mutex remains usable by the next attempt.

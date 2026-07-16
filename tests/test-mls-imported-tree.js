@@ -411,6 +411,7 @@ async function joinArguments(
         leafEncKeyPair: joiner.leafEncKp,
         ratchetTreeBytes: Nodes.ratchetTreeBytes(committer.ratchetTree),
         expectedSignerLeafIndex,
+        expectedCommitEpoch: committer.epoch - 1n,
         ...await bootstrapPins(committer),
     };
 }
@@ -450,12 +451,25 @@ async function main() {
             identity: bob.identity,
             leafEncKeyPair: bob.leafEncKp,
             ratchetTreeBytes: Nodes.ratchetTreeBytes(alice.ratchetTree),
+            expectedCommitEpoch: alice.epoch - 1n,
         };
         const args = { ...baseArgs, ...await bootstrapPins(alice) };
         await expectReject(
             Group.Group.joinFromWelcomeWithTree(args),
             'missing Commit sender',
             'Welcome without observable Commit is rejected fail-closed',
+        );
+        const {
+            expectedCommitEpoch: _omittedCommitEpoch,
+            ...missingCommitEpochArgs
+        } = args;
+        await expectReject(
+            Group.Group.joinFromWelcomeWithTree({
+                ...missingCommitEpochArgs,
+                expectedSignerLeafIndex: 0,
+            }),
+            'expectedCommitEpoch must be a uint64 BigInt',
+            'Welcome without the correlated Commit epoch is rejected fail-closed',
         );
         const joined = await Group.Group.joinFromWelcomeWithTree({
             ...args, expectedSignerLeafIndex: 0,
@@ -524,6 +538,7 @@ async function main() {
                 leafEncKeyPair: target.leafEncKp,
                 ratchetTreeBytes: Nodes.ratchetTreeBytes(imposter.ratchetTree),
                 expectedSignerLeafIndex: 0,
+                expectedCommitEpoch: imposter.epoch - 1n,
                 ...await bootstrapPins(alice),
             }),
             'creator signature_key does not match invite bootstrap pin',

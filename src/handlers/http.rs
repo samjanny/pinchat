@@ -12,7 +12,7 @@ use uuid::Uuid;
 use crate::handlers::auth::verify_csrf_for_api;
 use crate::ip_hash::{extract_client_ip_with_proxy, hash_ip};
 use crate::jwt::{WsTokenClaims, sign_token};
-use crate::models::{CreateRoomResponse, Room, RoomConfig};
+use crate::models::{CreateRoomResponse, Room, RoomConfig, RoomType};
 use crate::pow::{PowChallenge, calculate_difficulty};
 use crate::pow_session::{pow_cache_key, resolve_pow_session, should_use_secure_pow_cookies};
 use crate::state::AppState;
@@ -57,11 +57,18 @@ pub async fn create_room(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(config): Json<RoomConfig>,
-) -> Result<Json<CreateRoomResponse>, Response> {
+) -> Result<Response, Response> {
     // CSRF: defence-in-depth on top of SameSite=Strict + session auth.
     // Required because /api/rooms is a state-creating endpoint reachable
     // from any authenticated context (XSS, sibling-subdomain takeover, …).
     verify_csrf_for_api(&headers, &state.csrf_secret)?;
+    if config.room_type == RoomType::Group && !state.config.group_chat_enabled {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "Group chat is not enabled on this server" })),
+        )
+            .into_response());
+    }
 
     // Extract and hash client IP for challenge cache lookup
     // Considers trusted proxies for X-Forwarded-For when configured
@@ -202,6 +209,7 @@ pub async fn create_room(
     let ttl_minutes = room.ttl_minutes;
     let max_participants = room.max_participants;
     let creator_connection_id = room.creator_connection_id();
+    let creator_bootstrap_generation = room.creator_bootstrap_generation();
 
     // Allocate and sign the creator's WebSocket identity before publishing
     // the room. Group rooms fail closed here: inserting a room without a
@@ -209,11 +217,14 @@ pub async fn create_room(
     // the creator-only MLS administration invariant. One-to-one rooms retain
     // the legacy fallback where a later PoW-minted WebSocket token can be used.
     let ws_claims = match creator_connection_id {
-        Some(connection_id) => WsTokenClaims::new_for_connection(
+        Some(connection_id) => WsTokenClaims::for_creator_bootstrap(
             room_id,
             connection_id,
             state.config.jwt_token_ttl_secs,
             &state.config.jwt_issuer,
+            creator_bootstrap_generation,
+            false,
+            None,
         ),
         None => WsTokenClaims::new(
             room_id,
@@ -269,7 +280,12 @@ pub async fn create_room(
                 supported_subprotocols: vec!["pinchat.v1".to_string()],
             };
 
-            Ok(Json(response))
+            let mut response = Json(response).into_response();
+            response.headers_mut().insert(
+                header::CACHE_CONTROL,
+                "no-store".parse().expect("static Cache-Control value"),
+            );
+            Ok(response)
         }
         Err(_) => {
             // Server at capacity (checked atomically)
@@ -424,6 +440,7 @@ mod tests {
             website_dir: None,
             allow_anonymous: true,
             cors_allowed_origins: vec!["https://localhost:3000".to_string()],
+            group_chat_enabled: true,
         }
     }
 

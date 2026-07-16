@@ -5,16 +5,26 @@ on:
     branches: [main, experimental-groups-custom]
     paths:
       - 'static/**'
+      - 'hashes.json.signed'
+      - 'extensions/chrome/background.js'
+      - 'extensions/chrome/manifest.json'
+      - 'extensions/firefox/background.js'
+      - 'extensions/firefox/manifest.json'
       - '.github/scripts/verify-sri.js'
       - '.github/workflows/sri-check.yml'
   pull_request:
     paths:
       - 'static/**'
+      - 'hashes.json.signed'
+      - 'extensions/chrome/background.js'
+      - 'extensions/chrome/manifest.json'
+      - 'extensions/firefox/background.js'
+      - 'extensions/firefox/manifest.json'
       - '.github/scripts/verify-sri.js'
 
 jobs:
   verify-sri:
-    name: Verify inline SRI matches asset hashes
+    name: Verify inline SRI and signed manifest
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

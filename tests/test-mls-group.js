@@ -210,6 +210,35 @@ async function main() {
         );
     }
 
+    console.log('# Group — send ratchet advances only after encryption succeeds');
+    {
+        const { alice } = await buildSynthetic2LeafGroup();
+        const before = receiveStateSnapshot(alice);
+        const beforeGeneration = alice.senderRatchetGeneration;
+        const senderDataSecret = alice.epochSecrets.senderDataSecret;
+        alice.epochSecrets.senderDataSecret = {};
+        let rejected = false;
+        try {
+            await alice.encryptApplicationMessage(
+                'must not consume a generation',
+            );
+        } catch (_err) {
+            rejected = true;
+        } finally {
+            alice.epochSecrets.senderDataSecret = senderDataSecret;
+        }
+        assert(rejected, 'post-ratchet sender-data encryption failure is rejected');
+        assert(alice.senderRatchetGeneration === beforeGeneration
+            && receiveStateSnapshot(alice) === before,
+        'failed encryption leaves send ratchet byte-for-byte unchanged');
+        const recovered = await alice.encryptApplicationMessage(
+            'same generation remains usable',
+        );
+        assert(recovered instanceof Uint8Array
+            && alice.senderRatchetGeneration === beforeGeneration + 1,
+        'successful retry consumes the original generation exactly once');
+    }
+
     console.log('# Group — Alice ↔ Bob application messages (synthesised 2-leaf)');
     {
         const { alice, bob } = await buildSynthetic2LeafGroup();

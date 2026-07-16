@@ -44,6 +44,11 @@ const TEST_SUITES = {
         file: 'test-ratchet-correctness.js',
         description: 'C-01 concurrency, C-02 cross-DH late delivery, C-05 non-extractable DH'
     },
+    pfs: {
+        name: 'PFS Key Separation',
+        file: 'test-pfs-key-separation.js',
+        description: 'Handshake v2: two-role PFS, atomic peer commit, downgrade/tamper fail-closed'
+    },
     kat: {
         name: 'Known Answer Tests',
         file: 'test-kat.js',

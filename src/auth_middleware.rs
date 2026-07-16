@@ -212,6 +212,7 @@ mod tests {
             website_dir: None,
             allow_anonymous: false,
             cors_allowed_origins: vec!["https://localhost:3000".to_string()],
+            group_chat_enabled: true,
         }
     }
 

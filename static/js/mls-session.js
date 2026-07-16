@@ -389,6 +389,11 @@
             this._keyPackageRef = null;
             this._pendingWelcomeCommits = new Map();
             this._pendingWelcomeCommitBySender = new Map();
+            // Accepted Adds whose Welcome still awaits relay acceptance.
+            // The MLS epoch cannot be rolled back after the Commit echo; a
+            // permanent Welcome rejection therefore triggers a compensating
+            // Remove for the admitted-but-unreachable leaf.
+            this._acceptedWelcomeByCommit = new Map();
             // Per-sender_id → leafIndex map maintained by the creator.
             // We commit at most one KeyPackage per WebSocket sender_id;
             // a second KeyPackage from the same sender (or a sender
@@ -744,6 +749,7 @@
             this._clearEpochProposalState();
             this._pendingWelcomeCommits.clear();
             this._pendingWelcomeCommitBySender.clear();
+            this._acceptedWelcomeByCommit.clear();
             this._deferredEnvelopes.length = 0;
             this._deferredEnvelopeBytes = 0;
             this._deferredKeyPackages.clear();
@@ -774,6 +780,11 @@
             });
         }
 
+        destroy(reason = 'MLS session destroyed after terminal transport failure') {
+            if (this._state === 'desynced' || this._state === 'removed') return;
+            this._transitionToDesynced(reason);
+        }
+
         _transitionToRemoved(result) {
             if (!result || result.removedSelf !== true) {
                 throw new Error('mls-session: invalid authenticated-removal result');
@@ -794,6 +805,7 @@
             this._clearEpochProposalState();
             this._pendingWelcomeCommits.clear();
             this._pendingWelcomeCommitBySender.clear();
+            this._acceptedWelcomeByCommit.clear();
             this._deferredEnvelopes.length = 0;
             this._deferredEnvelopeBytes = 0;
             this._deferredKeyPackages.clear();
@@ -911,13 +923,31 @@
          */
         shouldHandleOwnEnvelope(envelope) {
             const pending = this._pendingCommit;
-            return Boolean(
+            const exactPendingCommit = Boolean(
                 pending
                 && envelope
                 && envelope.type === 'mls'
+                && envelope.sender_id === this.relaySenderId
                 && envelope.wire_format
                     === MLS.MLSMessage.WireFormat.MLS_PUBLIC_MESSAGE
                 && envelope.payload === pending.commitEnvelope.payload,
+            );
+            if (exactPendingCommit) return true;
+            if (!envelope || envelope.type !== 'mls'
+                || envelope.sender_id !== this.relaySenderId
+                || envelope.wire_format
+                    !== MLS.MLSMessage.WireFormat.MLS_WELCOME
+                || typeof envelope.commit_ref !== 'string') {
+                return false;
+            }
+            const accepted = this._acceptedWelcomeByCommit.get(
+                envelope.commit_ref,
+            );
+            return Boolean(
+                accepted
+                && envelope.payload === accepted.envelope.payload
+                && envelope.key_package_ref
+                    === accepted.envelope.key_package_ref,
             );
         }
 
@@ -1055,6 +1085,11 @@
                     // membership.
                     this._deferredRemovals.add(pending.senderId);
                 } else {
+                    this._acceptedWelcomeByCommit.set(pending.commitRef, {
+                        senderId: pending.senderId,
+                        addedLeafIndex: pending.addedLeafIndex,
+                        envelope: { ...pending.welcomeEnvelope },
+                    });
                     try {
                         // A Welcome describes the now-accepted epoch and must
                         // never precede acceptance of the Commit that created it.
@@ -1062,12 +1097,19 @@
                             pending.welcomeEnvelope,
                             'Welcome broadcast failed after Commit acceptance',
                         );
-                        this.onEvent({ kind: 'welcome-sent' });
                     } catch (err) {
                         // The Commit was already accepted, so rolling back here
-                        // would fork existing members. Keep the accepted epoch and
-                        // report that the intended joiner needs a fresh retry.
-                        this.onEvent({ kind: 'error', reason: err.message });
+                        // would fork existing members. If the exact Welcome was
+                        // not durably handed to the transport, remove the
+                        // unreachable leaf before accepting another KeyPackage.
+                        this._acceptedWelcomeByCommit.delete(
+                            pending.commitRef,
+                        );
+                        this._deferredRemovals.add(pending.senderId);
+                        this.onEvent({
+                            kind: 'error',
+                            reason: `${err.message}; removing the admitted leaf`,
+                        });
                     }
                 }
             } else if (pending.kind === 'update') {
@@ -1264,10 +1306,17 @@
                 throw new Error('mls-session: malformed transport rejection');
             }
             if (rejection.reason === 'welcome_not_correlated') {
+                const accepted = this._acceptedWelcomeByCommit.get(
+                    rejection.commit_ref,
+                );
+                if (!accepted) return false;
+                this._acceptedWelcomeByCommit.delete(rejection.commit_ref);
+                this._deferredRemovals.add(accepted.senderId);
                 this.onEvent({
                     kind: 'error',
-                    reason: 'relay permanently rejected Welcome because its accepted Add correlation is unavailable; the joiner must publish a fresh KeyPackage',
+                    reason: 'relay permanently rejected Welcome after accepting its Add; removing the unreachable leaf before allowing a fresh KeyPackage',
                 });
+                await this._drainDeferredEnvelopes();
                 return true;
             }
             const pending = this._pendingCommit;
@@ -1332,8 +1381,18 @@
         }
 
         async _onRelayEnvelope(envelope) {
-            if (this.shouldHandleOwnEnvelope(envelope)) {
+            if (this._pendingCommit
+                && this.shouldHandleOwnEnvelope(envelope)
+                && envelope.wire_format
+                    === MLS.MLSMessage.WireFormat.MLS_PUBLIC_MESSAGE) {
                 await this._acceptPendingCommit();
+                return;
+            }
+            if (this.shouldHandleOwnEnvelope(envelope)
+                && envelope.wire_format
+                    === MLS.MLSMessage.WireFormat.MLS_WELCOME) {
+                this._acceptedWelcomeByCommit.delete(envelope.commit_ref);
+                this.onEvent({ kind: 'welcome-sent' });
                 return;
             }
             let payload;
@@ -2393,6 +2452,13 @@
                     senderId,
                     removedLeafIndex: leafIndex,
                 });
+                if (!staged) {
+                    const error = new Error(
+                        'mls-session: Remove transport handoff failed before relay acceptance',
+                    );
+                    error.mlsRetryControl = true;
+                    throw error;
+                }
             } catch (err) {
                 if (candidateGroup && !staged) candidateGroup.destroySecrets();
                 // Preserve the revocation request and propagate failure so the

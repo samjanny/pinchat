@@ -79,6 +79,12 @@ pub struct WsTokenClaims {
     /// between token issuance and WebSocket admission.
     #[serde(default)]
     pub mls_control_cursor: Option<u64>,
+
+    /// Presence marks a token minted from the group creator's bootstrap
+    /// capability. Admission re-checks this generation atomically against the
+    /// room, so the first authenticated MLS ACK revokes already-issued JWTs.
+    #[serde(default)]
+    pub creator_bootstrap_generation: Option<u64>,
 }
 
 impl WsTokenClaims {
@@ -117,7 +123,24 @@ impl WsTokenClaims {
             iss: issuer.to_string(),
             resume: false,
             mls_control_cursor: None,
+            creator_bootstrap_generation: None,
         }
+    }
+
+    pub fn for_creator_bootstrap(
+        room_id: Uuid,
+        connection_id: Uuid,
+        ttl_secs: u64,
+        issuer: &str,
+        generation: u64,
+        resume: bool,
+        mls_control_cursor: Option<u64>,
+    ) -> Self {
+        let mut claims = Self::new_for_connection(room_id, connection_id, ttl_secs, issuer);
+        claims.resume = resume;
+        claims.mls_control_cursor = mls_control_cursor;
+        claims.creator_bootstrap_generation = Some(generation);
+        claims
     }
 
     /// Mint a fresh, single-use WebSocket token for an existing participant.
@@ -218,6 +241,7 @@ pub fn verify_token(
     // `aud`, `iss` — without these gates a token missing the claim would
     // skip the corresponding validation in jsonwebtoken.
     let mut validation = Validation::new(Algorithm::HS256);
+    validation.leeway = 0;
     validation.set_required_spec_claims(&["exp", "aud", "iss"]);
 
     // Audit C-2: pin both audience and issuer. set_audience accepts the
@@ -243,6 +267,7 @@ pub fn verify_resume_token(
 ) -> Result<WsResumeTokenClaims, jsonwebtoken::errors::Error> {
     let decoding_key = DecodingKey::from_secret(secret);
     let mut validation = Validation::new(Algorithm::HS256);
+    validation.leeway = 0;
     validation.set_required_spec_claims(&["exp", "aud", "iss"]);
     validation.aud = Some(HashSet::from([WS_RESUME_TOKEN_AUDIENCE.to_string()]));
     validation.iss = Some(HashSet::from([expected_issuer.to_string()]));
@@ -350,6 +375,7 @@ mod tests {
             iss: TEST_ISS.to_string(),
             resume: false,
             mls_control_cursor: None,
+            creator_bootstrap_generation: None,
         };
 
         let token = sign_token(&expired_claims, &secret).expect("Failed to sign");

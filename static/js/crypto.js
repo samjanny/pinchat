@@ -813,7 +813,7 @@ class CryptoManager {
     }
 
     /**
-     * Drop the bootstrap key reference after handshake completion (protocol v1).
+     * Drop the bootstrap key reference after handshake completion.
      *
      * PFS hardening: previously this method was a no-op to support re-handshaking
      * without re-reading the URL fragment. That kept the AES-GCM key alive in
@@ -822,7 +822,7 @@ class CryptoManager {
      * goes through `resetToBootstrapKey()` which re-extracts from the URL fragment.
      */
     deleteBootstrapKey() {
-        debugLog('[CRYPTO] Dropping bootstrap key reference (v1 hardening)');
+        debugLog('[CRYPTO] Dropping bootstrap key reference (PFS hardening)');
         this.key = null;
         if (this.mlsPskSecret) {
             this.mlsPskSecret.fill(0);

@@ -157,6 +157,7 @@ async function main() {
         leafEncKeyPair: bob.leafEncKp,
         ratchetTreeBytes: tree1,
         expectedSignerLeafIndex: 0,
+        expectedCommitEpoch: alice.epoch - 1n,
         ...await bootstrapPins(alice),
     });
 
@@ -173,6 +174,7 @@ async function main() {
         leafEncKeyPair: carol.leafEncKp,
         ratchetTreeBytes: tree2,
         expectedSignerLeafIndex: 0,
+        expectedCommitEpoch: alice.epoch - 1n,
         ...await bootstrapPins(alice),
     });
     assert(alice.epoch === 2n && bobGroup.epoch === 2n && carolGroup.epoch === 2n,
@@ -316,6 +318,7 @@ async function main() {
         leafEncKeyPair: dave.leafEncKp,
         ratchetTreeBytes: tree4,
         expectedSignerLeafIndex: 0,
+        expectedCommitEpoch: alice.epoch - 1n,
         ...await bootstrapPins(alice),
     });
     assert(daveGroup.myLeafIndex === 1,

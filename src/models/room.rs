@@ -53,6 +53,14 @@ pub struct Room {
     /// SHA-256 of the random creator bootstrap capability. The plaintext token
     /// is returned once by room creation and is never retained server-side.
     creator_bootstrap_hash: Option<[u8; 32]>,
+    /// Monotonic generation bound into every creator-bootstrap WebSocket
+    /// token. Consuming the bootstrap increments it, invalidating tokens that
+    /// were signed before the creator's first authenticated MLS ACK.
+    creator_bootstrap_generation: u64,
+    /// Ordinary group participants remain blocked until the creator has both
+    /// opened its ordered-control stream and durably appended the first
+    /// lifecycle entry.
+    creator_control_ready: bool,
 }
 
 impl Room {
@@ -82,17 +90,21 @@ impl Room {
         };
 
         let now = Utc::now();
-        let (creator_connection_id, creator_bootstrap_hash, creator_bootstrap_token) =
-            match config.room_type {
-                RoomType::OneToOne => (None, None, None),
-                RoomType::Group => {
-                    let mut token_bytes = [0u8; CREATOR_BOOTSTRAP_TOKEN_BYTES];
-                    OsRng.fill_bytes(&mut token_bytes);
-                    let token = URL_SAFE_NO_PAD.encode(token_bytes);
-                    let digest: [u8; 32] = Sha256::digest(token_bytes).into();
-                    (Some(Uuid::new_v4()), Some(digest), Some(token))
-                }
-            };
+        let (
+            creator_connection_id,
+            creator_bootstrap_hash,
+            creator_bootstrap_token,
+            creator_control_ready,
+        ) = match config.room_type {
+            RoomType::OneToOne => (None, None, None, true),
+            RoomType::Group => {
+                let mut token_bytes = [0u8; CREATOR_BOOTSTRAP_TOKEN_BYTES];
+                OsRng.fill_bytes(&mut token_bytes);
+                let token = URL_SAFE_NO_PAD.encode(token_bytes);
+                let digest: [u8; 32] = Sha256::digest(token_bytes).into();
+                (Some(Uuid::new_v4()), Some(digest), Some(token), false)
+            }
+        };
 
         (
             Self {
@@ -105,6 +117,8 @@ impl Room {
                 participant_ids: HashSet::new(),
                 creator_connection_id,
                 creator_bootstrap_hash,
+                creator_bootstrap_generation: 1,
+                creator_control_ready,
             },
             creator_bootstrap_token,
         )
@@ -133,7 +147,31 @@ impl Room {
     /// Permanently revoke the pre-Connected recovery capability after the
     /// creator proves receipt of ordered group state with its first MLS ACK.
     pub fn consume_creator_bootstrap(&mut self) {
-        self.creator_bootstrap_hash = None;
+        if self.creator_bootstrap_hash.take().is_some() {
+            self.creator_bootstrap_generation = self.creator_bootstrap_generation.saturating_add(1);
+        }
+    }
+
+    pub fn creator_bootstrap_generation(&self) -> u64 {
+        self.creator_bootstrap_generation
+    }
+
+    pub fn creator_bootstrap_is_live_at_generation(&self, generation: u64) -> bool {
+        self.creator_bootstrap_hash.is_some() && self.creator_bootstrap_generation == generation
+    }
+
+    pub fn creator_control_ready(&self) -> bool {
+        self.creator_control_ready
+    }
+
+    pub fn mark_creator_control_ready(&mut self, connection_id: Uuid) -> bool {
+        if self.creator_connection_id != Some(connection_id)
+            || !self.participant_ids.contains(&connection_id)
+        {
+            return false;
+        }
+        self.creator_control_ready = true;
+        true
     }
 
     /// Returns the stable relay identity assigned to a group-room creator.
@@ -235,9 +273,7 @@ impl Room {
     /// see the creator capability and must not hide the page from a creator
     /// who still owns the final reserved slot.
     pub fn is_full_for_non_creator(&self) -> bool {
-        if let Some(creator) = self.creator_connection_id
-            && !self.participant_ids.contains(&creator)
-        {
+        if self.creator_connection_id.is_some() && !self.creator_control_ready {
             // The creator must establish the first ordered-control boundary.
             // Otherwise an early joiner could publish a one-shot KeyPackage
             // before the creator opens its fresh stream, causing the creator
@@ -380,8 +416,16 @@ mod tests {
             "the creator establishes the first participant reservation"
         );
         assert!(
+            room.is_full_for_non_creator(),
+            "creator presence alone does not open ordinary admission"
+        );
+        assert!(
+            room.mark_creator_control_ready(creator),
+            "the creator opens admission only after its durable control boundary"
+        );
+        assert!(
             !room.is_full_for_non_creator(),
-            "one ordinary participant can join after the creator"
+            "one ordinary participant can join after creator control readiness"
         );
         assert!(
             room.add_participant(first_noncreator),

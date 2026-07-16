@@ -514,6 +514,20 @@ pub async fn ws_handler(
         );
         return (StatusCode::FORBIDDEN, "Token not valid for this room").into_response();
     }
+    if let Some(generation) = claims.creator_bootstrap_generation
+        && !state.creator_bootstrap_claim_is_live(&room_id, claims.connection_id, generation)
+    {
+        tracing::warn!(
+            "Revoked creator-bootstrap JWT rejected for room {} generation {}",
+            room_id,
+            generation
+        );
+        return (
+            StatusCode::FORBIDDEN,
+            "Group creator bootstrap token has been revoked",
+        )
+            .into_response();
+    }
 
     // SECURITY: Single-use token enforcement (prevents replay attacks).
     // C-07: this is the LAST gate before upgrade — every stateless check
@@ -538,6 +552,7 @@ pub async fn ws_handler(
     let connection_id = claims.connection_id;
     let resume_requested = claims.resume;
     let mls_control_cursor = claims.mls_control_cursor;
+    let creator_bootstrap_generation = claims.creator_bootstrap_generation;
     let ws_size = max_ws_size(state.config.max_image_size);
 
     // Echo only the base subprotocol back (do NOT echo the jwt.* companion —
@@ -554,6 +569,7 @@ pub async fn ws_handler(
                 connection_id,
                 resume_requested,
                 mls_control_cursor,
+                creator_bootstrap_generation,
             )
         })
 }
@@ -615,6 +631,25 @@ fn evict_group_participant(
     connection_id: Uuid,
     reason: &str,
 ) -> bool {
+    let closes_room = state
+        .rooms
+        .get(&room_id)
+        .map(|room| {
+            room.room_type == RoomType::Group
+                && room.creator_connection_id() == Some(connection_id)
+                && room.creator_control_ready()
+        })
+        .unwrap_or(false);
+    if closes_room {
+        tracing::warn!(
+            "Closing MLS room {} after definitive creator eviction {}: {}",
+            room_id,
+            connection_id,
+            reason
+        );
+        state.remove_room(&room_id);
+        return true;
+    }
     let Some(participant_count) = state.evict_participant(&connection_id, room_id) else {
         return false;
     };
@@ -662,18 +697,29 @@ fn schedule_connection_departure(state: &AppState, connection_id: Uuid) {
     let grace = Duration::from_secs(state.config.ws_reconnect_grace_secs);
     tokio::spawn(async move {
         tokio::time::sleep(grace).await;
-        let room_type = grace_state
-            .rooms
-            .get(&detached_room_id)
-            .map(|room| room.room_type);
+        let room_departure = grace_state.rooms.get(&detached_room_id).map(|room| {
+            (
+                room.room_type,
+                room.room_type == RoomType::Group
+                    && room.creator_connection_id() == Some(connection_id)
+                    && room.creator_control_ready(),
+            )
+        });
         let Some(participant_count) =
             grace_state.finalize_disconnection(&connection_id, detached_room_id)
         else {
             return;
         };
 
-        match room_type {
-            Some(RoomType::Group) => {
+        match room_departure {
+            Some((RoomType::Group, true)) => {
+                tracing::warn!(
+                    "Closing MLS room {} after creator reconnect grace expired",
+                    detached_room_id
+                );
+                grace_state.remove_room(&detached_room_id);
+            }
+            Some((RoomType::Group, false)) => {
                 evict_lagging_group_participants(&grace_state, detached_room_id);
                 let _ = append_ordered_group_departure(
                     &grace_state,
@@ -682,7 +728,7 @@ fn schedule_connection_departure(state: &AppState, connection_id: Uuid) {
                     participant_count,
                 );
             }
-            Some(RoomType::OneToOne) => {
+            Some((RoomType::OneToOne, _)) => {
                 let leave_msg = Message::UserLeft {
                     user_id: connection_id,
                     participant_count,
@@ -717,6 +763,7 @@ async fn handle_socket(
     connection_id: Uuid,
     resume_requested: bool,
     mls_control_cursor: Option<u64>,
+    creator_bootstrap_generation: Option<u64>,
 ) {
     // Verify that the room exists AND is not expired.
     // Without the is_expired() gate, a room past its hard TTL can still accept
@@ -742,7 +789,12 @@ async fn handle_socket(
     // Attempt to add the connection to the room. Reclaiming an ID that is
     // already grace-reserved requires the resume bit from the signed upgrade
     // JWT; two simultaneously active sockets with the same ID are rejected.
-    let admission = match state.add_connection(connection_id, room_id, resume_requested) {
+    let admission = match state.add_connection_with_bootstrap_generation(
+        connection_id,
+        room_id,
+        resume_requested,
+        creator_bootstrap_generation,
+    ) {
         Some(admission) => admission,
         None => {
             #[cfg(debug_assertions)]
@@ -883,6 +935,18 @@ async fn handle_socket(
             // control order.
             state.remove_room(&room_id);
             let _ = send_error(socket, "Unable to establish secure group lifecycle").await;
+            return;
+        }
+        let creator_needs_handoff = state
+            .rooms
+            .get(&room_id)
+            .map(|room| {
+                room.creator_connection_id() == Some(connection_id) && !room.creator_control_ready()
+            })
+            .unwrap_or(false);
+        if creator_needs_handoff && !state.mark_creator_control_ready(&room_id, connection_id) {
+            state.remove_room(&room_id);
+            let _ = send_error(socket, "Unable to establish group creator control boundary").await;
             return;
         }
     }
@@ -2383,6 +2447,7 @@ mod tests {
             website_dir: None,
             allow_anonymous: true,
             cors_allowed_origins: vec!["https://localhost:3000".to_string()],
+            group_chat_enabled: true,
         }
     }
 
@@ -2545,6 +2610,7 @@ mod tests {
             iss: state.config.jwt_issuer.clone(),
             resume: false,
             mls_control_cursor: None,
+            creator_bootstrap_generation: None,
         };
         let token = sign_token(&expired, &state.jwt_secret).unwrap();
         let sp = format!("pinchat.v1, pinchat.v1.jwt.{}", token);
@@ -2724,6 +2790,7 @@ mod tests {
             .expect("open Alice control stream");
         assert_eq!(alice_stream.cursor, 0);
         assert_eq!(alice_stream.through_seq, 0);
+        assert!(state.mark_creator_control_ready(&room_id, alice));
 
         assert_eq!(
             state.add_connection(bob, room_id, false),
@@ -2861,6 +2928,7 @@ mod tests {
         state
             .open_mls_control_stream(&room_id, alice, None)
             .expect("open Alice stream");
+        assert!(state.mark_creator_control_ready(&room_id, alice));
         assert_eq!(
             state.add_connection(stalled, room_id, false),
             Some(ConnectionAdmission::New)
@@ -2931,15 +2999,21 @@ mod tests {
         state.try_create_room(room).unwrap();
         let bob = Uuid::new_v4();
 
-        for participant in [alice, bob] {
-            assert_eq!(
-                state.add_connection(participant, room_id, false),
-                Some(ConnectionAdmission::New)
-            );
-            state
-                .open_mls_control_stream(&room_id, participant, None)
-                .expect("open synchronized MLS stream");
-        }
+        assert_eq!(
+            state.add_connection(alice, room_id, false),
+            Some(ConnectionAdmission::New)
+        );
+        state
+            .open_mls_control_stream(&room_id, alice, None)
+            .expect("open synchronized creator MLS stream");
+        assert!(state.mark_creator_control_ready(&room_id, alice));
+        assert_eq!(
+            state.add_connection(bob, room_id, false),
+            Some(ConnectionAdmission::New)
+        );
+        state
+            .open_mls_control_stream(&room_id, bob, None)
+            .expect("open synchronized member MLS stream");
 
         let opened_at = std::time::Instant::now();
         let appended_at = opened_at + MLS_CONTROL_ACK_TIMEOUT + Duration::from_secs(1);
@@ -2999,6 +3073,7 @@ mod tests {
             state.add_connection(alice, room_id, false),
             Some(ConnectionAdmission::New)
         );
+        assert!(state.mark_creator_control_ready(&room_id, alice));
         assert_eq!(
             state.add_connection(bob, room_id, false),
             Some(ConnectionAdmission::New)
@@ -3115,6 +3190,7 @@ mod tests {
             .expect("group room has stable creator identity");
         let creator_bootstrap =
             creator_bootstrap.expect("group room exposes creator bootstrap capability");
+        let bootstrap_generation = room.creator_bootstrap_generation();
         assert!(room.verify_creator_bootstrap(&creator_bootstrap));
         state.try_create_room(room).unwrap();
 
@@ -3132,13 +3208,8 @@ mod tests {
         );
         assert_eq!(
             state.add_connection(first_noncreator, room_id, false),
-            Some(ConnectionAdmission::New),
-            "ordinary admission opens only after creator admission"
-        );
-        assert_eq!(
-            state.add_connection(second_noncreator, room_id, false),
             None,
-            "ordinary admission cannot exceed the physical room cap"
+            "ordinary admission stays closed until durable creator control setup"
         );
 
         let (_creator_rx, creator_stream) = state
@@ -3147,11 +3218,22 @@ mod tests {
         assert_eq!(creator_stream.cursor, 0);
         assert_eq!(
             state
-                .append_and_broadcast_mls_control(&room_id, |seq| {
-                    Some(format!(r#"{{"type":"test","control_seq":{seq}}}"#))
+                .append_and_broadcast_mls_lifecycle(&room_id, |seq| {
+                    Some(format!(r#"{{"type":"userjoined","control_seq":{seq}}}"#))
                 })
-                .expect("append control"),
+                .expect("append creator lifecycle"),
             1
+        );
+        assert!(state.mark_creator_control_ready(&room_id, creator));
+        assert_eq!(
+            state.add_connection(first_noncreator, room_id, false),
+            Some(ConnectionAdmission::New),
+            "ordinary admission opens after creator control readiness"
+        );
+        assert_eq!(
+            state.add_connection(second_noncreator, room_id, false),
+            None,
+            "ordinary admission cannot exceed the physical room cap"
         );
         assert!(state.acknowledge_mls_control(&room_id, creator, 1));
         assert!(
@@ -3167,12 +3249,64 @@ mod tests {
             .acknowledged_mls_control_cursor(&room_id, creator)
             .expect("grace-reserved creator has server-authoritative cursor");
         assert_eq!(cursor, 1);
+        assert_eq!(
+            state.add_connection_with_bootstrap_generation(
+                creator,
+                room_id,
+                true,
+                Some(bootstrap_generation),
+            ),
+            None,
+            "a JWT minted before bootstrap revocation cannot reclaim the creator"
+        );
+        assert_eq!(
+            state.add_connection_with_bootstrap_generation(creator, room_id, true, None,),
+            Some(ConnectionAdmission::Resumed),
+            "the normal post-ACK resume credential remains valid"
+        );
 
         let claims =
             WsTokenClaims::for_resume(room_id, creator, 30, &state.config.jwt_issuer, Some(cursor));
         assert_eq!(claims.connection_id, creator);
         assert!(claims.resume);
         assert_eq!(claims.mls_control_cursor, Some(1));
+    }
+
+    #[test]
+    fn definitive_creator_eviction_closes_established_group_room() {
+        let state = AppState::new(1000, test_config());
+        let room = Room::new(RoomConfig {
+            room_type: RoomType::Group,
+            ttl_minutes: 60,
+            max_participants: 4,
+        });
+        let room_id = room.id;
+        let creator = room.creator_connection_id().unwrap();
+        state.try_create_room(room).unwrap();
+        assert_eq!(
+            state.add_connection(creator, room_id, false),
+            Some(ConnectionAdmission::New),
+        );
+        state
+            .open_mls_control_stream(&room_id, creator, None)
+            .expect("creator stream");
+        state
+            .append_and_broadcast_mls_lifecycle(&room_id, |seq| {
+                Some(format!(r#"{{"type":"userjoined","control_seq":{seq}}}"#))
+            })
+            .expect("creator lifecycle");
+        assert!(state.mark_creator_control_ready(&room_id, creator));
+
+        assert!(evict_group_participant(
+            &state,
+            room_id,
+            creator,
+            "test definitive creator departure",
+        ));
+        assert!(
+            !state.rooms.contains_key(&room_id),
+            "an established creator-centric group cannot survive creator eviction",
+        );
     }
 
     #[test]
@@ -3358,5 +3492,46 @@ mod tests {
             ),
             Err(MlsControlAppendError::WelcomeNotCorrelated),
         ));
+
+        let departed_joiner = Uuid::new_v4();
+        let departed_key_package_ref = mls_key_package_ref(b"departed-key-package").unwrap();
+        let departed_commit_ref = "D".repeat(43);
+        state
+            .append_and_broadcast_mls_envelope(
+                &room_id,
+                MlsControlAdmission::KeyPackage {
+                    sender_id: departed_joiner,
+                    key_package_ref: departed_key_package_ref.clone(),
+                },
+                |seq| Some(format!(r#"{{"type":"kp3","control_seq":{seq}}}"#)),
+            )
+            .expect("departing joiner publishes KeyPackage");
+        state
+            .append_and_broadcast_mls_envelope(
+                &room_id,
+                MlsControlAdmission::AddCommit {
+                    sender_id: creator,
+                    commit_ref: departed_commit_ref.clone(),
+                    key_package_ref: departed_key_package_ref.clone(),
+                },
+                |seq| Some(format!(r#"{{"type":"commit3","control_seq":{seq}}}"#)),
+            )
+            .expect("accepted Add registers target-bound Welcome correlation");
+        state.forget_mls_control_participant(room_id, &departed_joiner);
+        assert!(
+            matches!(
+                state.append_and_broadcast_mls_envelope(
+                    &room_id,
+                    MlsControlAdmission::Welcome {
+                        sender_id: creator,
+                        commit_ref: departed_commit_ref,
+                        key_package_ref: departed_key_package_ref,
+                    },
+                    |seq| Some(format!(r#"{{"type":"welcome3","control_seq":{seq}}}"#)),
+                ),
+                Err(MlsControlAppendError::WelcomeNotCorrelated),
+            ),
+            "departure of the Welcome target removes the pending correlation"
+        );
     }
 }
