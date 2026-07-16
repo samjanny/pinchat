@@ -96,9 +96,16 @@ pub enum ConnectionAdmission {
 const BROADCAST_CHANNEL_ENTRIES: usize = 8;
 const MAX_BROADCAST_ROOM_BYTES: usize = 4 * 1024 * 1024;
 const MAX_BROADCAST_GLOBAL_BYTES: usize = 64 * 1024 * 1024;
-const MAX_MLS_CONTROL_LOG_ENTRIES: usize = 256;
+pub(crate) const MAX_MLS_CONTROL_LOG_ENTRIES: usize = 256;
 const MAX_MLS_CONTROL_LOG_BYTES: usize = 2 * 1024 * 1024;
 const MAX_MLS_CONTROL_LOG_GLOBAL_BYTES: usize = 64 * 1024 * 1024;
+// Ordinary MLS envelopes may not consume the final lifecycle slots. A
+// UserLeft that cannot be durably sequenced would leave relay membership and
+// the authenticated MLS roster disagreeing about who is still authorised.
+pub(crate) const MLS_LIFECYCLE_RESERVED_ENTRIES: usize = 32;
+const MLS_LIFECYCLE_RESERVED_BYTES: usize = 128 * 1024;
+const MAX_PENDING_MLS_WELCOME_CORRELATIONS: usize = 64;
+const MAX_CONSUMED_MLS_KEY_PACKAGE_REFS: usize = 4096;
 
 #[derive(Debug)]
 struct BroadcastPayloadInner {
@@ -266,6 +273,11 @@ struct MlsControlLog {
     retained_bytes: usize,
     entries: VecDeque<MlsControlEntry>,
     acknowledged: HashMap<Uuid, MlsControlAcknowledgement>,
+    key_package_by_sender: HashMap<Uuid, String>,
+    key_package_refs: HashMap<String, Uuid>,
+    consumed_key_package_refs: HashSet<String>,
+    pending_welcome_by_commit: HashMap<(Uuid, String), String>,
+    pending_welcome_order: VecDeque<(Uuid, String)>,
 }
 
 /// One retained ordered MLS-control entry. Replays expose the sequence
@@ -298,6 +310,34 @@ pub enum MlsControlAppendError {
     SerializationFailed,
     CapacityExceeded,
     BroadcastCapacity,
+    DuplicateKeyPackage,
+    CommitCorrelationConflict,
+    WelcomeNotCorrelated,
+    UnknownKeyPackageRef,
+    DuplicateKeyPackageRef,
+}
+
+/// Relay-visible admission metadata for an ordered MLS envelope. The relay
+/// remains blind to cryptographic contents; these fields only bind the
+/// transport-level Add Commit / Welcome pair and enforce one KeyPackage per
+/// stable participant admission.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MlsControlAdmission {
+    Ordinary,
+    KeyPackage {
+        sender_id: Uuid,
+        key_package_ref: String,
+    },
+    AddCommit {
+        sender_id: Uuid,
+        commit_ref: String,
+        key_package_ref: String,
+    },
+    Welcome {
+        sender_id: Uuid,
+        commit_ref: String,
+        key_package_ref: String,
+    },
 }
 
 /// Application state shared across all threads
@@ -997,6 +1037,7 @@ impl AppState {
     /// Assign and broadcast the next room-global MLS group-control sequence
     /// while holding the log mutex. This preserves the same total order in
     /// both the durable replay log and the live broadcast channel.
+    #[cfg(test)]
     pub fn append_and_broadcast_mls_control<F>(
         &self,
         room_id: &Uuid,
@@ -1005,13 +1046,59 @@ impl AppState {
     where
         F: FnOnce(u64) -> Option<String>,
     {
-        self.append_and_broadcast_mls_control_at(room_id, Instant::now(), serialize)
+        self.append_and_broadcast_mls_control_at(
+            room_id,
+            Instant::now(),
+            false,
+            MlsControlAdmission::Ordinary,
+            serialize,
+        )
+    }
+
+    /// Append a lifecycle event using the capacity reserved from ordinary MLS
+    /// envelopes. Callers must still fail the room closed if even this
+    /// reserved path cannot durably sequence the event.
+    pub fn append_and_broadcast_mls_lifecycle<F>(
+        &self,
+        room_id: &Uuid,
+        serialize: F,
+    ) -> Result<u64, MlsControlAppendError>
+    where
+        F: FnOnce(u64) -> Option<String>,
+    {
+        self.append_and_broadcast_mls_control_at(
+            room_id,
+            Instant::now(),
+            true,
+            MlsControlAdmission::Ordinary,
+            serialize,
+        )
+    }
+
+    pub fn append_and_broadcast_mls_envelope<F>(
+        &self,
+        room_id: &Uuid,
+        admission: MlsControlAdmission,
+        serialize: F,
+    ) -> Result<u64, MlsControlAppendError>
+    where
+        F: FnOnce(u64) -> Option<String>,
+    {
+        self.append_and_broadcast_mls_control_at(
+            room_id,
+            Instant::now(),
+            false,
+            admission,
+            serialize,
+        )
     }
 
     fn append_and_broadcast_mls_control_at<F>(
         &self,
         room_id: &Uuid,
         appended_at: Instant,
+        lifecycle: bool,
+        admission: MlsControlAdmission,
         serialize: F,
     ) -> Result<u64, MlsControlAppendError>
     where
@@ -1027,13 +1114,75 @@ impl AppState {
             .get(room_id)
             .ok_or(MlsControlAppendError::MissingRoom)?;
         let mut log = log.lock().unwrap();
+
+        match &admission {
+            MlsControlAdmission::Ordinary => {}
+            MlsControlAdmission::KeyPackage {
+                sender_id,
+                key_package_ref,
+            } => {
+                if log.key_package_by_sender.contains_key(sender_id) {
+                    return Err(MlsControlAppendError::DuplicateKeyPackage);
+                }
+                if log.key_package_refs.contains_key(key_package_ref) {
+                    return Err(MlsControlAppendError::DuplicateKeyPackageRef);
+                }
+                if log.consumed_key_package_refs.contains(key_package_ref) {
+                    return Err(MlsControlAppendError::DuplicateKeyPackageRef);
+                }
+            }
+            MlsControlAdmission::AddCommit {
+                sender_id,
+                commit_ref,
+                key_package_ref,
+            } => {
+                if !log.key_package_refs.contains_key(key_package_ref) {
+                    return Err(MlsControlAppendError::UnknownKeyPackageRef);
+                }
+                if log.consumed_key_package_refs.len() >= MAX_CONSUMED_MLS_KEY_PACKAGE_REFS {
+                    return Err(MlsControlAppendError::CapacityExceeded);
+                }
+                if let Some(existing) = log
+                    .pending_welcome_by_commit
+                    .get(&(*sender_id, commit_ref.clone()))
+                    && existing != key_package_ref
+                {
+                    return Err(MlsControlAppendError::CommitCorrelationConflict);
+                }
+            }
+            MlsControlAdmission::Welcome {
+                sender_id,
+                commit_ref,
+                key_package_ref,
+            } => {
+                if log
+                    .pending_welcome_by_commit
+                    .get(&(*sender_id, commit_ref.clone()))
+                    .map(String::as_str)
+                    != Some(key_package_ref.as_str())
+                {
+                    return Err(MlsControlAppendError::WelcomeNotCorrelated);
+                }
+            }
+        }
+
         let seq = log
             .head_seq
             .checked_add(1)
             .ok_or(MlsControlAppendError::SequenceExhausted)?;
         let json = serialize(seq).ok_or(MlsControlAppendError::SerializationFailed)?;
-        if log.entries.len() >= MAX_MLS_CONTROL_LOG_ENTRIES
-            || log.retained_bytes.saturating_add(json.len()) > MAX_MLS_CONTROL_LOG_BYTES
+        let entry_limit = if lifecycle {
+            MAX_MLS_CONTROL_LOG_ENTRIES
+        } else {
+            MAX_MLS_CONTROL_LOG_ENTRIES - MLS_LIFECYCLE_RESERVED_ENTRIES
+        };
+        let byte_limit = if lifecycle {
+            MAX_MLS_CONTROL_LOG_BYTES
+        } else {
+            MAX_MLS_CONTROL_LOG_BYTES - MLS_LIFECYCLE_RESERVED_BYTES
+        };
+        if log.entries.len() >= entry_limit
+            || log.retained_bytes.saturating_add(json.len()) > byte_limit
         {
             return Err(MlsControlAppendError::CapacityExceeded);
         }
@@ -1060,6 +1209,52 @@ impl AppState {
             appended_at,
             json,
         });
+
+        match admission {
+            MlsControlAdmission::Ordinary => {}
+            MlsControlAdmission::KeyPackage {
+                sender_id,
+                key_package_ref,
+            } => {
+                log.key_package_by_sender
+                    .insert(sender_id, key_package_ref.clone());
+                log.key_package_refs.insert(key_package_ref, sender_id);
+            }
+            MlsControlAdmission::AddCommit {
+                sender_id,
+                commit_ref,
+                key_package_ref,
+            } => {
+                let correlation_key = (sender_id, commit_ref);
+                let consumed_key_package_ref = key_package_ref.clone();
+                if !log.pending_welcome_by_commit.contains_key(&correlation_key) {
+                    while log.pending_welcome_by_commit.len()
+                        >= MAX_PENDING_MLS_WELCOME_CORRELATIONS
+                    {
+                        let Some(expired) = log.pending_welcome_order.pop_front() else {
+                            break;
+                        };
+                        log.pending_welcome_by_commit.remove(&expired);
+                    }
+                    log.pending_welcome_order.push_back(correlation_key.clone());
+                }
+                log.pending_welcome_by_commit
+                    .insert(correlation_key, key_package_ref);
+                log.key_package_refs.remove(&consumed_key_package_ref);
+                log.consumed_key_package_refs
+                    .insert(consumed_key_package_ref);
+            }
+            MlsControlAdmission::Welcome {
+                sender_id,
+                commit_ref,
+                ..
+            } => {
+                let correlation_key = (sender_id, commit_ref);
+                log.pending_welcome_by_commit.remove(&correlation_key);
+                log.pending_welcome_order
+                    .retain(|queued| queued != &correlation_key);
+            }
+        }
 
         // A room with no currently subscribed receivers still retains the
         // control entry for a participant that resumes within its grace
@@ -1171,7 +1366,13 @@ impl AppState {
     where
         F: FnOnce(u64) -> Option<String>,
     {
-        self.append_and_broadcast_mls_control_at(room_id, appended_at, serialize)
+        self.append_and_broadcast_mls_control_at(
+            room_id,
+            appended_at,
+            false,
+            MlsControlAdmission::Ordinary,
+            serialize,
+        )
     }
 
     #[cfg(test)]
@@ -1205,6 +1406,13 @@ impl AppState {
         };
         let mut log = log.lock().unwrap();
         log.acknowledged.remove(connection_id);
+        if let Some(key_package_ref) = log.key_package_by_sender.remove(connection_id) {
+            log.key_package_refs.remove(&key_package_ref);
+        }
+        log.pending_welcome_by_commit
+            .retain(|(sender_id, _), _| sender_id != connection_id);
+        log.pending_welcome_order
+            .retain(|(sender_id, _)| sender_id != connection_id);
         Self::prune_acknowledged_mls_controls(&mut log, &participant_ids);
     }
 

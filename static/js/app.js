@@ -420,7 +420,8 @@ document.addEventListener('alpine:init', () => {
                             // likewise replayed from the unchanged cursor.
                             if (isPendingCommitAck
                                 || err?.mlsFatalState === true
-                                || err?.mlsRetryControl === true) throw err;
+                                || err?.mlsRetryControl === true
+                                || err?.mlsControlRejected === true) throw err;
                         }
                     }
                     break;

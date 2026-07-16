@@ -16,7 +16,7 @@ use uuid::Uuid;
 use crate::jwt::{WsResumeTokenClaims, sign_resume_token, verify_token};
 use crate::models::message::MessageHeader;
 use crate::models::{IncomingMessage, Message, RoomType};
-use crate::state::{AppState, ConnectionAdmission};
+use crate::state::{AppState, ConnectionAdmission, MlsControlAdmission};
 
 /// Maximum allowed size for ECDH public key payload (8KB)
 /// Typical ECDH payload with P-256: ~500 bytes (65-byte key + encryption overhead + AAD)
@@ -85,6 +85,42 @@ fn decode_bounded_base64url(
         return Err("non-canonical Base64url value");
     }
     Ok(decoded)
+}
+
+fn append_mls_varint(output: &mut Vec<u8>, value: usize) -> Result<(), &'static str> {
+    if value < 64 {
+        output.push(value as u8);
+        return Ok(());
+    }
+    if value < 16_384 {
+        let encoded = (value as u16) | 0x4000;
+        output.extend_from_slice(&encoded.to_be_bytes());
+        return Ok(());
+    }
+    if value < (1usize << 30) {
+        let encoded = (value as u32) | 0x8000_0000;
+        output.extend_from_slice(&encoded.to_be_bytes());
+        return Ok(());
+    }
+    Err("MLS vector length exceeds 2^30-1")
+}
+
+/// RFC 9420 §5.2 RefHash for the fixed KeyPackage reference label. The relay
+/// computes this from the already-bounded opaque KeyPackage body so an Add
+/// Commit can only reserve a Welcome for a KeyPackage it previously accepted.
+fn mls_key_package_ref(key_package_bytes: &[u8]) -> Result<String, &'static str> {
+    const LABEL: &[u8] = b"MLS 1.0 KeyPackage Reference";
+    let mut input = Vec::with_capacity(
+        LABEL
+            .len()
+            .saturating_add(key_package_bytes.len())
+            .saturating_add(6),
+    );
+    append_mls_varint(&mut input, LABEL.len())?;
+    input.extend_from_slice(LABEL);
+    append_mls_varint(&mut input, key_package_bytes.len())?;
+    input.extend_from_slice(key_package_bytes);
+    Ok(URL_SAFE_NO_PAD.encode(Sha256::digest(input)))
 }
 
 /// Read the MLS vector-length varint used by the shallow PublicMessage
@@ -530,8 +566,8 @@ fn append_ordered_group_departure(
     room_id: Uuid,
     connection_id: Uuid,
     participant_count: usize,
-) {
-    let append_result = state.append_and_broadcast_mls_control(&room_id, |control_seq| {
+) -> bool {
+    let append_result = state.append_and_broadcast_mls_lifecycle(&room_id, |control_seq| {
         serde_json::to_string(&Message::UserLeft {
             user_id: connection_id,
             participant_count,
@@ -541,11 +577,14 @@ fn append_ordered_group_departure(
     });
     if let Err(error) = append_result {
         tracing::error!(
-            "Failed to append ordered group departure in room {}: {:?}",
+            "Failed to append ordered group departure in room {}; closing the room fail-closed: {:?}",
             room_id,
             error
         );
+        state.remove_room(&room_id);
+        return false;
     }
+    true
 }
 
 fn evict_group_participant(
@@ -563,7 +602,7 @@ fn evict_group_participant(
         room_id,
         reason
     );
-    append_ordered_group_departure(state, room_id, connection_id, participant_count);
+    let _ = append_ordered_group_departure(state, room_id, connection_id, participant_count);
     true
 }
 
@@ -614,7 +653,7 @@ fn schedule_connection_departure(state: &AppState, connection_id: Uuid) {
         match room_type {
             Some(RoomType::Group) => {
                 evict_lagging_group_participants(&grace_state, detached_room_id);
-                append_ordered_group_departure(
+                let _ = append_ordered_group_departure(
                     &grace_state,
                     detached_room_id,
                     connection_id,
@@ -803,7 +842,7 @@ async fn handle_socket(
     }
     if admission == ConnectionAdmission::New && room_type == RoomType::Group {
         let participant_count = state.get_participant_count(&room_id);
-        let append_result = state.append_and_broadcast_mls_control(&room_id, |control_seq| {
+        let append_result = state.append_and_broadcast_mls_lifecycle(&room_id, |control_seq| {
             serde_json::to_string(&Message::UserJoined {
                 user_id: connection_id,
                 participant_count,
@@ -817,7 +856,10 @@ async fn handle_socket(
                 room_id,
                 error
             );
-            state.remove_connection(&connection_id);
+            // Existing members must never continue in a room whose relay
+            // lifecycle can no longer be represented in the authenticated
+            // control order.
+            state.remove_room(&room_id);
             let _ = send_error(socket, "Unable to establish secure group lifecycle").await;
             return;
         }
@@ -1502,21 +1544,17 @@ async fn handle_socket(
                                     .map(Vec::len)
                                     .unwrap_or(0),
                             );
-                            // KeyPackages, Proposals, and Welcomes already have
-                            // narrow structural/count bounds and must not be
-                            // silently lost after WebSocket.send accepted them.
-                            // Charge expensive Commits and ephemeral encrypted
-                            // application traffic to the aggregate room bucket.
-                            let charge_room_budget =
-                                is_commit || wire_format == WIRE_PRIVATE_MESSAGE;
-                            if charge_room_budget
-                                && !state_clone.admit_room_traffic(
-                                    room_id,
-                                    connection_id,
-                                    now,
-                                    traffic_bytes,
-                                )
-                            {
+                            // Every MLS envelope consumes aggregate room
+                            // count/byte budget. Otherwise large Welcome or
+                            // KeyPackage controls can amplify decode, replay,
+                            // and broadcast work on every member while
+                            // bypassing the room-wide limiter.
+                            if !state_clone.admit_room_traffic(
+                                room_id,
+                                connection_id,
+                                now,
+                                traffic_bytes,
+                            ) {
                                 tracing::warn!(
                                     "Room {} rejected traffic from {} at aggregate/sender budget",
                                     room_id,
@@ -1535,10 +1573,21 @@ async fn handle_socket(
                                         let _ = recv_direct_tx.try_send(json);
                                     }
                                 }
-                                // The sender remains connected. Private
-                                // messages are ephemeral; a staged Commit gets
-                                // the typed retry response above.
-                                continue;
+                                if is_commit {
+                                    // A staged Commit gets a typed retry and
+                                    // remains pending on the browser.
+                                    continue;
+                                }
+                                if wire_format == WIRE_PRIVATE_MESSAGE {
+                                    // Private messages are ephemeral.
+                                    continue;
+                                }
+                                // WebSocketManager retains ordered controls
+                                // until their sequenced own echo. Closing here
+                                // causes the exact KeyPackage/Proposal/Welcome
+                                // to be retried after replay sync rather than
+                                // silently accepting-and-dropping it.
+                                break;
                             }
                             if is_commit {
                                 state_clone
@@ -1613,8 +1662,41 @@ async fn handle_socket(
                                     }
                                 }
                             } else {
-                                let append_result = state_clone.append_and_broadcast_mls_control(
+                                let admission = match wire_format {
+                                    WIRE_KEY_PACKAGE => MlsControlAdmission::KeyPackage {
+                                        sender_id: connection_id,
+                                        key_package_ref: mls_key_package_ref(
+                                            &validated.payload_bytes,
+                                        )
+                                        .expect("bounded KeyPackage reference input"),
+                                    },
+                                    WIRE_WELCOME => MlsControlAdmission::Welcome {
+                                        sender_id: connection_id,
+                                        commit_ref: commit_ref
+                                            .clone()
+                                            .expect("Welcome validated with commit_ref"),
+                                        key_package_ref: key_package_ref
+                                            .clone()
+                                            .expect("Welcome validated with key_package_ref"),
+                                    },
+                                    WIRE_PUBLIC_MESSAGE
+                                        if is_commit && key_package_ref.is_some() =>
+                                    {
+                                        MlsControlAdmission::AddCommit {
+                                            sender_id: connection_id,
+                                            commit_ref: commit_ref
+                                                .clone()
+                                                .expect("Commit validated with commit_ref"),
+                                            key_package_ref: key_package_ref
+                                                .clone()
+                                                .expect("guarded by is_some"),
+                                        }
+                                    }
+                                    _ => MlsControlAdmission::Ordinary,
+                                };
+                                let append_result = state_clone.append_and_broadcast_mls_envelope(
                                     &room_id,
+                                    admission,
                                     |control_seq| {
                                         serde_json::to_string(&Message::Mls {
                                             payload,
@@ -2873,7 +2955,7 @@ mod tests {
     }
 
     #[test]
-    fn mls_control_log_never_evicts_unacknowledged_history_to_make_room() {
+    fn mls_control_log_reserves_unacknowledged_capacity_for_lifecycle() {
         let state = AppState::new(1000, test_config());
         let room = Room::new(RoomConfig {
             room_type: RoomType::Group,
@@ -2883,7 +2965,10 @@ mod tests {
         let room_id = room.id;
         state.try_create_room(room).unwrap();
 
-        for expected in 1..=256u64 {
+        let ordinary_limit = (crate::state::app_state::MAX_MLS_CONTROL_LOG_ENTRIES
+            - crate::state::app_state::MLS_LIFECYCLE_RESERVED_ENTRIES)
+            as u64;
+        for expected in 1..=ordinary_limit {
             let seq = state
                 .append_and_broadcast_mls_control(&room_id, |seq| {
                     Some(format!(r#"{{"type":"test","control_seq":{seq}}}"#))
@@ -2897,11 +2982,151 @@ mod tests {
                     Some(format!(r#"{{"type":"test","control_seq":{seq}}}"#))
                 })
                 .is_err(),
-            "the 257th unacknowledged control is rejected, not silently evicted"
+            "ordinary controls cannot consume lifecycle-reserved entries"
+        );
+        for offset in 1..=crate::state::app_state::MLS_LIFECYCLE_RESERVED_ENTRIES as u64 {
+            let expected = ordinary_limit + offset;
+            let seq = state
+                .append_and_broadcast_mls_lifecycle(&room_id, |seq| {
+                    Some(format!(r#"{{"type":"userleft","control_seq":{seq}}}"#))
+                })
+                .expect("reserved lifecycle entry remains appendable");
+            assert_eq!(seq, expected);
+        }
+        assert!(
+            state
+                .append_and_broadcast_mls_lifecycle(&room_id, |seq| {
+                    Some(format!(r#"{{"type":"userleft","control_seq":{seq}}}"#))
+                })
+                .is_err(),
+            "the hard log cap still rejects rather than evicting history"
         );
         assert!(
             state.validate_mls_control_cursor(&room_id, 0).is_ok(),
             "the oldest unacknowledged cursor remains replayable"
         );
+        assert!(
+            !append_ordered_group_departure(&state, room_id, Uuid::new_v4(), 1,),
+            "an unsequencable departure reports fail-closed",
+        );
+        assert!(
+            !state.rooms.contains_key(&room_id),
+            "failure to durably sequence UserLeft closes the entire MLS room",
+        );
+    }
+
+    #[test]
+    fn relay_correlates_welcome_and_limits_keypackage_per_admission() {
+        use crate::state::app_state::MlsControlAppendError;
+
+        let state = AppState::new(1000, test_config());
+        let room = Room::new(RoomConfig {
+            room_type: RoomType::Group,
+            ttl_minutes: 60,
+            max_participants: 4,
+        });
+        let room_id = room.id;
+        state.try_create_room(room).unwrap();
+        let creator = Uuid::new_v4();
+        let joiner = Uuid::new_v4();
+        let key_package_ref = mls_key_package_ref(b"accepted-key-package").unwrap();
+        assert_eq!(
+            key_package_ref, "RS0flmwTqm9bsvjt1GZttoE7EkV1iO5FP3xaZxOqNGE",
+            "relay RefHash matches the MLS client implementation",
+        );
+
+        state
+            .append_and_broadcast_mls_envelope(
+                &room_id,
+                MlsControlAdmission::KeyPackage {
+                    sender_id: joiner,
+                    key_package_ref: key_package_ref.clone(),
+                },
+                |seq| Some(format!(r#"{{"type":"kp","control_seq":{seq}}}"#)),
+            )
+            .expect("first KeyPackage for stable admission");
+        assert!(matches!(
+            state.append_and_broadcast_mls_envelope(
+                &room_id,
+                MlsControlAdmission::KeyPackage {
+                    sender_id: joiner,
+                    key_package_ref: key_package_ref.clone(),
+                },
+                |seq| Some(format!(r#"{{"type":"kp2","control_seq":{seq}}}"#)),
+            ),
+            Err(MlsControlAppendError::DuplicateKeyPackage),
+        ));
+
+        let commit_ref = "C".repeat(43);
+        assert!(matches!(
+            state.append_and_broadcast_mls_envelope(
+                &room_id,
+                MlsControlAdmission::AddCommit {
+                    sender_id: creator,
+                    commit_ref: "U".repeat(43),
+                    key_package_ref: "X".repeat(43),
+                },
+                |seq| Some(format!(r#"{{"type":"commit0","control_seq":{seq}}}"#)),
+            ),
+            Err(MlsControlAppendError::UnknownKeyPackageRef),
+        ));
+        state
+            .append_and_broadcast_mls_envelope(
+                &room_id,
+                MlsControlAdmission::AddCommit {
+                    sender_id: creator,
+                    commit_ref: commit_ref.clone(),
+                    key_package_ref: key_package_ref.clone(),
+                },
+                |seq| Some(format!(r#"{{"type":"commit","control_seq":{seq}}}"#)),
+            )
+            .expect("Add Commit registers one pending Welcome");
+        assert!(matches!(
+            state.append_and_broadcast_mls_envelope(
+                &room_id,
+                MlsControlAdmission::KeyPackage {
+                    sender_id: Uuid::new_v4(),
+                    key_package_ref: key_package_ref.clone(),
+                },
+                |seq| Some(format!(r#"{{"type":"kp-replay","control_seq":{seq}}}"#)),
+            ),
+            Err(MlsControlAppendError::DuplicateKeyPackageRef),
+        ));
+
+        assert!(matches!(
+            state.append_and_broadcast_mls_envelope(
+                &room_id,
+                MlsControlAdmission::Welcome {
+                    sender_id: Uuid::new_v4(),
+                    commit_ref: commit_ref.clone(),
+                    key_package_ref: key_package_ref.clone(),
+                },
+                |seq| Some(format!(r#"{{"type":"welcome","control_seq":{seq}}}"#)),
+            ),
+            Err(MlsControlAppendError::WelcomeNotCorrelated),
+        ));
+        state
+            .append_and_broadcast_mls_envelope(
+                &room_id,
+                MlsControlAdmission::Welcome {
+                    sender_id: creator,
+                    commit_ref: commit_ref.clone(),
+                    key_package_ref: key_package_ref.clone(),
+                },
+                |seq| Some(format!(r#"{{"type":"welcome","control_seq":{seq}}}"#)),
+            )
+            .expect("matching Welcome consumes the correlation");
+        assert!(matches!(
+            state.append_and_broadcast_mls_envelope(
+                &room_id,
+                MlsControlAdmission::Welcome {
+                    sender_id: creator,
+                    commit_ref,
+                    key_package_ref,
+                },
+                |seq| Some(format!(r#"{{"type":"welcome2","control_seq":{seq}}}"#)),
+            ),
+            Err(MlsControlAppendError::WelcomeNotCorrelated),
+        ));
     }
 }

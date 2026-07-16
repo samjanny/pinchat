@@ -70,6 +70,7 @@
     const MAX_DEFERRED_PRIVATE_MESSAGES = 32;
     const MAX_DEFERRED_PRIVATE_BYTES = 4 * 1024 * 1024;
     const MAX_DEFERRED_KEYPACKAGE_BYTES = 512 * 1024;
+    const MAX_CONSUMED_KEY_PACKAGE_REFS = 4096;
     // The visible label carries 80 bits of the SHA-256 fingerprint. The full
     // 256-bit value is always emitted alongside it for tooltips/comparison.
     const VISIBLE_FINGERPRINT_HEX = 20;
@@ -116,6 +117,40 @@
         return rejected;
     }
 
+    function validationMlsControlError(message) {
+        const error = message instanceof Error
+            ? message : new Error(String(message));
+        error.mlsValidationFailure = true;
+        return error;
+    }
+
+    function retryableMlsControlError(error, prefix = '') {
+        if (error?.mlsFatalState === true
+            || error?.mlsRetryControl === true
+            || error?.mlsControlRejected === true) {
+            return error;
+        }
+        const detail = error instanceof Error ? error.message : String(error);
+        const retryable = new Error(`${prefix}${detail}`);
+        retryable.mlsRetryControl = true;
+        if (error?.mlsAuthenticatedControl === true) {
+            retryable.mlsAuthenticatedControl = true;
+        }
+        return retryable;
+    }
+
+    function classifyMlsControlError(error, prefix = '') {
+        if (error?.mlsFatalState === true
+            || error?.mlsRetryControl === true
+            || error?.mlsControlRejected === true) {
+            return error;
+        }
+        if (error?.mlsValidationFailure === true) {
+            return rejectedMlsControlError(error, prefix);
+        }
+        return retryableMlsControlError(error, prefix);
+    }
+
     function envelopeEncodedBytes(envelope) {
         if (!envelope || typeof envelope !== 'object') return 0;
         let total = 256;
@@ -138,11 +173,13 @@
         try {
             decoded = base64UrlDecode(value);
         } catch (_err) {
-            throw new Error(`mls-session: ${name} is not valid base64url`);
+            throw validationMlsControlError(
+                `mls-session: ${name} is not valid base64url`,
+            );
         }
         if (decoded.length !== CORRELATION_REF_BYTES
             || base64UrlEncode(decoded) !== value) {
-            throw new Error(
+            throw validationMlsControlError(
                 `mls-session: ${name} must be a canonical `
                 + `${CORRELATION_REF_BYTES}-byte base64url value`,
             );
@@ -352,6 +389,12 @@
             // a single peer can publish many KeyPackages, growing the
             // tree arbitrarily and exhausting committer resources.
             this._leafBySenderId = new Map();
+            // RFC 9420 KeyPackages are one-shot. Keep every accepted Add's
+            // KeyPackageRef for the lifetime of this room, including after a
+            // Remove, so an old init key cannot be replayed to re-admit the
+            // former member. The set is never evicted; reaching the hard cap
+            // fails future Adds closed.
+            this._consumedKeyPackageRefs = new Set();
             // Reverse leafIndex → sender_id binding used ONLY for transport
             // routing diagnostics. The MLS signature authenticates the leaf
             // and its signature_key; sender_id is relay metadata and MUST
@@ -524,10 +567,28 @@
                 keyPackageBytes,
             });
             if (!equalBytes(supplied, expected)) {
-                throw new Error(
+                throw validationMlsControlError(
                     'mls-session: KeyPackage bootstrap proof is invalid',
                 );
             }
+        }
+
+        async _availableKeyPackageRef(keyPackageBytes) {
+            const reference = base64UrlEncode(
+                await MLS.KeyPackage.keyPackageRef(keyPackageBytes),
+            );
+            if (this._consumedKeyPackageRefs.has(reference)) {
+                throw validationMlsControlError(
+                    'mls-session: KeyPackageRef was already consumed by an accepted Add',
+                );
+            }
+            if (this._consumedKeyPackageRefs.size
+                >= MAX_CONSUMED_KEY_PACKAGE_REFS) {
+                throw fatalMlsStateError(
+                    'MLS consumed KeyPackageRef capacity exhausted',
+                );
+            }
+            return reference;
         }
 
         /**
@@ -683,6 +744,7 @@
             this._deferredRemovals.clear();
             this._departedSenderIds.clear();
             this._leafBySenderId.clear();
+            this._consumedKeyPackageRefs.clear();
             this._senderIdByLeaf.clear();
             this._identityBySignatureKey.clear();
             wipeBytes(this.pskSecret);
@@ -732,6 +794,7 @@
             this._deferredRemovals.clear();
             this._departedSenderIds.clear();
             this._leafBySenderId.clear();
+            this._consumedKeyPackageRefs.clear();
             this._senderIdByLeaf.clear();
             this._identityBySignatureKey.clear();
 
@@ -873,7 +936,10 @@
                 // Keep the candidate pending so a transient local hashing
                 // failure can be retried by a later exact echo.
                 pending.accepting = false;
-                throw err;
+                throw retryableMlsControlError(
+                    err,
+                    'mls-session: pending Commit roster derivation failed: ',
+                );
             }
 
             // Clear first so a duplicate echo cannot install or announce the
@@ -897,6 +963,18 @@
             this.onEvent(rosterEvent);
 
             if (pending.kind === 'add') {
+                if (typeof pending.keyPackageRef !== 'string'
+                    || this._consumedKeyPackageRefs.has(
+                        pending.keyPackageRef,
+                    )) {
+                    this._transitionToDesynced(
+                        'accepted Add has an invalid or reused KeyPackageRef',
+                    );
+                    throw fatalMlsStateError(
+                        'accepted Add violated one-shot KeyPackageRef state',
+                    );
+                }
+                this._consumedKeyPackageRefs.add(pending.keyPackageRef);
                 this._leafBySenderId.set(pending.senderId, pending.addedLeafIndex);
                 this._senderIdByLeaf.set(pending.addedLeafIndex, pending.senderId);
                 this._state = 'joined';
@@ -983,6 +1061,7 @@
                             || this._leafBySenderId.has(senderId)) {
                             continue;
                         }
+                        let keyPackageRef;
                         try {
                             // A preceding accepted Add may have consumed the
                             // final leaf slot or installed a key which collides
@@ -992,16 +1071,46 @@
                             await this.group.validateKeyPackageForAdd(
                                 deferred.bytes,
                             );
+                            keyPackageRef = await this._availableKeyPackageRef(
+                                deferred.bytes,
+                            );
                         } catch (err) {
+                            const classified = classifyMlsControlError(
+                                err, 'deferred KeyPackage validation failed: ',
+                            );
+                            if (classified.mlsRetryControl === true
+                                || classified.mlsFatalState === true) {
+                                this._deferredKeyPackages.set(
+                                    senderId, deferred,
+                                );
+                                this._deferredKeyPackageBytes +=
+                                    deferred.encodedBytes;
+                                throw classified;
+                            }
                             this.onEvent({
                                 kind: 'error',
-                                reason: `deferred KeyPackage rejected: ${err.message}`,
+                                reason: classified.message,
                             });
                             continue;
                         }
-                        const staged = await this._handleIncomingKeyPackage(
-                            deferred.bytes, senderId,
-                        );
+                        let staged;
+                        try {
+                            staged = await this._handleIncomingKeyPackage(
+                                deferred.bytes, senderId, keyPackageRef,
+                            );
+                        } catch (err) {
+                            if (err?.mlsRetryControl === true
+                                || err?.mlsFatalState === true) {
+                                this._deferredKeyPackages.set(
+                                    senderId, deferred,
+                                );
+                                this._deferredKeyPackageBytes +=
+                                    deferred.encodedBytes;
+                            }
+                            if (err?.mlsFatalState === true) throw err;
+                            if (err?.mlsRetryControl === true) break;
+                            continue;
+                        }
                         if (!staged && !this._departedSenderIds.has(senderId)
                             && !this._leafBySenderId.has(senderId)) {
                             // A transient local crypto/platform failure must
@@ -1166,6 +1275,7 @@
                         || this._deferredKeyPackages.has(senderId)) {
                         return;
                     }
+                    let keyPackageRef;
                     try {
                         await this._verifyKeyPackageBootstrapProof(
                             payload, senderId, envelope.bootstrap_proof,
@@ -1174,12 +1284,18 @@
                         // before treating this ordered control as durably
                         // accepted.
                         await this.group.validateKeyPackageForAdd(payload);
+                        keyPackageRef = await this._availableKeyPackageRef(
+                            payload,
+                        );
                     } catch (err) {
+                        const classified = classifyMlsControlError(
+                            err, 'invalid deferred KeyPackage: ',
+                        );
                         this.onEvent({
                             kind: 'error',
-                            reason: `invalid deferred KeyPackage: ${err.message}`,
+                            reason: classified.message,
                         });
-                        return;
+                        throw classified;
                     }
                     const encodedBytes = envelopeEncodedBytes(envelope);
                     if (this._deferredKeyPackageBytes + encodedBytes
@@ -1191,6 +1307,7 @@
                     this._deferredKeyPackages.set(senderId, {
                         bytes: Uint8Array.from(payload),
                         encodedBytes,
+                        keyPackageRef,
                     });
                     this._deferredKeyPackageBytes += encodedBytes;
                     return;
@@ -1238,20 +1355,27 @@
                         reason: `sender ${senderId} already has a leaf — duplicate KeyPackage rejected` });
                     return;
                 }
+                let keyPackageRef;
                 try {
                     await this._verifyKeyPackageBootstrapProof(
                         payload, senderId, envelope.bootstrap_proof,
                     );
                     await this.group.validateKeyPackageForAdd(payload);
+                    keyPackageRef = await this._availableKeyPackageRef(
+                        payload,
+                    );
                 } catch (err) {
+                    const classified = classifyMlsControlError(
+                        err, 'invalid KeyPackage: ',
+                    );
                     this.onEvent({
                         kind: 'error',
-                        reason: `invalid KeyPackage: ${err.message}`,
+                        reason: classified.message,
                     });
-                    return;
+                    throw classified;
                 }
                 const staged = await this._handleIncomingKeyPackage(
-                    payload, senderId,
+                    payload, senderId, keyPackageRef,
                 );
                 if (!staged && !this._departedSenderIds.has(senderId)
                     && !this._leafBySenderId.has(senderId)) {
@@ -1292,7 +1416,7 @@
                     this._pendingWelcomeCommitBySender.clear();
                     return;
                 } catch (err) {
-                    throw rejectedMlsControlError(
+                    throw classifyMlsControlError(
                         err, 'mls-session: rejected targeted Welcome: ',
                     );
                 }
@@ -1317,7 +1441,7 @@
                     await this._bufferWelcomeCommit(payload, envelope);
                     return;
                 } catch (err) {
-                    throw rejectedMlsControlError(
+                    throw classifyMlsControlError(
                         err, 'mls-session: rejected pre-Welcome control: ',
                     );
                 }
@@ -1365,7 +1489,7 @@
                     },
                 );
             } catch (err) {
-                throw new Error(
+                throw validationMlsControlError(
                     `mls-session: malformed pre-Welcome PublicMessage: ${err.message}`,
                 );
             }
@@ -1377,7 +1501,9 @@
                 || !envelope.key_package_ref) return false;
 
             if (!this._keyPackageRefBytes || !this._keyPackageRef) {
-                throw new Error('mls-session: local KeyPackageRef is unavailable');
+                throw validationMlsControlError(
+                    'mls-session: local KeyPackageRef is unavailable',
+                );
             }
             const envelopeKeyPackageRef = decodeCorrelationRef(
                 envelope.key_package_ref, 'key_package_ref',
@@ -1386,14 +1512,14 @@
                 return false;
             }
             if (!equalBytes(pm.content.groupId, this.expectedGroupId)) {
-                throw new Error(
+                throw validationMlsControlError(
                     'mls-session: correlated Add Commit has unexpected group_id',
                 );
             }
             if (!pm.content.sender
                 || pm.content.sender.senderType !== MLS.Framing.SenderType.MEMBER
                 || pm.content.sender.leafIndex !== CREATOR_LEAF_INDEX) {
-                throw new Error(
+                throw validationMlsControlError(
                     'mls-session: correlated Add Commit was not sent by creator leaf 0',
                 );
             }
@@ -1417,7 +1543,7 @@
                 }
             }
             if (!containsOurKeyPackage) {
-                throw new Error(
+                throw validationMlsControlError(
                     'mls-session: correlated Add Commit does not contain our KeyPackage',
                 );
             }
@@ -1427,12 +1553,12 @@
             );
             const computedCommitRef = await MLS.Labeled.sha256(mlsMessageBytes);
             if (!equalBytes(commitRefBytes, computedCommitRef)) {
-                throw new Error(
+                throw validationMlsControlError(
                     'mls-session: commit_ref does not match PublicMessage payload',
                 );
             }
             if (!envelope.sender_id) {
-                throw new Error(
+                throw validationMlsControlError(
                     'mls-session: correlated Add Commit envelope missing sender_id',
                 );
             }
@@ -1440,7 +1566,7 @@
             const existing = this._pendingWelcomeCommits.get(commitRef);
             if (existing) {
                 if (existing.senderId !== envelope.sender_id) {
-                    throw new Error(
+                    throw validationMlsControlError(
                         'mls-session: duplicate commit_ref arrived from a different relay sender',
                     );
                 }
@@ -1458,7 +1584,7 @@
             if (!previousCommitRef
                 && this._pendingWelcomeCommits.size
                     >= MAX_PENDING_WELCOME_SENDERS) {
-                throw new Error(
+                throw validationMlsControlError(
                     'mls-session: too many distinct Welcome Commit senders',
                 );
             }
@@ -1484,7 +1610,9 @@
          */
         async _matchingWelcomeCommit(mlsMessageBytes, envelope) {
             if (!this._keyPackageRefBytes || !this._keyPackageRef) {
-                throw new Error('mls-session: local KeyPackageRef is unavailable');
+                throw validationMlsControlError(
+                    'mls-session: local KeyPackageRef is unavailable',
+                );
             }
             const envelopeKeyPackageRef = decodeCorrelationRef(
                 envelope.key_package_ref, 'key_package_ref',
@@ -1497,12 +1625,14 @@
             try {
                 welcome = MLS.Welcome.parseWelcome(mlsMessageBytes);
             } catch (err) {
-                throw new Error(`mls-session: malformed targeted Welcome: ${err.message}`);
+                throw validationMlsControlError(
+                    `mls-session: malformed targeted Welcome: ${err.message}`,
+                );
             }
             const containsOurKeyPackageRef = welcome.secrets.some((entry) =>
                 equalBytes(entry.newMember, this._keyPackageRefBytes));
             if (!containsOurKeyPackageRef) {
-                throw new Error(
+                throw validationMlsControlError(
                     'mls-session: targeted Welcome does not contain our KeyPackageRef',
                 );
             }
@@ -1513,24 +1643,26 @@
             const commitRef = base64UrlEncode(commitRefBytes);
             const candidate = this._pendingWelcomeCommits.get(commitRef);
             if (!candidate) {
-                throw new Error(
+                throw validationMlsControlError(
                     'mls-session: Welcome received without its matching buffered Commit',
                 );
             }
             if (candidate.keyPackageRef !== this._keyPackageRef) {
-                throw new Error(
+                throw validationMlsControlError(
                     'mls-session: Welcome/Commit KeyPackageRef correlation mismatch',
                 );
             }
             if (candidate.senderId !== envelope.sender_id) {
-                throw new Error(
+                throw validationMlsControlError(
                     'mls-session: Welcome and Commit relay sender_id mismatch',
                 );
             }
             return candidate;
         }
 
-        async _handleIncomingKeyPackage(kpBytes, senderId) {
+        async _handleIncomingKeyPackage(
+            kpBytes, senderId, admittedKeyPackageRef = null,
+        ) {
             // The envelope payload is the raw KeyPackage body — wire_format
             // rides as a separate envelope field, so the bytes are NOT wrapped
             // in MLSMessage framing. Pass them straight to commitAddMember
@@ -1543,6 +1675,11 @@
             let staged = false;
             let candidateGroup = null;
             try {
+                const keyPackageRef = admittedKeyPackageRef
+                    || await this._availableKeyPackageRef(kpBytes);
+                decodeCorrelationRef(
+                    keyPackageRef, 'admitted key_package_ref',
+                );
                 candidateGroup = this.group.forkForPendingCommit();
                 const { commitMessage, welcomeMessage, addedLeafIndex } =
                     await candidateGroup.commitAddMember({
@@ -1552,9 +1689,6 @@
                 // the leftmost blank leaf before growing the tree.
                 const ratchetTreeBytes = MLS.Nodes.ratchetTreeBytes(
                     candidateGroup.ratchetTree,
-                );
-                const keyPackageRef = base64UrlEncode(
-                    await MLS.KeyPackage.keyPackageRef(kpBytes),
                 );
                 const commitRef = base64UrlEncode(
                     await MLS.Labeled.sha256(stripMlsWrapper(commitMessage)),
@@ -1579,8 +1713,12 @@
                 });
             } catch (err) {
                 if (candidateGroup && !staged) candidateGroup.destroySecrets();
-                console.error('[MLS] commitAddMember failed:', err);
-                this.onEvent({ kind: 'error', reason: `commitAddMember failed: ${err.message}` });
+                const classified = classifyMlsControlError(
+                    err, 'commitAddMember failed: ',
+                );
+                console.error('[MLS] commitAddMember failed:', classified);
+                this.onEvent({ kind: 'error', reason: classified.message });
+                throw classified;
             } finally {
                 this._localCommitBusy = false;
             }
@@ -1604,7 +1742,7 @@
             // old epoch into the cryptographic join routine.
             if (!candidate
                 || this._pendingWelcomeCommits.get(candidate.commitRef) !== candidate) {
-                throw new Error(
+                throw validationMlsControlError(
                     'mls-session: Welcome has no live correlated Commit candidate',
                 );
             }
@@ -1612,7 +1750,7 @@
                 await MLS.Labeled.sha256(candidate.bytes),
             );
             if (computedCommitRef !== candidate.commitRef) {
-                throw new Error(
+                throw validationMlsControlError(
                     'mls-session: buffered Commit bytes no longer match commit_ref',
                 );
             }
@@ -1635,8 +1773,9 @@
                 rosterEvent = await this._authenticatedRosterEvent(joinedGroup);
             } catch (err) {
                 joinedGroup.destroySecrets();
-                throw new Error(
-                    `mls-session: authenticated roster derivation failed: ${err.message}`,
+                throw retryableMlsControlError(
+                    err,
+                    'mls-session: authenticated roster derivation failed: ',
                 );
             }
             this.group = joinedGroup;
@@ -1758,7 +1897,10 @@
             } catch (err) {
                 this.onEvent({ kind: 'error',
                     reason: `malformed PublicMessage: ${err.message}` });
-                return;
+                throw rejectedMlsControlError(
+                    validationMlsControlError(err),
+                    'malformed PublicMessage: ',
+                );
             }
             if (pm.content.contentType === MLS.Framing.ContentType.PROPOSAL) {
                 await this._handleIncomingProposal(wrapped);
@@ -1770,6 +1912,9 @@
             }
             this.onEvent({ kind: 'error',
                 reason: `unsupported PublicMessage content_type ${pm.content.contentType}` });
+            throw rejectedMlsControlError(validationMlsControlError(
+                `unsupported PublicMessage content_type ${pm.content.contentType}`,
+            ));
         }
 
         /**
@@ -1786,17 +1931,24 @@
             try {
                 verified = await this.group.verifyUpdateProposal(wrappedBytes);
             } catch (err) {
+                const classified = classifyMlsControlError(
+                    err, 'invalid Update proposal: ',
+                );
                 this.onEvent({ kind: 'error',
-                    reason: `invalid Update proposal: ${err.message}` });
-                return;
+                    reason: classified.message });
+                throw classified;
             }
             let stored;
             try {
                 stored = this._storeAuthenticatedProposal(verified);
             } catch (err) {
+                const classified = rejectedMlsControlError(
+                    validationMlsControlError(err),
+                    'invalid Update proposal store entry: ',
+                );
                 this.onEvent({ kind: 'error',
-                    reason: `invalid Update proposal: ${err.message}` });
-                return;
+                    reason: classified.message });
+                throw classified;
             }
             if (!stored.isNew) return;
             if (this.role === 'creator') {
@@ -1829,6 +1981,11 @@
             } catch (err) {
                 console.error('[MLS] processCommit failed:', err);
                 const reason = `processCommit failed: ${err.message}`;
+                if (err?.mlsRetryControl === true
+                    || err?.mlsFatalState === true) {
+                    this.onEvent({ kind: 'error', reason });
+                    throw err;
+                }
                 if (err?.authenticatedMlsControl === true) {
                     // The relay sequence names a current-epoch Commit whose
                     // creator signature and membership_tag are valid. If its
@@ -1840,8 +1997,10 @@
                     this._transitionToDesynced(reason);
                     throw fatalMlsStateError(reason);
                 }
-                this.onEvent({ kind: 'error', reason });
-                return;
+                const classified = classifyMlsControlError(err, '');
+                this.onEvent({ kind: 'error',
+                    reason: classified.message || reason });
+                throw classified;
             }
             if (result.removedSelf === true) {
                 this._transitionToRemoved(result);
@@ -2063,20 +2222,34 @@
         async _removeMemberBySenderId(senderId) {
             if (this.role !== 'creator') return;
             if (typeof senderId !== 'string' || senderId.length === 0) return;
-            // Record the final relay departure before inspecting current MLS
-            // state. In particular, the peer may have a KeyPackage queued or
-            // an Add awaiting acceptance but no live leaf mapping yet.
-            this._departedSenderIds.add(senderId);
             if (this._state === 'removed') return;
-            if (this._pendingCommit?.kind === 'remove'
-                && this._pendingCommit.senderId === senderId) return;
-            if (this._pendingCommit?.kind === 'add'
-                && this._pendingCommit.senderId === senderId) {
+            const hasLiveLeaf = this._leafBySenderId.has(senderId);
+            const hasDeferredKeyPackage =
+                this._deferredKeyPackages.has(senderId);
+            const pendingAdd = this._pendingCommit?.kind === 'add'
+                && this._pendingCommit.senderId === senderId;
+            const pendingRemove = this._pendingCommit?.kind === 'remove'
+                && this._pendingCommit.senderId === senderId;
+            // Ordered UserLeft for a route which never published a
+            // KeyPackage and never owned a leaf needs no tombstone: every
+            // earlier control has already been processed by this mutex, so
+            // retaining arbitrary relay IDs would only create an unbounded
+            // attacker-controlled set.
+            if (!hasLiveLeaf && !hasDeferredKeyPackage
+                && !pendingAdd && !pendingRemove) {
+                return;
+            }
+            // Record the final relay departure only when there is actual MLS
+            // admission state which a delayed operation could resurrect.
+            this._departedSenderIds.add(senderId);
+            if (pendingRemove) return;
+            if (pendingAdd) {
                 this._deferredRemovals.add(senderId);
                 return;
             }
+            if (hasDeferredKeyPackage && !hasLiveLeaf) return;
             if (this._state !== 'joined') return;
-            if (!this._leafBySenderId.has(senderId)) return;
+            if (!hasLiveLeaf) return;
             if (this._localCommitBusy || this._pendingCommit) {
                 this._deferredRemovals.add(senderId);
                 return;

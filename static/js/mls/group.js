@@ -215,6 +215,52 @@
         }
     }
 
+    function wipeEpochSecretObject(epochSecrets) {
+        if (!epochSecrets || typeof epochSecrets !== 'object') return;
+        for (const value of Object.values(epochSecrets)) wipeBytes(value);
+    }
+
+    const DETERMINISTIC_CONTROL_ERROR_PREFIXES = Object.freeze([
+        'group.join:', 'group.join ', 'processCommit:',
+        'validateKeyPackageForAdd:',
+        'verifyUpdateProposal:', 'verifyUpdateLeaf:', 'verifyCommitLeaf:',
+        'verifyKeyPackage', 'imported-tree:', 'parent-hash:',
+        'Decoder:', 'varint:', 'mls_message:', 'public-message:',
+        'authenticated_content:', 'framed_content:', 'sender:',
+        'proposal:', 'proposal_or_ref:', 'commit:', 'welcome:',
+        'group_secrets:', 'group_info:', 'key_package:', 'ratchet_tree:',
+        'leaf_node:', 'node:', 'credential:', 'extensions:',
+        'capabilities:', 'optional:',
+    ]);
+
+    /**
+     * Separate deterministic wire/authentication rejection from unexpected
+     * platform failures. MLSSession consumes the former ordered control, but
+     * reconnects and replays the latter from the unchanged cursor.
+     */
+    function classifyGroupControlError(error) {
+        if (!error || (typeof error !== 'object' && typeof error !== 'function')) {
+            const wrapped = new Error(String(error));
+            wrapped.mlsRetryControl = true;
+            return wrapped;
+        }
+        if (error.mlsValidationFailure === true
+            || error.mlsRetryControl === true
+            || error.mlsFatalState === true) {
+            return error;
+        }
+        const message = error instanceof Error ? error.message : String(error);
+        if (error instanceof RangeError
+            || DETERMINISTIC_CONTROL_ERROR_PREFIXES.some(
+                (prefix) => message.startsWith(prefix),
+            )) {
+            error.mlsValidationFailure = true;
+        } else {
+            error.mlsRetryControl = true;
+        }
+        return error;
+    }
+
     const CONSUMED_EPOCH_SECRETS = new Set([
         'joinerSecret',
         'welcomeSecret',
@@ -355,6 +401,12 @@
             // for in-flight messages across a Commit). See
             // _snapshotPrevEpoch / _decryptFromPreviousEpoch.
             this._prevEpoch = null;
+            // Expiry must not depend on another old-epoch ciphertext
+            // arriving. A real timer releases the retained decrypt context
+            // once the grace deadline passes; the snapshot identity check in
+            // _schedulePrevEpochExpiry prevents a stale callback from
+            // deleting a newer epoch's context.
+            this._prevEpochTimer = null;
         }
 
         _markGenerationConsumed(leafIndex, generation) {
@@ -436,7 +488,7 @@
                     allowedSenderLeafIndices.add(leafIndex);
                 }
             }
-            this._prevEpoch = {
+            const snapshot = {
                 epoch: this.epoch,
                 nLeaves: this.nLeaves,
                 ratchetTree: this.ratchetTree,
@@ -452,6 +504,8 @@
                 allowedSenderLeafIndices,
                 expiresAt: Date.now() + PREV_EPOCH_GRACE_MS,
             };
+            this._prevEpoch = snapshot;
+            this._schedulePrevEpochExpiry(snapshot);
             // sender_data_secret remains owned by the bounded grace context.
             // Everything else from the outgoing epoch has no remaining use.
             for (const [name, value] of Object.entries(outgoingEpochSecrets)) {
@@ -463,9 +517,49 @@
         }
 
         /**
+         * Arm (or re-arm) expiry for one exact previous-epoch snapshot.
+         * Browsers may throttle background timers, so the callback rechecks
+         * the wall-clock deadline and releases the secrets as soon as the
+         * event loop is allowed to run. It never relies on message arrival.
+         */
+        _schedulePrevEpochExpiry(snapshot) {
+            if (this._prevEpochTimer !== null) {
+                clearTimeout(this._prevEpochTimer);
+                this._prevEpochTimer = null;
+            }
+            if (!snapshot || this._prevEpoch !== snapshot) return;
+            const delay = Math.max(0, snapshot.expiresAt - Date.now());
+            try {
+                this._prevEpochTimer = setTimeout(() => {
+                    this._prevEpochTimer = null;
+                    if (this._prevEpoch !== snapshot) return;
+                    if (Date.now() < snapshot.expiresAt) {
+                        this._schedulePrevEpochExpiry(snapshot);
+                        return;
+                    }
+                    this._dropPrevEpoch();
+                }, delay);
+                // Browser timers have no unref(); Node regression tests do.
+                if (typeof this._prevEpochTimer?.unref === 'function') {
+                    this._prevEpochTimer.unref();
+                }
+            } catch (_err) {
+                // Failing to schedule must shorten, never extend, retention.
+                // Drop the optional grace state immediately while leaving the
+                // newly committed epoch usable.
+                this._prevEpochTimer = null;
+                this._dropPrevEpoch();
+            }
+        }
+
+        /**
          * Zero and drop the retained previous-epoch context.
          */
         _dropPrevEpoch() {
+            if (this._prevEpochTimer !== null) {
+                clearTimeout(this._prevEpochTimer);
+                this._prevEpochTimer = null;
+            }
             if (!this._prevEpoch) return;
             wipeBytes(this._prevEpoch.senderDataSecret);
             this._wipeChainStateMap(this._prevEpoch.chainStates);
@@ -826,7 +920,8 @@
             for (const [key, value] of Object.entries(this)) {
                 if (key === 'consumedByLeaf'
                     || key === '_chainStates'
-                    || key === '_prevEpoch') continue;
+                    || key === '_prevEpoch'
+                    || key === '_prevEpochTimer') continue;
                 state[key] = cloneMutableState(value);
             }
             const candidate = new Group(state);
@@ -1187,6 +1282,7 @@
      */
     Group.prototype.validateKeyPackageForAdd =
         async function validateKeyPackageForAdd(keyPackageBytes) {
+            try {
             const kp = KeyPackage.parseKeyPackage(keyPackageBytes);
             await verifyKeyPackageBindings(kp, 'validateKeyPackageForAdd');
             const position = nextAddPosition(
@@ -1208,6 +1304,9 @@
                 addedLeafIndex: position.leafIndex,
                 nLeaves: position.nLeaves,
             };
+            } catch (err) {
+                throw classifyGroupControlError(err);
+            }
         };
 
     /**
@@ -1335,10 +1434,21 @@
             nodeType: Nodes.NodeType.LEAF, leaf: kp.leafNode,
         };
 
+        let leafSecret = null;
+        let leafNodePair = null;
+        let chain = [];
+        let epochSecrets = null;
+        let preparedEpoch = null;
+        let welcomeSecret = null;
+        let wKey = null;
+        let wNonce = null;
+        let gsBytes = null;
+        let stateInstalled = false;
+        try {
         // ---- 2. Generate fresh leaf_secret + path-secret chain ----
-        const leafSecret = randomBytes(HPKE.Nh);
-        const leafNodePair = await TreeKEM.leafKeyPairFromSecret(leafSecret, this.myLeafIndex);
-        const chain = await TreeKEM.pathSecretChain(leafSecret, this.myLeafIndex, newNLeaves);
+        leafSecret = randomBytes(HPKE.Nh);
+        leafNodePair = await TreeKEM.leafKeyPairFromSecret(leafSecret, this.myLeafIndex);
+        chain = await TreeKEM.pathSecretChain(leafSecret, this.myLeafIndex, newNLeaves);
         const committerDirectPath = TreeMath.directPathWithRoot(
             TreeMath.leafToNode(this.myLeafIndex), newNLeaves,
         );
@@ -1489,7 +1599,6 @@
 
         const rootChainEntry = chain[chain.length - 1];
         const commitSecretBytes = await TreeKEM.commitSecret(rootChainEntry.pathSecret);
-        let epochSecrets;
         try {
             epochSecrets = await KeySchedule.deriveEpoch({
                 initSecretPrev: this.epochSecrets.initSecret,
@@ -1533,10 +1642,11 @@
         const groupInfo = { ...groupInfoPreSign, signature: giSignature };
         const giBytes = GroupInfo.groupInfoBytes(groupInfo);
 
-        const welcomeSecret = await Welcome.deriveWelcomeSecret(
+        welcomeSecret = await Welcome.deriveWelcomeSecret(
             epochSecrets.joinerSecret, this.pskSecret,
         );
-        const { key: wKey, nonce: wNonce } = await Welcome.welcomeKeyNonce(welcomeSecret);
+        ({ key: wKey, nonce: wNonce } =
+            await Welcome.welcomeKeyNonce(welcomeSecret));
         const encryptedGroupInfo = await Welcome.sealEncryptedGroupInfo(wKey, wNonce, giBytes);
 
         // The path_secret to ship in the Welcome is the chain entry at
@@ -1560,7 +1670,7 @@
             pathSecret: chain[lcaIndexForNewMember].pathSecret,
             psks: [],
         };
-        const gsBytes = Welcome.groupSecretsBytes(groupSecrets);
+        gsBytes = Welcome.groupSecretsBytes(groupSecrets);
         const ref = await KeyPackage.keyPackageRef(keyPackageBytes);
         const { kemOutput: gsKem, ciphertext: gsCt } = await Labeled.encryptWithLabel(
             kp.initKey, 'Welcome', encryptedGroupInfo, gsBytes,
@@ -1582,7 +1692,7 @@
         wKey.fill(0);
         wNonce.fill(0);
 
-        const preparedEpoch = await prepareEpochSecretsForStorage(
+        preparedEpoch = await prepareEpochSecretsForStorage(
             epochSecrets, newTree, newNLeaves,
         );
         const previousInitSecret = this.epochSecrets.initSecret;
@@ -1619,9 +1729,22 @@
         // chain states now live in the grace-window snapshot; fresh
         // maps start the new epoch.
         this.consumedByLeaf = new Map();
-        wipeTreeKemSecrets(leafSecret, leafNodePair, chain);
-
+        stateInstalled = true;
         return { commitMessage, welcomeMessage, addedLeafIndex: newLeafIndex };
+        } finally {
+            wipeTreeKemSecrets(leafSecret, leafNodePair, chain);
+            wipeBytes(welcomeSecret);
+            wipeBytes(wKey);
+            wipeBytes(wNonce);
+            wipeBytes(gsBytes);
+            if (!stateInstalled) {
+                wipeEpochSecretObject(epochSecrets);
+                if (preparedEpoch) {
+                    wipeEpochSecretObject(preparedEpoch.epochSecrets);
+                    this._wipeChainStateMap(preparedEpoch.chainStates);
+                }
+            }
+        }
     };
 
     /**
@@ -1660,10 +1783,17 @@
             newTree[nodeIdx] = null;
         }
 
+        let leafSecret = null;
+        let leafNodePair = null;
+        let chain = [];
+        let epochSecrets = null;
+        let preparedEpoch = null;
+        let stateInstalled = false;
+        try {
         // ---- 2. Generate fresh leaf_secret + path-secret chain for committer ----
-        const leafSecret = randomBytes(HPKE.Nh);
-        const leafNodePair = await TreeKEM.leafKeyPairFromSecret(leafSecret, this.myLeafIndex);
-        const chain = await TreeKEM.pathSecretChain(leafSecret, this.myLeafIndex, newNLeaves);
+        leafSecret = randomBytes(HPKE.Nh);
+        leafNodePair = await TreeKEM.leafKeyPairFromSecret(leafSecret, this.myLeafIndex);
+        chain = await TreeKEM.pathSecretChain(leafSecret, this.myLeafIndex, newNLeaves);
         const committerDirectPath = TreeMath.directPathWithRoot(
             TreeMath.leafToNode(this.myLeafIndex), newNLeaves,
         );
@@ -1810,7 +1940,6 @@
 
         const rootChainEntry = chain[chain.length - 1];
         const commitSecretBytes = await TreeKEM.commitSecret(rootChainEntry.pathSecret);
-        let epochSecrets;
         try {
             epochSecrets = await KeySchedule.deriveEpoch({
                 initSecretPrev: this.epochSecrets.initSecret,
@@ -1838,7 +1967,7 @@
         const pm = { content, auth, membershipTag };
         const pmBytes = PublicMessage.publicMessageBytes(pm);
         const commitMessage = MLSMessage.serializeMLSMessage(wireFormat, pmBytes);
-        const preparedEpoch = await prepareEpochSecretsForStorage(
+        preparedEpoch = await prepareEpochSecretsForStorage(
             epochSecrets, newTree, newNLeaves,
         );
         const previousInitSecret = this.epochSecrets.initSecret;
@@ -1866,9 +1995,18 @@
             this.parentKeyPairs.set(committerDirectPath[i], chain[i].keyPair);
         }
         this.consumedByLeaf = new Map();
-        wipeTreeKemSecrets(leafSecret, leafNodePair, chain);
-
+        stateInstalled = true;
         return { commitMessage };
+        } finally {
+            wipeTreeKemSecrets(leafSecret, leafNodePair, chain);
+            if (!stateInstalled) {
+                wipeEpochSecretObject(epochSecrets);
+                if (preparedEpoch) {
+                    wipeEpochSecretObject(preparedEpoch.epochSecrets);
+                    this._wipeChainStateMap(preparedEpoch.chainStates);
+                }
+            }
+        }
     };
 
     /**
@@ -1967,6 +2105,7 @@
         proposalMessageBytes,
         { allowOwnSender = false } = {},
     ) {
+        try {
         const frame = MLSMessage.parseMLSMessage(proposalMessageBytes);
         if (frame.wireFormat !== MLSMessage.WireFormat.MLS_PUBLIC_MESSAGE) {
             throw new Error(
@@ -2062,6 +2201,9 @@
             reference,
             messageBytes: Uint8Array.from(proposalMessageBytes),
         };
+        } catch (err) {
+            throw classifyGroupControlError(err);
+        }
     };
 
     /**
@@ -2167,10 +2309,17 @@
             }
         }
 
+        let leafSecret = null;
+        let leafNodePair = null;
+        let chain = [];
+        let epochSecrets = null;
+        let preparedEpoch = null;
+        let stateInstalled = false;
+        try {
         // ---- 1. Fresh leaf_secret + path-secret chain for committer ----
-        const leafSecret = randomBytes(HPKE.Nh);
-        const leafNodePair = await TreeKEM.leafKeyPairFromSecret(leafSecret, this.myLeafIndex);
-        const chain = await TreeKEM.pathSecretChain(leafSecret, this.myLeafIndex, newNLeaves);
+        leafSecret = randomBytes(HPKE.Nh);
+        leafNodePair = await TreeKEM.leafKeyPairFromSecret(leafSecret, this.myLeafIndex);
+        chain = await TreeKEM.pathSecretChain(leafSecret, this.myLeafIndex, newNLeaves);
         const committerDirectPath = TreeMath.directPathWithRoot(
             TreeMath.leafToNode(this.myLeafIndex), newNLeaves,
         );
@@ -2306,7 +2455,6 @@
 
         const rootChainEntry = chain[chain.length - 1];
         const commitSecretBytes = await TreeKEM.commitSecret(rootChainEntry.pathSecret);
-        let epochSecrets;
         try {
             epochSecrets = await KeySchedule.deriveEpoch({
                 initSecretPrev: this.epochSecrets.initSecret,
@@ -2334,7 +2482,7 @@
         const pm = { content, auth, membershipTag };
         const pmBytes = PublicMessage.publicMessageBytes(pm);
         const commitMessage = MLSMessage.serializeMLSMessage(wireFormat, pmBytes);
-        const preparedEpoch = await prepareEpochSecretsForStorage(
+        preparedEpoch = await prepareEpochSecretsForStorage(
             epochSecrets, newTree, newNLeaves,
         );
         const previousInitSecret = this.epochSecrets.initSecret;
@@ -2362,9 +2510,18 @@
             this.parentKeyPairs.set(committerDirectPath[i], chain[i].keyPair);
         }
         this.consumedByLeaf = new Map();
-        wipeTreeKemSecrets(leafSecret, leafNodePair, chain);
-
+        stateInstalled = true;
         return { commitMessage };
+        } finally {
+            wipeTreeKemSecrets(leafSecret, leafNodePair, chain);
+            if (!stateInstalled) {
+                wipeEpochSecretObject(epochSecrets);
+                if (preparedEpoch) {
+                    wipeEpochSecretObject(preparedEpoch.epochSecrets);
+                    this._wipeChainStateMap(preparedEpoch.chainStates);
+                }
+            }
+        }
     };
 
     /**
@@ -2378,6 +2535,10 @@
      */
     Group.prototype.processCommit = async function processCommit(commitMessageBytes, opts = {}) {
         let authenticatedCreatorCommit = false;
+        let transitionEpochSecrets = null;
+        let preparedTransition = null;
+        let derivedParentKeyPairs = null;
+        let transitionInstalled = false;
         try {
         // pendingSelfUpdate: the { publicKeyBytes, privateKey, ... } keypair
         // we generated for an Update proposal that may be folded into this
@@ -2754,6 +2915,7 @@
         // commits from any committer whose copath sibling resolution
         // lands on one of these nodes.
         const newParentKeyPairs = new Map();
+        derivedParentKeyPairs = newParentKeyPairs;
         let cur = lcaPathSecret;
         let commitSecretBytes;
         try {
@@ -2801,9 +2963,8 @@
         };
         const epochGroupContextBytes = GroupContext.groupContextBytes(epochGroupContext);
 
-        let newEpochSecrets;
         try {
-            newEpochSecrets = await KeySchedule.deriveEpoch({
+            transitionEpochSecrets = await KeySchedule.deriveEpoch({
                 initSecretPrev: this.epochSecrets.initSecret,
                 commitSecret: commitSecretBytes,
                 pskSecret: this.pskSecret,
@@ -2814,17 +2975,17 @@
         }
 
         const expectedConfTag = await TranscriptHashes.confirmationTag(
-            newEpochSecrets.confirmationKey, newConfirmedTranscriptHash,
+            transitionEpochSecrets.confirmationKey, newConfirmedTranscriptHash,
         );
         if (!equalBytes(expectedConfTag, pm.auth.confirmationTag)) {
-            for (const value of Object.values(newEpochSecrets)) wipeBytes(value);
+            wipeEpochSecretObject(transitionEpochSecrets);
             throw new Error('processCommit: confirmation_tag mismatch');
         }
         const newInterimTranscriptHash = await TranscriptHashes.interimTranscriptHash(
             newConfirmedTranscriptHash, expectedConfTag,
         );
-        const preparedEpoch = await prepareEpochSecretsForStorage(
-            newEpochSecrets, newTree, newNLeaves,
+        preparedTransition = await prepareEpochSecretsForStorage(
+            transitionEpochSecrets, newTree, newNLeaves,
         );
         const previousInitSecret = this.epochSecrets.initSecret;
 
@@ -2838,8 +2999,8 @@
         this.treeHash = newTreeHash;
         this.confirmedTranscriptHash = newConfirmedTranscriptHash;
         this.interimTranscriptHash = newInterimTranscriptHash;
-        this.epochSecrets = preparedEpoch.epochSecrets;
-        this._chainStates = preparedEpoch.chainStates;
+        this.epochSecrets = preparedTransition.epochSecrets;
+        this._chainStates = preparedTransition.chainStates;
         previousInitSecret.fill(0);
         this.senderRatchetGeneration = 0;
         if (selfUpdated) this.leafKeyPair = nextLeafKeyPair;
@@ -2868,6 +3029,7 @@
         // the grace-window snapshot; fresh maps start the new epoch.
         this.consumedByLeaf = new Map();
 
+        transitionInstalled = true;
         return {
             addedLeafIndex: lastAddedLeafIndex,
             addedLeafIndices,
@@ -2881,11 +3043,25 @@
             ),
         };
         } catch (err) {
-            if (authenticatedCreatorCommit && err
-                && (typeof err === 'object' || typeof err === 'function')) {
-                err.authenticatedMlsControl = true;
+            const classified = classifyGroupControlError(err);
+            if (authenticatedCreatorCommit) {
+                classified.mlsAuthenticatedControl = true;
+                if (classified.mlsValidationFailure === true) {
+                    classified.authenticatedMlsControl = true;
+                }
             }
-            throw err;
+            throw classified;
+        } finally {
+            if (!transitionInstalled) {
+                wipeEpochSecretObject(transitionEpochSecrets);
+                if (preparedTransition) {
+                    wipeEpochSecretObject(preparedTransition.epochSecrets);
+                    this._wipeChainStateMap(preparedTransition.chainStates);
+                }
+                if (derivedParentKeyPairs instanceof Map) {
+                    derivedParentKeyPairs.clear();
+                }
+            }
         }
     };
 
@@ -3310,6 +3486,8 @@
         group._chainStates = preparedEpoch.chainStates;
         installed = true;
         return group;
+        } catch (err) {
+            throw classifyGroupControlError(err);
         } finally {
             for (const value of transientSecrets) wipeBytes(value);
             transientSecrets.clear();

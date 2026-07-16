@@ -31,6 +31,7 @@ const _COMMON_RELAY_MESSAGE_TYPES = new Set([
 const MAX_INBOUND_QUEUE_MESSAGES = 128;
 const MAX_INBOUND_QUEUE_CHARS = 8 * 1024 * 1024;
 const MAX_PENDING_MLS_CONTROLS = 64;
+const MAX_MLS_CONTROL_REPLAY_ATTEMPTS = 3;
 
 function _isMessageAllowedForRoom(roomType, messageType) {
     if (_COMMON_RELAY_MESSAGE_TYPES.has(messageType)) return true;
@@ -95,6 +96,11 @@ class WebSocketManager {
         // important for a Welcome produced after its Add Commit is already
         // accepted: that epoch cannot safely be rolled back.
         this._pendingMlsControls = new Map();
+        // Unexpected local crypto/platform failures replay the immutable
+        // control from the unchanged cursor. Bound those retries so a
+        // persistent browser failure cannot create an infinite reconnect
+        // loop; exhaustion terminates the MLS session fail-closed.
+        this._mlsControlRetryAttempts = new Map();
         // Set from the first server-authenticated Connected frame and pinned
         // for the lifetime of this page. It gates every subsequent relay
         // message before application dispatch.
@@ -818,6 +824,7 @@ class WebSocketManager {
                                 const seq = message.control_seq;
                                 if (seq <= this.lastMlsControlSeq) {
                                     // Harmless retransmission after an ACK race.
+                                    this._mlsControlRetryAttempts.delete(seq);
                                     this._confirmMlsControl(message);
                                     this._sendMlsControlAck(
                                         this.lastMlsControlSeq,
@@ -840,6 +847,7 @@ class WebSocketManager {
                                     return;
                                 }
                                 this.lastMlsControlSeq = seq;
+                                this._mlsControlRetryAttempts.delete(seq);
                                 this._confirmMlsControl(message);
                                 this._sendMlsControlAck(seq);
                                 return;
@@ -899,10 +907,30 @@ class WebSocketManager {
                                 const seq = message.control_seq;
                                 if (seq === this.lastMlsControlSeq + 1) {
                                     this.lastMlsControlSeq = seq;
+                                    this._mlsControlRetryAttempts.delete(seq);
                                     this._confirmMlsControl(message);
                                     this._sendMlsControlAck(seq);
                                 }
                                 return;
+                            }
+                            if (isOrderedGroupControl
+                                && err?.mlsRetryControl === true) {
+                                const seq = message.control_seq;
+                                const attempts = (
+                                    this._mlsControlRetryAttempts.get(seq) || 0
+                                ) + 1;
+                                this._mlsControlRetryAttempts.set(
+                                    seq, attempts,
+                                );
+                                if (attempts
+                                    >= MAX_MLS_CONTROL_REPLAY_ATTEMPTS) {
+                                    this._failMlsState(
+                                        `MLS control ${seq} failed `
+                                        + `${attempts} replay attempts: `
+                                        + `${err.message}`,
+                                    );
+                                    return;
+                                }
                             }
                             if ((isOrderedGroupControl
                                 || message.type === 'mlssync'

@@ -1,8 +1,8 @@
 {
   "data": {
     "version": "1.2.0",
-    "sequence": 77,
-    "generated": "2026-07-16T12:10:20.588Z",
+    "sequence": 78,
+    "generated": "2026-07-16T12:58:36.842Z",
     "site": "https://pinchat.io",
     "files": [
       {
@@ -15,7 +15,7 @@
       },
       {
         "path": "/static/js/app.js",
-        "hash": "4d8fadb94e476274821c383cea6375467b49641ae43164bed6d031008da3fc05"
+        "hash": "0130af951a0d4fb98c4eedae934db2f66d5b41e72e033e0966e911adee273e4d"
       },
       {
         "path": "/static/js/cookie-notice.js",
@@ -71,7 +71,7 @@
       },
       {
         "path": "/static/js/websocket.js",
-        "hash": "a1d9763c1acc3b92a96c8a598fe2ead30b07c692c9fae35f65d3b5c130ba9022"
+        "hash": "c545dbdc4aa7a34df1c5cf8aa8444600ba52508a6ac850a8f6e1cf3cfce24f27"
       },
       {
         "path": "/static/js/debug.js",
@@ -131,7 +131,7 @@
       },
       {
         "path": "/static/js/mls/tree-kem.js",
-        "hash": "4b66d94a37bbcfe204382b681ae356fa86650503a61f8705b295e0bf63c224b9"
+        "hash": "bdb55a33e3233580c5b157992575e4d1eafe40eb9e7547e80944fac446f5744c"
       },
       {
         "path": "/static/js/mls/group-context.js",
@@ -179,11 +179,11 @@
       },
       {
         "path": "/static/js/mls/group.js",
-        "hash": "ed2e7ce4318eaa368f3827fbc60707a0549383824b0c4eb4c5b0741584beae5f"
+        "hash": "c5b10948ca5f338dd4f02ae4e4b6be861ff3f6dc938273e22133bc30f837988c"
       },
       {
         "path": "/static/js/mls-session.js",
-        "hash": "2b11520f7fc26cc3bc4f7d854127f9e10608107bbf69fa06b6c33c2982ef7136"
+        "hash": "ed3bfa181f5dcf855caccec981754747f2a75109e5add187121650c2e80ff27f"
       },
       {
         "path": "/static/index.html",
@@ -195,7 +195,7 @@
       },
       {
         "path": "/static/chat.html",
-        "hash": "fcfecb3031a8750d128f82ae7a8fa8bcfa6b522ad7f21f19f25087e1306f9441"
+        "hash": "4a4a7458ce12a8bacd6edcaba3b6bf398bb358eeadf0762a127fa0325cfcbcb7"
       },
       {
         "path": "/static/terms.html",
@@ -211,5 +211,5 @@
       }
     ]
   },
-  "signature": "MEYCIQDO2cOuHzrykTRHmH4QSbxOeF3WlyH+DvsOiuMqfWKshgIhAKtwevOob2jQmjjb0dNNbk01SGCafCtwd6sy4GWsimuO"
+  "signature": "MEYCIQCxBm1jWZ+d6cOl/7EV78hg76R7yV1lF743Fj/GprhLFwIhAOJbKblDjN0juqpjwaaPJeoi5SWQ9DB8DnDtp1B3nyb7"
 }

@@ -521,6 +521,61 @@ async function main() {
 
     queuedResponses = [
         response(200, { csrf_token: csrfToken }),
+        successToken('retry-budget-mls-control-token'),
+    ];
+    const retryBudgetManager =
+        new WebSocketManager('retry-budget-mls-room');
+    let retryBudgetError = null;
+    retryBudgetManager.onError = (error) => {
+        retryBudgetError = error.message;
+    };
+    retryBudgetManager.onMessage = async (message) => {
+        if (message.type === 'mls') {
+            const error = new Error('one-shot platform operation failed');
+            error.mlsRetryControl = true;
+            throw error;
+        }
+    };
+    await retryBudgetManager.connect();
+    const retryBudgetSocket = FakeWebSocket.instances.at(-1);
+    retryBudgetSocket.onopen();
+    retryBudgetSocket.onmessage({
+        data: JSON.stringify({
+            type: 'connected',
+            user_id: 'retry-budget-relay-id',
+            room_type: 'group',
+            resumed: false,
+            resume_token: resumeToken,
+            mls_control_cursor: 0,
+        }),
+    });
+    await retryBudgetManager._inboundQueue;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+        // Model replay of the unchanged sequence on each resumed socket
+        // without rebuilding the whole token exchange in this unit test.
+        retryBudgetSocket.readyState = FakeWebSocket.OPEN;
+        retryBudgetSocket.onmessage({
+            data: JSON.stringify({
+                type: 'mls',
+                payload: 'AA',
+                wire_format: 5,
+                sender_id: 'peer-retry',
+                control_seq: 1,
+            }),
+        });
+        await retryBudgetManager._inboundQueue;
+    }
+    const retryBudgetFrames =
+        retryBudgetSocket.sent.map((raw) => JSON.parse(raw));
+    check(retryBudgetManager.lastMlsControlSeq === 0
+        && !retryBudgetFrames.some((frame) =>
+            frame.type === 'mlsack' && frame.control_seq === 1)
+        && retryBudgetSocket.closedWith?.code === 1008
+        && retryBudgetError === 'MLS_STATE_DESYNC',
+    'retryable MLS control exhausts a bounded replay budget and fails closed');
+
+    queuedResponses = [
+        response(200, { csrf_token: csrfToken }),
         successToken('rejected-mls-control-token'),
     ];
     const rejectedManager = new WebSocketManager('rejected-mls-control-room');

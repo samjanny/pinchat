@@ -263,15 +263,28 @@ async function main() {
     } catch (_e) { threwGraceReplay = true; }
     assert(threwGraceReplay, 'replay through the grace window rejected');
 
-    // Force the window shut: an old-epoch message is now rejected.
+    // Force the wall-clock deadline forward and re-arm the same production
+    // scheduler. Expiry must happen without receiving another ciphertext;
+    // message arrival is not a secret-cleanup mechanism.
     const inFlight2 = await bobGroup.encryptApplicationMessage('too late');
-    alice._prevEpoch.expiresAt = Date.now() - 1;
+    const expiringPreviousEpoch = alice._prevEpoch;
+    const expiringSenderDataSecret = expiringPreviousEpoch.senderDataSecret;
+    const expiringChainSecrets = [...expiringPreviousEpoch.chainStates.values()]
+        .map((state) => state.secret);
+    expiringPreviousEpoch.expiresAt = Date.now();
+    alice._schedulePrevEpochExpiry(expiringPreviousEpoch);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    assert(alice._prevEpoch === null,
+        'previous-epoch timer drops the grace context without message arrival');
+    assert(expiringSenderDataSecret.every((byte) => byte === 0)
+        && expiringChainSecrets.every((secret) =>
+            secret.every((byte) => byte === 0)),
+    'previous-epoch timer zeroes sender-data and chain secrets at expiry');
     let threwExpired = false;
     try {
         await alice.decryptApplicationMessage(inFlight2);
     } catch (_e) { threwExpired = true; }
     assert(threwExpired, 'old-epoch message after grace expiry rejected');
-    assert(alice._prevEpoch === null, 'expired grace context dropped and zeroed');
 
     // Bob catches up and the group converges at epoch 3.
     await bobGroup.processCommit(updCommit2);

@@ -89,6 +89,26 @@ async function signatureKeyFingerprint(group, leafIndex) {
     return Buffer.from(digest).toString('hex');
 }
 
+async function bootstrapProofForSender({
+    pskSecret,
+    groupId,
+    creatorKeyHash,
+    senderId,
+    keyPackageBytes,
+}) {
+    const encoder = new global.MLS.Codec.Encoder();
+    encoder.writeOpaque(new TextEncoder().encode(
+        'pinchat-mls-key-package-bootstrap-proof-v1',
+    ));
+    encoder.writeOpaque(groupId);
+    encoder.writeOpaque(creatorKeyHash);
+    encoder.writeOpaque(new TextEncoder().encode(senderId));
+    encoder.writeOpaque(keyPackageBytes);
+    return global.MLS.Codec.bytesToBase64Url(
+        await global.MLS.HPKE.hmacSha256(pskSecret, encoder.bytes()),
+    );
+}
+
 function latestRoster(events) {
     return events.filter((event) => event.kind === 'roster').at(-1);
 }
@@ -431,14 +451,20 @@ async function main() {
     assert(typeof proofKeyPackage.bootstrap_proof === 'string'
         && proofKeyPackage.bootstrap_proof.length === 43,
     'joiner KeyPackage carries a canonical invite-secret possession proof');
-    await proofCreator.onRelayEnvelope({
-        ...proofKeyPackage,
-        bootstrap_proof: Buffer.alloc(32, 0x44).toString('base64url'),
-        sender_id: 'proof-joiner',
-    });
+    let invalidProofError = null;
+    try {
+        await proofCreator.onRelayEnvelope({
+            ...proofKeyPackage,
+            bootstrap_proof: Buffer.alloc(32, 0x44).toString('base64url'),
+            sender_id: 'proof-joiner',
+        });
+    } catch (err) {
+        invalidProofError = err;
+    }
     assert(proofCreator.group.epoch === 0n
         && proofCreator._pendingCommit === null
         && proofCreatorOut.length === 0
+        && invalidProofError?.mlsControlRejected === true
         && proofCreatorEvents.some((event) =>
             event.kind === 'error'
                 && event.reason.includes('bootstrap proof is invalid')),
@@ -652,6 +678,269 @@ async function main() {
             && event.reason.includes('retrying after 1 seconds')),
     'aggregate room rejection retains the exact Commit candidate for retry');
 
+    // KeyPackages are one-shot beyond the lifetime of the leaf they admitted.
+    // Removing that leaf must not make the old init key eligible for another
+    // Welcome, even when the former client still knows the invite PSK and can
+    // produce a fresh bootstrap proof for a new relay route.
+    const reusedKeyPackagePsk = new Uint8Array(32).fill(0x62);
+    const reusedKeyPackage = await createExchange({
+        pskSecret: reusedKeyPackagePsk,
+    });
+    await completeExchangeJoin(reusedKeyPackage, 'creator-kp-once');
+    const originalKeyPackageEnvelope = reusedKeyPackage.joinerOut.find(
+        (envelope) => envelope.wire_format === WireFormat.MLS_KEY_PACKAGE,
+    );
+    const originalKeyPackageBytes = global.MLS.Codec.base64UrlToBytes(
+        originalKeyPackageEnvelope.payload,
+    );
+    const consumedKeyPackageRef = reusedKeyPackage.commit.key_package_ref;
+    assert(reusedKeyPackage.creator._consumedKeyPackageRefs.has(
+        consumedKeyPackageRef,
+    ), 'accepted Add records its KeyPackageRef as permanently consumed');
+    await reusedKeyPackage.creator.removeMemberBySenderId('joiner-1');
+    const keyPackageRemoveCommit = reusedKeyPackage.creatorOut
+        .filter((envelope) =>
+            envelope.wire_format === WireFormat.MLS_PUBLIC_MESSAGE)
+        .at(-1);
+    await echoPendingCommit(
+        reusedKeyPackage.creator,
+        keyPackageRemoveCommit,
+        'creator-kp-once',
+    );
+    const epochAfterKeyPackageRemove = reusedKeyPackage.creator.group.epoch;
+    const replaySenderId = 'joiner-replayed-keypackage';
+    const replayBootstrapProof = await bootstrapProofForSender({
+        pskSecret: reusedKeyPackagePsk,
+        groupId: reusedKeyPackage.creator.bootstrapPins.groupId,
+        creatorKeyHash:
+            reusedKeyPackage.creator.bootstrapPins.creatorKeyHash,
+        senderId: replaySenderId,
+        keyPackageBytes: originalKeyPackageBytes,
+    });
+    let reusedKeyPackageError = null;
+    try {
+        await reusedKeyPackage.creator.onRelayEnvelope({
+            ...originalKeyPackageEnvelope,
+            bootstrap_proof: replayBootstrapProof,
+            sender_id: replaySenderId,
+        });
+    } catch (err) {
+        reusedKeyPackageError = err;
+    }
+    assert(reusedKeyPackageError?.mlsControlRejected === true
+        && reusedKeyPackageError.message.includes('already consumed')
+        && reusedKeyPackage.creator.group.epoch
+            === epochAfterKeyPackageRemove
+        && reusedKeyPackage.creator._pendingCommit === null,
+    'old KeyPackage is rejected after Remove without advancing the epoch');
+
+    const departedCountBefore =
+        reusedKeyPackage.creator._departedSenderIds.size;
+    for (let index = 0; index < 256; index += 1) {
+        await reusedKeyPackage.creator.removeMemberBySenderId(
+            `never-admitted-${index}`,
+        );
+    }
+    assert(reusedKeyPackage.creator._departedSenderIds.size
+        === departedCountBefore,
+    'UserLeft for never-admitted routes does not grow departure tombstones');
+
+    // Unexpected local failures are retryable from the unchanged ordered
+    // cursor. Deterministic malformed controls remain consumable rejections.
+    const welcomeRetry = await createExchange();
+    await welcomeRetry.joiner.onRelayEnvelope({
+        ...welcomeRetry.commit,
+        sender_id: 'creator-welcome-retry',
+    });
+    const welcomeCandidateCount =
+        welcomeRetry.joiner._pendingWelcomeCommits.size;
+    const originalRosterBuilder =
+        welcomeRetry.joiner._authenticatedRosterEvent.bind(
+            welcomeRetry.joiner,
+        );
+    let failRosterOnce = true;
+    welcomeRetry.joiner._authenticatedRosterEvent = async (...args) => {
+        if (failRosterOnce) {
+            failRosterOnce = false;
+            throw new Error('forced one-shot roster digest failure');
+        }
+        return originalRosterBuilder(...args);
+    };
+    let welcomeRetryError = null;
+    try {
+        await welcomeRetry.joiner.onRelayEnvelope({
+            ...welcomeRetry.welcome,
+            sender_id: 'creator-welcome-retry',
+        });
+    } catch (err) {
+        welcomeRetryError = err;
+    }
+    assert(welcomeRetryError?.mlsRetryControl === true
+        && welcomeRetry.joiner.state === 'awaiting-welcome'
+        && welcomeRetry.joiner._pendingWelcomeCommits.size
+            === welcomeCandidateCount,
+    'one-shot Welcome platform failure requests replay and preserves correlation state');
+    welcomeRetry.joiner._authenticatedRosterEvent = originalRosterBuilder;
+    await welcomeRetry.joiner.onRelayEnvelope({
+        ...welcomeRetry.welcome,
+        sender_id: 'creator-welcome-retry',
+    });
+    assert(welcomeRetry.joiner.state === 'joined',
+        'replayed Welcome succeeds after transient local failure clears');
+
+    const pendingCommitRetry = await createExchange({
+        acceptCommit: false,
+    });
+    const pendingCommitLiveBefore = captureLiveGroup(
+        pendingCommitRetry.creator,
+    );
+    const pendingCommitCandidate =
+        pendingCommitRetry.creator._pendingCommit;
+    const originalCreatorRosterBuilder =
+        pendingCommitRetry.creator._authenticatedRosterEvent.bind(
+            pendingCommitRetry.creator,
+        );
+    let failCreatorRosterOnce = true;
+    pendingCommitRetry.creator._authenticatedRosterEvent =
+        async (...args) => {
+            if (failCreatorRosterOnce) {
+                failCreatorRosterOnce = false;
+                throw new Error('forced creator roster platform failure');
+            }
+            return originalCreatorRosterBuilder(...args);
+        };
+    let pendingCommitRetryError = null;
+    try {
+        await echoPendingCommit(
+            pendingCommitRetry.creator,
+            pendingCommitRetry.commit,
+            'creator-self',
+        );
+    } catch (err) {
+        pendingCommitRetryError = err;
+    }
+    assert(pendingCommitRetryError?.mlsRetryControl === true
+        && pendingCommitRetry.creator._pendingCommit
+            === pendingCommitCandidate
+        && pendingCommitCandidate.accepting === false
+        && liveGroupMatches(
+            pendingCommitRetry.creator, pendingCommitLiveBefore,
+        ),
+    'creator Commit roster failure remains retryable without installing candidate state');
+    pendingCommitRetry.creator._authenticatedRosterEvent =
+        originalCreatorRosterBuilder;
+    await echoPendingCommit(
+        pendingCommitRetry.creator,
+        pendingCommitRetry.commit,
+        'creator-self',
+    );
+    assert(pendingCommitRetry.creator.group.epoch === 1n
+        && pendingCommitRetry.creator._pendingCommit === null,
+    'replayed exact creator Commit installs once after transient roster failure');
+
+    const addConstructionOut = [];
+    const addConstructionCreator = new MLSSession({
+        role: 'creator',
+        send: (envelope) => addConstructionOut.push(envelope),
+        onEvent: () => {},
+        pskSecret: DEFAULT_PSK,
+        relaySenderId: 'creator-add-retry',
+    });
+    await addConstructionCreator.start();
+    const addConstructionPins = addConstructionCreator.bootstrapPins;
+    const addConstructionJoinerOut = [];
+    const addConstructionJoiner = new MLSSession({
+        role: 'joiner',
+        send: (envelope) => addConstructionJoinerOut.push(envelope),
+        onEvent: () => {},
+        pskSecret: DEFAULT_PSK,
+        expectedGroupId: addConstructionPins.groupId,
+        expectedCreatorKeyHash: addConstructionPins.creatorKeyHash,
+        relaySenderId: 'joiner-add-retry',
+    });
+    await addConstructionJoiner.start();
+    const addConstructionKeyPackage = addConstructionJoinerOut.find(
+        (envelope) => envelope.wire_format === WireFormat.MLS_KEY_PACKAGE,
+    );
+    const originalForkForAdd =
+        addConstructionCreator.group.forkForPendingCommit.bind(
+            addConstructionCreator.group,
+        );
+    let failAddConstructionOnce = true;
+    addConstructionCreator.group.forkForPendingCommit = () => {
+        const candidate = originalForkForAdd();
+        if (failAddConstructionOnce) {
+            failAddConstructionOnce = false;
+            candidate.commitAddMember = async () => {
+                throw new Error('forced Add construction platform failure');
+            };
+        }
+        return candidate;
+    };
+    let addConstructionRetryError = null;
+    try {
+        await addConstructionCreator.onRelayEnvelope({
+            ...addConstructionKeyPackage,
+            sender_id: 'joiner-add-retry',
+        });
+    } catch (err) {
+        addConstructionRetryError = err;
+    }
+    assert(addConstructionRetryError?.mlsRetryControl === true
+        && addConstructionCreator.group.epoch === 0n
+        && addConstructionCreator._pendingCommit === null
+        && addConstructionCreator._deferredKeyPackages.size === 0,
+    'transient Add construction failure leaves KeyPackage control unconsumed for replay');
+    addConstructionCreator.group.forkForPendingCommit =
+        originalForkForAdd;
+    await addConstructionCreator.onRelayEnvelope({
+        ...addConstructionKeyPackage,
+        sender_id: 'joiner-add-retry',
+    });
+    assert(addConstructionCreator._pendingCommit?.kind === 'add',
+        'replayed KeyPackage stages Add after transient construction failure clears');
+
+    const proposalRetry = await createExchange();
+    await completeExchangeJoin(proposalRetry, 'creator-proposal-retry');
+    const proposalRetryOutBefore = proposalRetry.joinerOut.length;
+    await proposalRetry.joiner.proposeUpdate();
+    const retryProposalEnvelope = proposalRetry.joinerOut
+        .slice(proposalRetryOutBefore)
+        .find((envelope) =>
+            envelope.wire_format === WireFormat.MLS_PUBLIC_MESSAGE);
+    const originalVerifyProposal =
+        proposalRetry.creator.group.verifyUpdateProposal.bind(
+            proposalRetry.creator.group,
+        );
+    let failProposalVerifyOnce = true;
+    proposalRetry.creator.group.verifyUpdateProposal = async (...args) => {
+        if (failProposalVerifyOnce) {
+            failProposalVerifyOnce = false;
+            throw new Error('forced one-shot verification platform failure');
+        }
+        return originalVerifyProposal(...args);
+    };
+    let proposalRetryError = null;
+    try {
+        await proposalRetry.creator.onRelayEnvelope({
+            ...retryProposalEnvelope,
+            sender_id: 'joiner-1',
+        });
+    } catch (err) {
+        proposalRetryError = err;
+    }
+    assert(proposalRetryError?.mlsRetryControl === true
+        && proposalRetry.creator._proposalStore.size === 0,
+    'one-shot Proposal verification failure leaves store unchanged for replay');
+    proposalRetry.creator.group.verifyUpdateProposal =
+        originalVerifyProposal;
+    await proposalRetry.creator.onRelayEnvelope({
+        ...retryProposalEnvelope,
+        sender_id: 'joiner-1',
+    });
+    assert(proposalRetry.creator._proposalStore.size === 1,
+        'replayed authenticated Proposal succeeds after transient failure clears');
+
     // app.js reports userleft without awaiting the Remove promise. If that
     // races an already-pending local Commit, retain the revocation request
     // and stage it immediately after the first Commit is accepted.
@@ -814,16 +1103,22 @@ async function main() {
         await proposalQuotaExchange.joiner.group.proposeUpdate();
     const maliciousThirdReferenceKey =
         global.MLS.Group.proposalReferenceKey(maliciousThird.reference);
-    await proposalQuotaExchange.creator.onRelayEnvelope({
-        ...proposalEnvelope(maliciousThird),
-        sender_id: 'joiner-1',
-    });
+    let maliciousThirdError = null;
+    try {
+        await proposalQuotaExchange.creator.onRelayEnvelope({
+            ...proposalEnvelope(maliciousThird),
+            sender_id: 'joiner-1',
+        });
+    } catch (err) {
+        maliciousThirdError = err;
+    }
     assert(proposalQuotaExchange.creator._proposalStore
         .has(quotaReferenceKeys[0])
         && proposalQuotaExchange.creator._proposalStore
             .has(quotaReferenceKeys[1])
         && !proposalQuotaExchange.creator._proposalStore
-            .has(maliciousThirdReferenceKey),
+            .has(maliciousThirdReferenceKey)
+        && maliciousThirdError?.mlsControlRejected === true,
     'malicious excess Proposal is rejected without evicting earlier ProposalRefs');
 
     const unrelatedRef = global.MLS.Codec.bytesToBase64Url(
@@ -1092,15 +1387,21 @@ async function main() {
         pm.auth.signature[0] ^= 0x01;
     });
     const signatureEventsBefore = exchange.creatorEvents.length;
-    await exchange.creator.onRelayEnvelope({
-        ...badSignatureProposal,
-        sender_id: 'joiner-1',
-    });
+    let badSignatureControlError = null;
+    try {
+        await exchange.creator.onRelayEnvelope({
+            ...badSignatureProposal,
+            sender_id: 'joiner-1',
+        });
+    } catch (err) {
+        badSignatureControlError = err;
+    }
     const signatureError = exchange.creatorEvents
         .slice(signatureEventsBefore)
         .find((event) => event.kind === 'error');
     assert(
         Boolean(signatureError)
+            && badSignatureControlError?.mlsControlRejected === true
             && signatureError.reason.includes('FramedContent signature invalid'),
         'tampered Update FramedContent signature is rejected',
         signatureError ? signatureError.reason : 'no error event',
@@ -1113,15 +1414,21 @@ async function main() {
         pm.membershipTag[0] ^= 0x01;
     });
     const membershipEventsBefore = exchange.creatorEvents.length;
-    await exchange.creator.onRelayEnvelope({
-        ...badMembershipProposal,
-        sender_id: 'joiner-1',
-    });
+    let badMembershipControlError = null;
+    try {
+        await exchange.creator.onRelayEnvelope({
+            ...badMembershipProposal,
+            sender_id: 'joiner-1',
+        });
+    } catch (err) {
+        badMembershipControlError = err;
+    }
     const membershipError = exchange.creatorEvents
         .slice(membershipEventsBefore)
         .find((event) => event.kind === 'error');
     assert(
         Boolean(membershipError)
+            && badMembershipControlError?.mlsControlRejected === true
             && membershipError.reason.includes('membership_tag invalid'),
         'tampered Update membership_tag is rejected',
         membershipError ? membershipError.reason : 'no error event',
@@ -1143,15 +1450,21 @@ async function main() {
         },
     );
     const reusedKeyEventsBefore = exchange.creatorEvents.length;
-    await exchange.creator.onRelayEnvelope({
-        ...reusedLeafKeyProposal,
-        sender_id: 'joiner-1',
-    });
+    let reusedKeyControlError = null;
+    try {
+        await exchange.creator.onRelayEnvelope({
+            ...reusedLeafKeyProposal,
+            sender_id: 'joiner-1',
+        });
+    } catch (err) {
+        reusedKeyControlError = err;
+    }
     const reusedKeyError = exchange.creatorEvents
         .slice(reusedKeyEventsBefore)
         .find((event) => event.kind === 'error');
     assert(
         Boolean(reusedKeyError)
+            && reusedKeyControlError?.mlsControlRejected === true
             && reusedKeyError.reason.includes('must differ from the current leaf'),
         'authenticated Update that reuses current leaf key is rejected',
         reusedKeyError ? reusedKeyError.reason : 'no error event',
@@ -1171,15 +1484,21 @@ async function main() {
         },
     );
     const collisionEventsBefore = exchange.creatorEvents.length;
-    await exchange.creator.onRelayEnvelope({
-        ...collidingLeafKeyProposal,
-        sender_id: 'joiner-1',
-    });
+    let collisionControlError = null;
+    try {
+        await exchange.creator.onRelayEnvelope({
+            ...collidingLeafKeyProposal,
+            sender_id: 'joiner-1',
+        });
+    } catch (err) {
+        collisionControlError = err;
+    }
     const collisionError = exchange.creatorEvents
         .slice(collisionEventsBefore)
         .find((event) => event.kind === 'error');
     assert(
         Boolean(collisionError)
+            && collisionControlError?.mlsControlRejected === true
             && collisionError.reason.includes('duplicate encryption_key'),
         'authenticated Update with colliding tree key is rejected',
         collisionError ? collisionError.reason : 'no error event',
@@ -1238,14 +1557,21 @@ async function main() {
     // back to its previous HPKE key unless the outer PublicMessage epoch and
     // authenticators are checked before buffering.
     const replayEventsBefore = exchange.creatorEvents.length;
-    await exchange.creator.onRelayEnvelope({
-        ...updateProposal,
-        sender_id: 'joiner-1',
-    });
+    let staleProposalError = null;
+    try {
+        await exchange.creator.onRelayEnvelope({
+            ...updateProposal,
+            sender_id: 'joiner-1',
+        });
+    } catch (err) {
+        staleProposalError = err;
+    }
     const replayError = exchange.creatorEvents
         .slice(replayEventsBefore)
         .find((event) => event.kind === 'error');
-    assert(Boolean(replayError) && replayError.reason.includes('wrong epoch'),
+    assert(Boolean(replayError)
+        && staleProposalError?.mlsControlRejected === true
+        && replayError.reason.includes('wrong epoch'),
         'previous-epoch Update proposal replay is rejected',
         replayError ? replayError.reason : 'no error event');
     assert(exchange.creator._pendingUpdateProposals.size === 0,
@@ -1701,14 +2027,24 @@ async function main() {
         ...racingEnvelopeB,
         sender_id: 'multi-a',
     });
-    await multiCreator.onRelayEnvelope({
-        ...racingEnvelopeC,
-        sender_id: 'multi-a',
-    });
-    await multiB.onRelayEnvelope({
-        ...racingEnvelopeC,
-        sender_id: 'multi-a',
-    });
+    let creatorRacingQuotaError = null;
+    let passiveRacingQuotaError = null;
+    try {
+        await multiCreator.onRelayEnvelope({
+            ...racingEnvelopeC,
+            sender_id: 'multi-a',
+        });
+    } catch (err) {
+        creatorRacingQuotaError = err;
+    }
+    try {
+        await multiB.onRelayEnvelope({
+            ...racingEnvelopeC,
+            sender_id: 'multi-a',
+        });
+    } catch (err) {
+        passiveRacingQuotaError = err;
+    }
     const racingReferenceB =
         global.MLS.Group.proposalReferenceKey(racingProposalB.reference);
     const racingReferenceC =
@@ -1718,7 +2054,9 @@ async function main() {
         && multiCreator._proposalStore.has(racingReferenceB)
         && multiB._proposalStore.has(racingReferenceB)
         && !multiCreator._proposalStore.has(racingReferenceC)
-        && !multiB._proposalStore.has(racingReferenceC),
+        && !multiB._proposalStore.has(racingReferenceC)
+        && creatorRacingQuotaError?.mlsControlRejected === true
+        && passiveRacingQuotaError?.mlsControlRejected === true,
     'Proposal race preserves every reference that a staged Commit may use');
     await echoPendingCommit(multiCreator, multiReferenceCommit, 'multi-creator');
     await multiA.onRelayEnvelope({
@@ -2171,12 +2509,18 @@ async function main() {
     const victimKeyPackage = victimOut.find(
         (envelope) => envelope.wire_format === WireFormat.MLS_KEY_PACKAGE,
     );
-    await alternateCreator.onRelayEnvelope({
-        ...victimKeyPackage,
-        sender_id: 'victim-route',
-    });
+    let alternateProofError = null;
+    try {
+        await alternateCreator.onRelayEnvelope({
+            ...victimKeyPackage,
+            sender_id: 'victim-route',
+        });
+    } catch (err) {
+        alternateProofError = err;
+    }
     assert(alternateCreator._pendingCommit === null
         && attackerOut.length === 0
+        && alternateProofError?.mlsControlRejected === true
         && alternateEvents.some((event) =>
             event.reason?.includes('bootstrap proof is invalid')),
     'KeyPackage proof is bound to the intended group and creator pins');

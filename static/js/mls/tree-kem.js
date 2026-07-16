@@ -53,21 +53,34 @@
 
         const chain = [];
         let pathSecret = leafSecret;
-        for (const nodeIndex of directPath) {
-            // Advance one step up the direct path.
-            pathSecret = await KeySchedule.deriveSecret(pathSecret, 'path');
-            const nodeSecret = await KeySchedule.deriveSecret(pathSecret, 'node');
-            let keyPair;
-            try {
-                keyPair = await HPKE.deriveKeyPair(nodeSecret);
-            } finally {
-                // node_secret is a one-shot KEM derivation input; the
-                // resulting non-extractable CryptoKey pair is sufficient.
-                nodeSecret.fill(0);
+        try {
+            for (const nodeIndex of directPath) {
+                // Advance one step up the direct path.
+                pathSecret = await KeySchedule.deriveSecret(pathSecret, 'path');
+                const nodeSecret = await KeySchedule.deriveSecret(pathSecret, 'node');
+                let keyPair;
+                try {
+                    keyPair = await HPKE.deriveKeyPair(nodeSecret);
+                } finally {
+                    // node_secret is a one-shot KEM derivation input; the
+                    // resulting non-extractable CryptoKey pair is sufficient.
+                    nodeSecret.fill(0);
+                }
+                chain.push({ nodeIndex, pathSecret, keyPair });
             }
-            chain.push({ nodeIndex, pathSecret, keyPair });
+            return chain;
+        } catch (err) {
+            // The caller still owns leafSecret, but every secret derived
+            // above it belongs exclusively to this failed operation.
+            if (pathSecret !== leafSecret) pathSecret.fill(0);
+            for (const entry of chain) {
+                if (entry?.pathSecret instanceof Uint8Array) {
+                    entry.pathSecret.fill(0);
+                }
+            }
+            chain.length = 0;
+            throw err;
         }
-        return chain;
     }
 
     /**
