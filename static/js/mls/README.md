@@ -96,6 +96,11 @@ The browser-facing flow runs entirely over MLS for group rooms:
   windows and each window must be applied and cumulatively ACKed before the
   next is released. A member that stalls for 60 seconds or 64 controls is
   removed from the pruning quorum, so it cannot freeze the room's log.
+  Locally-authored controls are retained in a bounded page-memory queue until
+  their exact server-sequenced echo arrives. Controls created during a
+  transient socket gap are retried after `mlssync`; in particular, an Add
+  Welcome cannot be lost if the connection drops immediately after the Add
+  Commit's acceptance echo.
 - **Forward secrecy within the epoch.** Application AEAD keys come from
   stateful per-sender chains (`Group._chainKeyNonce`): only the current
   chain position's secret is kept (overwritten as the chain advances),

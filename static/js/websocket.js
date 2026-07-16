@@ -30,6 +30,7 @@ const _COMMON_RELAY_MESSAGE_TYPES = new Set([
 ]);
 const MAX_INBOUND_QUEUE_MESSAGES = 128;
 const MAX_INBOUND_QUEUE_CHARS = 8 * 1024 * 1024;
+const MAX_PENDING_MLS_CONTROLS = 64;
 
 function _isMessageAllowedForRoom(roomType, messageType) {
     if (_COMMON_RELAY_MESSAGE_TYPES.has(messageType)) return true;
@@ -88,9 +89,11 @@ class WebSocketManager {
         this._mlsControlSyncing = false;
         this._connectionGeneration = 0;
         // Exact locally-sent KeyPackage/Proposal/Commit/Welcome envelopes
-        // awaiting their server-sequenced own echo. They are retried after a
-        // resumed replay completes if the previous socket died before relay
-        // acceptance.
+        // awaiting their server-sequenced own echo. They are retained even
+        // when a transient disconnect happens immediately before send(), then
+        // retried only after resumed replay completes. This is especially
+        // important for a Welcome produced after its Add Commit is already
+        // accepted: that epoch cannot safely be rolled back.
         this._pendingMlsControls = new Map();
         // Set from the first server-authenticated Connected frame and pinned
         // for the lifetime of this page. It gates every subsequent relay
@@ -963,47 +966,87 @@ class WebSocketManager {
     /**
      * Sends a message through the WebSocket
      * @param {object} message
-     * @returns {boolean} True if it was sent successfully
+     * Ordered MLS controls use store-and-retry semantics: during a transient
+     * group disconnect, accepting the envelope into the bounded pending map is
+     * success even though no socket write happened yet. The exact envelope is
+     * retried after `mlssync` and removed only by its sequenced own echo.
+     *
+     * @returns {boolean} True if sent or durably retained for this page session
      */
     send(message) {
-        if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-            console.error('WebSocket is not connected');
-            return false;
-        }
-
         let trackedKey = null;
-        let previousGeneration = null;
         let insertedTracking = false;
         if (this.roomType === 'group'
             && this._isMlsControlEnvelope(message)) {
             trackedKey = this._mlsControlKey(message);
             const existing = this._pendingMlsControls.get(trackedKey);
             if (existing) {
-                previousGeneration = existing.lastSentGeneration;
-                existing.lastSentGeneration = this._connectionGeneration;
+                // A caller can retry the same control while the current
+                // socket is no longer writable. Mark it eligible for the next
+                // sync even if it was previously handed to this generation.
+                existing.lastSentGeneration = Math.min(
+                    existing.lastSentGeneration,
+                    this._connectionGeneration - 1,
+                );
             } else {
+                if (this._pendingMlsControls.size
+                    >= MAX_PENDING_MLS_CONTROLS) {
+                    console.error('Pending MLS control queue is full');
+                    return false;
+                }
                 this._pendingMlsControls.set(trackedKey, {
                     envelope: { ...message },
-                    lastSentGeneration: this._connectionGeneration,
+                    lastSentGeneration: this._connectionGeneration - 1,
                 });
                 insertedTracking = true;
             }
         }
 
+        let serialized;
         try {
-            this.ws.send(JSON.stringify(message));
-            return true;
+            serialized = JSON.stringify(message);
         } catch (error) {
+            if (insertedTracking) this._pendingMlsControls.delete(trackedKey);
+            console.error('Failed to serialize WebSocket message:', error);
+            return false;
+        }
+
+        if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+            if (trackedKey !== null
+                && !this._fatalAuthFailure
+                && !this.isManuallyDisconnected) {
+                console.warn('WebSocket disconnected; queued MLS control for retry');
+                return true;
+            }
+            if (insertedTracking) this._pendingMlsControls.delete(trackedKey);
+            console.error('WebSocket is not connected');
+            return false;
+        }
+
+        try {
+            this.ws.send(serialized);
             if (trackedKey !== null) {
-                if (insertedTracking) {
-                    this._pendingMlsControls.delete(trackedKey);
-                } else {
-                    const existing = this._pendingMlsControls.get(trackedKey);
-                    if (existing) {
-                        existing.lastSentGeneration = previousGeneration;
-                    }
+                const tracked = this._pendingMlsControls.get(trackedKey);
+                if (tracked) {
+                    tracked.lastSentGeneration = this._connectionGeneration;
                 }
             }
+            return true;
+        } catch (error) {
+            if (trackedKey !== null
+                && !this._fatalAuthFailure
+                && !this.isManuallyDisconnected) {
+                const tracked = this._pendingMlsControls.get(trackedKey);
+                if (tracked) {
+                    tracked.lastSentGeneration = Math.min(
+                        tracked.lastSentGeneration,
+                        this._connectionGeneration - 1,
+                    );
+                }
+                console.warn('WebSocket send failed; queued MLS control for retry:', error);
+                return true;
+            }
+            if (insertedTracking) this._pendingMlsControls.delete(trackedKey);
             console.error('Failed to send message:', error);
             return false;
         }

@@ -272,6 +272,41 @@ async function main() {
     check(orderedManager._pendingMlsControls.size === 1,
         'rate-limited Commit stays tracked for retry instead of being lost');
 
+    const offlineWelcomeManager = new WebSocketManager(
+        'offline-welcome-room',
+    );
+    offlineWelcomeManager.roomType = 'group';
+    offlineWelcomeManager._connectionGeneration = 7;
+    const offlineWelcome = {
+        type: 'mls',
+        payload: 'welcome-after-accepted-add',
+        wire_format: 3,
+        ratchet_tree: 'ratchet-tree',
+        key_package_ref: 'K'.repeat(43),
+        commit_ref: 'C'.repeat(43),
+    };
+    check(offlineWelcomeManager.send(offlineWelcome)
+        && offlineWelcomeManager._pendingMlsControls.size === 1,
+    'Welcome created after Commit acceptance is retained across a transient disconnect');
+    const welcomeRetrySocket = new FakeWebSocket(
+        'wss://pinchat.test/ws/offline-welcome', [],
+    );
+    offlineWelcomeManager.ws = welcomeRetrySocket;
+    offlineWelcomeManager._connectionGeneration += 1;
+    offlineWelcomeManager._retryPendingMlsControls();
+    check(welcomeRetrySocket.sent.map((raw) => JSON.parse(raw)).some(
+        (frame) => frame.payload === offlineWelcome.payload
+            && frame.ratchet_tree === offlineWelcome.ratchet_tree),
+    'post-acceptance Welcome is retried byte-for-byte after transport sync');
+    offlineWelcomeManager._confirmMlsControl(offlineWelcome);
+    check(offlineWelcomeManager._pendingMlsControls.size === 0,
+        'retried Welcome remains pending until its exact own echo');
+
+    const offlineOneToOne = new WebSocketManager('offline-onetoone-room');
+    offlineOneToOne.roomType = 'onetoone';
+    check(offlineOneToOne.send({ type: 'message', payload: 'not queued' }) === false,
+        'ordinary disconnected traffic is not silently queued');
+
     orderedSocket.onmessage({
         data: JSON.stringify({
             type: 'mls',
