@@ -127,7 +127,7 @@ const TEST_SUITES = {
     'mls-treekem': {
         name: 'MLS TreeKEM path-secret chain',
         file: 'test-mls-treekem.js',
-        description: 'P-256 scalar-mul, HPKE DeriveKeyPair, path-secret derivation (RFC 9420 §7.5)'
+        description: 'Native P-256 key recovery, HPKE DeriveKeyPair, path-secret derivation (RFC 9420 §7.5)'
     },
     'mls-update-path': {
         name: 'MLS UpdatePath wire-format',

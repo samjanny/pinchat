@@ -213,6 +213,25 @@ async function main() {
 
         const s2 = await sender.export(new TextEncoder().encode('other-label'), 32);
         assert(hex(s2) !== hex(s1), 'different exporter context → different secret');
+
+        sender.destroy();
+        receiver.destroy();
+        sender.destroy();
+        receiver.destroy();
+        let senderDestroyed = false;
+        let receiverDestroyed = false;
+        try {
+            await sender.export(label, 32);
+        } catch (err) {
+            senderDestroyed = err.message.includes('context destroyed');
+        }
+        try {
+            await receiver.open(new Uint8Array(0), new Uint8Array(16));
+        } catch (err) {
+            receiverDestroyed = err.message.includes('context destroyed');
+        }
+        assert(senderDestroyed && receiverDestroyed,
+            'destroyed HPKE contexts reject use after secret zeroization');
     }
 
     console.log('');

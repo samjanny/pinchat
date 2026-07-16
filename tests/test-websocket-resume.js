@@ -521,6 +521,57 @@ async function main() {
 
     queuedResponses = [
         response(200, { csrf_token: csrfToken }),
+        successToken('rejected-mls-control-token'),
+    ];
+    const rejectedManager = new WebSocketManager('rejected-mls-control-room');
+    const rejectedDispatches = [];
+    rejectedManager.onMessage = async (message) => {
+        rejectedDispatches.push(message.control_seq || message.type);
+        if (message.type === 'mls' && message.control_seq === 1) {
+            const error = new Error('deterministically invalid MLS control');
+            error.mlsControlRejected = true;
+            throw error;
+        }
+    };
+    await rejectedManager.connect();
+    const rejectedSocket = FakeWebSocket.instances.at(-1);
+    rejectedSocket.onopen();
+    rejectedSocket.onmessage({
+        data: JSON.stringify({
+            type: 'connected',
+            user_id: 'rejected-control-relay-id',
+            room_type: 'group',
+            resumed: false,
+            resume_token: resumeToken,
+            mls_control_cursor: 0,
+        }),
+    });
+    await rejectedManager._inboundQueue;
+    for (const controlSeq of [1, 2]) {
+        rejectedSocket.onmessage({
+            data: JSON.stringify({
+                type: 'mls',
+                payload: 'AA',
+                wire_format: 5,
+                sender_id: `peer-${controlSeq}`,
+                control_seq: controlSeq,
+            }),
+        });
+        await rejectedManager._inboundQueue;
+    }
+    const rejectedFrames = rejectedSocket.sent.map((raw) => JSON.parse(raw));
+    check(rejectedManager.lastMlsControlSeq === 2
+        && rejectedSocket.closedWith === null
+        && rejectedDispatches.includes(1)
+        && rejectedDispatches.includes(2)
+        && rejectedFrames.some((frame) =>
+            frame.type === 'mlsack' && frame.control_seq === 1)
+        && rejectedFrames.some((frame) =>
+            frame.type === 'mlsack' && frame.control_seq === 2),
+    'deterministically rejected MLS control is ACKed and does not pin the next sequence');
+
+    queuedResponses = [
+        response(200, { csrf_token: csrfToken }),
         successToken('bounded-inbound-token'),
     ];
     const queueManager = new WebSocketManager('bounded-inbound-room');

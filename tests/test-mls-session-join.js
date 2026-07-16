@@ -633,6 +633,25 @@ async function main() {
         && quotaRejected.creator.group === quotaCandidate,
     'a later acceptance echo installs the retained rate-limited candidate');
 
+    const roomLimited = await createExchange({
+        acceptCommit: false,
+        pskSecret: new Uint8Array(32).fill(0x5f),
+    });
+    const roomLimitedConsumed =
+        await roomLimited.creator.onTransportRejection({
+            type: 'mlsrejected',
+            commit_ref: roomLimited.commit.commit_ref,
+            reason: 'room_rate_limited',
+            retry_after_secs: 1,
+        });
+    assert(roomLimitedConsumed
+        && roomLimited.creator._pendingCommit !== null
+        && liveGroupMatches(roomLimited.creator, roomLimited.beforeAdd)
+        && roomLimited.creatorEvents.some((event) =>
+            event.reason?.includes('room traffic limit')
+            && event.reason.includes('retrying after 1 seconds')),
+    'aggregate room rejection retains the exact Commit candidate for retry');
+
     // app.js reports userleft without awaiting the Remove promise. If that
     // races an already-pending local Commit, retain the revocation request
     // and stage it immediately after the first Commit is accepted.
@@ -818,7 +837,7 @@ async function main() {
     assert(exchange.joiner._pendingWelcomeCommits.size === 0,
         'Add Commit for another KeyPackage does not occupy the join buffer');
 
-    let badCommitRefError = '';
+    let badCommitRefError = null;
     try {
         await exchange.joiner.onRelayEnvelope({
             ...exchange.commit,
@@ -826,11 +845,32 @@ async function main() {
             sender_id: 'creator-1',
         });
     } catch (err) {
-        badCommitRefError = err.message;
+        badCommitRefError = err;
     }
-    assert(badCommitRefError.includes('does not match PublicMessage payload')
+    assert(badCommitRefError?.mlsControlRejected === true
+        && badCommitRefError.message.includes('does not match PublicMessage payload')
         && exchange.joiner._pendingWelcomeCommits.size === 0,
-    'mismatched commit_ref is rejected before buffering');
+    'mismatched commit_ref is a consumable rejection before buffering');
+
+    const malformedCommitBody = global.MLS.Codec.base64UrlToBytes(
+        exchange.commit.payload,
+    ).subarray(0, -5);
+    let malformedPreWelcomeError = null;
+    try {
+        await exchange.joiner.onRelayEnvelope({
+            ...exchange.commit,
+            payload: global.MLS.Codec.bytesToBase64Url(malformedCommitBody),
+            sender_id: 'attacker-route',
+        });
+    } catch (err) {
+        malformedPreWelcomeError = err;
+    }
+    assert(malformedPreWelcomeError?.mlsControlRejected === true
+        && malformedPreWelcomeError.message.includes(
+            'malformed pre-Welcome PublicMessage',
+        )
+        && exchange.joiner._pendingWelcomeCommits.size === 0,
+    'malformed pre-Welcome control is rejected without becoming replay-blocking');
 
     await exchange.joiner.onRelayEnvelope({
         ...exchange.commit,
@@ -847,7 +887,7 @@ async function main() {
         && exchange.joiner._pendingWelcomeCommits.size === 1,
     'unrelated Welcome neither joins nor consumes matching Commit');
 
-    let wrongWelcomeRefError = '';
+    let wrongWelcomeRefError = null;
     try {
         await exchange.joiner.onRelayEnvelope({
             ...exchange.welcome,
@@ -855,11 +895,14 @@ async function main() {
             sender_id: 'creator-1',
         });
     } catch (err) {
-        wrongWelcomeRefError = err.message;
+        wrongWelcomeRefError = err;
     }
-    assert(wrongWelcomeRefError.includes('without its matching buffered Commit')
+    assert(wrongWelcomeRefError?.mlsControlRejected === true
+        && wrongWelcomeRefError.message.includes(
+            'without its matching buffered Commit',
+        )
         && exchange.joiner._pendingWelcomeCommits.size === 1,
-    'Welcome with wrong commit_ref is rejected without consuming candidate');
+    'Welcome with wrong commit_ref is consumably rejected without consuming candidate');
 
     // The GroupInfo epoch must be the direct successor of the exact buffered
     // Commit epoch. Exercise the fail-closed join boundary and then restore
@@ -1995,19 +2038,22 @@ async function main() {
     'transport failure after bounded insertion restores the exact prior ProposalRef state');
 
     const noCommitExchange = await createExchange();
-    let noCommitError = '';
+    let noCommitError = null;
     try {
         await noCommitExchange.joiner.onRelayEnvelope({
             ...noCommitExchange.welcome,
             sender_id: 'creator-2',
         });
     } catch (err) {
-        noCommitError = err.message;
+        noCommitError = err;
     }
     assert(
-        noCommitError.includes('without its matching buffered Commit'),
-        'Welcome without buffered Commit is rejected fail-closed',
-        noCommitError,
+        noCommitError?.mlsControlRejected === true
+            && noCommitError.message.includes(
+                'without its matching buffered Commit',
+            ),
+        'Welcome without buffered Commit is consumably rejected fail-closed',
+        noCommitError?.message,
     );
     assert(noCommitExchange.joiner.state === 'awaiting-welcome',
         'failed Welcome does not advance joiner state');

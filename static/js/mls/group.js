@@ -2919,10 +2919,18 @@
         expectedSignerLeafIndex, expectedCommitEpoch,
         expectedGroupId, expectedCreatorKeyHash,
     }) {
+        const transientSecrets = new Set();
+        const trackSecret = (value) => {
+            if (value instanceof Uint8Array) transientSecrets.add(value);
+            return value;
+        };
         // The joined Group owns and eventually erases this copy.
-        const psk = pskSecret
+        const psk = trackSecret(pskSecret
             ? Uint8Array.from(pskSecret)
-            : new Uint8Array(HPKE.Nh);
+            : new Uint8Array(HPKE.Nh));
+        let parentKeyPairsForCleanup = null;
+        let installed = false;
+        try {
         if (psk.length !== HPKE.Nh) {
             throw new Error(`group.join: pskSecret must be ${HPKE.Nh} bytes (got ${psk.length})`);
         }
@@ -2988,6 +2996,8 @@
         const gs = await Welcome.decryptGroupSecrets(
             entry.encryptedGroupSecrets, initPrivateKey, kp.initKey, welcome.encryptedGroupInfo,
         );
+        trackSecret(gs.joinerSecret);
+        trackSecret(gs.pathSecret);
         if (!Array.isArray(gs.psks) || gs.psks.length !== 0) {
             throw new Error(
                 'group.join: MLS PSK identifiers are unsupported by the PinChat profile',
@@ -2996,10 +3006,12 @@
         // Welcome AEAD is keyed off (joiner_secret, psk_secret). A joiner
         // with the wrong PSK will fail the AES-GCM auth tag here, which
         // is exactly the bootstrap-key gating we want.
-        const welcomeSecret = await Welcome.deriveWelcomeSecret(
+        const welcomeSecret = trackSecret(await Welcome.deriveWelcomeSecret(
             gs.joinerSecret, psk,
-        );
+        ));
         const { key: wKey, nonce: wNonce } = await Welcome.welcomeKeyNonce(welcomeSecret);
+        trackSecret(wKey);
+        trackSecret(wNonce);
         let giBytes;
         try {
             giBytes = await Welcome.openEncryptedGroupInfo(
@@ -3171,6 +3183,7 @@
             throw new Error('group.join: signer leaf not under any of our ancestors');
         }
         const parentKeyPairs = new Map();
+        parentKeyPairsForCleanup = parentKeyPairs;
         let cur = gs.pathSecret;
         try {
             for (let i = lcaIdx; i < myDirectPath.length; i += 1) {
@@ -3203,23 +3216,41 @@
 
         // Derive epoch secrets using gs.joinerSecret as the joiner_secret.
         // psk_secret is the URL-fragment-derived PSK (zeros in tests).
-        const memberSecret = await HPKE.hkdfExtract(
+        const memberSecret = trackSecret(await HPKE.hkdfExtract(
             gs.joinerSecret, psk,
-        );
-        const epochSecretRaw = await KeySchedule.expandWithLabel(
+        ));
+        const epochSecretRaw = trackSecret(await KeySchedule.expandWithLabel(
             memberSecret, 'epoch',
             GroupContext.groupContextBytes(groupInfo.groupContext),
             HPKE.Nh,
+        ));
+        const senderDataSecret = trackSecret(
+            await KeySchedule.deriveSecret(epochSecretRaw, 'sender data'),
         );
-        const senderDataSecret = await KeySchedule.deriveSecret(epochSecretRaw, 'sender data');
-        const encryptionSecret = await KeySchedule.deriveSecret(epochSecretRaw, 'encryption');
-        const exporterSecret = await KeySchedule.deriveSecret(epochSecretRaw, 'exporter');
-        const externalSecret = await KeySchedule.deriveSecret(epochSecretRaw, 'external');
-        const confirmationKey = await KeySchedule.deriveSecret(epochSecretRaw, 'confirm');
-        const membershipKey = await KeySchedule.deriveSecret(epochSecretRaw, 'membership');
-        const resumptionPsk = await KeySchedule.deriveSecret(epochSecretRaw, 'resumption');
-        const epochAuthenticator = await KeySchedule.deriveSecret(epochSecretRaw, 'authentication');
-        const initSecret = await KeySchedule.deriveSecret(epochSecretRaw, 'init');
+        const encryptionSecret = trackSecret(
+            await KeySchedule.deriveSecret(epochSecretRaw, 'encryption'),
+        );
+        const exporterSecret = trackSecret(
+            await KeySchedule.deriveSecret(epochSecretRaw, 'exporter'),
+        );
+        const externalSecret = trackSecret(
+            await KeySchedule.deriveSecret(epochSecretRaw, 'external'),
+        );
+        const confirmationKey = trackSecret(
+            await KeySchedule.deriveSecret(epochSecretRaw, 'confirm'),
+        );
+        const membershipKey = trackSecret(
+            await KeySchedule.deriveSecret(epochSecretRaw, 'membership'),
+        );
+        const resumptionPsk = trackSecret(
+            await KeySchedule.deriveSecret(epochSecretRaw, 'resumption'),
+        );
+        const epochAuthenticator = trackSecret(
+            await KeySchedule.deriveSecret(epochSecretRaw, 'authentication'),
+        );
+        const initSecret = trackSecret(
+            await KeySchedule.deriveSecret(epochSecretRaw, 'init'),
+        );
         memberSecret.fill(0);
 
         const epochSecrets = {
@@ -3251,6 +3282,12 @@
         const preparedEpoch = await prepareEpochSecretsForStorage(
             epochSecrets, tree, nLeaves,
         );
+        // prepareEpochSecretsForStorage has consumed transition-only values.
+        // The remaining values and PSK are now owned by the returned Group.
+        for (const value of Object.values(preparedEpoch.epochSecrets)) {
+            transientSecrets.delete(value);
+        }
+        transientSecrets.delete(psk);
 
         const state = {
             cipherSuite: CIPHERSUITE,
@@ -3271,7 +3308,18 @@
         };
         const group = new Group(state);
         group._chainStates = preparedEpoch.chainStates;
+        installed = true;
         return group;
+        } finally {
+            for (const value of transientSecrets) wipeBytes(value);
+            transientSecrets.clear();
+            if (!installed && parentKeyPairsForCleanup) {
+                // CryptoKey handles cannot be explicitly zeroized through
+                // WebCrypto. Drop every reference immediately so the engine
+                // can release failed-join parent private keys.
+                parentKeyPairsForCleanup.clear();
+            }
+        }
     };
 
     // --- Internal helpers ------------------------------------------------
@@ -3692,6 +3740,11 @@
     ) {
         if (!Array.isArray(extensions)) {
             throw new Error(`${errorPrefix}: ${fieldName} are malformed`);
+        }
+        try {
+            Nodes.validateExtensionTypes(extensions);
+        } catch (err) {
+            throw new Error(`${errorPrefix}: ${fieldName} ${err.message}`);
         }
         for (const ext of extensions) {
             if (!ext || !Number.isInteger(ext.extensionType)

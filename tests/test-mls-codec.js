@@ -12,6 +12,7 @@
 
 const path = require('path');
 const Codec = require(path.join(__dirname, '..', 'static', 'js', 'mls', 'codec.js'));
+const Nodes = require(path.join(__dirname, '..', 'static', 'js', 'mls', 'nodes.js'));
 
 let passed = 0;
 let failed = 0;
@@ -186,6 +187,37 @@ console.log('# vector T<V>');
     eqHex(enc2.bytes(), bytes('00'), 'encode empty vector');
     const dec2 = new Codec.Decoder(enc2.bytes());
     eq(dec2.readVector(() => 'unused'), [], 'decode empty vector');
+})();
+
+// ---------------------------------------------------------------------------
+// Extension-list uniqueness — RFC 9420 §13.4
+// ---------------------------------------------------------------------------
+console.log('# extension-list uniqueness');
+(function () {
+    const duplicateExtensions = [
+        {
+            extensionType: 0x4242,
+            extensionData: bytes('01'),
+        },
+        {
+            extensionType: 0x4242,
+            extensionData: bytes('02'),
+        },
+    ];
+    throws(
+        () => Nodes.writeExtensions(new Codec.Encoder(), duplicateExtensions),
+        'extension encoder rejects duplicate extension_type',
+    );
+
+    const raw = new Codec.Encoder();
+    raw.writeVector(duplicateExtensions, (encoder, ext) => {
+        encoder.writeU16(ext.extensionType);
+        encoder.writeOpaque(ext.extensionData);
+    });
+    throws(
+        () => Nodes.readExtensions(new Codec.Decoder(raw.bytes())),
+        'extension decoder rejects duplicate extension_type',
+    );
 })();
 
 // ---------------------------------------------------------------------------

@@ -3,9 +3,9 @@
 Branch: `experimental-groups-custom`
 
 This branch implements **MLS (RFC 9420) + TreeKEM** from scratch, with no
-vendored cryptographic libraries. The only cryptographic surface we depend
-on is the browser's WebCrypto API (HMAC-SHA256, ECDH P-256, AES-GCM), which
-is already used by the 1:1 crypto path.
+vendored cryptographic libraries. All secret-dependent cryptographic
+operations use the browser's WebCrypto API (HMAC-SHA256, ECDH/ECDSA P-256,
+AES-GCM), which is already used by the 1:1 crypto path.
 
 ## Ciphersuite
 
@@ -16,6 +16,13 @@ We commit to a single MLS ciphersuite:
 Rationale: every primitive is already in the PinChat TCB, natively exposed
 through WebCrypto, and the ciphersuite is a first-class citizen of RFC 9420.
 See [`ciphersuite.js`](ciphersuite.js) for the full profile.
+
+RFC 9180 deterministic P-256 key derivation imports each candidate scalar as
+an opaque, non-extractable PKCS#8 WebCrypto key. Native ECDH derives the public
+x-coordinate and native ECDSA selects its public y-coordinate. The small
+[`p256.js`](p256.js) helper performs only public point decompression; secret
+scalars are never processed by hand-written JavaScript elliptic-curve
+arithmetic.
 
 PinChat further narrows the ciphersuite's ECDSA signature acceptance to
 canonical, completely consumed ASN.1 DER with P-256 scalars in range and a
@@ -42,7 +49,7 @@ are intentionally not interoperable.
 | [`tree-hash.js`](tree-hash.js)           |   ✅   | [`test-mls-tree-hash.js`](../../../tests/test-mls-tree-hash.js) (IETF vectors)               |
 | [`parent-hash.js`](parent-hash.js)       |   ✅   | [`test-mls-parent-hash.js`](../../../tests/test-mls-parent-hash.js) (round-trip + splice rejection) |
 | [`ratchet-tree.js`](ratchet-tree.js)     |   ✅   | [`test-mls-ratchet-tree.js`](../../../tests/test-mls-ratchet-tree.js) (IETF vectors)         |
-| [`p256.js`](p256.js)                     |   ✅   | [`test-mls-treekem.js`](../../../tests/test-mls-treekem.js) (WebCrypto round-trip)           |
+| [`p256.js`](p256.js)                     |   ✅   | [`test-mls-treekem.js`](../../../tests/test-mls-treekem.js) (native deterministic key recovery + IETF update-path vectors) |
 | [`tree-kem.js`](tree-kem.js)             |   ✅   | [`test-mls-treekem.js`](../../../tests/test-mls-treekem.js) (IETF vectors: 62 update_paths × DeriveSecret/path closure + commit_secret + keypair-pub matches across filtered direct path) |
 | [`group-context.js`](group-context.js)   |   ✅   | [`test-mls-key-package.js`](../../../tests/test-mls-key-package.js) (IETF vectors)           |
 | [`key-package.js`](key-package.js)       |   ✅   | [`test-mls-key-package.js`](../../../tests/test-mls-key-package.js) (IETF vectors)           |

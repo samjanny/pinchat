@@ -102,6 +102,20 @@
         return error;
     }
 
+    function rejectedMlsControlError(error, prefix = '') {
+        if (error?.mlsFatalState === true || error?.mlsRetryControl === true) {
+            return error;
+        }
+        if (error?.mlsControlRejected === true) return error;
+        const detail = error instanceof Error ? error.message : String(error);
+        const rejected = new Error(`${prefix}${detail}`);
+        // A deterministic, unauthenticated/invalid ordered control must be
+        // consumed after rejection. Replaying the same immutable relay
+        // sequence cannot make it valid and would otherwise pin reconnect.
+        rejected.mlsControlRejected = true;
+        return rejected;
+    }
+
     function envelopeEncodedBytes(envelope) {
         if (!envelope || typeof envelope !== 'object') return 0;
         let total = 256;
@@ -1054,7 +1068,8 @@
 
         async _onTransportRejection(rejection) {
             if (!rejection || rejection.type !== 'mlsrejected'
-                || rejection.reason !== 'commit_rate_limited'
+                || (rejection.reason !== 'commit_rate_limited'
+                    && rejection.reason !== 'room_rate_limited')
                 || typeof rejection.commit_ref !== 'string') {
                 throw new Error('mls-session: malformed transport rejection');
             }
@@ -1067,7 +1082,9 @@
                 ? Math.min(rejection.retry_after_secs, 3600) : 60;
             this.onEvent({
                 kind: 'error',
-                reason: `MLS Commit was rate-limited by the relay; retrying after `
+                reason: `MLS Commit was ${rejection.reason === 'room_rate_limited'
+                    ? 'deferred by the room traffic limit'
+                    : 'rate-limited by the relay'}; retrying after `
                     + `${retryAfter} seconds`,
             });
             if (!pending.retryTimer) {
@@ -1100,7 +1117,14 @@
                 await this._acceptPendingCommit();
                 return;
             }
-            const payload = base64UrlDecode(envelope.payload);
+            let payload;
+            try {
+                payload = base64UrlDecode(envelope.payload);
+            } catch (err) {
+                throw rejectedMlsControlError(
+                    err, 'mls-session: malformed MLS envelope payload: ',
+                );
+            }
             const wireFormat = envelope.wire_format;
             if (this._localCommitBusy || this._pendingCommit) {
                 if (wireFormat
@@ -1142,12 +1166,21 @@
                         || this._deferredKeyPackages.has(senderId)) {
                         return;
                     }
-                    await this._verifyKeyPackageBootstrapProof(
-                        payload, senderId, envelope.bootstrap_proof,
-                    );
-                    // Validate all deterministic admission properties before
-                    // treating this ordered control as durably accepted.
-                    await this.group.validateKeyPackageForAdd(payload);
+                    try {
+                        await this._verifyKeyPackageBootstrapProof(
+                            payload, senderId, envelope.bootstrap_proof,
+                        );
+                        // Validate all deterministic admission properties
+                        // before treating this ordered control as durably
+                        // accepted.
+                        await this.group.validateKeyPackageForAdd(payload);
+                    } catch (err) {
+                        this.onEvent({
+                            kind: 'error',
+                            reason: `invalid deferred KeyPackage: ${err.message}`,
+                        });
+                        return;
+                    }
                     const encodedBytes = envelopeEncodedBytes(envelope);
                     if (this._deferredKeyPackageBytes + encodedBytes
                         > MAX_DEFERRED_KEYPACKAGE_BYTES) {
@@ -1237,26 +1270,32 @@
 
             if (wireFormat === MLS.MLSMessage.WireFormat.MLS_WELCOME
                 && this.role === 'joiner' && this._state === 'awaiting-welcome') {
-                const candidate = await this._matchingWelcomeCommit(
-                    payload, envelope,
-                );
-                // Welcomes are room broadcasts. A Welcome for another
-                // KeyPackage is expected during simultaneous joins and must
-                // not consume any of our buffered Commit candidates.
-                if (!candidate) return;
-                if (!envelope.ratchet_tree) {
-                    this.onEvent({ kind: 'error',
-                        reason: 'Welcome envelope missing ratchet_tree side-channel' });
+                try {
+                    const candidate = await this._matchingWelcomeCommit(
+                        payload, envelope,
+                    );
+                    // Welcomes are room broadcasts. A Welcome for another
+                    // KeyPackage is expected during simultaneous joins and
+                    // must not consume any of our buffered Commit candidates.
+                    if (!candidate) return;
+                    if (!envelope.ratchet_tree) {
+                        this.onEvent({ kind: 'error',
+                            reason: 'Welcome envelope missing ratchet_tree side-channel' });
+                        return;
+                    }
+                    await this._handleWelcome(
+                        payload,
+                        base64UrlDecode(envelope.ratchet_tree),
+                        candidate,
+                    );
+                    this._pendingWelcomeCommits.clear();
+                    this._pendingWelcomeCommitBySender.clear();
                     return;
+                } catch (err) {
+                    throw rejectedMlsControlError(
+                        err, 'mls-session: rejected targeted Welcome: ',
+                    );
                 }
-                await this._handleWelcome(
-                    payload,
-                    base64UrlDecode(envelope.ratchet_tree),
-                    candidate,
-                );
-                this._pendingWelcomeCommits.clear();
-                this._pendingWelcomeCommitBySender.clear();
-                return;
             }
 
             // Existing members (creator or already-joined joiners) process
@@ -1274,8 +1313,14 @@
             }
             if (wireFormat === MLS.MLSMessage.WireFormat.MLS_PUBLIC_MESSAGE
                 && this.role === 'joiner' && this._state === 'awaiting-welcome') {
-                await this._bufferWelcomeCommit(payload, envelope);
-                return;
+                try {
+                    await this._bufferWelcomeCommit(payload, envelope);
+                    return;
+                } catch (err) {
+                    throw rejectedMlsControlError(
+                        err, 'mls-session: rejected pre-Welcome control: ',
+                    );
+                }
             }
 
             if (wireFormat === MLS.MLSMessage.WireFormat.MLS_PRIVATE_MESSAGE

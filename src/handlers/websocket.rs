@@ -1444,7 +1444,9 @@ async fn handle_socket(
                             // PublicMessage Proposal is authenticated but does
                             // not run TreeKEM/key schedule and must not consume
                             // the creator's Commit budget.
-                            if validated.public_kind == Some(PublicMessageKind::Commit) {
+                            let is_commit =
+                                validated.public_kind == Some(PublicMessageKind::Commit);
+                            if is_commit {
                                 let max_commits = state_clone.config.commit_rate_limit;
                                 let commit_window = state_clone.config.commit_rate_window_secs;
                                 let mut commit_ts = state_clone
@@ -1471,7 +1473,6 @@ async fn handle_socket(
                                     }
                                     continue;
                                 }
-                                commit_ts.push_back(now);
                             } else if validated.public_kind == Some(PublicMessageKind::Proposal) {
                                 let max_proposals = state_clone.config.proposal_rate_limit;
                                 let proposal_window = state_clone.config.proposal_rate_window_secs;
@@ -1501,19 +1502,50 @@ async fn handle_socket(
                                     .map(Vec::len)
                                     .unwrap_or(0),
                             );
-                            if !state_clone.admit_room_traffic(
-                                room_id,
-                                now,
-                                traffic_bytes,
-                                state_clone.config.msg_rate_window_secs,
-                                state_clone.config.room_msg_rate_limit,
-                                state_clone.config.room_byte_rate_limit,
-                            ) {
+                            // KeyPackages, Proposals, and Welcomes already have
+                            // narrow structural/count bounds and must not be
+                            // silently lost after WebSocket.send accepted them.
+                            // Charge expensive Commits and ephemeral encrypted
+                            // application traffic to the aggregate room bucket.
+                            let charge_room_budget =
+                                is_commit || wire_format == WIRE_PRIVATE_MESSAGE;
+                            if charge_room_budget
+                                && !state_clone.admit_room_traffic(
+                                    room_id,
+                                    connection_id,
+                                    now,
+                                    traffic_bytes,
+                                )
+                            {
                                 tracing::warn!(
-                                    "Room {} exceeded aggregate traffic budget",
-                                    room_id
+                                    "Room {} rejected traffic from {} at aggregate/sender budget",
+                                    room_id,
+                                    connection_id,
                                 );
-                                break;
+                                if is_commit {
+                                    let rejection = Message::MlsRejected {
+                                        commit_ref: commit_ref.clone(),
+                                        reason: "room_rate_limited".to_string(),
+                                        retry_after_secs: u64::try_from(
+                                            state_clone.config.msg_rate_window_secs,
+                                        )
+                                        .unwrap_or(1),
+                                    };
+                                    if let Ok(json) = serde_json::to_string(&rejection) {
+                                        let _ = recv_direct_tx.try_send(json);
+                                    }
+                                }
+                                // The sender remains connected. Private
+                                // messages are ephemeral; a staged Commit gets
+                                // the typed retry response above.
+                                continue;
+                            }
+                            if is_commit {
+                                state_clone
+                                    .connection_commit_timestamps
+                                    .entry(connection_id)
+                                    .or_default()
+                                    .push_back(now);
                             }
 
                             if wire_format != WIRE_PRIVATE_MESSAGE {
@@ -1691,17 +1723,20 @@ async fn handle_socket(
 
                                 if !state_clone.admit_room_traffic(
                                     room_id,
+                                    connection_id,
                                     now,
                                     payload.len(),
-                                    rate_window_secs,
-                                    state_clone.config.room_msg_rate_limit,
-                                    state_clone.config.room_byte_rate_limit,
                                 ) {
                                     tracing::warn!(
-                                        "Room {} exceeded aggregate traffic budget",
-                                        room_id
+                                        "Room {} rejected traffic from {} at aggregate/sender budget",
+                                        room_id,
+                                        connection_id,
                                     );
-                                    break;
+                                    // Aggregate pressure is not evidence that
+                                    // this sender caused it. Drop this
+                                    // ephemeral frame without severing the
+                                    // authenticated relay identity.
+                                    continue;
                                 }
 
                                 let room_ttl_minutes = state_clone
@@ -2718,7 +2753,7 @@ mod tests {
     }
 
     #[test]
-    fn room_traffic_and_broadcast_memory_are_byte_bounded() {
+    fn idle_room_does_not_age_a_future_mls_control_backlog() {
         let state = AppState::new(1000, test_config());
         let room = Room::new(RoomConfig {
             room_type: RoomType::Group,
@@ -2727,13 +2762,93 @@ mod tests {
         });
         let room_id = room.id;
         state.try_create_room(room).unwrap();
+        let alice = Uuid::new_v4();
+        let bob = Uuid::new_v4();
+
+        for participant in [alice, bob] {
+            assert_eq!(
+                state.add_connection(participant, room_id, false),
+                Some(ConnectionAdmission::New)
+            );
+            state
+                .open_mls_control_stream(&room_id, participant, None)
+                .expect("open synchronized MLS stream");
+        }
+
+        let opened_at = std::time::Instant::now();
+        let appended_at = opened_at + MLS_CONTROL_ACK_TIMEOUT + Duration::from_secs(1);
+        state
+            .append_and_broadcast_mls_control_at_for_test(&room_id, appended_at, |seq| {
+                Some(format!(r#"{{"type":"test","control_seq":{seq}}}"#))
+            })
+            .expect("append control after an idle interval");
+
+        assert!(
+            state
+                .lagging_mls_control_participants_at_for_test(
+                    &room_id,
+                    u64::MAX,
+                    MLS_CONTROL_ACK_TIMEOUT,
+                    appended_at,
+                )
+                .is_empty(),
+            "time spent fully caught up must not consume a new backlog's ACK deadline"
+        );
+
+        let expired_at = appended_at + MLS_CONTROL_ACK_TIMEOUT;
+        let mut lagging = state.lagging_mls_control_participants_at_for_test(
+            &room_id,
+            u64::MAX,
+            MLS_CONTROL_ACK_TIMEOUT,
+            expired_at,
+        );
+        lagging.sort_unstable();
+        let mut expected = vec![alice, bob];
+        expected.sort_unstable();
+        assert_eq!(
+            lagging, expected,
+            "the same unacknowledged control becomes evictable only after its own deadline"
+        );
+    }
+
+    #[test]
+    fn room_traffic_and_broadcast_memory_are_byte_bounded() {
+        let mut config = test_config();
+        config.msg_rate_window_secs = 1;
+        config.room_msg_rate_limit = 4;
+        config.room_byte_rate_limit = 1024;
+        let state = AppState::new(1000, config);
+        let room = Room::new(RoomConfig {
+            room_type: RoomType::Group,
+            ttl_minutes: 60,
+            max_participants: 4,
+        });
+        let room_id = room.id;
+        state.try_create_room(room).unwrap();
+        let alice = Uuid::new_v4();
+        let bob = Uuid::new_v4();
+        assert_eq!(
+            state.add_connection(alice, room_id, false),
+            Some(ConnectionAdmission::New)
+        );
+        assert_eq!(
+            state.add_connection(bob, room_id, false),
+            Some(ConnectionAdmission::New)
+        );
 
         let now = Utc::now();
-        assert!(state.admit_room_traffic(room_id, now, 512, 1, 2, 1024));
-        assert!(state.admit_room_traffic(room_id, now, 512, 1, 2, 1024));
+        assert!(state.admit_room_traffic(room_id, alice, now, 512));
         assert!(
-            !state.admit_room_traffic(room_id, now, 1, 1, 2, 1024),
-            "aggregate count/byte budget rejects the next room message"
+            !state.admit_room_traffic(room_id, alice, now, 1),
+            "one sender cannot consume bytes reserved for its peers"
+        );
+        assert!(
+            state.admit_room_traffic(room_id, bob, now, 512),
+            "another sender retains its share after a peer reaches its cap"
+        );
+        assert!(
+            !state.admit_room_traffic(room_id, bob, now, 1),
+            "aggregate and per-sender byte ceilings remain bounded"
         );
 
         let _receiver = state

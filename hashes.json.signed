@@ -1,8 +1,8 @@
 {
   "data": {
     "version": "1.2.0",
-    "sequence": 75,
-    "generated": "2026-07-16T10:40:50.550Z",
+    "sequence": 77,
+    "generated": "2026-07-16T12:10:20.588Z",
     "site": "https://pinchat.io",
     "files": [
       {
@@ -71,7 +71,7 @@
       },
       {
         "path": "/static/js/websocket.js",
-        "hash": "ca3d5a90214676e56aa6b24ba5d754d0ece7683c4e9665669a546d417cfd5c55"
+        "hash": "a1d9763c1acc3b92a96c8a598fe2ead30b07c692c9fae35f65d3b5c130ba9022"
       },
       {
         "path": "/static/js/debug.js",
@@ -87,7 +87,7 @@
       },
       {
         "path": "/static/js/mls/p256.js",
-        "hash": "d6b5915bc590c36e544128bd6f7675ee85aef3d2c7308a1001dfec54fee9d497"
+        "hash": "8cc749d0c4935877a463bdd000f9b95d88711d230ecca2b36f6a4f3f66119eba"
       },
       {
         "path": "/static/js/mls/ciphersuite.js",
@@ -95,7 +95,7 @@
       },
       {
         "path": "/static/js/mls/hpke.js",
-        "hash": "9974992244d9dfc81ba68b0dccfce382614a3cbfbe9b75248a1aa55eb1de328e"
+        "hash": "71c6089586c86ae725b78dc254cd1070ad5d5bf62bbf6e60013b6ba180384522"
       },
       {
         "path": "/static/js/mls/signature.js",
@@ -115,7 +115,7 @@
       },
       {
         "path": "/static/js/mls/nodes.js",
-        "hash": "8c2bc4abbee0ff504ec5db19af8f918b87ebbc08063077b9c6732168e0a3f2d9"
+        "hash": "0f012a87d9a70f80c9752fd7ce64bb876e92881b5cece2311039bed4f78aea31"
       },
       {
         "path": "/static/js/mls/tree-hash.js",
@@ -151,7 +151,7 @@
       },
       {
         "path": "/static/js/mls/welcome.js",
-        "hash": "d7172ac39046e85dea80a689573c813e57ba3394d508eb2c3f6b22743aacf090"
+        "hash": "c4510e53078fa402adcf2be1b8a03d32aeb2c5e09b84e74a3943e9a786762ea6"
       },
       {
         "path": "/static/js/mls/framing.js",
@@ -179,11 +179,11 @@
       },
       {
         "path": "/static/js/mls/group.js",
-        "hash": "384e823e01338f4e64b5c76b2bb3cbf57a3c3af52c28c6346f2418558d31f50f"
+        "hash": "ed2e7ce4318eaa368f3827fbc60707a0549383824b0c4eb4c5b0741584beae5f"
       },
       {
         "path": "/static/js/mls-session.js",
-        "hash": "ce10a550e47c49075e5f87b2238d312c8847036289c531ef9f0614cfd178418c"
+        "hash": "2b11520f7fc26cc3bc4f7d854127f9e10608107bbf69fa06b6c33c2982ef7136"
       },
       {
         "path": "/static/index.html",
@@ -195,7 +195,7 @@
       },
       {
         "path": "/static/chat.html",
-        "hash": "59d55b02f078ff7cca3b7b31af63b0e8121deb10a347f862e1e66ca58f2139d4"
+        "hash": "fcfecb3031a8750d128f82ae7a8fa8bcfa6b522ad7f21f19f25087e1306f9441"
       },
       {
         "path": "/static/terms.html",
@@ -211,5 +211,5 @@
       }
     ]
   },
-  "signature": "MEUCID3z7/C52xonAe+/PPUDC/9LYFjrr/5EuZyoxVpGc7YqAiEAuamSsh1P2dZNecJcqFEccn8LoCFgEMBxPKSCNbuzC4Y="
+  "signature": "MEYCIQDO2cOuHzrykTRHmH4QSbxOeF3WlyH+DvsOiuMqfWKshgIhAKtwevOob2jQmjjb0dNNbk01SGCafCtwd6sy4GWsimuO"
 }

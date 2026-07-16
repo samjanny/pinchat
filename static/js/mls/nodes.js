@@ -136,12 +136,34 @@
         return { extensionType, extensionData };
     }
 
+    function validateExtensionTypes(exts) {
+        if (!Array.isArray(exts)) {
+            throw new Error('extensions: expected an array');
+        }
+        const seen = new Set();
+        for (const ext of exts) {
+            if (!ext || !Number.isInteger(ext.extensionType)
+                || ext.extensionType < 0 || ext.extensionType > 0xffff
+                || !(ext.extensionData instanceof Uint8Array)) {
+                throw new Error('extensions: malformed extension');
+            }
+            if (seen.has(ext.extensionType)) {
+                throw new Error(
+                    `extensions: duplicate extension_type ${ext.extensionType}`,
+                );
+            }
+            seen.add(ext.extensionType);
+        }
+        return exts;
+    }
+
     function writeExtensions(encoder, exts) {
+        validateExtensionTypes(exts);
         encoder.writeVector(exts, writeExtension);
     }
 
     function readExtensions(decoder) {
-        return decoder.readVector(readExtension);
+        return validateExtensionTypes(decoder.readVector(readExtension));
     }
 
     // --- Lifetime ----------------------------------------------------------
@@ -443,6 +465,7 @@
         readExtension,
         writeExtensions,
         readExtensions,
+        validateExtensionTypes,
         writeLifetime,
         readLifetime,
         writeLeafNode,

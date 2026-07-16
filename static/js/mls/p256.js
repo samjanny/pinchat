@@ -1,28 +1,18 @@
 /**
- * PinChat MLS — P-256 scalar multiplication (hand-rolled).
+ * PinChat MLS — public P-256 point helpers.
  *
- * WebCrypto supplies key generation, ECDH, ECDSA and JWK import for
- * P-256 — but it does *not* expose scalar multiplication of the base
- * point `G`. TreeKEM needs exactly that: given a path secret deterministic
- * scalar `d`, produce the matching public point (x, y). Without (x, y)
- * WebCrypto refuses to import the private key (the JWK import validates
- * `(x, y) = d·G`).
+ * TreeKEM's deterministic DHKEM DeriveKeyPair starts from a secret scalar,
+ * but JavaScript must never multiply that scalar with hand-written BigInt
+ * curve code. hpke.js imports the scalar as an opaque, non-extractable
+ * PKCS#8 WebCrypto key and asks the native ECDH implementation for the
+ * public x-coordinate.
  *
- * This module implements the minimum needed: `scalarBaseMul(d)` returning
- * the affine `(x, y)` bytes for the point `d·G` on the NIST P-256 curve.
- * It uses BigInt throughout, Jacobian coordinates to avoid one inversion
- * per bit, and a straightforward double-and-add scalar loop. Constant-
- * time-ness is *not* claimed: BigInt's operations are data-dependent in
- * JS engines. Since scalars here come from HKDF-SHA256 output (not user
- * secrets in a classical timing-attack sense) and are used once per
- * TreeKEM path update, this is an acceptable trade-off for auditability.
- *
- * Curve parameters from FIPS 186-4 / SEC2:
- *   p = 2^256 - 2^224 + 2^192 + 2^96 - 1
- *   a = -3 mod p
- *   b = 0x5ac635d8aa3a93e7b3ebbd55769886bc651d06b0cc53b0f63bce3c3e27d2604b
- *   G = (Gx, Gy)
- *   n = 0xffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551
+ * Recovering y from a public x-coordinate is ordinary point decompression:
+ * P-256's field prime is 3 mod 4, so y = rhs^((p+1)/4) mod p. The two
+ * possible signs are returned to hpke.js, which selects the matching one
+ * using native ECDSA sign/verify. Every BigInt operation in this module is
+ * therefore performed only on public curve coordinates or fixed constants,
+ * never on a TreeKEM/path-secret scalar.
  */
 (function (root, factory) {
     if (typeof module !== 'undefined' && module.exports) {
@@ -36,130 +26,59 @@
 
     const P = 0xffffffff00000001000000000000000000000000ffffffffffffffffffffffffn;
     const N = 0xffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551n;
-    const A = P - 3n; // a = -3 mod p
+    const A = P - 3n;
+    const B = 0x5ac635d8aa3a93e7b3ebbd55769886bc651d06b0cc53b0f63bce3c3e27d2604bn;
     const GX = 0x6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296n;
     const GY = 0x4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5n;
 
-    // --- Field arithmetic mod p --------------------------------------------
-
-    function mod(x, m) {
-        const r = x % m;
-        return r < 0n ? r + m : r;
+    function mod(value) {
+        const reduced = value % P;
+        return reduced < 0n ? reduced + P : reduced;
     }
 
-    function fadd(a, b) { return mod(a + b, P); }
-    function fsub(a, b) { return mod(a - b, P); }
-    function fmul(a, b) { return mod(a * b, P); }
-    function fsqr(a)    { return mod(a * a, P); }
+    function multiply(a, b) {
+        return mod(a * b);
+    }
 
-    // Modular inverse via Fermat's little theorem: a^(p-2) mod p.
-    function fpow(base, exp) {
+    function square(value) {
+        return multiply(value, value);
+    }
+
+    // The exponent is the fixed public constant (P + 1) / 4.
+    function powPublic(base, exponent) {
         let result = 1n;
-        let b = mod(base, P);
-        let e = exp;
-        while (e > 0n) {
-            if (e & 1n) result = fmul(result, b);
-            b = fsqr(b);
-            e >>= 1n;
+        let factor = mod(base);
+        let remaining = exponent;
+        while (remaining > 0n) {
+            if ((remaining & 1n) !== 0n) result = multiply(result, factor);
+            factor = square(factor);
+            remaining >>= 1n;
         }
         return result;
     }
 
-    function finv(a) {
-        if (a === 0n) throw new Error('p256: finv(0) is undefined');
-        return fpow(a, P - 2n);
-    }
-
-    // --- Jacobian point ops ------------------------------------------------
-    // Jacobian: (X, Y, Z) where affine (x, y) = (X/Z^2, Y/Z^3).
-    // Identity / point-at-infinity: Z = 0.
-
-    function isIdentity(p) { return p.Z === 0n; }
-
-    function jacobianFromAffine(x, y) {
-        return { X: x, Y: y, Z: 1n };
-    }
-
-    function affineFromJacobian(p) {
-        if (isIdentity(p)) throw new Error('p256: affine of identity');
-        const zinv = finv(p.Z);
-        const zinv2 = fsqr(zinv);
-        const zinv3 = fmul(zinv2, zinv);
-        return { x: fmul(p.X, zinv2), y: fmul(p.Y, zinv3) };
-    }
-
-    // Point doubling in Jacobian coords (RFC 6090 appendix F / Bernstein).
-    // Uses the specific a = -3 speedup: M = 3(X - Z^2)(X + Z^2).
-    function jDouble(p) {
-        if (isIdentity(p) || p.Y === 0n) return { X: 0n, Y: 1n, Z: 0n };
-        const Y2 = fsqr(p.Y);
-        const S = fmul(fmul(4n, p.X), Y2);
-        const Z2 = fsqr(p.Z);
-        const M = fmul(3n, fmul(fsub(p.X, Z2), fadd(p.X, Z2)));
-        const X3 = fsub(fsqr(M), fmul(2n, S));
-        const Y3 = fsub(fmul(M, fsub(S, X3)), fmul(8n, fsqr(Y2)));
-        const Z3 = fmul(fmul(2n, p.Y), p.Z);
-        return { X: X3, Y: Y3, Z: Z3 };
-    }
-
-    // Point addition (Jacobian + Jacobian). Handles identity and equal-X
-    // special cases. Not constant-time.
-    function jAdd(p, q) {
-        if (isIdentity(p)) return q;
-        if (isIdentity(q)) return p;
-
-        const Z1Z1 = fsqr(p.Z);
-        const Z2Z2 = fsqr(q.Z);
-        const U1 = fmul(p.X, Z2Z2);
-        const U2 = fmul(q.X, Z1Z1);
-        const S1 = fmul(p.Y, fmul(Z2Z2, q.Z));
-        const S2 = fmul(q.Y, fmul(Z1Z1, p.Z));
-        const H = fsub(U2, U1);
-        const r = fsub(S2, S1);
-
-        if (H === 0n) {
-            if (r === 0n) return jDouble(p);
-            return { X: 0n, Y: 1n, Z: 0n };
+    /** Serialize a BigInt into out[offset..offset+length] big-endian. */
+    function writeBigUint(value, out, offset, length) {
+        let remaining = value;
+        for (let i = length - 1; i >= 0; i -= 1) {
+            out[offset + i] = Number(remaining & 0xffn);
+            remaining >>= 8n;
         }
-
-        const HH = fsqr(H);
-        const HHH = fmul(HH, H);
-        const U1HH = fmul(U1, HH);
-        const X3 = fsub(fsub(fsqr(r), HHH), fmul(2n, U1HH));
-        const Y3 = fsub(fmul(r, fsub(U1HH, X3)), fmul(S1, HHH));
-        const Z3 = fmul(fmul(p.Z, q.Z), H);
-        return { X: X3, Y: Y3, Z: Z3 };
-    }
-
-    // Left-to-right double-and-add scalar multiplication of `scalar * p`.
-    function jScalarMul(scalar, p) {
-        let result = { X: 0n, Y: 1n, Z: 0n }; // identity
-        const bits = scalar.toString(2);
-        for (let i = 0; i < bits.length; i += 1) {
-            result = jDouble(result);
-            if (bits[i] === '1') {
-                result = jAdd(result, p);
-            }
+        if (remaining !== 0n) {
+            throw new Error('p256: value does not fit requested width');
         }
-        return result;
     }
 
-    // --- Public API --------------------------------------------------------
+    /** Parse a public big-endian byte array into a BigInt. */
+    function bytesToBigInt(bytes) {
+        let value = 0n;
+        for (let i = 0; i < bytes.length; i += 1) {
+            value = (value << 8n) | BigInt(bytes[i]);
+        }
+        return value;
+    }
 
-    /**
-     * Compute `scalar · G` on P-256. Input: a BigInt `d` with 0 < d < n.
-     * Output: the uncompressed public key as a 65-byte Uint8Array
-     * (0x04 || X || Y), each coordinate 32 bytes big-endian.
-     */
-    function scalarBaseMul(scalar) {
-        if (typeof scalar !== 'bigint') throw new TypeError('p256: scalar must be BigInt');
-        const d = mod(scalar, N);
-        if (d === 0n) throw new Error('p256: scalar is a multiple of curve order');
-
-        const G = jacobianFromAffine(GX, GY);
-        const result = jScalarMul(d, G);
-        const { x, y } = affineFromJacobian(result);
-
+    function uncompressedPoint(x, y) {
         const out = new Uint8Array(65);
         out[0] = 0x04;
         writeBigUint(x, out, 1, 32);
@@ -167,32 +86,44 @@
         return out;
     }
 
-    /** Serialize a BigInt into `out[offset..offset+len]` big-endian. */
-    function writeBigUint(v, out, offset, len) {
-        let n = v;
-        for (let i = len - 1; i >= 0; i -= 1) {
-            out[offset + i] = Number(n & 0xffn);
-            n >>= 8n;
-        }
-        if (n !== 0n) throw new Error('p256: scalar does not fit in requested width');
+    function generatorBytes() {
+        return uncompressedPoint(GX, GY);
     }
 
-    /** Parse a big-endian byte array into a BigInt. */
-    function bytesToBigInt(bytes) {
-        let n = 0n;
-        for (let i = 0; i < bytes.length; i += 1) {
-            n = (n << 8n) | BigInt(bytes[i]);
+    /**
+     * Return the two possible uncompressed P-256 points for a public
+     * x-coordinate. Throws when x is out of range or not on the curve.
+     */
+    function publicKeyCandidatesFromX(xBytes) {
+        if (!(xBytes instanceof Uint8Array) || xBytes.length !== 32) {
+            throw new Error('p256: x-coordinate must be 32 bytes');
         }
-        return n;
+        const x = bytesToBigInt(xBytes);
+        if (x >= P) throw new Error('p256: x-coordinate out of range');
+        const rhs = mod(multiply(square(x), x) + multiply(A, x) + B);
+        const y = powPublic(rhs, (P + 1n) >> 2n);
+        if (square(y) !== rhs) {
+            throw new Error('p256: x-coordinate is not on the curve');
+        }
+        const negY = mod(-y);
+        if (negY === y) {
+            throw new Error('p256: ambiguous point with zero y-coordinate');
+        }
+        return [
+            uncompressedPoint(x, y),
+            uncompressedPoint(x, negY),
+        ];
     }
 
     return Object.freeze({
         P,
         N,
         A,
+        B,
         GX,
         GY,
-        scalarBaseMul,
+        generatorBytes,
+        publicKeyCandidatesFromX,
         bytesToBigInt,
     });
 });

@@ -123,6 +123,18 @@
 
     const HPKE_SUITE_ID = hpkeSuiteId();
     const KEM_SUITE_ID = kemSuiteId();
+    const P256_PKCS8_SCALAR_PREFIX = Uint8Array.of(
+        0x30, 0x41, 0x02, 0x01, 0x00,
+        0x30, 0x13,
+        0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01,
+        0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07,
+        0x04, 0x27,
+        0x30, 0x25, 0x02, 0x01, 0x01, 0x04, 0x20,
+    );
+    const PUBLIC_KEY_RECOVERY_PROBE = enc.encode(
+        'PinChat HPKE DeriveKeyPair public-key recovery v1',
+    );
+    let generatorPublicKeyPromise = null;
 
     // --- HKDF on top of HMAC-SHA256 ----------------------------------------
     //
@@ -134,17 +146,27 @@
         // HMAC with a zero-length key is valid (RFC 2104) but WebCrypto
         // refuses it; pad a 0-length key to 1 zero byte (HMAC is invariant
         // under zero-padding up to the block size).
-        const keyBytes = key.length === 0 ? new Uint8Array(1) : key;
-        const k = await getSubtle().importKey(
-            'raw', keyBytes, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
-        );
-        const sig = await getSubtle().sign('HMAC', k, data);
-        return new Uint8Array(sig);
+        const allocatedKey = key.length === 0 ? new Uint8Array(1) : null;
+        const keyBytes = allocatedKey || key;
+        try {
+            const k = await getSubtle().importKey(
+                'raw', keyBytes, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
+            );
+            const sig = await getSubtle().sign('HMAC', k, data);
+            return new Uint8Array(sig);
+        } finally {
+            if (allocatedKey) allocatedKey.fill(0);
+        }
     }
 
     async function hkdfExtract(salt, ikm) {
-        const effectiveSalt = salt.length === 0 ? new Uint8Array(Nh) : salt;
-        return hmacSha256(effectiveSalt, ikm);
+        const allocatedSalt = salt.length === 0 ? new Uint8Array(Nh) : null;
+        const effectiveSalt = allocatedSalt || salt;
+        try {
+            return await hmacSha256(effectiveSalt, ikm);
+        } finally {
+            if (allocatedSalt) allocatedSalt.fill(0);
+        }
     }
 
     async function hkdfExpand(prk, info, length) {
@@ -153,19 +175,39 @@
         const output = new Uint8Array(length);
         let previous = new Uint8Array(0);
         let offset = 0;
-        for (let i = 1; i <= n; i += 1) {
-            const t = await hmacSha256(prk, concat(previous, info, new Uint8Array([i])));
-            const take = Math.min(Nh, length - offset);
-            output.set(t.subarray(0, take), offset);
-            offset += take;
-            previous = t;
+        try {
+            for (let i = 1; i <= n; i += 1) {
+                const hmacInput = concat(
+                    previous, info, new Uint8Array([i]),
+                );
+                let next = null;
+                try {
+                    next = await hmacSha256(prk, hmacInput);
+                } finally {
+                    hmacInput.fill(0);
+                }
+                const take = Math.min(Nh, length - offset);
+                output.set(next.subarray(0, take), offset);
+                offset += take;
+                previous.fill(0);
+                previous = next;
+            }
+            return output;
+        } catch (err) {
+            output.fill(0);
+            throw err;
+        } finally {
+            previous.fill(0);
         }
-        return output;
     }
 
     async function labeledExtract(salt, suiteId, label, ikm) {
         const labeledIkm = concat(HPKE_VERSION, suiteId, enc.encode(label), ikm);
-        return hkdfExtract(salt, labeledIkm);
+        try {
+            return await hkdfExtract(salt, labeledIkm);
+        } finally {
+            labeledIkm.fill(0);
+        }
     }
 
     async function labeledExpand(prk, suiteId, label, info, length) {
@@ -176,7 +218,11 @@
             enc.encode(label),
             info,
         );
-        return hkdfExpand(prk, labeledInfo, length);
+        try {
+            return await hkdfExpand(prk, labeledInfo, length);
+        } finally {
+            labeledInfo.fill(0);
+        }
     }
 
     // --- DHKEM(P-256, HKDF-SHA256) -----------------------------------------
@@ -208,8 +254,11 @@
      * returned key-pair object. Throws if 256 consecutive candidates are
      * out of range (the probability is astronomically small).
      *
-     * `P256.scalarBaseMul` computes sk*G in pure JS since WebCrypto
-     * cannot derive the public point from a known scalar.
+     * The secret scalar is imported directly into WebCrypto as an RFC 5915
+     * ECPrivateKey inside PKCS#8. Native ECDH against the public generator
+     * yields x(sk*G); p256.js decompresses that public coordinate, and a
+     * native ECDSA sign/verify probe selects the correct sign of y. No secret
+     * scalar enters JavaScript BigInt elliptic-curve arithmetic.
      */
     async function deriveKeyPair(ikm) {
         const dkpPrk = await labeledExtract(new Uint8Array(0), KEM_SUITE_ID, 'dkp_prk', ikm);
@@ -222,17 +271,8 @@
                     // P-256: bitmask = 0xFF, so no masking is needed. Kept
                     // explicit to match RFC 9180 pseudocode exactly.
                     cand[0] &= 0xff;
-                    const scalar = P256.bytesToBigInt(cand);
-                    if (scalar > 0n && scalar < P256.N) {
-                        const pubBytes = P256.scalarBaseMul(scalar);
-                        const privateKey = await importPrivateKey(cand, pubBytes);
-                        const publicKey = await deserializePublicKey(pubBytes);
-                        return {
-                            privateKey,
-                            publicKey,
-                            publicKeyBytes: pubBytes,
-                        };
-                    }
+                    const keyPair = await deriveKeyPairFromScalar(cand);
+                    if (keyPair) return keyPair;
                 } finally {
                     cand.fill(0);
                 }
@@ -240,6 +280,105 @@
             throw new Error('hpke: DeriveKeyPair exhausted counter');
         } finally {
             dkpPrk.fill(0);
+        }
+    }
+
+    function privateScalarPkcs8(rawScalarBytes) {
+        if (!(rawScalarBytes instanceof Uint8Array)
+            || rawScalarBytes.length !== 32) {
+            throw new Error('hpke: private scalar must be 32 bytes');
+        }
+        return concat(P256_PKCS8_SCALAR_PREFIX, rawScalarBytes);
+    }
+
+    function generatorPublicKey() {
+        if (!generatorPublicKeyPromise) {
+            generatorPublicKeyPromise = deserializePublicKey(
+                P256.generatorBytes(),
+            );
+        }
+        return generatorPublicKeyPromise;
+    }
+
+    async function deriveKeyPairFromScalar(rawScalarBytes) {
+        const pkcs8 = privateScalarPkcs8(rawScalarBytes);
+        let publicX = null;
+        let signature = null;
+        let candidates = [];
+        let selectedPublicBytes = null;
+        try {
+            const subtle = getSubtle();
+            let privateKey;
+            try {
+                privateKey = await subtle.importKey(
+                    'pkcs8', pkcs8,
+                    { name: 'ECDH', namedCurve: 'P-256' },
+                    false, ['deriveBits'],
+                );
+            } catch (err) {
+                if (err?.name === 'DataError') {
+                    // WebCrypto performs the 0 < sk < order validation inside
+                    // the native EC implementation. A rejected scalar advances
+                    // RFC 9180's public counter without exposing its bytes to
+                    // JavaScript comparison or BigInt arithmetic.
+                    return null;
+                }
+                throw err;
+            }
+            const [signingKey, generator] = await Promise.all([
+                subtle.importKey(
+                    'pkcs8', pkcs8,
+                    { name: 'ECDSA', namedCurve: 'P-256' },
+                    false, ['sign'],
+                ),
+                generatorPublicKey(),
+            ]);
+            publicX = new Uint8Array(await subtle.deriveBits(
+                { name: 'ECDH', public: generator }, privateKey, 256,
+            ));
+            candidates = P256.publicKeyCandidatesFromX(publicX);
+            signature = new Uint8Array(await subtle.sign(
+                { name: 'ECDSA', hash: 'SHA-256' },
+                signingKey,
+                PUBLIC_KEY_RECOVERY_PROBE,
+            ));
+            const matches = await Promise.all(candidates.map(async (candidate) => {
+                const verificationKey = await subtle.importKey(
+                    'raw', candidate,
+                    { name: 'ECDSA', namedCurve: 'P-256' },
+                    false, ['verify'],
+                );
+                return subtle.verify(
+                    { name: 'ECDSA', hash: 'SHA-256' },
+                    verificationKey,
+                    signature,
+                    PUBLIC_KEY_RECOVERY_PROBE,
+                );
+            }));
+            const matchingIndices = matches
+                .map((matchesCandidate, index) =>
+                    matchesCandidate ? index : -1)
+                .filter((index) => index !== -1);
+            if (matchingIndices.length !== 1) {
+                throw new Error(
+                    `hpke: native public-key recovery matched `
+                    + `${matchingIndices.length} P-256 candidates`,
+                );
+            }
+            selectedPublicBytes = candidates[matchingIndices[0]];
+            const publicKey = await deserializePublicKey(selectedPublicBytes);
+            return {
+                privateKey,
+                publicKey,
+                publicKeyBytes: selectedPublicBytes,
+            };
+        } finally {
+            pkcs8.fill(0);
+            if (publicX) publicX.fill(0);
+            if (signature) signature.fill(0);
+            for (const candidate of candidates) {
+                if (candidate !== selectedPublicBytes) candidate.fill(0);
+            }
         }
     }
 
@@ -315,7 +454,13 @@
 
     async function extractAndExpand(dh, kemContext) {
         const eaePrk = await labeledExtract(new Uint8Array(0), KEM_SUITE_ID, 'eae_prk', dh);
-        return labeledExpand(eaePrk, KEM_SUITE_ID, 'shared_secret', kemContext, Nsecret);
+        try {
+            return await labeledExpand(
+                eaePrk, KEM_SUITE_ID, 'shared_secret', kemContext, Nsecret,
+            );
+        } finally {
+            eaePrk.fill(0);
+        }
     }
 
     async function encap(pkR) {
@@ -325,8 +470,13 @@
         const ephemeral = await generateKeyPair();
         const dh = await ecdh(ephemeral.privateKey, pkRKey);
         const kemContext = concat(ephemeral.publicKeyBytes, pkRBytes);
-        const sharedSecret = await extractAndExpand(dh, kemContext);
-        return { sharedSecret, enc: ephemeral.publicKeyBytes };
+        try {
+            const sharedSecret = await extractAndExpand(dh, kemContext);
+            return { sharedSecret, enc: ephemeral.publicKeyBytes };
+        } finally {
+            dh.fill(0);
+            kemContext.fill(0);
+        }
     }
 
     async function decap(encBytes, skR, pkRBytes) {
@@ -336,7 +486,12 @@
         const pkE = await deserializePublicKey(encBytes);
         const dh = await ecdh(skR, pkE);
         const kemContext = concat(encBytes, pkRBytes);
-        return extractAndExpand(dh, kemContext);
+        try {
+            return await extractAndExpand(dh, kemContext);
+        } finally {
+            dh.fill(0);
+            kemContext.fill(0);
+        }
     }
 
     // --- HPKE key schedule (base mode) -------------------------------------
@@ -346,15 +501,49 @@
     const DEFAULT_PSK_ID = new Uint8Array(0);
 
     async function keyScheduleBase(sharedSecret, info) {
-        const pskIdHash = await labeledExtract(new Uint8Array(0), HPKE_SUITE_ID, 'psk_id_hash', DEFAULT_PSK_ID);
-        const infoHash = await labeledExtract(new Uint8Array(0), HPKE_SUITE_ID, 'info_hash', info);
-        const ksContext = concat(new Uint8Array([MODE_BASE]), pskIdHash, infoHash);
-
-        const secret = await labeledExtract(sharedSecret, HPKE_SUITE_ID, 'secret', DEFAULT_PSK);
-        const key = await labeledExpand(secret, HPKE_SUITE_ID, 'key', ksContext, Nk);
-        const baseNonce = await labeledExpand(secret, HPKE_SUITE_ID, 'base_nonce', ksContext, Nn);
-        const exporterSecret = await labeledExpand(secret, HPKE_SUITE_ID, 'exp', ksContext, Nh);
-        return { key, baseNonce, exporterSecret };
+        let pskIdHash = null;
+        let infoHash = null;
+        let ksContext = null;
+        let secret = null;
+        let key = null;
+        let baseNonce = null;
+        let exporterSecret = null;
+        try {
+            pskIdHash = await labeledExtract(
+                new Uint8Array(0), HPKE_SUITE_ID,
+                'psk_id_hash', DEFAULT_PSK_ID,
+            );
+            infoHash = await labeledExtract(
+                new Uint8Array(0), HPKE_SUITE_ID, 'info_hash', info,
+            );
+            ksContext = concat(
+                new Uint8Array([MODE_BASE]), pskIdHash, infoHash,
+            );
+            secret = await labeledExtract(
+                sharedSecret, HPKE_SUITE_ID, 'secret', DEFAULT_PSK,
+            );
+            key = await labeledExpand(
+                secret, HPKE_SUITE_ID, 'key', ksContext, Nk,
+            );
+            baseNonce = await labeledExpand(
+                secret, HPKE_SUITE_ID, 'base_nonce', ksContext, Nn,
+            );
+            exporterSecret = await labeledExpand(
+                secret, HPKE_SUITE_ID, 'exp', ksContext, Nh,
+            );
+            const schedule = { key, baseNonce, exporterSecret };
+            key = null;
+            baseNonce = null;
+            exporterSecret = null;
+            return schedule;
+        } finally {
+            for (const value of [
+                pskIdHash, infoHash, ksContext, secret,
+                key, baseNonce, exporterSecret,
+            ]) {
+                if (value instanceof Uint8Array) value.fill(0);
+            }
+        }
     }
 
     async function importAesKey(keyBytes) {
@@ -386,67 +575,146 @@
 
     async function seal(pkR, info, aad, plaintext) {
         const { sharedSecret, enc: encBytes } = await encap(pkR);
-        const { key, baseNonce } = await keyScheduleBase(sharedSecret, info);
-        // Single-shot: sequence number = 0, so nonce = baseNonce.
-        const ct = await aeadSeal(key, baseNonce, aad, plaintext);
-        return { enc: encBytes, ct };
+        let schedule = null;
+        try {
+            schedule = await keyScheduleBase(sharedSecret, info);
+            // Single-shot: sequence number = 0, so nonce = baseNonce.
+            const ct = await aeadSeal(
+                schedule.key, schedule.baseNonce, aad, plaintext,
+            );
+            return { enc: encBytes, ct };
+        } finally {
+            sharedSecret.fill(0);
+            destroySchedule(schedule);
+        }
     }
 
     async function open(encBytes, skR, pkRBytes, info, aad, ct) {
         const sharedSecret = await decap(encBytes, skR, pkRBytes);
-        const { key, baseNonce } = await keyScheduleBase(sharedSecret, info);
-        return aeadOpen(key, baseNonce, aad, ct);
+        let schedule = null;
+        try {
+            schedule = await keyScheduleBase(sharedSecret, info);
+            return await aeadOpen(
+                schedule.key, schedule.baseNonce, aad, ct,
+            );
+        } finally {
+            sharedSecret.fill(0);
+            destroySchedule(schedule);
+        }
     }
 
     // --- Stateful context (useful for unit tests and for the secret-tree AEAD stream) ---
 
     async function setupBaseSender(pkR, info) {
         const { sharedSecret, enc: encBytes } = await encap(pkR);
-        const ctx = await keyScheduleBase(sharedSecret, info);
-        return { enc: encBytes, context: makeSenderContext(ctx) };
+        let schedule = null;
+        try {
+            schedule = await keyScheduleBase(sharedSecret, info);
+            const context = makeSenderContext(schedule);
+            schedule = null;
+            return { enc: encBytes, context };
+        } finally {
+            sharedSecret.fill(0);
+            destroySchedule(schedule);
+        }
     }
 
     async function setupBaseReceiver(encBytes, skR, pkRBytes, info) {
         const sharedSecret = await decap(encBytes, skR, pkRBytes);
-        const ctx = await keyScheduleBase(sharedSecret, info);
-        return makeReceiverContext(ctx);
+        let schedule = null;
+        try {
+            schedule = await keyScheduleBase(sharedSecret, info);
+            const context = makeReceiverContext(schedule);
+            schedule = null;
+            return context;
+        } finally {
+            sharedSecret.fill(0);
+            destroySchedule(schedule);
+        }
     }
 
     function computeNonce(baseNonce, seq) {
         const seqBytes = i2osp(seq, Nn);
-        return xor(baseNonce, seqBytes);
+        try {
+            return xor(baseNonce, seqBytes);
+        } finally {
+            seqBytes.fill(0);
+        }
+    }
+
+    function destroySchedule(schedule) {
+        if (!schedule) return;
+        for (const value of [
+            schedule.key, schedule.baseNonce, schedule.exporterSecret,
+        ]) {
+            if (value instanceof Uint8Array) value.fill(0);
+        }
     }
 
     function makeSenderContext(schedule) {
         let seq = 0n;
+        let destroyed = false;
+        const requireLive = () => {
+            if (destroyed) throw new Error('hpke: sender context destroyed');
+        };
         return {
             async seal(aad, plaintext) {
+                requireLive();
                 const nonce = computeNonce(schedule.baseNonce, seq);
-                const ct = await aeadSeal(schedule.key, nonce, aad, plaintext);
-                seq += 1n;
-                return ct;
+                try {
+                    const ct = await aeadSeal(
+                        schedule.key, nonce, aad, plaintext,
+                    );
+                    seq += 1n;
+                    return ct;
+                } finally {
+                    nonce.fill(0);
+                }
             },
             async export(exporterContext, length) {
+                requireLive();
                 return labeledExpand(
                     schedule.exporterSecret, HPKE_SUITE_ID, 'sec', exporterContext, length,
                 );
+            },
+            destroy() {
+                if (destroyed) return;
+                destroyed = true;
+                seq = 0n;
+                destroySchedule(schedule);
             },
         };
     }
 
     function makeReceiverContext(schedule) {
         let seq = 0n;
+        let destroyed = false;
+        const requireLive = () => {
+            if (destroyed) throw new Error('hpke: receiver context destroyed');
+        };
         return {
             async open(aad, ct) {
+                requireLive();
                 const nonce = computeNonce(schedule.baseNonce, seq);
-                const pt = await aeadOpen(schedule.key, nonce, aad, ct);
-                seq += 1n;
-                return pt;
+                try {
+                    const pt = await aeadOpen(schedule.key, nonce, aad, ct);
+                    seq += 1n;
+                    return pt;
+                } finally {
+                    nonce.fill(0);
+                }
             },
             async export(exporterContext, length) {
+                requireLive();
                 return labeledExpand(
                     schedule.exporterSecret, HPKE_SUITE_ID, 'sec', exporterContext, length,
                 );
+            },
+            destroy() {
+                if (destroyed) return;
+                destroyed = true;
+                seq = 0n;
+                destroySchedule(schedule);
             },
         };
     }

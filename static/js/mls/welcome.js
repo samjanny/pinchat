@@ -208,7 +208,14 @@
             encryptedGroupSecrets.kemOutput,
             encryptedGroupSecrets.ciphertext,
         );
-        return parseGroupSecrets(pt);
+        try {
+            return parseGroupSecrets(pt);
+        } finally {
+            // parseGroupSecrets returns independent Uint8Array fields. The
+            // decrypted aggregate still contains joiner_secret/path_secret
+            // and must not survive solely until garbage collection.
+            pt.fill(0);
+        }
     }
 
     /**
@@ -218,9 +225,25 @@
      * KDF.Extract(joiner_secret, psk_secret) with label "welcome").
      */
     async function welcomeKeyNonce(welcomeSecret) {
-        const key = await KeySchedule.expandWithLabel(welcomeSecret, 'key', new Uint8Array(0), HPKE.Nk);
-        const nonce = await KeySchedule.expandWithLabel(welcomeSecret, 'nonce', new Uint8Array(0), HPKE.Nn);
-        return { key, nonce };
+        let key = null;
+        let nonce = null;
+        try {
+            key = await KeySchedule.expandWithLabel(
+                welcomeSecret, 'key', new Uint8Array(0), HPKE.Nk,
+            );
+            nonce = await KeySchedule.expandWithLabel(
+                welcomeSecret, 'nonce', new Uint8Array(0), HPKE.Nn,
+            );
+            const result = { key, nonce };
+            key = null;
+            nonce = null;
+            return result;
+        } finally {
+            // On success ownership transfers to the caller. On a partial KDF
+            // failure, erase every output that was already derived.
+            if (key) key.fill(0);
+            if (nonce) nonce.fill(0);
+        }
     }
 
     /**
@@ -233,7 +256,13 @@
      */
     async function deriveWelcomeSecret(joinerSecret, pskSecret) {
         const memberSecret = await HPKE.hkdfExtract(joinerSecret, pskSecret);
-        return KeySchedule.expandWithLabel(memberSecret, 'welcome', new Uint8Array(0), HPKE.Nh);
+        try {
+            return await KeySchedule.expandWithLabel(
+                memberSecret, 'welcome', new Uint8Array(0), HPKE.Nh,
+            );
+        } finally {
+            memberSecret.fill(0);
+        }
     }
 
     /**

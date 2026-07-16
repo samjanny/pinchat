@@ -888,6 +888,22 @@ class WebSocketManager {
                                 this._failMlsState(err.message);
                                 return;
                             }
+                            if (isOrderedGroupControl
+                                && err?.mlsControlRejected === true) {
+                                // MLSSession has conclusively rejected an
+                                // unauthenticated/malformed control without
+                                // mutating accepted state. The relay sequence
+                                // is immutable, so replay cannot repair it:
+                                // advance the cumulative cursor and continue
+                                // with subsequent authentic controls.
+                                const seq = message.control_seq;
+                                if (seq === this.lastMlsControlSeq + 1) {
+                                    this.lastMlsControlSeq = seq;
+                                    this._confirmMlsControl(message);
+                                    this._sendMlsControlAck(seq);
+                                }
+                                return;
+                            }
                             if ((isOrderedGroupControl
                                 || message.type === 'mlssync'
                                 || message.type === 'connected') && this.ws

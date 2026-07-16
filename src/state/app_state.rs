@@ -213,7 +213,7 @@ impl ReplayCache {
 
 #[derive(Debug, Default)]
 struct RoomTrafficWindow {
-    entries: VecDeque<(DateTime<Utc>, usize)>,
+    entries: VecDeque<(DateTime<Utc>, Uuid, usize)>,
     retained_bytes: usize,
 }
 
@@ -251,13 +251,13 @@ impl AsRef<str> for MlsControlPayload {
 #[derive(Debug, Clone)]
 struct MlsControlEntry {
     seq: u64,
+    appended_at: Instant,
     json: MlsControlPayload,
 }
 
 #[derive(Debug, Clone, Copy)]
 struct MlsControlAcknowledgement {
     seq: u64,
-    last_progress: Instant,
 }
 
 #[derive(Debug, Default)]
@@ -822,30 +822,73 @@ impl AppState {
     pub fn admit_room_traffic(
         &self,
         room_id: Uuid,
+        connection_id: Uuid,
         now: DateTime<Utc>,
         bytes: usize,
-        window_secs: i64,
-        max_messages: usize,
-        max_bytes: usize,
     ) -> bool {
+        let window_secs = self.config.msg_rate_window_secs;
+        let max_messages = self.config.room_msg_rate_limit;
+        let max_bytes = self.config.room_byte_rate_limit;
         let cutoff = now - chrono::Duration::seconds(window_secs);
         let mut window = self.room_traffic_windows.entry(room_id).or_default();
         while window
             .entries
             .front()
-            .map(|(timestamp, _)| *timestamp <= cutoff)
+            .map(|(timestamp, _, _)| *timestamp <= cutoff)
             .unwrap_or(false)
         {
-            if let Some((_, expired_bytes)) = window.entries.pop_front() {
+            if let Some((_, _, expired_bytes)) = window.entries.pop_front() {
                 window.retained_bytes = window.retained_bytes.saturating_sub(expired_bytes);
             }
+        }
+
+        // Reserve at least half of each aggregate bucket for other room
+        // participants. Without a sender contribution cap, one member can
+        // consume the entire byte window and make the next honest sender look
+        // like the offender. A single-member room may use the whole bucket.
+        let has_other_participant = self
+            .rooms
+            .get(&room_id)
+            .map(|room| {
+                room.participant_ids
+                    .iter()
+                    .any(|participant_id| *participant_id != connection_id)
+            })
+            .unwrap_or(false);
+        let sender_message_limit = if has_other_participant {
+            max_messages.div_ceil(2)
+        } else {
+            max_messages
+        };
+        let sender_byte_limit = if has_other_participant {
+            max_bytes.div_ceil(2)
+        } else {
+            max_bytes
+        };
+        let (sender_messages, sender_bytes) = window
+            .entries
+            .iter()
+            .filter(|(_, sender_id, _)| *sender_id == connection_id)
+            .fold(
+                (0usize, 0usize),
+                |(count, retained), (_, _, entry_bytes)| {
+                    (
+                        count.saturating_add(1),
+                        retained.saturating_add(*entry_bytes),
+                    )
+                },
+            );
+        if sender_messages >= sender_message_limit
+            || sender_bytes.saturating_add(bytes) > sender_byte_limit
+        {
+            return false;
         }
         if window.entries.len() >= max_messages
             || window.retained_bytes.saturating_add(bytes) > max_bytes
         {
             return false;
         }
-        window.entries.push_back((now, bytes));
+        window.entries.push_back((now, connection_id, bytes));
         window.retained_bytes = window.retained_bytes.saturating_add(bytes);
         true
     }
@@ -918,25 +961,16 @@ impl AppState {
             return Err(MlsControlCursorError::CursorRegressed);
         }
         Self::validate_mls_cursor_locked(&log, cursor)?;
-        let now = Instant::now();
         match log.acknowledged.get_mut(&connection_id) {
             Some(previous) if cursor > previous.seq => {
                 previous.seq = cursor;
-                previous.last_progress = now;
             }
             Some(_) => {
-                // Reopening a transport at the same cursor is not ACK
-                // progress. Preserve the original deadline so reconnect
-                // cycling cannot pin the room's control history forever.
+                // Reopening at the same cursor does not change the backlog.
             }
             None => {
-                log.acknowledged.insert(
-                    connection_id,
-                    MlsControlAcknowledgement {
-                        seq: cursor,
-                        last_progress: now,
-                    },
-                );
+                log.acknowledged
+                    .insert(connection_id, MlsControlAcknowledgement { seq: cursor });
             }
         }
         Self::prune_acknowledged_mls_controls(&mut log, &participant_ids);
@@ -966,6 +1000,18 @@ impl AppState {
     pub fn append_and_broadcast_mls_control<F>(
         &self,
         room_id: &Uuid,
+        serialize: F,
+    ) -> Result<u64, MlsControlAppendError>
+    where
+        F: FnOnce(u64) -> Option<String>,
+    {
+        self.append_and_broadcast_mls_control_at(room_id, Instant::now(), serialize)
+    }
+
+    fn append_and_broadcast_mls_control_at<F>(
+        &self,
+        room_id: &Uuid,
+        appended_at: Instant,
         serialize: F,
     ) -> Result<u64, MlsControlAppendError>
     where
@@ -1009,7 +1055,11 @@ impl AppState {
         }));
         log.head_seq = seq;
         log.retained_bytes = log.retained_bytes.saturating_add(retained_bytes);
-        log.entries.push_back(MlsControlEntry { seq, json });
+        log.entries.push_back(MlsControlEntry {
+            seq,
+            appended_at,
+            json,
+        });
 
         // A room with no currently subscribed receivers still retains the
         // control entry for a participant that resumes within its grace
@@ -1035,25 +1085,17 @@ impl AppState {
         if seq > log.head_seq {
             return false;
         }
-        let now = Instant::now();
         match log.acknowledged.get_mut(&connection_id) {
             Some(previous) if seq < previous.seq => return false,
             Some(previous) if seq > previous.seq => {
                 previous.seq = seq;
-                previous.last_progress = now;
             }
             Some(_) => {
-                // Duplicate cumulative ACKs are valid but do not refresh the
-                // progress deadline.
+                // Duplicate cumulative ACKs are valid.
             }
             None => {
-                log.acknowledged.insert(
-                    connection_id,
-                    MlsControlAcknowledgement {
-                        seq,
-                        last_progress: now,
-                    },
-                );
+                log.acknowledged
+                    .insert(connection_id, MlsControlAcknowledgement { seq });
             }
         }
         Self::prune_acknowledged_mls_controls(&mut log, &participant_ids);
@@ -1070,6 +1112,21 @@ impl AppState {
         max_unacknowledged: u64,
         max_stall: Duration,
     ) -> Vec<Uuid> {
+        self.lagging_mls_control_participants_at(
+            room_id,
+            max_unacknowledged,
+            max_stall,
+            Instant::now(),
+        )
+    }
+
+    fn lagging_mls_control_participants_at(
+        &self,
+        room_id: &Uuid,
+        max_unacknowledged: u64,
+        max_stall: Duration,
+        now: Instant,
+    ) -> Vec<Uuid> {
         let participant_ids: Vec<Uuid> = self
             .rooms
             .get(room_id)
@@ -1079,19 +1136,53 @@ impl AppState {
             return Vec::new();
         };
         let log = log.lock().unwrap();
-        let now = Instant::now();
         participant_ids
             .into_iter()
             .filter(|participant_id| {
-                let Some(ack) = log.acknowledged.get(participant_id) else {
-                    return log.head_seq > 0;
-                };
-                let outstanding = log.head_seq.saturating_sub(ack.seq);
+                let acknowledged_seq = log
+                    .acknowledged
+                    .get(participant_id)
+                    .map(|ack| ack.seq)
+                    .unwrap_or(0);
+                let outstanding = log.head_seq.saturating_sub(acknowledged_seq);
+                let oldest_unacknowledged_at = log
+                    .entries
+                    .iter()
+                    .find(|entry| entry.seq > acknowledged_seq)
+                    .map(|entry| entry.appended_at);
                 outstanding > 0
                     && (outstanding >= max_unacknowledged
-                        || now.saturating_duration_since(ack.last_progress) >= max_stall)
+                        || oldest_unacknowledged_at
+                            .map(|appended_at| {
+                                now.saturating_duration_since(appended_at) >= max_stall
+                            })
+                            .unwrap_or(false))
             })
             .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn append_and_broadcast_mls_control_at_for_test<F>(
+        &self,
+        room_id: &Uuid,
+        appended_at: Instant,
+        serialize: F,
+    ) -> Result<u64, MlsControlAppendError>
+    where
+        F: FnOnce(u64) -> Option<String>,
+    {
+        self.append_and_broadcast_mls_control_at(room_id, appended_at, serialize)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn lagging_mls_control_participants_at_for_test(
+        &self,
+        room_id: &Uuid,
+        max_unacknowledged: u64,
+        max_stall: Duration,
+        now: Instant,
+    ) -> Vec<Uuid> {
+        self.lagging_mls_control_participants_at(room_id, max_unacknowledged, max_stall, now)
     }
 
     /// True only while this exact stable participant currently owns the

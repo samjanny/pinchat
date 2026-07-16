@@ -44,27 +44,26 @@ function hex(u8) { return Buffer.from(u8).toString('hex'); }
 
 async function main() {
     // ---------------------------------------------------------------------
-    // P-256 sanity: 1·G == (Gx, Gy); a WebCrypto-generated key round-trips.
+    // P-256 public point decompression used by native key recovery.
     // ---------------------------------------------------------------------
-    console.log('# p256.scalarBaseMul');
+    console.log('# P-256 public point decompression');
     {
-        const g = P256.scalarBaseMul(1n);
+        const generator = P256.generatorBytes();
+        const candidates = P256.publicKeyCandidatesFromX(
+            generator.slice(1, 33),
+        );
         assert(
-            P256.bytesToBigInt(g.slice(1, 33)) === P256.GX &&
-            P256.bytesToBigInt(g.slice(33, 65)) === P256.GY,
-            'scalarBaseMul(1) equals the generator G'
+            P256.bytesToBigInt(generator.slice(1, 33)) === P256.GX
+            && P256.bytesToBigInt(generator.slice(33, 65)) === P256.GY,
+            'generator encoding matches the P-256 constants',
         );
-
-        const kp = await webcrypto.subtle.generateKey(
-            { name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveBits']
+        assert(
+            candidates.some((candidate) => hex(candidate) === hex(generator)),
+            'decompressing generator x includes the standard generator point',
         );
-        const rawPub = new Uint8Array(await webcrypto.subtle.exportKey('raw', kp.publicKey));
-        const jwk = await webcrypto.subtle.exportKey('jwk', kp.privateKey);
-        const pad = '='.repeat((4 - (jwk.d.length % 4)) % 4);
-        const dBuf = Buffer.from(jwk.d.replace(/-/g, '+').replace(/_/g, '/') + pad, 'base64');
-        const scalar = P256.bytesToBigInt(new Uint8Array(dBuf));
-        const ourPub = P256.scalarBaseMul(scalar);
-        assert(hex(ourPub) === hex(rawPub), 'scalarBaseMul matches WebCrypto for a random scalar');
+        assert(!Object.hasOwn(P256, 'scalarBaseMul')
+            && !Object.hasOwn(P256, 'isValidScalarBytes'),
+        'public P-256 helper exposes no secret-scalar arithmetic or comparison');
     }
 
     // ---------------------------------------------------------------------
