@@ -107,6 +107,12 @@ function check(condition, message) {
     passed += 1;
 }
 
+function deferred() {
+    let resolve;
+    const promise = new Promise((res) => { resolve = res; });
+    return { promise, resolve };
+}
+
 async function main() {
     console.log('# WebSocket stable-identity resume');
 
@@ -248,6 +254,11 @@ async function main() {
     'unconfirmed MLS control is retransmitted after a new connection syncs');
 
     orderedManager.ws = orderedSocket;
+    // This test swaps only the socket object to exercise retransmission; it
+    // does not install a real second generation's handlers. Restore the
+    // original generation before continuing to deliver frames to the
+    // original socket closure.
+    orderedManager._connectionGeneration -= 1;
     orderedSocket.readyState = FakeWebSocket.OPEN;
     orderedSocket.onmessage({
         data: JSON.stringify({
@@ -306,23 +317,79 @@ async function main() {
         ),
     'fresh-identity retry cannot replay the rejected resume bearer');
 
-    const deliveredBeforeInvalid = delivered;
-    resumeError = null;
-    socket.onmessage({
+    queuedResponses = [
+        response(200, { csrf_token: csrfToken }),
+        successToken('invalid-connected-token'),
+    ];
+    const invalidConnectedManager =
+        new WebSocketManager('invalid-connected-room');
+    let invalidConnectedError = null;
+    let invalidConnectedDispatches = 0;
+    invalidConnectedManager.onError = (error) => {
+        invalidConnectedError = error.message;
+    };
+    invalidConnectedManager.onMessage = async () => {
+        invalidConnectedDispatches += 1;
+    };
+    await invalidConnectedManager.connect();
+    const invalidConnectedSocket = FakeWebSocket.instances.at(-1);
+    invalidConnectedSocket.onopen();
+    invalidConnectedSocket.onmessage({
         data: JSON.stringify({
             type: 'connected',
-            user_id: 'relay-id',
+            user_id: 'invalid-connected-relay-id',
             room_type: 'group',
-            resumed: true,
+            resumed: false,
             resume_token: 'malformed',
+            mls_control_cursor: 0,
         }),
     });
-    await manager._inboundQueue;
-    check(socket.closedWith && socket.closedWith.code === 1008
-        && resumeError === 'RESUME_TOKEN_INVALID',
+    await invalidConnectedManager._inboundQueue;
+    check(invalidConnectedSocket.closedWith
+        && invalidConnectedSocket.closedWith.code === 1008
+        && invalidConnectedError === 'RESUME_TOKEN_INVALID',
     'malformed server resume credential closes the transport fail-closed');
-    check(delivered === deliveredBeforeInvalid,
+    check(invalidConnectedDispatches === 0,
         'invalid Connected frame is never dispatched to application state');
+
+    queuedResponses = [
+        response(200, { csrf_token: csrfToken }),
+        successToken('duplicate-connected-token'),
+    ];
+    const duplicateConnectedManager =
+        new WebSocketManager('duplicate-connected-room');
+    let duplicateConnectedError = null;
+    let duplicateConnectedDispatches = 0;
+    duplicateConnectedManager.onError = (error) => {
+        duplicateConnectedError = error.message;
+    };
+    duplicateConnectedManager.onMessage = async () => {
+        duplicateConnectedDispatches += 1;
+    };
+    await duplicateConnectedManager.connect();
+    const duplicateConnectedSocket = FakeWebSocket.instances.at(-1);
+    duplicateConnectedSocket.onopen();
+    const validConnectedFrame = {
+        type: 'connected',
+        user_id: 'duplicate-connected-relay-id',
+        room_type: 'group',
+        resumed: false,
+        resume_token: resumeToken,
+        mls_control_cursor: 0,
+    };
+    duplicateConnectedSocket.onmessage({
+        data: JSON.stringify(validConnectedFrame),
+    });
+    await duplicateConnectedManager._inboundQueue;
+    duplicateConnectedSocket.onmessage({
+        data: JSON.stringify(validConnectedFrame),
+    });
+    await duplicateConnectedManager._inboundQueue;
+    check(duplicateConnectedSocket.closedWith
+        && duplicateConnectedSocket.closedWith.code === 1008
+        && duplicateConnectedError === 'ROOM_PROTOCOL_VIOLATION'
+        && duplicateConnectedDispatches === 1,
+    'a second Connected frame is rejected before duplicate application dispatch');
 
     queuedResponses = [
         response(200, { csrf_token: csrfToken }),
@@ -358,6 +425,102 @@ async function main() {
     'group client closes on a relay-delivered 1:1 protocol frame');
     check(protocolDispatches === 1,
         'cross-protocol frame is rejected before application dispatch');
+
+    queuedResponses = [
+        response(200, { csrf_token: csrfToken }),
+        successToken('terminal-mls-state-token'),
+    ];
+    const terminalManager = new WebSocketManager('terminal-mls-room');
+    let terminalError = null;
+    terminalManager.onError = (error) => { terminalError = error.message; };
+    terminalManager.onMessage = async (message) => {
+        if (message.type === 'mls') {
+            const error = new Error('authenticated Commit cannot apply');
+            error.mlsFatalState = true;
+            throw error;
+        }
+    };
+    await terminalManager.connect();
+    const terminalSocket = FakeWebSocket.instances.at(-1);
+    terminalSocket.onopen();
+    terminalSocket.onmessage({
+        data: JSON.stringify({
+            type: 'connected',
+            user_id: 'terminal-relay-id',
+            room_type: 'group',
+            resumed: false,
+            resume_token: resumeToken,
+            mls_control_cursor: 0,
+        }),
+    });
+    await terminalManager._inboundQueue;
+    terminalSocket.onmessage({
+        data: JSON.stringify({
+            type: 'mls',
+            payload: 'authenticated-malformed-commit',
+            wire_format: 1,
+            sender_id: 'creator-route',
+            control_seq: 1,
+        }),
+    });
+    // Queue the same sequence again before the first handler rejects. A
+    // terminal failure must prevent already-queued work from later ACKing the
+    // sequence after MLSSession has destroyed its state.
+    terminalSocket.onmessage({
+        data: JSON.stringify({
+            type: 'mls',
+            payload: 'authenticated-malformed-commit',
+            wire_format: 1,
+            sender_id: 'creator-route',
+            control_seq: 1,
+        }),
+    });
+    await terminalManager._inboundQueue;
+    const terminalFrames = terminalSocket.sent.map((raw) => JSON.parse(raw));
+    check(terminalManager.lastMlsControlSeq === 0
+        && !terminalFrames.some((frame) =>
+            frame.type === 'mlsack' && frame.control_seq === 1)
+        && terminalSocket.closedWith?.code === 1008
+        && terminalError === 'MLS_STATE_DESYNC',
+    'terminal MLS application failure neither advances nor ACKs its control');
+
+    queuedResponses = [
+        response(200, { csrf_token: csrfToken }),
+        successToken('bounded-inbound-token'),
+    ];
+    const queueManager = new WebSocketManager('bounded-inbound-room');
+    let queueError = null;
+    const queueGate = deferred();
+    queueManager.onError = (error) => { queueError = error.message; };
+    queueManager.onMessage = async (message) => {
+        if (message.type === 'message') await queueGate.promise;
+    };
+    await queueManager.connect();
+    const queueSocket = FakeWebSocket.instances.at(-1);
+    queueSocket.onopen();
+    queueSocket.onmessage({
+        data: JSON.stringify({
+            type: 'connected',
+            user_id: 'bounded-relay-id',
+            room_type: 'onetoone',
+            resumed: false,
+            resume_token: resumeToken,
+        }),
+    });
+    await queueManager._inboundQueue;
+    const queuedFrame = JSON.stringify({
+        type: 'message',
+        payload: 'queued',
+    });
+    for (let index = 0; index < 129; index += 1) {
+        queueSocket.onmessage({ data: queuedFrame });
+    }
+    check(queueSocket.closedWith?.code === 1009
+        && queueError === 'INBOUND_QUEUE_OVERFLOW'
+        && queueManager._queuedInboundMessages === 128,
+    'browser inbound queue fails closed at its bounded message budget');
+    queueGate.resolve();
+    await queueManager._inboundQueue;
 
     queuedResponses = [
         response(200, { csrf_token: csrfToken }),

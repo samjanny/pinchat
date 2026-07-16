@@ -9,5 +9,8 @@
   "devDependencies": {
     "@jazzer.js/core": "^2.1.0",
     "fast-check": "^3.23.2"
+  },
+  "overrides": {
+    "tar": "^7.5.20"
   }
 }

@@ -15,8 +15,8 @@
  *        - Bob's epoch-2 state cannot decrypt epoch-3 application msgs.
  *        - Bob's processCommit returns an authenticated terminal result and
  *          erases its stale epoch capabilities.
- *   5. Alice can still add a new member (Dave) at epoch 4 with the
- *      blanked Bob slot still in place.
+ *   5. Alice can still add a new member (Dave) at epoch 4 by reusing
+ *      Bob's blanked leaf index.
  */
 
 const path = require('path');
@@ -25,6 +25,8 @@ const Group = require(path.join(__dirname, '..', 'static', 'js', 'mls', 'group.j
 const Signature = require(path.join(__dirname, '..', 'static', 'js', 'mls', 'signature.js'));
 const HPKE = require(path.join(__dirname, '..', 'static', 'js', 'mls', 'hpke.js'));
 const Nodes = require(path.join(__dirname, '..', 'static', 'js', 'mls', 'nodes.js'));
+const TreeMath = require(path.join(__dirname, '..', 'static', 'js', 'mls', 'tree-math.js'));
+const RatchetTree = require(path.join(__dirname, '..', 'static', 'js', 'mls', 'ratchet-tree.js'));
 const KeyPackage = require(path.join(__dirname, '..', 'static', 'js', 'mls', 'key-package.js'));
 const Labeled = require(path.join(__dirname, '..', 'static', 'js', 'mls', 'labeled.js'));
 
@@ -296,13 +298,14 @@ async function main() {
     } catch (_) { alreadyBlankThrew = true; }
     assert(alreadyBlankThrew, 'commitRemoveMember rejects already-blank leaf');
 
-    // ---- Add Dave AFTER the Remove (Bob's slot is still blank) ----
+    // ---- Add Dave AFTER the Remove (reuse Bob's blank slot) ----
     const dave = await buildKeyPackage();
     const r4 = await alice.commitAddMember({ keyPackageBytes: dave.keyPackageBytes });
     await carolGroup.processCommit(r4.commitMessage);
     assert(alice.epoch === 4n && carolGroup.epoch === 4n,
         'Alice and Carol advanced to epoch 4 after add-after-remove');
-    assert(alice.nLeaves === 4, 'Alice tree has 4 leaves (Bob slot still occupied by blank)');
+    assert(alice.nLeaves === 3,
+        'Alice tree reuses Bob\'s blank leaf without growing');
 
     const tree4 = Nodes.ratchetTreeBytes(alice.ratchetTree);
     const daveGroup = await Group.Group.joinFromWelcomeWithTree({
@@ -315,7 +318,8 @@ async function main() {
         expectedSignerLeafIndex: 0,
         ...await bootstrapPins(alice),
     });
-    assert(daveGroup.myLeafIndex === 3, 'Dave joined at leaf 3 (after blank Bob slot)');
+    assert(daveGroup.myLeafIndex === 1,
+        'Dave joins in the leftmost blank leaf');
 
     const wireA4 = await alice.encryptApplicationMessage('post-remove epoch');
     assert(new TextDecoder().decode((await daveGroup.decryptApplicationMessage(wireA4)).plaintext) === 'post-remove epoch',
@@ -324,6 +328,36 @@ async function main() {
         await daveGroup.encryptApplicationMessage('hi from dave'),
     )).plaintext) === 'hi from dave',
         'Dave → Carol app msg at epoch 4');
+
+    const cappedCandidate = alice.forkForPendingCommit();
+    const existingLeaf = RatchetTree.leafFor(
+        cappedCandidate.ratchetTree, 0,
+    );
+    cappedCandidate.nLeaves = Group.MAX_GROUP_LEAVES;
+    cappedCandidate.ratchetTree = new Array(
+        TreeMath.nodeWidth(Group.MAX_GROUP_LEAVES),
+    ).fill(null);
+    for (let leafIndex = 0;
+        leafIndex < Group.MAX_GROUP_LEAVES;
+        leafIndex += 1) {
+        cappedCandidate.ratchetTree[TreeMath.leafToNode(leafIndex)] = {
+            nodeType: Nodes.NodeType.LEAF,
+            leaf: existingLeaf,
+        };
+    }
+    const overflowMember = await buildKeyPackage();
+    let leafCapRejected = false;
+    try {
+        await cappedCandidate.commitAddMember({
+            keyPackageBytes: overflowMember.keyPackageBytes,
+        });
+    } catch (error) {
+        leafCapRejected = error.message.includes('20-leaf limit');
+    } finally {
+        cappedCandidate.destroySecrets();
+    }
+    assert(leafCapRejected,
+        'cryptographic Add path enforces the 20-leaf profile cap');
 
     console.log('');
     console.log(`group-remove: ${passed} passed, ${failed} failed`);

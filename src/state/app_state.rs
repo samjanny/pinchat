@@ -7,6 +7,7 @@ use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
 use rand::RngCore;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::sync::broadcast;
@@ -19,6 +20,70 @@ pub enum RoomCreationError {
     AtCapacity,
 }
 
+#[cfg(test)]
+mod resource_bound_tests {
+    use super::{MlsControlPayload, MlsControlPayloadInner, ReplayCache};
+    use chrono::{Duration, Utc};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn replay_cache_has_bounded_fifo_eviction_and_expiry() {
+        let mut cache = ReplayCache::default();
+        let now = Utc::now();
+        let cutoff = now - Duration::minutes(1);
+        assert!(cache.insert_if_new("a".into(), now, cutoff, 2));
+        assert!(!cache.insert_if_new("a".into(), now, cutoff, 2));
+        assert!(cache.insert_if_new("b".into(), now, cutoff, 2));
+        assert!(
+            !cache.insert_if_new("b".into(), now, cutoff, 2),
+            "a duplicate at capacity must not evict a different entry"
+        );
+        assert!(cache.contains("a") && cache.contains("b"));
+        assert!(cache.insert_if_new("c".into(), now + Duration::seconds(1), cutoff, 2,));
+        assert_eq!(cache.len(), 2);
+        assert!(!cache.contains("a") && cache.contains("b") && cache.contains("c"));
+        assert!(
+            cache.insert_if_new("a".into(), now + Duration::seconds(2), cutoff, 2,),
+            "oldest entry was evicted without sorting the cache"
+        );
+        assert_eq!(cache.len(), 2);
+
+        cache.remove("a");
+        assert!(cache.insert_if_new("a".into(), now + Duration::seconds(2), cutoff, 2,));
+        assert!(cache.contains("a"));
+
+        let future = now + Duration::minutes(3);
+        assert!(cache.insert_if_new("fresh".into(), future, future - Duration::minutes(1), 2,));
+        assert_eq!(cache.len(), 1, "expired entries are removed incrementally");
+    }
+
+    #[test]
+    fn mls_control_bytes_follow_the_final_shared_clone() {
+        let retained_bytes = 7;
+        let global_bytes = Arc::new(AtomicUsize::new(retained_bytes));
+        let payload = MlsControlPayload(Arc::new(MlsControlPayloadInner {
+            json: "control".to_string(),
+            retained_bytes,
+            global_bytes: global_bytes.clone(),
+        }));
+        let replay_clone = payload.clone();
+
+        drop(payload);
+        assert_eq!(
+            global_bytes.load(Ordering::Acquire),
+            retained_bytes,
+            "dropping the log clone must not release a live replay clone",
+        );
+        drop(replay_clone);
+        assert_eq!(
+            global_bytes.load(Ordering::Acquire),
+            0,
+            "the final clone releases the global control-log reservation",
+        );
+    }
+}
+
 /// Result of admitting a WebSocket relay identity into a room.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectionAdmission {
@@ -28,13 +93,165 @@ pub enum ConnectionAdmission {
     Resumed,
 }
 
-const MAX_MLS_CONTROL_LOG_ENTRIES: usize = 1024;
-const MAX_MLS_CONTROL_LOG_BYTES: usize = 16 * 1024 * 1024;
+const BROADCAST_CHANNEL_ENTRIES: usize = 8;
+const MAX_BROADCAST_ROOM_BYTES: usize = 4 * 1024 * 1024;
+const MAX_BROADCAST_GLOBAL_BYTES: usize = 64 * 1024 * 1024;
+const MAX_MLS_CONTROL_LOG_ENTRIES: usize = 256;
+const MAX_MLS_CONTROL_LOG_BYTES: usize = 2 * 1024 * 1024;
+const MAX_MLS_CONTROL_LOG_GLOBAL_BYTES: usize = 64 * 1024 * 1024;
+
+#[derive(Debug)]
+struct BroadcastPayloadInner {
+    json: String,
+    retained_bytes: usize,
+    room_bytes: Arc<AtomicUsize>,
+    global_bytes: Arc<AtomicUsize>,
+}
+
+impl Drop for BroadcastPayloadInner {
+    fn drop(&mut self) {
+        self.room_bytes
+            .fetch_sub(self.retained_bytes, Ordering::AcqRel);
+        self.global_bytes
+            .fetch_sub(self.retained_bytes, Ordering::AcqRel);
+    }
+}
+
+/// One shared room-broadcast value. The channel ring and every receiver clone
+/// share the same JSON allocation; aggregate byte counters are released only
+/// when the final clone disappears.
+#[derive(Debug, Clone)]
+pub struct BroadcastPayload(Arc<BroadcastPayloadInner>);
+
+impl BroadcastPayload {
+    pub fn as_str(&self) -> &str {
+        &self.0.json
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BroadcastError {
+    MissingRoom,
+    RoomByteCapacity,
+    GlobalByteCapacity,
+}
+
+#[derive(Debug, Default)]
+pub struct ReplayCache {
+    by_hash: HashMap<String, DateTime<Utc>>,
+    insertion_order: VecDeque<(String, DateTime<Utc>)>,
+}
+
+impl ReplayCache {
+    /// Returns true only for a new hash which was inserted. Expiry and
+    /// capacity eviction are O(1) amortized; no attacker-controlled sort or
+    /// full-set scan occurs on the message path.
+    pub fn insert_if_new(
+        &mut self,
+        hash: String,
+        now: DateTime<Utc>,
+        cutoff: DateTime<Utc>,
+        max_entries: usize,
+    ) -> bool {
+        while self
+            .insertion_order
+            .front()
+            .map(|(_, timestamp)| *timestamp <= cutoff)
+            .unwrap_or(false)
+        {
+            self.pop_oldest();
+        }
+        if self.by_hash.contains_key(&hash) {
+            return false;
+        }
+        while self.by_hash.len() >= max_entries {
+            if self.insertion_order.is_empty() {
+                break;
+            }
+            self.pop_oldest();
+        }
+        self.by_hash.insert(hash.clone(), now);
+        self.insertion_order.push_back((hash, now));
+        true
+    }
+
+    pub fn remove(&mut self, hash: &str) {
+        if self.by_hash.remove(hash).is_some()
+            && self
+                .insertion_order
+                .back()
+                .map(|(queued_hash, _)| queued_hash == hash)
+                .unwrap_or(false)
+        {
+            // Rollback is called immediately after a failed broadcast while
+            // the cache guard is still held, so the inserted entry is the
+            // queue tail. Removing it avoids leaving a stale timestamp that
+            // could later collide with an identical retry timestamp.
+            self.insertion_order.pop_back();
+        }
+    }
+
+    fn pop_oldest(&mut self) {
+        let Some((front_hash, timestamp)) = self.insertion_order.pop_front() else {
+            return;
+        };
+        if self.by_hash.get(&front_hash).copied() == Some(timestamp) {
+            self.by_hash.remove(&front_hash);
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.by_hash.len()
+    }
+
+    #[cfg(test)]
+    fn contains(&self, hash: &str) -> bool {
+        self.by_hash.contains_key(hash)
+    }
+}
+
+#[derive(Debug, Default)]
+struct RoomTrafficWindow {
+    entries: VecDeque<(DateTime<Utc>, usize)>,
+    retained_bytes: usize,
+}
+
+#[derive(Debug)]
+struct MlsControlPayloadInner {
+    json: String,
+    retained_bytes: usize,
+    global_bytes: Arc<AtomicUsize>,
+}
+
+impl Drop for MlsControlPayloadInner {
+    fn drop(&mut self) {
+        self.global_bytes
+            .fetch_sub(self.retained_bytes, Ordering::AcqRel);
+    }
+}
+
+/// Shared ordered-control JSON whose global byte reservation follows the
+/// final log/replay clone rather than an ACK or room-removal race.
+#[derive(Debug, Clone)]
+pub struct MlsControlPayload(Arc<MlsControlPayloadInner>);
+
+impl MlsControlPayload {
+    pub fn as_str(&self) -> &str {
+        &self.0.json
+    }
+}
+
+impl AsRef<str> for MlsControlPayload {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
 
 #[derive(Debug, Clone)]
 struct MlsControlEntry {
     seq: u64,
-    json: String,
+    json: MlsControlPayload,
 }
 
 #[derive(Debug, Default)]
@@ -49,7 +266,7 @@ struct MlsControlLog {
 pub struct MlsControlStream {
     pub cursor: u64,
     pub through_seq: u64,
-    pub replay: Vec<String>,
+    pub replay: Vec<MlsControlPayload>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,6 +281,8 @@ pub enum MlsControlAppendError {
     MissingRoom,
     SequenceExhausted,
     SerializationFailed,
+    CapacityExceeded,
+    BroadcastCapacity,
 }
 
 /// Application state shared across all threads
@@ -78,7 +297,9 @@ pub struct AppState {
 
     /// Broadcast channels for each room: room_id -> Sender
     /// Uses tokio::sync::broadcast to distribute messages
-    pub broadcast_channels: Arc<DashMap<Uuid, tokio::sync::broadcast::Sender<String>>>,
+    pub broadcast_channels: Arc<DashMap<Uuid, tokio::sync::broadcast::Sender<BroadcastPayload>>>,
+    broadcast_room_bytes: Arc<DashMap<Uuid, Arc<AtomicUsize>>>,
+    broadcast_global_bytes: Arc<AtomicUsize>,
 
     /// Ordered, bounded replay log for MLS group-control envelopes
     /// (UserJoined/UserLeft, KeyPackage, Proposal, Commit, Welcome). MLS
@@ -86,11 +307,12 @@ pub struct AppState {
     /// participant acknowledges the highest sequence it has applied; a
     /// resumed socket replays from that cursor.
     mls_control_logs: Arc<DashMap<Uuid, Arc<Mutex<MlsControlLog>>>>,
+    mls_control_global_bytes: Arc<AtomicUsize>,
 
-    /// Anti-replay: Cache of seen message hashes per room
-    /// room_id -> Set<(payload_hash, timestamp)>
-    /// Prevents same-room replay attacks and protects late joiners
-    pub seen_message_hashes: Arc<DashMap<Uuid, HashSet<(String, DateTime<Utc>)>>>,
+    /// Anti-replay: bounded hash lookup + FIFO insertion queue per room.
+    /// Prevents same-room replay attacks without attacker-controlled sorting.
+    pub seen_message_hashes: Arc<DashMap<Uuid, ReplayCache>>,
+    room_traffic_windows: Arc<DashMap<Uuid, RoomTrafficWindow>>,
 
     /// Per-connection message rate limiting
     /// connection_id -> VecDeque<timestamp>
@@ -107,6 +329,7 @@ pub struct AppState {
     /// single peer can inflict on every other room member. Only structurally
     /// classified Commits consume this budget; Proposals do not.
     pub connection_commit_timestamps: Arc<DashMap<Uuid, VecDeque<DateTime<Utc>>>>,
+    pub connection_proposal_timestamps: Arc<DashMap<Uuid, VecDeque<DateTime<Utc>>>>,
 
     /// Per-connection global frame timestamps.
     /// Applied to EVERY text frame (ECDH, message, image, unknown, malformed),
@@ -190,10 +413,15 @@ impl AppState {
             rooms: Arc::new(DashMap::new()),
             connections: Arc::new(DashMap::new()),
             broadcast_channels: Arc::new(DashMap::new()),
+            broadcast_room_bytes: Arc::new(DashMap::new()),
+            broadcast_global_bytes: Arc::new(AtomicUsize::new(0)),
             mls_control_logs: Arc::new(DashMap::new()),
+            mls_control_global_bytes: Arc::new(AtomicUsize::new(0)),
             seen_message_hashes: Arc::new(DashMap::new()),
+            room_traffic_windows: Arc::new(DashMap::new()),
             connection_message_timestamps: Arc::new(DashMap::new()),
             connection_commit_timestamps: Arc::new(DashMap::new()),
+            connection_proposal_timestamps: Arc::new(DashMap::new()),
             connection_frame_timestamps: Arc::new(DashMap::new()),
             connection_protocol_errors: Arc::new(DashMap::new()),
             connection_ecdh_timestamps: Arc::new(DashMap::new()),
@@ -272,15 +500,12 @@ impl AppState {
         // Atomic insert (inside lock)
         let room_id = room.id;
 
-        // Create the broadcast channel for the room with dynamic buffer size
-        // Buffer size scales with max_participants to reduce message loss:
-        // - Small rooms (1:1): 100 messages buffer
-        // - Medium rooms (10 users): 500 messages buffer
-        // - Large rooms (50 users): 2500 messages buffer
-        //
-        // This mitigates buffer overflow when slow clients (for example, on
-        // mobile 3G links) cannot consume messages fast enough during bursts.
-        let buffer_size = (room.max_participants * 50).max(100);
+        // Ephemeral application traffic is intentionally a small ring. Slow
+        // clients are disconnected on lag and group controls are recovered
+        // from the separate ordered replay log. Scaling this count by room
+        // size previously allowed image-sized payloads to retain hundreds of
+        // MiB per room.
+        let buffer_size = BROADCAST_CHANNEL_ENTRIES;
         let (tx, _) = tokio::sync::broadcast::channel(buffer_size);
 
         #[cfg(debug_assertions)]
@@ -292,6 +517,8 @@ impl AppState {
 
         self.rooms.insert(room_id, room);
         self.broadcast_channels.insert(room_id, tx);
+        self.broadcast_room_bytes
+            .insert(room_id, Arc::new(AtomicUsize::new(0)));
         self.mls_control_logs
             .insert(room_id, Arc::new(Mutex::new(MlsControlLog::default())));
 
@@ -321,6 +548,7 @@ impl AppState {
             self.connections.remove(&connection_id);
             self.connection_message_timestamps.remove(&connection_id);
             self.connection_commit_timestamps.remove(&connection_id);
+            self.connection_proposal_timestamps.remove(&connection_id);
             self.connection_frame_timestamps.remove(&connection_id);
             self.connection_protocol_errors.remove(&connection_id);
             self.connection_ecdh_timestamps.remove(&connection_id);
@@ -328,10 +556,12 @@ impl AppState {
 
         // Remove the broadcast channel
         self.broadcast_channels.remove(room_id);
+        self.broadcast_room_bytes.remove(room_id);
         self.mls_control_logs.remove(room_id);
 
         // Remove the message hash cache (anti-replay)
         self.seen_message_hashes.remove(room_id);
+        self.room_traffic_windows.remove(room_id);
 
         // Remove the room
         self.rooms.remove(room_id);
@@ -416,6 +646,7 @@ impl AppState {
 
                 self.connection_message_timestamps.remove(connection_id);
                 self.connection_commit_timestamps.remove(connection_id);
+                self.connection_proposal_timestamps.remove(connection_id);
                 self.connection_frame_timestamps.remove(connection_id);
                 self.connection_protocol_errors.remove(connection_id);
                 self.connection_ecdh_timestamps.remove(connection_id);
@@ -468,6 +699,97 @@ impl AppState {
         (self.rooms.len() * 100) / self.max_rooms
     }
 
+    fn reserve_bytes(counter: &AtomicUsize, amount: usize, limit: usize) -> bool {
+        counter
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current.checked_add(amount).filter(|next| *next <= limit)
+            })
+            .is_ok()
+    }
+
+    fn tracked_broadcast_payload(
+        &self,
+        room_id: &Uuid,
+        json: String,
+    ) -> Result<BroadcastPayload, BroadcastError> {
+        let room_bytes = self
+            .broadcast_room_bytes
+            .get(room_id)
+            .map(|entry| entry.value().clone())
+            .ok_or(BroadcastError::MissingRoom)?;
+        let retained_bytes = json.len();
+        if !Self::reserve_bytes(
+            room_bytes.as_ref(),
+            retained_bytes,
+            MAX_BROADCAST_ROOM_BYTES,
+        ) {
+            return Err(BroadcastError::RoomByteCapacity);
+        }
+        if !Self::reserve_bytes(
+            self.broadcast_global_bytes.as_ref(),
+            retained_bytes,
+            MAX_BROADCAST_GLOBAL_BYTES,
+        ) {
+            room_bytes.fetch_sub(retained_bytes, Ordering::AcqRel);
+            return Err(BroadcastError::GlobalByteCapacity);
+        }
+        Ok(BroadcastPayload(Arc::new(BroadcastPayloadInner {
+            json,
+            retained_bytes,
+            room_bytes,
+            global_bytes: self.broadcast_global_bytes.clone(),
+        })))
+    }
+
+    /// Broadcast one ephemeral room frame under both per-room and global byte
+    /// budgets. The returned value is the number of active receivers.
+    pub fn broadcast_room_message(
+        &self,
+        room_id: &Uuid,
+        json: String,
+    ) -> Result<usize, BroadcastError> {
+        let tx = self
+            .broadcast_channels
+            .get(room_id)
+            .map(|entry| entry.value().clone())
+            .ok_or(BroadcastError::MissingRoom)?;
+        let payload = self.tracked_broadcast_payload(room_id, json)?;
+        Ok(tx.send(payload).unwrap_or(0))
+    }
+
+    /// Aggregate room-level count and byte limiter. Per-connection limits
+    /// alone allow a 20-member room to multiply the receiver workload.
+    pub fn admit_room_traffic(
+        &self,
+        room_id: Uuid,
+        now: DateTime<Utc>,
+        bytes: usize,
+        window_secs: i64,
+        max_messages: usize,
+        max_bytes: usize,
+    ) -> bool {
+        let cutoff = now - chrono::Duration::seconds(window_secs);
+        let mut window = self.room_traffic_windows.entry(room_id).or_default();
+        while window
+            .entries
+            .front()
+            .map(|(timestamp, _)| *timestamp <= cutoff)
+            .unwrap_or(false)
+        {
+            if let Some((_, expired_bytes)) = window.entries.pop_front() {
+                window.retained_bytes = window.retained_bytes.saturating_sub(expired_bytes);
+            }
+        }
+        if window.entries.len() >= max_messages
+            || window.retained_bytes.saturating_add(bytes) > max_bytes
+        {
+            return false;
+        }
+        window.entries.push_back((now, bytes));
+        window.retained_bytes = window.retained_bytes.saturating_add(bytes);
+        true
+    }
+
     /// Validate a resume cursor before minting a short-lived WebSocket token.
     /// A cursor is usable when every sequence after it is still retained.
     pub fn validate_mls_control_cursor(
@@ -508,7 +830,8 @@ impl AppState {
         room_id: &Uuid,
         connection_id: Uuid,
         resume_cursor: Option<u64>,
-    ) -> Result<(broadcast::Receiver<String>, MlsControlStream), MlsControlCursorError> {
+    ) -> Result<(broadcast::Receiver<BroadcastPayload>, MlsControlStream), MlsControlCursorError>
+    {
         let tx = self
             .broadcast_channels
             .get(room_id)
@@ -553,6 +876,7 @@ impl AppState {
         let tx = self
             .broadcast_channels
             .get(room_id)
+            .map(|entry| entry.value().clone())
             .ok_or(MlsControlAppendError::MissingRoom)?;
         let log = self
             .mls_control_logs
@@ -564,26 +888,35 @@ impl AppState {
             .checked_add(1)
             .ok_or(MlsControlAppendError::SequenceExhausted)?;
         let json = serialize(seq).ok_or(MlsControlAppendError::SerializationFailed)?;
-        log.head_seq = seq;
-        log.retained_bytes = log.retained_bytes.saturating_add(json.len());
-        log.entries.push_back(MlsControlEntry {
-            seq,
-            json: json.clone(),
-        });
-
-        while log.entries.len() > MAX_MLS_CONTROL_LOG_ENTRIES
-            || log.retained_bytes > MAX_MLS_CONTROL_LOG_BYTES
+        if log.entries.len() >= MAX_MLS_CONTROL_LOG_ENTRIES
+            || log.retained_bytes.saturating_add(json.len()) > MAX_MLS_CONTROL_LOG_BYTES
         {
-            let Some(expired) = log.entries.pop_front() else {
-                break;
-            };
-            log.retained_bytes = log.retained_bytes.saturating_sub(expired.json.len());
+            return Err(MlsControlAppendError::CapacityExceeded);
         }
+        let broadcast_payload = self
+            .tracked_broadcast_payload(room_id, json.clone())
+            .map_err(|_| MlsControlAppendError::BroadcastCapacity)?;
+        if !Self::reserve_bytes(
+            self.mls_control_global_bytes.as_ref(),
+            json.len(),
+            MAX_MLS_CONTROL_LOG_GLOBAL_BYTES,
+        ) {
+            return Err(MlsControlAppendError::CapacityExceeded);
+        }
+        let retained_bytes = json.len();
+        let json = MlsControlPayload(Arc::new(MlsControlPayloadInner {
+            json,
+            retained_bytes,
+            global_bytes: self.mls_control_global_bytes.clone(),
+        }));
+        log.head_seq = seq;
+        log.retained_bytes = log.retained_bytes.saturating_add(retained_bytes);
+        log.entries.push_back(MlsControlEntry { seq, json });
 
         // A room with no currently subscribed receivers still retains the
         // control entry for a participant that resumes within its grace
         // window. Broadcast failure therefore does not roll the sequence back.
-        let _ = tx.send(json);
+        let _ = tx.send(broadcast_payload);
         Ok(seq)
     }
 
@@ -643,7 +976,9 @@ impl AppState {
             .unwrap_or(false)
         {
             let acknowledged = log.entries.pop_front().expect("front checked");
-            log.retained_bytes = log.retained_bytes.saturating_sub(acknowledged.json.len());
+            log.retained_bytes = log
+                .retained_bytes
+                .saturating_sub(acknowledged.json.as_str().len());
         }
     }
 }

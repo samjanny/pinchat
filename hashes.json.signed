@@ -1,8 +1,8 @@
 {
   "data": {
     "version": "1.2.0",
-    "sequence": 72,
-    "generated": "2026-07-16T08:25:07.597Z",
+    "sequence": 73,
+    "generated": "2026-07-16T09:37:23.800Z",
     "site": "https://pinchat.io",
     "files": [
       {
@@ -15,7 +15,7 @@
       },
       {
         "path": "/static/js/app.js",
-        "hash": "474ddf543bb853fcd25d66a22ad834cddf1ed744261087b24357e5e78b2bc6e8"
+        "hash": "f4fc01701d50f39707772745fb0435efea244b1525dc74d33368043674e9efb2"
       },
       {
         "path": "/static/js/cookie-notice.js",
@@ -71,7 +71,7 @@
       },
       {
         "path": "/static/js/websocket.js",
-        "hash": "fe57d9b600901dd9340b875631dc3bd1519ab03f94bbfde83af213665b1af7b1"
+        "hash": "2278679e6129434f24eb2b72ac02ef18cad81c627d4ca9bc3cdb7654bc069ef9"
       },
       {
         "path": "/static/js/debug.js",
@@ -171,7 +171,7 @@
       },
       {
         "path": "/static/js/mls/secret-tree.js",
-        "hash": "5ec6327467ef0596297bea70ebf9c1dbb51d640282539c7a1c557cdd8049f97c"
+        "hash": "dcceec75bb4a308db6f107d16620dc360aa8b3cce3e28cac6b83fb435b62fe54"
       },
       {
         "path": "/static/js/mls/private-message.js",
@@ -179,11 +179,11 @@
       },
       {
         "path": "/static/js/mls/group.js",
-        "hash": "c732e715b0b7f80d34f396a09cdfe1900790af6689c567ec3e78e285a0ff446f"
+        "hash": "384e823e01338f4e64b5c76b2bb3cbf57a3c3af52c28c6346f2418558d31f50f"
       },
       {
         "path": "/static/js/mls-session.js",
-        "hash": "7ddce6ddd0f05125cd85797b8ca87617295e9191f428c928224d44cdfa290705"
+        "hash": "4914c087be3b104d761c369d66808d9b048356049cc48db26f7bcbd99c38077f"
       },
       {
         "path": "/static/index.html",
@@ -195,7 +195,7 @@
       },
       {
         "path": "/static/chat.html",
-        "hash": "2ed68d132de79b497b824f1a66ff9a5e0c29681ebfc5bb9bd16fcd6a55fa42fc"
+        "hash": "8e1083ca69b9407a3c65ca32395478f3e189a783d4abe6888602a5bfbac4763a"
       },
       {
         "path": "/static/terms.html",
@@ -211,5 +211,5 @@
       }
     ]
   },
-  "signature": "MEUCIQCbNTVxGzgufeMrDHZndgL7Wlas6XMI9csjDcU1/LRLTQIgPAke+ybAWQBa12y+9V5KSsydcpMVv3glOgvGTyufHwc="
+  "signature": "MEYCIQD16Q+LqBnfaT5BlbiAds13Z2Llgv4lKuXwheb3HfOVtgIhANEMhBll7auzG4yoUcBnVSP6hUSwqRaF/iTEuiRXk46+"
 }

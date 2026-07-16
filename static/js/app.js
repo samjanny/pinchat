@@ -5,6 +5,19 @@
 // Read room ID from URL (only parameter needed)
 // Room configuration (type, ttl, max) will be provided by server via WebSocket
 const urlParams = new URLSearchParams(window.location.search);
+const MAX_CHAT_HISTORY_ENTRIES = 250;
+const MAX_CHAT_HISTORY_BYTES = 8 * 1024 * 1024;
+const MAX_CHAT_HISTORY_PIXELS = 16 * 1024 * 1024;
+const MAX_IMAGE_DIMENSION = 8192;
+const MAX_IMAGE_PIXELS = 8 * 1024 * 1024;
+const MAX_PENDING_IMAGE_DECODES = 2;
+const MAX_PENDING_IMAGE_DECODE_BYTES = 4 * 1024 * 1024;
+const SAFE_IMAGE_MIME_TYPES = new Set([
+    'image/png',
+    'image/jpeg',
+    'image/webp',
+    'image/avif',
+]);
 
 window.ROOM_CONFIG = {
     roomId: urlParams.get('room')
@@ -44,6 +57,8 @@ document.addEventListener('alpine:init', () => {
 
         // Messages
         messages: [],
+        messageHistoryBytes: 0,
+        messageHistoryPixels: 0,
         messageInput: '',
         nextMessageId: 0,
 
@@ -58,10 +73,13 @@ document.addEventListener('alpine:init', () => {
         copied: false,
 
         // Image sharing
-        pendingImage: null,      // {dataUrl, name, size, mimeType, arrayBuffer}
+        pendingImage: null,      // {previewUrl, name, size, mimeType, arrayBuffer}
         sendingImage: false,
         fullscreenImage: null,   // URL for fullscreen viewer
         maxImageSize: 300 * 1024,  // Default 300KB, will be overridden by server config
+        _incomingImageDecodeQueue: Promise.resolve(),
+        _pendingImageDecodeCount: 0,
+        _pendingImageDecodeBytes: 0,
 
         // TTL timer
         timeRemaining: null,
@@ -235,6 +253,25 @@ document.addEventListener('alpine:init', () => {
                         + 'This tab cannot safely continue; refresh and create a new room.';
                     return;
                 }
+                if (msg === 'MLS_STATE_DESYNC') {
+                    this.mlsTransportSynced = false;
+                    this.mlsReady = false;
+                    this.mlsRosterValid = false;
+                    this.mlsSelfIdentity = null;
+                    this.groupPeers = [];
+                    this._stopMlsUpdateTimer();
+                    this.error = '⚠️ An authenticated group update could not be applied. '
+                        + 'This session stopped before acknowledging it; refresh and create a new room.';
+                    return;
+                }
+                if (msg === 'INBOUND_QUEUE_OVERFLOW') {
+                    this.mlsTransportSynced = false;
+                    this.mlsReady = false;
+                    this._stopMlsUpdateTimer();
+                    this.error = '⚠️ Incoming traffic exceeded the browser safety budget. '
+                        + 'The connection was stopped instead of dropping ordered secure state.';
+                    return;
+                }
                 if (msg === 'RESUME_TOKEN_INVALID') {
                     this.mlsReady = false;
                     this.error = '⚠️ Server returned an invalid reconnect credential. Connection stopped.';
@@ -376,8 +413,14 @@ document.addEventListener('alpine:init', () => {
                             console.error('[MLS] Failed to process envelope:', err);
                             this.error = '⚠️ Group crypto error: ' + err.message;
                             // The WebSocket control cursor must not advance
-                            // past a failed exact PendingCommit acceptance.
-                            if (isPendingCommitAck) throw err;
+                            // past a failed exact PendingCommit acceptance or
+                            // an authenticated creator Commit which could not
+                            // be applied. A validated KeyPackage which failed
+                            // only during local candidate construction is
+                            // likewise replayed from the unchanged cursor.
+                            if (isPendingCommitAck
+                                || err?.mlsFatalState === true
+                                || err?.mlsRetryControl === true) throw err;
                         }
                     }
                     break;
@@ -545,6 +588,127 @@ document.addEventListener('alpine:init', () => {
             }
         },
 
+        _messageRetainedBytes(message, explicitBytes = null) {
+            if (Number.isSafeInteger(explicitBytes) && explicitBytes >= 0) {
+                return explicitBytes + 512;
+            }
+            let bytes = 512;
+            if (typeof message?.text === 'string') {
+                bytes += message.text.length * 2;
+            }
+            if (typeof message?.nickname === 'string') {
+                bytes += message.nickname.length * 2;
+            }
+            return bytes;
+        },
+
+        _releaseMessageResources(message, { revokeImage = true } = {}) {
+            if (!message) return;
+            const retainedBytes = Number.isSafeInteger(message.retainedBytes)
+                ? message.retainedBytes : 0;
+            this.messageHistoryBytes = Math.max(
+                0, this.messageHistoryBytes - retainedBytes,
+            );
+            const retainedPixels = Number.isSafeInteger(message.retainedPixels)
+                ? message.retainedPixels : 0;
+            this.messageHistoryPixels = Math.max(
+                0, this.messageHistoryPixels - retainedPixels,
+            );
+            if (revokeImage && message.type === 'image'
+                && typeof message.imageUrl === 'string'
+                && message.imageUrl.startsWith('blob:')) {
+                if (this.fullscreenImage === message.imageUrl) {
+                    this.fullscreenImage = null;
+                }
+                try { URL.revokeObjectURL(message.imageUrl); } catch (_) {}
+                message.imageUrl = null;
+            }
+        },
+
+        _appendMessage(
+            message, explicitBytes = null, explicitPixels = 0,
+        ) {
+            const retainedBytes = this._messageRetainedBytes(
+                message, explicitBytes,
+            );
+            const retainedPixels =
+                Number.isSafeInteger(explicitPixels) && explicitPixels >= 0
+                    ? explicitPixels : 0;
+            const entry = {
+                ...message,
+                retainedBytes,
+                retainedPixels,
+            };
+            this.messages.push(entry);
+            this.messageHistoryBytes += retainedBytes;
+            this.messageHistoryPixels += retainedPixels;
+            while (this.messages.length > MAX_CHAT_HISTORY_ENTRIES
+                || this.messageHistoryBytes > MAX_CHAT_HISTORY_BYTES
+                || this.messageHistoryPixels > MAX_CHAT_HISTORY_PIXELS) {
+                const expired = this.messages.shift();
+                this._releaseMessageResources(expired);
+            }
+            return entry;
+        },
+
+        _removeMessageById(messageId, options = {}) {
+            const index = this.messages.findIndex(
+                (message) => message.id === messageId,
+            );
+            if (index === -1) return false;
+            const [removed] = this.messages.splice(index, 1);
+            this._releaseMessageResources(removed, options);
+            return true;
+        },
+
+        async _validateImageBlob(blob) {
+            if (!(blob instanceof Blob)
+                || !SAFE_IMAGE_MIME_TYPES.has(blob.type)) {
+                throw new Error('unsupported image format');
+            }
+            let width;
+            let height;
+            if (typeof createImageBitmap === 'function') {
+                const bitmap = await createImageBitmap(blob);
+                try {
+                    width = bitmap.width;
+                    height = bitmap.height;
+                } finally {
+                    if (typeof bitmap.close === 'function') bitmap.close();
+                }
+            } else {
+                const objectUrl = URL.createObjectURL(blob);
+                try {
+                    const dimensions = await new Promise((resolve, reject) => {
+                        const image = new Image();
+                        image.onload = () => resolve({
+                            width: image.naturalWidth,
+                            height: image.naturalHeight,
+                        });
+                        image.onerror = () => reject(
+                            new Error('image decoder rejected the file'),
+                        );
+                        image.src = objectUrl;
+                    });
+                    width = dimensions.width;
+                    height = dimensions.height;
+                } finally {
+                    URL.revokeObjectURL(objectUrl);
+                }
+            }
+            if (!Number.isSafeInteger(width) || !Number.isSafeInteger(height)
+                || width < 1 || height < 1
+                || width > MAX_IMAGE_DIMENSION
+                || height > MAX_IMAGE_DIMENSION
+                || width * height > MAX_IMAGE_PIXELS) {
+                throw new Error(
+                    `image dimensions exceed ${MAX_IMAGE_DIMENSION}px / `
+                    + `${MAX_IMAGE_PIXELS} pixels`,
+                );
+            }
+            return { width, height };
+        },
+
         /**
          * Handles an incoming encrypted message
          *
@@ -572,7 +736,7 @@ document.addEventListener('alpine:init', () => {
                 // Generate nickname from sender UUID (for display)
                 const nicknameData = generateNickname(message.sender_id);
 
-                this.messages.push({
+                this._appendMessage({
                     id: this.nextMessageId++,
                     type: 'message',
                     text: plaintext,
@@ -618,9 +782,11 @@ document.addEventListener('alpine:init', () => {
                     this.error = '⚠️ Authenticated MLS self identity is unavailable.';
                     return;
                 }
+                let localMessageId = null;
                 try {
-                    this.messages.push({
-                        id: this.nextMessageId++,
+                    localMessageId = this.nextMessageId++;
+                    this._appendMessage({
+                        id: localMessageId,
                         type: 'message',
                         text,
                         timestamp: new Date(),
@@ -634,16 +800,20 @@ document.addEventListener('alpine:init', () => {
                     await this.mlsSession.sendMessage(text);
                 } catch (error) {
                     console.error('[MLS] Failed to send:', error);
-                    this.messages.pop();
+                    if (localMessageId !== null) {
+                        this._removeMessageById(localMessageId);
+                    }
                     this.messageInput = text;
                     this.error = '⚠️ Unable to send the group message: ' + error.message;
                 }
                 return;
             }
 
+            let localMessageId = null;
             try {
-                this.messages.push({
-                    id: this.nextMessageId++,
+                localMessageId = this.nextMessageId++;
+                this._appendMessage({
+                    id: localMessageId,
                     type: 'message',
                     text: text,
                     timestamp: new Date(),
@@ -674,13 +844,17 @@ document.addEventListener('alpine:init', () => {
                 });
 
                 if (!sent) {
-                    this.messages.pop();
+                    this._removeMessageById(localMessageId);
                     this.messageInput = text;
                     this.error = '⚠️ Unable to send the message. Please try again.';
                 }
 
             } catch (error) {
                 console.error('Failed to send message:', error);
+                if (localMessageId !== null) {
+                    this._removeMessageById(localMessageId);
+                }
+                this.messageInput = text;
                 this.error = '⚠️ Error encrypting the message.';
             }
         },
@@ -879,7 +1053,7 @@ document.addEventListener('alpine:init', () => {
                     if (event.attributionWarning) {
                         this.addSystemMessage('🔐 Security warning: relay routing ID changed for an authenticated MLS member; the displayed key fingerprint is unchanged');
                     }
-                    this.messages.push({
+                    this._appendMessage({
                         id: this.nextMessageId++,
                         type: 'message',
                         text: event.text,
@@ -904,20 +1078,7 @@ document.addEventListener('alpine:init', () => {
                     if (event.attributionWarning) {
                         this.addSystemMessage('🔐 Security warning: relay routing ID changed for an authenticated MLS member; the displayed key fingerprint is unchanged');
                     }
-                    const blob = new Blob([event.data], { type: event.mimeType });
-                    const imageUrl = URL.createObjectURL(blob);
-                    this.messages.push({
-                        id: this.nextMessageId++,
-                        type: 'image',
-                        imageUrl,
-                        timestamp: new Date(),
-                        isOwn: false,
-                        nickname: identity.displayName,
-                        senderFingerprint: identity.fingerprint,
-                        senderTitle: this.mlsIdentityTitle(identity),
-                        senderLeafIndex: event.senderLeafIndex,
-                    });
-                    requestAnimationFrame(() => this.scrollToBottom());
+                    this._queueIncomingMlsImage(event, identity);
                     break;
                 }
                 case 'commit-applied':
@@ -938,6 +1099,15 @@ document.addEventListener('alpine:init', () => {
                     this.addSystemMessage('🔒 You were removed from this secure group');
                     this.error = '⚠️ You were removed from this group. Sending is disabled.';
                     break;
+                case 'desynced':
+                    this._stopMlsUpdateTimer();
+                    this.mlsTransportSynced = false;
+                    this.mlsReady = false;
+                    this.mlsRosterValid = false;
+                    this.mlsSelfIdentity = null;
+                    this.groupPeers = [];
+                    this.error = '⚠️ ' + event.reason;
+                    break;
                 case 'error':
                     console.error('[MLS]', event.reason);
                     if (event.fatalIdentity === true) {
@@ -951,6 +1121,74 @@ document.addEventListener('alpine:init', () => {
             }
         },
 
+        async _appendIncomingMlsImage(event, identity) {
+            try {
+                if (!(event.data instanceof Uint8Array)
+                    || event.data.byteLength > this.maxImageSize) {
+                    throw new Error('decrypted MLS image exceeds the room size limit');
+                }
+                const blob = new Blob(
+                    [event.data], { type: event.mimeType },
+                );
+                const dimensions = await this._validateImageBlob(blob);
+                const imageUrl = URL.createObjectURL(blob);
+                this._appendMessage({
+                    id: this.nextMessageId++,
+                    type: 'image',
+                    imageUrl,
+                    timestamp: new Date(),
+                    isOwn: false,
+                    nickname: identity.displayName,
+                    senderFingerprint: identity.fingerprint,
+                    senderTitle: this.mlsIdentityTitle(identity),
+                    senderLeafIndex: event.senderLeafIndex,
+                }, blob.size, dimensions.width * dimensions.height);
+                requestAnimationFrame(() => this.scrollToBottom());
+            } catch (error) {
+                console.error('[MLS] Rejected image payload:', error);
+                this.error = '⚠️ Rejected unsafe or oversized group image.';
+            }
+        },
+
+        _queueIncomingMlsImage(event, identity) {
+            const byteLength = event?.data instanceof Uint8Array
+                ? event.data.byteLength : -1;
+            if (byteLength < 0 || byteLength > this.maxImageSize
+                || this._pendingImageDecodeCount
+                    >= MAX_PENDING_IMAGE_DECODES
+                || this._pendingImageDecodeBytes + byteLength
+                    > MAX_PENDING_IMAGE_DECODE_BYTES) {
+                this.error = '⚠️ Incoming group image decode queue is full.';
+                return false;
+            }
+
+            // MLSSession emits a view into its authenticated plaintext.
+            // Copy only after passing the quota so the asynchronous browser
+            // decoder owns a stable, bounded buffer.
+            const queuedEvent = {
+                ...event,
+                data: Uint8Array.from(event.data),
+            };
+            const queuedIdentity = { ...identity };
+            this._pendingImageDecodeCount += 1;
+            this._pendingImageDecodeBytes += byteLength;
+            const decodeTask = this._incomingImageDecodeQueue
+                .then(() => this._appendIncomingMlsImage(
+                    queuedEvent, queuedIdentity,
+                ))
+                .finally(() => {
+                    this._pendingImageDecodeCount = Math.max(
+                        0, this._pendingImageDecodeCount - 1,
+                    );
+                    this._pendingImageDecodeBytes = Math.max(
+                        0, this._pendingImageDecodeBytes - byteLength,
+                    );
+                });
+            this._incomingImageDecodeQueue =
+                decodeTask.catch(() => undefined);
+            return true;
+        },
+
         /**
          * Handles image file selection
          */
@@ -959,8 +1197,8 @@ document.addEventListener('alpine:init', () => {
             if (!file) return;
 
             // Validate file type
-            if (!file.type.startsWith('image/')) {
-                this.error = '⚠️ Please select an image file.';
+            if (!SAFE_IMAGE_MIME_TYPES.has(file.type)) {
+                this.error = '⚠️ Please select a PNG, JPEG, WebP, or AVIF image.';
                 return;
             }
 
@@ -971,6 +1209,7 @@ document.addEventListener('alpine:init', () => {
             }
 
             try {
+                const dimensions = await this._validateImageBlob(file);
                 // Read file as ArrayBuffer for encryption
                 const arrayBuffer = await file.arrayBuffer();
 
@@ -980,12 +1219,18 @@ document.addEventListener('alpine:init', () => {
                 // allowed and avoid the base64 round-trip in memory.
                 const previewUrl = URL.createObjectURL(file);
 
+                if (this.pendingImage?.previewUrl) {
+                    try {
+                        URL.revokeObjectURL(this.pendingImage.previewUrl);
+                    } catch (_) {}
+                }
                 this.pendingImage = {
                     previewUrl,           // blob: URL (CSP-compatible)
                     name: file.name,
                     size: file.size,
                     mimeType: file.type,
-                    arrayBuffer: arrayBuffer
+                    arrayBuffer: arrayBuffer,
+                    pixelCount: dimensions.width * dimensions.height,
                 };
 
                 this.error = '';
@@ -1041,8 +1286,9 @@ document.addEventListener('alpine:init', () => {
                 this.error = '⚠️ Authenticated MLS self identity is unavailable.';
                 return;
             }
-            this.messages.push({
-                id: this.nextMessageId++,
+            const localMessageId = this.nextMessageId++;
+            this._appendMessage({
+                id: localMessageId,
                 type: 'image',
                 imageUrl: localImageUrl,
                 timestamp: new Date(),
@@ -1054,7 +1300,7 @@ document.addEventListener('alpine:init', () => {
                     ? ownMlsIdentity.fingerprint : null,
                 senderTitle: ownMlsIdentity
                     ? this.mlsIdentityTitle(ownMlsIdentity) : this.userId,
-            });
+            }, this.pendingImage.size, this.pendingImage.pixelCount);
             requestAnimationFrame(() => this.scrollToBottom());
 
             try {
@@ -1078,8 +1324,9 @@ document.addEventListener('alpine:init', () => {
                     if (!sent) {
                         // Remove local message on failure — the only reference
                         // to the blob URL goes with it, so revoke to free it.
-                        this.messages.pop();
-                        try { URL.revokeObjectURL(localImageUrl); } catch {}
+                        this._removeMessageById(
+                            localMessageId, { revokeImage: false },
+                        );
                         this.error = '⚠️ Unable to send image. Please try again.';
                         return;
                     }
@@ -1093,7 +1340,9 @@ document.addEventListener('alpine:init', () => {
                 // blob URL here: pendingImage still owns it (it is cleared
                 // only on the happy path above), so the composer preview
                 // stays usable for a retry.
-                this.messages.pop();
+                this._removeMessageById(
+                    localMessageId, { revokeImage: false },
+                );
                 this.error = '⚠️ Error encrypting image.';
             } finally {
                 this.sendingImage = false;
@@ -1115,15 +1364,20 @@ document.addEventListener('alpine:init', () => {
                     this.roomId,
                     message.sender_id
                 );
+                if (!(imageData.data instanceof Uint8Array)
+                    || imageData.data.byteLength > this.maxImageSize) {
+                    throw new Error('decrypted image exceeds the room size limit');
+                }
 
                 // Create blob URL from decrypted data
                 const blob = new Blob([imageData.data], { type: imageData.mimeType });
+                const dimensions = await this._validateImageBlob(blob);
                 const imageUrl = URL.createObjectURL(blob);
 
                 // Generate nickname from sender UUID
                 const nicknameData = generateNickname(message.sender_id);
 
-                this.messages.push({
+                this._appendMessage({
                     id: this.nextMessageId++,
                     type: 'image',
                     imageUrl: imageUrl,
@@ -1133,7 +1387,7 @@ document.addEventListener('alpine:init', () => {
                     senderId: message.sender_id,
                     senderTitle: message.sender_id,
                     outOfOrder: imageData.outOfOrder === true
-                });
+                }, blob.size, dimensions.width * dimensions.height);
 
                 // Scroll to bottom
                 requestAnimationFrame(() => this.scrollToBottom());
@@ -1218,7 +1472,7 @@ document.addEventListener('alpine:init', () => {
          * Adds a system message
          */
         addSystemMessage(text) {
-            this.messages.push({
+            this._appendMessage({
                 id: this.nextMessageId++,
                 type: 'system',
                 text: text,

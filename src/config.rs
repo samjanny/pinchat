@@ -51,6 +51,10 @@ pub struct Config {
     // Per-connection message rate limiting
     pub msg_rate_limit: usize,
     pub msg_rate_window_secs: i64,
+    // Aggregate per-room traffic caps prevent many individually compliant
+    // members from multiplying broadcast/decryption work.
+    pub room_msg_rate_limit: usize,
+    pub room_byte_rate_limit: usize,
 
     // Per-connection MLS Commit rate limit. Commits are broadcast to every
     // member and trigger TreeKEM verification + transcript hash + signature
@@ -60,6 +64,11 @@ pub struct Config {
     // admission burst while still bounding sustained TreeKEM work.
     pub commit_rate_limit: usize,
     pub commit_rate_window_secs: i64,
+    // Standalone MLS Update Proposal rate. Honest clients emit these only
+    // during periodic PCS rotation; a much tighter bucket prevents one member
+    // from monopolising every recipient's bounded ProposalRef store.
+    pub proposal_rate_limit: usize,
+    pub proposal_rate_window_secs: i64,
 
     // Per-connection global frame rate limit (applies to EVERY text frame,
     // including handshakes, unknown types, and malformed JSON, not just
@@ -206,6 +215,14 @@ impl Config {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(1),
+            room_msg_rate_limit: env::var("ROOM_MSG_RATE_LIMIT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(120),
+            room_byte_rate_limit: env::var("ROOM_BYTE_RATE_LIMIT")
+                .ok()
+                .and_then(|v| parse_size_with_suffix(&v))
+                .unwrap_or(8 * 1024 * 1024),
 
             // MLS Commit rate limit (default: 24 commits per 60 seconds).
             // A fresh 20-member room requires 19 Add commits, so the former
@@ -215,6 +232,14 @@ impl Config {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(24),
             commit_rate_window_secs: env::var("COMMIT_RATE_WINDOW_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(60),
+            proposal_rate_limit: env::var("PROPOSAL_RATE_LIMIT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(8),
+            proposal_rate_window_secs: env::var("PROPOSAL_RATE_WINDOW_SECS")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(60),
@@ -341,20 +366,12 @@ impl Config {
                 })
                 .unwrap_or_default(),
 
-            // Anti-replay cache max entries per room (default: 1000).
-            //
-            // Memory budget (worst-case, all rooms at full cache):
-            //   HashSet<(String,DateTime<Utc>)> overhead per entry ≈ 136 bytes
-            //   (64-byte hex SHA-256 + 24 bytes String header + 16 bytes
-            //   DateTime + ~32 bytes HashSet slot/load-factor amortised).
-            //   1000 entries × 1000 rooms × 136 B ≈ 136 MB worst case.
-            //
-            // The previous default was 10000, which extrapolated to ~1.4 GB
-            // worst case on a VPS — disproportionate given the cache is an
-            // advisory anti-replay layer (the authoritative defence is the
-            // Double Ratchet monotone counter, checked client-side). 1000
-            // entries still tolerate ~17 minutes at the msg_rate_limit of
-            // 30 msg/s before eviction starts mattering for a busy room.
+            // Anti-replay cache max entries per room (default: 1000). The
+            // implementation uses a hash lookup plus FIFO insertion queue,
+            // so expiry/eviction is O(1) amortized rather than sorting
+            // attacker-controlled entries on the message path. The hard
+            // validation cap below prevents operators from accidentally
+            // multiplying this advisory cache into unbounded room memory.
             replay_cache_max_per_room: env::var("REPLAY_CACHE_MAX_PER_ROOM")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -457,6 +474,15 @@ impl Config {
         if self.commit_rate_limit == 0 {
             panic!("COMMIT_RATE_LIMIT must be greater than 0");
         }
+        if self.room_msg_rate_limit == 0 {
+            panic!("ROOM_MSG_RATE_LIMIT must be greater than 0");
+        }
+        if self.room_byte_rate_limit < 64 * 1024 || self.room_byte_rate_limit > 64 * 1024 * 1024 {
+            panic!("ROOM_BYTE_RATE_LIMIT must be between 64KB and 64MB");
+        }
+        if self.proposal_rate_limit == 0 {
+            panic!("PROPOSAL_RATE_LIMIT must be greater than 0");
+        }
         if self.frame_rate_limit == 0 {
             panic!("FRAME_RATE_LIMIT must be greater than 0");
         }
@@ -482,6 +508,9 @@ impl Config {
         }
         if self.commit_rate_window_secs <= 0 {
             panic!("COMMIT_RATE_WINDOW_SECS must be greater than 0");
+        }
+        if self.proposal_rate_window_secs <= 0 {
+            panic!("PROPOSAL_RATE_WINDOW_SECS must be greater than 0");
         }
 
         // Validate TTLs are non-zero
@@ -529,13 +558,23 @@ impl Config {
         if self.replay_cache_max_per_room == 0 {
             panic!("REPLAY_CACHE_MAX_PER_ROOM must be greater than 0");
         }
+        if self.replay_cache_max_per_room > 10_000 {
+            panic!("REPLAY_CACHE_MAX_PER_ROOM cannot exceed 10000");
+        }
 
-        // Validate max image size (reasonable bounds: 1KB to 50MB)
+        // A 2MB raw image expands to roughly 2.8MB after encryption and
+        // Base64url framing, remaining below the relay's 4MB per-room
+        // retained-broadcast ceiling and the browser's 8MB history/decode
+        // budgets. Larger configured values would be accepted at startup but
+        // deterministically rejected by the bounded transport.
         if self.max_image_size < 1024 {
             panic!("MAX_IMAGE_SIZE must be at least 1KB (1024 bytes)");
         }
-        if self.max_image_size > 50 * 1024 * 1024 {
-            panic!("MAX_IMAGE_SIZE cannot exceed 50MB");
+        if self.max_image_size > 2 * 1024 * 1024 {
+            panic!("MAX_IMAGE_SIZE cannot exceed 2MB");
+        }
+        if self.room_byte_rate_limit < self.max_image_size.saturating_mul(2) {
+            panic!("ROOM_BYTE_RATE_LIMIT must be at least twice MAX_IMAGE_SIZE");
         }
     }
 

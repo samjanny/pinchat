@@ -527,8 +527,12 @@ These settings control application behavior only. They do not automatically conf
 | `ROOM_TOKEN_PERIOD_SECS` | `600` | Window for room/token rate limiting |
 | `MSG_RATE_LIMIT` | `30` | Messages per connection per window |
 | `MSG_RATE_WINDOW_SECS` | `1` | Window length for per-connection message rate limiting |
+| `ROOM_MSG_RATE_LIMIT` | `120` | Aggregate messages admitted per room per message-rate window |
+| `ROOM_BYTE_RATE_LIMIT` | `8MB` | Aggregate validated payload bytes admitted per room per message-rate window (decoded bytes for MLS) |
 | `COMMIT_RATE_LIMIT` | `24` | MLS Commits allowed per connection per Commit window; sized for a full 20-member Add burst |
 | `COMMIT_RATE_WINDOW_SECS` | `60` | Window length for the MLS Commit limiter |
+| `PROPOSAL_RATE_LIMIT` | `8` | Standalone MLS Update Proposals allowed per member per Proposal window |
+| `PROPOSAL_RATE_WINDOW_SECS` | `60` | Window length for the MLS Proposal limiter |
 | `POW_MIN_DIFFICULTY` | `12` | Minimum proof-of-work difficulty, in bits |
 | `POW_MAX_DIFFICULTY` | `18` | Maximum proof-of-work difficulty, in bits |
 | `CHALLENGE_TTL_SECS` | `300` | Proof-of-work challenge TTL |
@@ -541,8 +545,8 @@ These settings control application behavior only. They do not automatically conf
 | `LOGIN_BURST_SIZE` | `5` | Login attempts allowed per period |
 | `LOGIN_PERIOD_SECS` | `900` | Window for login rate limiting |
 | `TRUSTED_PROXIES` | empty | Comma-separated proxy IPs/CIDRs trusted for `X-Forwarded-For` |
-| `REPLAY_CACHE_MAX_PER_ROOM` | `1000` | Maximum anti-replay entries per room. The cache is an advisory layer; the authoritative anti-replay is the Double Ratchet counter, checked client-side. |
-| `MAX_IMAGE_SIZE` | `300KB` | Maximum image size, as bytes or with `KB`/`MB` suffix |
+| `REPLAY_CACHE_MAX_PER_ROOM` | `1000` | Maximum anti-replay entries per room (hard maximum 10000). Lookup and eviction are O(1) amortized. The authoritative anti-replay remains the client ratchet generation state. |
+| `MAX_IMAGE_SIZE` | `300KB` | Maximum image size, as bytes or with `KB`/`MB` suffix (hard maximum `2MB`) |
 | `WEBSITE_DIR` | empty | Custom static files directory. Falls back to `/static` |
 
 ## Privacy Modes

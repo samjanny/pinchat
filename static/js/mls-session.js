@@ -14,10 +14,10 @@
  * - Emit outgoing `mls` relay envelopes through a caller-supplied
  *   transport function.
  *
- * The orchestration this commit lands is the MVP path: 2-leaf groups
- * only, creator (leaf 0) + one joiner (leaf 1). 3+-member support is
- * a follow-up that will need Group.processCommit and filtered direct
- * path encryption.
+ * The orchestration implements the creator-centric PinChat profile for
+ * groups of up to 20 logical leaves. Leaf 0 is the permanent creator/admin;
+ * other members may publish authenticated Update Proposals, while only leaf
+ * 0 authors Commits.
  *
  * Transport contract
  * ------------------
@@ -61,8 +61,14 @@
     const CREATOR_LEAF_INDEX = 0;
     const BOOTSTRAP_PIN_BYTES = 32;
     const CORRELATION_REF_BYTES = 32;
-    const MAX_PENDING_WELCOME_COMMITS = 8;
-    const MAX_PROPOSALS_PER_EPOCH = 64;
+    const MAX_GROUP_LEAVES = MLS.Group.MAX_GROUP_LEAVES || 20;
+    const MAX_PENDING_WELCOME_SENDERS = MAX_GROUP_LEAVES;
+    const MAX_PROPOSALS_PER_SENDER = 2;
+    const MAX_PROPOSALS_PER_EPOCH =
+        MAX_GROUP_LEAVES * MAX_PROPOSALS_PER_SENDER;
+    const MAX_DEFERRED_PRIVATE_MESSAGES = 32;
+    const MAX_DEFERRED_PRIVATE_BYTES = 4 * 1024 * 1024;
+    const MAX_DEFERRED_KEYPACKAGE_BYTES = 512 * 1024;
     // The visible label carries 80 bits of the SHA-256 fingerprint. The full
     // 256-bit value is always emitted alongside it for tooltips/comparison.
     const VISIBLE_FINGERPRINT_HEX = 20;
@@ -87,6 +93,26 @@
 
     function wipeBytes(value) {
         if (value instanceof Uint8Array) value.fill(0);
+    }
+
+    function fatalMlsStateError(message) {
+        const error = new Error(message);
+        error.mlsFatalState = true;
+        return error;
+    }
+
+    function envelopeEncodedBytes(envelope) {
+        if (!envelope || typeof envelope !== 'object') return 0;
+        let total = 256;
+        for (const name of [
+            'payload', 'ratchet_tree', 'key_package_ref', 'commit_ref',
+            'sender_id',
+        ]) {
+            if (typeof envelope[name] === 'string') {
+                total += envelope[name].length;
+            }
+        }
+        return total;
     }
 
     function decodeCorrelationRef(value, name) {
@@ -258,6 +284,7 @@
             this._keyPackageRefBytes = null;
             this._keyPackageRef = null;
             this._pendingWelcomeCommits = new Map();
+            this._pendingWelcomeCommitBySender = new Map();
             // Per-sender_id → leafIndex map maintained by the creator.
             // We commit at most one KeyPackage per WebSocket sender_id;
             // a second KeyPackage from the same sender (or a sender
@@ -284,6 +311,7 @@
             // recipient must resolve from its own store. Entries are
             // consumed atomically only when an epoch transition succeeds.
             this._proposalStore = new Map();
+            this._proposalRefsBySender = new Map();
             // Creator-only selection queue: latest newly observed Update per
             // proposer leaf, awaiting the next periodic Commit. Older valid
             // proposals remain resolvable in _proposalStore but a replay of
@@ -317,6 +345,13 @@
             // or proposal state from changing underneath the candidate and
             // being rolled back when the candidate is installed.
             this._deferredEnvelopes = [];
+            this._deferredEnvelopeBytes = 0;
+            // KeyPackages are ordered controls, so accepting one into a
+            // bounded, validated per-sender map is the durable application
+            // action which permits its control ACK while a prior local Commit
+            // is awaiting its own relay echo.
+            this._deferredKeyPackages = new Map();
+            this._deferredKeyPackageBytes = 0;
             this._deferredRemovals = new Set();
             // Relay lifecycle departures are ordered with MLS controls, but
             // they can still arrive while the corresponding Add is staged or
@@ -476,25 +511,107 @@
                 }
                 return { entry: existing, isNew: false };
             }
+            const senderLeafIndex = verified.senderLeafIndex;
+            if (!Number.isInteger(senderLeafIndex)
+                || senderLeafIndex < 0 || senderLeafIndex >= MAX_GROUP_LEAVES) {
+                throw new Error(
+                    'mls-session: proposal store entry has invalid sender leaf',
+                );
+            }
+            let senderReferences =
+                this._proposalRefsBySender.get(senderLeafIndex);
+            if (!senderReferences) {
+                senderReferences = [];
+                this._proposalRefsBySender.set(
+                    senderLeafIndex, senderReferences,
+                );
+            }
+            let evicted = null;
+            if (senderReferences.length >= MAX_PROPOSALS_PER_SENDER) {
+                const evictedReferenceKey = senderReferences.shift();
+                evicted = this._proposalStore.get(evictedReferenceKey) || null;
+                this._proposalStore.delete(evictedReferenceKey);
+                this._pendingSelfUpdates.delete(evictedReferenceKey);
+                if (this._pendingSelfUpdate?.referenceKey
+                    === evictedReferenceKey) {
+                    this._pendingSelfUpdate = null;
+                }
+                const selected = this._pendingUpdateProposals.get(
+                    senderLeafIndex,
+                );
+                if (selected && MLS.Group.proposalReferenceKey(
+                    selected.reference,
+                ) === evictedReferenceKey) {
+                    this._pendingUpdateProposals.delete(senderLeafIndex);
+                }
+            }
             if (this._proposalStore.size >= MAX_PROPOSALS_PER_EPOCH) {
-                throw new Error('mls-session: current-epoch proposal store is full');
+                throw new Error(
+                    'mls-session: authenticated proposal store invariant exceeded',
+                );
             }
             const entry = Object.freeze({
                 proposal: verified.proposal,
-                senderLeafIndex: verified.senderLeafIndex,
+                senderLeafIndex,
                 epoch: verified.epoch,
                 reference: Uint8Array.from(verified.reference),
                 messageBytes: Uint8Array.from(verified.messageBytes),
             });
             this._proposalStore.set(referenceKey, entry);
-            return { entry, isNew: true };
+            senderReferences.push(referenceKey);
+            return { entry, isNew: true, evicted };
         }
 
         _clearEpochProposalState() {
             this._proposalStore.clear();
+            this._proposalRefsBySender.clear();
             this._pendingUpdateProposals.clear();
             this._pendingSelfUpdates.clear();
             this._pendingSelfUpdate = null;
+        }
+
+        _transitionToDesynced(reason) {
+            if (this._state === 'desynced') return;
+            const liveGroup = this.group;
+            const candidateGroup = this._pendingCommit?.candidateGroup || null;
+            if (this._pendingCommit?.retryTimer) {
+                clearTimeout(this._pendingCommit.retryTimer);
+            }
+            if (candidateGroup && candidateGroup !== liveGroup) {
+                candidateGroup.destroySecrets();
+            }
+            if (liveGroup) liveGroup.destroySecrets();
+            this._pendingCommit = null;
+            this._clearEpochProposalState();
+            this._pendingWelcomeCommits.clear();
+            this._pendingWelcomeCommitBySender.clear();
+            this._deferredEnvelopes.length = 0;
+            this._deferredEnvelopeBytes = 0;
+            this._deferredKeyPackages.clear();
+            this._deferredKeyPackageBytes = 0;
+            this._deferredRemovals.clear();
+            this._departedSenderIds.clear();
+            this._leafBySenderId.clear();
+            this._senderIdByLeaf.clear();
+            this._identityBySignatureKey.clear();
+            wipeBytes(this.pskSecret);
+            wipeBytes(this._keyPackageRefBytes);
+            wipeBytes(this.expectedGroupId);
+            wipeBytes(this.expectedCreatorKeyHash);
+            this.pskSecret = null;
+            this._keyPackageRefBytes = null;
+            this._keyPackageRef = null;
+            this.expectedGroupId = null;
+            this.expectedCreatorKeyHash = null;
+            this.keyPackageBundle = null;
+            this.identity = null;
+            this._localCommitBusy = false;
+            this.group = null;
+            this._state = 'desynced';
+            this.onEvent({
+                kind: 'desynced',
+                reason,
+            });
         }
 
         _transitionToRemoved(result) {
@@ -516,7 +633,11 @@
             this._pendingCommit = null;
             this._clearEpochProposalState();
             this._pendingWelcomeCommits.clear();
+            this._pendingWelcomeCommitBySender.clear();
             this._deferredEnvelopes.length = 0;
+            this._deferredEnvelopeBytes = 0;
+            this._deferredKeyPackages.clear();
+            this._deferredKeyPackageBytes = 0;
             this._deferredRemovals.clear();
             this._departedSenderIds.clear();
             this._leafBySenderId.clear();
@@ -748,8 +869,59 @@
                 while (!this._localCommitBusy
                     && !this._pendingCommit) {
                     if (this._deferredEnvelopes.length > 0) {
-                        const envelope = this._deferredEnvelopes.shift();
-                        await this._onRelayEnvelope(envelope);
+                        const deferred = this._deferredEnvelopes.shift();
+                        this._deferredEnvelopeBytes = Math.max(
+                            0,
+                            this._deferredEnvelopeBytes
+                                - deferred.encodedBytes,
+                        );
+                        await this._onRelayEnvelope(deferred.envelope);
+                        continue;
+                    }
+                    const nextKeyPackage =
+                        this._deferredKeyPackages.entries().next();
+                    if (!nextKeyPackage.done) {
+                        const [senderId, deferred] = nextKeyPackage.value;
+                        this._deferredKeyPackages.delete(senderId);
+                        this._deferredKeyPackageBytes = Math.max(
+                            0,
+                            this._deferredKeyPackageBytes
+                                - deferred.encodedBytes,
+                        );
+                        if (this._departedSenderIds.has(senderId)
+                            || this._leafBySenderId.has(senderId)) {
+                            continue;
+                        }
+                        try {
+                            // A preceding accepted Add may have consumed the
+                            // final leaf slot or installed a key which collides
+                            // with this already-ACKed KeyPackage. Revalidate
+                            // against the new live tree and deterministically
+                            // reject it instead of retrying forever.
+                            await this.group.validateKeyPackageForAdd(
+                                deferred.bytes,
+                            );
+                        } catch (err) {
+                            this.onEvent({
+                                kind: 'error',
+                                reason: `deferred KeyPackage rejected: ${err.message}`,
+                            });
+                            continue;
+                        }
+                        const staged = await this._handleIncomingKeyPackage(
+                            deferred.bytes, senderId,
+                        );
+                        if (!staged && !this._departedSenderIds.has(senderId)
+                            && !this._leafBySenderId.has(senderId)) {
+                            // A transient local crypto/platform failure must
+                            // not lose an already-ACKed KeyPackage. Retain it
+                            // for the next replay-sync/timer drain without
+                            // spinning in this invocation.
+                            this._deferredKeyPackages.set(senderId, deferred);
+                            this._deferredKeyPackageBytes +=
+                                deferred.encodedBytes;
+                            break;
+                        }
                         continue;
                     }
                     // userleft handling is deliberately fire-and-forget in
@@ -851,21 +1023,78 @@
                 await this._acceptPendingCommit();
                 return;
             }
+            const payload = base64UrlDecode(envelope.payload);
+            const wireFormat = envelope.wire_format;
             if (this._localCommitBusy || this._pendingCommit) {
-                // Room membership is capped well below this. The bound keeps
-                // a withheld ACK from turning this into an unbounded queue.
-                if (this._deferredEnvelopes.length >= 64) {
+                if (wireFormat
+                    === MLS.MLSMessage.WireFormat.MLS_PRIVATE_MESSAGE) {
+                    const encodedBytes = envelopeEncodedBytes(envelope);
+                    if (this._deferredEnvelopes.length
+                            >= MAX_DEFERRED_PRIVATE_MESSAGES
+                        || this._deferredEnvelopeBytes + encodedBytes
+                            > MAX_DEFERRED_PRIVATE_BYTES) {
+                        // PrivateMessages are ephemeral rather than ordered
+                        // controls. Drop excess traffic instead of allowing a
+                        // peer to grow the candidate's old-epoch receive queue
+                        // without bound.
+                        this.onEvent({
+                            kind: 'error',
+                            reason: 'MLS private-message queue full while Commit awaits acceptance',
+                        });
+                        return;
+                    }
+                    this._deferredEnvelopes.push({
+                        envelope: { ...envelope },
+                        encodedBytes,
+                    });
+                    this._deferredEnvelopeBytes += encodedBytes;
+                    return;
+                }
+                if (wireFormat === MLS.MLSMessage.WireFormat.MLS_KEY_PACKAGE
+                    && this.role === 'creator'
+                    && (this._state === 'awaiting-keypackage'
+                        || this._state === 'joined')) {
+                    const senderId = envelope.sender_id;
+                    if (!senderId) {
+                        this.onEvent({ kind: 'error',
+                            reason: 'KeyPackage envelope missing sender_id' });
+                        return;
+                    }
+                    if (this._departedSenderIds.has(senderId)
+                        || this._leafBySenderId.has(senderId)
+                        || this._deferredKeyPackages.has(senderId)) {
+                        return;
+                    }
+                    // Validate all deterministic admission properties before
+                    // treating this ordered control as durably accepted.
+                    await this.group.validateKeyPackageForAdd(payload);
+                    const encodedBytes = envelopeEncodedBytes(envelope);
+                    if (this._deferredKeyPackageBytes + encodedBytes
+                        > MAX_DEFERRED_KEYPACKAGE_BYTES) {
+                        throw fatalMlsStateError(
+                            'MLS deferred KeyPackage byte budget exhausted',
+                        );
+                    }
+                    this._deferredKeyPackages.set(senderId, {
+                        bytes: Uint8Array.from(payload),
+                        encodedBytes,
+                    });
+                    this._deferredKeyPackageBytes += encodedBytes;
+                    return;
+                }
+                // PublicMessage Proposal/Commit controls are safe to parse
+                // against the unchanged live epoch while our candidate waits.
+                // In particular, never ACK a raw, unvalidated PublicMessage
+                // merely because it was appended to a deferred queue.
+                if (wireFormat !==
+                    MLS.MLSMessage.WireFormat.MLS_PUBLIC_MESSAGE) {
                     this.onEvent({
                         kind: 'error',
-                        reason: 'MLS envelope queue full while Commit awaits acceptance',
+                        reason: 'unsupported MLS envelope while Commit awaits acceptance',
                     });
                     return;
                 }
-                this._deferredEnvelopes.push({ ...envelope });
-                return;
             }
-            const payload = base64UrlDecode(envelope.payload);
-            const wireFormat = envelope.wire_format;
 
             // Creator: accept KeyPackages from new joiners while we have
             // a valid group to commit into. The state machine moves
@@ -896,7 +1125,30 @@
                         reason: `sender ${senderId} already has a leaf — duplicate KeyPackage rejected` });
                     return;
                 }
-                await this._handleIncomingKeyPackage(payload, senderId);
+                try {
+                    await this.group.validateKeyPackageForAdd(payload);
+                } catch (err) {
+                    this.onEvent({
+                        kind: 'error',
+                        reason: `invalid KeyPackage: ${err.message}`,
+                    });
+                    return;
+                }
+                const staged = await this._handleIncomingKeyPackage(
+                    payload, senderId,
+                );
+                if (!staged && !this._departedSenderIds.has(senderId)
+                    && !this._leafBySenderId.has(senderId)) {
+                    // Validation succeeded, but the local candidate could
+                    // not be built or staged. This is an ordered control:
+                    // force a reconnect without ACK so the relay replays the
+                    // same KeyPackage instead of silently losing the join.
+                    const error = new Error(
+                        'mls-session: validated KeyPackage could not be staged',
+                    );
+                    error.mlsRetryControl = true;
+                    throw error;
+                }
                 return;
             }
 
@@ -920,6 +1172,7 @@
                     candidate,
                 );
                 this._pendingWelcomeCommits.clear();
+                this._pendingWelcomeCommitBySender.clear();
                 return;
             }
 
@@ -1050,6 +1303,11 @@
                     'mls-session: commit_ref does not match PublicMessage payload',
                 );
             }
+            if (!envelope.sender_id) {
+                throw new Error(
+                    'mls-session: correlated Add Commit envelope missing sender_id',
+                );
+            }
             const commitRef = base64UrlEncode(commitRefBytes);
             const existing = this._pendingWelcomeCommits.get(commitRef);
             if (existing) {
@@ -1060,14 +1318,20 @@
                 }
                 return true;
             }
-            if (this._pendingWelcomeCommits.size >= MAX_PENDING_WELCOME_COMMITS) {
-                throw new Error(
-                    'mls-session: too many correlated Add Commits while awaiting Welcome',
-                );
+            const previousCommitRef =
+                this._pendingWelcomeCommitBySender.get(envelope.sender_id);
+            if (previousCommitRef && previousCommitRef !== commitRef) {
+                // Pre-Welcome Commit signatures cannot yet be verified. Keep
+                // exactly one candidate per stable relay sender so one room
+                // participant cannot consume every candidate slot and starve
+                // the authentic creator's later Commit.
+                this._pendingWelcomeCommits.delete(previousCommitRef);
             }
-            if (!envelope.sender_id) {
+            if (!previousCommitRef
+                && this._pendingWelcomeCommits.size
+                    >= MAX_PENDING_WELCOME_SENDERS) {
                 throw new Error(
-                    'mls-session: correlated Add Commit envelope missing sender_id',
+                    'mls-session: too many distinct Welcome Commit senders',
                 );
             }
             this._pendingWelcomeCommits.set(commitRef, {
@@ -1078,6 +1342,9 @@
                 senderLeafIndex: CREATOR_LEAF_INDEX,
                 epoch: pm.content.epoch,
             });
+            this._pendingWelcomeCommitBySender.set(
+                envelope.sender_id, commitRef,
+            );
             return true;
         }
 
@@ -1149,13 +1416,12 @@
             let candidateGroup = null;
             try {
                 candidateGroup = this.group.forkForPendingCommit();
-                const { commitMessage, welcomeMessage } =
+                const { commitMessage, welcomeMessage, addedLeafIndex } =
                     await candidateGroup.commitAddMember({
                         keyPackageBytes: kpBytes,
                     });
-                // commitAddMember always inserts at `nLeaves` (pre-bump).
-                // Only the candidate has advanced at this point.
-                const addedLeafIndex = candidateGroup.nLeaves - 1;
+                // commitAddMember returns the exact slot because Add reuses
+                // the leftmost blank leaf before growing the tree.
                 const ratchetTreeBytes = MLS.Nodes.ratchetTreeBytes(
                     candidateGroup.ratchetTree,
                 );
@@ -1194,6 +1460,7 @@
             // It matters for a synchronous relay echo, which may already
             // have accepted the candidate while _localCommitBusy was true.
             await this._drainDeferredEnvelopes();
+            return staged;
         }
 
         async _handleWelcome(mlsMessageBytes, ratchetTreeBytes, candidate) {
@@ -1433,8 +1700,19 @@
                 });
             } catch (err) {
                 console.error('[MLS] processCommit failed:', err);
-                this.onEvent({ kind: 'error',
-                    reason: `processCommit failed: ${err.message}` });
+                const reason = `processCommit failed: ${err.message}`;
+                if (err?.authenticatedMlsControl === true) {
+                    // The relay sequence names a current-epoch Commit whose
+                    // creator signature and membership_tag are valid. If its
+                    // tree/path/proposal/confirmation processing fails, ACKing
+                    // and continuing would strand this member in the old
+                    // epoch. Make the state terminal and propagate a typed
+                    // failure so WebSocketManager neither advances the cursor
+                    // nor reconnects into an infinite replay loop.
+                    this._transitionToDesynced(reason);
+                    throw fatalMlsStateError(reason);
+                }
+                this.onEvent({ kind: 'error', reason });
                 return;
             }
             if (result.removedSelf === true) {
@@ -1559,17 +1837,28 @@
                 return;
             }
             let proposed;
-            let stored = null;
-            let referenceKey = null;
-            let hadPendingKey = false;
-            let previousPendingKey;
-            const previousLatest = this._pendingSelfUpdate;
+            // Insertion may evict the oldest per-sender entry. Snapshot every
+            // bounded bookkeeping map first: a transport rejection must
+            // restore any displaced ProposalRef/private key exactly.
+            const proposalStoreBefore = new Map(this._proposalStore);
+            const proposalRefsBefore = new Map(
+                [...this._proposalRefsBySender].map(
+                    ([leafIndex, references]) => [
+                        leafIndex, [...references],
+                    ],
+                ),
+            );
+            const pendingUpdatesBefore =
+                new Map(this._pendingUpdateProposals);
+            const pendingSelfUpdatesBefore =
+                new Map(this._pendingSelfUpdates);
+            const pendingSelfUpdateBefore = this._pendingSelfUpdate;
             try {
                 proposed = await this.group.proposeUpdate();
-                stored = this._storeAuthenticatedProposal(proposed);
-                referenceKey = MLS.Group.proposalReferenceKey(proposed.reference);
-                hadPendingKey = this._pendingSelfUpdates.has(referenceKey);
-                previousPendingKey = this._pendingSelfUpdates.get(referenceKey);
+                this._storeAuthenticatedProposal(proposed);
+                const referenceKey = MLS.Group.proposalReferenceKey(
+                    proposed.reference,
+                );
                 this._pendingSelfUpdates.set(
                     referenceKey, proposed.pendingLeafKeyPair,
                 );
@@ -1590,30 +1879,27 @@
                 }, 'Update proposal broadcast failed');
             } catch (err) {
                 // A locally-created proposal that never reached the relay
-                // must not occupy the bounded current-epoch store or leave a
-                // private key that can never be selected. Restore exactly
-                // the entries that existed before this attempt.
-                if (referenceKey !== null) {
-                    if (stored?.isNew
-                        && this._proposalStore.get(referenceKey) === stored.entry) {
-                        this._proposalStore.delete(referenceKey);
-                    }
-                    if (this._pendingSelfUpdates.get(referenceKey)
-                        === proposed?.pendingLeafKeyPair) {
-                        if (hadPendingKey) {
-                            this._pendingSelfUpdates.set(
-                                referenceKey, previousPendingKey,
-                            );
-                        } else {
-                            this._pendingSelfUpdates.delete(referenceKey);
-                        }
-                    }
-                    if (this._pendingSelfUpdate?.referenceKey === referenceKey
-                        && this._pendingSelfUpdate?.keyPair
-                            === proposed?.pendingLeafKeyPair) {
-                        this._pendingSelfUpdate = previousLatest;
-                    }
+                // must not occupy the store, evict an older resolvable
+                // ProposalRef, or leave an unselectable private key.
+                this._proposalStore.clear();
+                for (const [key, value] of proposalStoreBefore) {
+                    this._proposalStore.set(key, value);
                 }
+                this._proposalRefsBySender.clear();
+                for (const [leafIndex, references] of proposalRefsBefore) {
+                    this._proposalRefsBySender.set(
+                        leafIndex, [...references],
+                    );
+                }
+                this._pendingUpdateProposals.clear();
+                for (const [leafIndex, entry] of pendingUpdatesBefore) {
+                    this._pendingUpdateProposals.set(leafIndex, entry);
+                }
+                this._pendingSelfUpdates.clear();
+                for (const [key, keyPair] of pendingSelfUpdatesBefore) {
+                    this._pendingSelfUpdates.set(key, keyPair);
+                }
+                this._pendingSelfUpdate = pendingSelfUpdateBefore;
                 console.error('[MLS] proposeUpdate failed:', err);
                 this.onEvent({ kind: 'error',
                     reason: `proposeUpdate failed: ${err.message}` });

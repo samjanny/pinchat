@@ -219,15 +219,19 @@ AuthenticatedContent before applying the referenced leaf update.
   the previous epoch's `(leaf, generation)` tuples become irrelevant
   (the encryption_secret has changed). Replay across reload is moot
   in our architecture because we don't survive reloads, we re-join.
-- **Tree pruning.** After `Remove`, the target leaf and its direct
-  path are blanked but the tree width (`nLeaves`) is not trimmed. A
-  subsequent `Add` will fill the next free slot to the right of the
-  blank, growing the tree rather than reusing the blanked index.
+- **Tree capacity.** After `Remove`, the target leaf and its direct
+  path remain blank at the same indices. A subsequent `Add` reuses the
+  leftmost blank leaf before growing the tree. The PinChat group profile
+  enforces a maximum of 20 logical leaves in creation, Commit processing,
+  and Welcome import.
 - **`ratchet_tree` GroupInfo extension.** The new joiner currently
   receives the serialised tree as a side-channel field on the Welcome
-  envelope; the standardised extension path is unimplemented.
-- **`hashes.json.signed`.** Regenerated unsigned (sequence ≥ 31). The
-  operator re-signs locally with their ECDSA key.
+  envelope; the standardised extension path is unimplemented. This custom
+  side-channel deliberately carries the complete logical node width,
+  including trailing blanks, because no separate tree-size field exists.
+  It must not be presented as the canonical RFC extension encoding.
+- **`hashes.json.signed`.** The operator re-signs locally with their
+  ECDSA key whenever a protected static asset changes.
 
 ## Test vectors
 

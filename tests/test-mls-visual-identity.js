@@ -35,7 +35,16 @@ global.alert = () => {
     throw new Error('unexpected alert while loading app.js test harness');
 };
 global.requestAnimationFrame = () => 0;
-global.URL.createObjectURL = () => 'blob:mls-visual-identity-test';
+let blobCounter = 0;
+const revokedBlobs = [];
+global.URL.createObjectURL = () =>
+    `blob:mls-visual-identity-test-${blobCounter++}`;
+global.URL.revokeObjectURL = (value) => revokedBlobs.push(value);
+global.createImageBitmap = async () => ({
+    width: 1,
+    height: 1,
+    close() {},
+});
 global.debugLog = () => {};
 global.generateNickname = (value) => {
     nicknameInputs.push(value);
@@ -151,12 +160,16 @@ async function main() {
         senderId: 'another-relay-forged-name',
         attributionWarning: false,
     });
+    await chatStore._incomingImageDecodeQueue;
     const displayedImage = chatStore.messages.at(-1);
     assert(displayedImage.type === 'image'
         && displayedImage.nickname === creator.displayName
         && displayedImage.senderFingerprint === creator.fingerprint
         && displayedImage.senderId === undefined,
     'image bubble also uses only authenticated MLS identity');
+    assert(chatStore._pendingImageDecodeCount === 0
+        && chatStore._pendingImageDecodeBytes === 0,
+    'MLS image decoding releases its bounded queue reservation');
 
     const acceptedMessages = chatStore.messages.length;
     chatStore._handleMlsEvent({
@@ -214,6 +227,63 @@ async function main() {
     assert(chatStore.groupPeers.length === 0
         && chatStore.authenticatedMemberCount() === 1,
     'authenticated post-Remove roster is the only event that removes the peer');
+
+    for (let index = 0; index < 300; index += 1) {
+        chatStore._appendMessage({
+            id: chatStore.nextMessageId++,
+            type: 'message',
+            text: `bounded-${index}`,
+            timestamp: new Date(),
+        });
+    }
+    assert(chatStore.messages.length <= 250,
+        'visible message history has a hard entry bound');
+
+    for (let index = 0; index < 10; index += 1) {
+        chatStore._appendMessage({
+            id: chatStore.nextMessageId++,
+            type: 'image',
+            imageUrl: `blob:resource-bound-${index}`,
+            timestamp: new Date(),
+        }, 1024 * 1024);
+    }
+    assert(chatStore.messageHistoryBytes <= 8 * 1024 * 1024
+        && revokedBlobs.some((url) =>
+            url.startsWith('blob:resource-bound-')),
+    'history byte eviction revokes discarded image Blob URLs');
+    chatStore._appendMessage({
+        id: chatStore.nextMessageId++,
+        type: 'image',
+        imageUrl: 'blob:pixel-bound-a',
+        timestamp: new Date(),
+    }, 1, 10 * 1024 * 1024);
+    chatStore._appendMessage({
+        id: chatStore.nextMessageId++,
+        type: 'image',
+        imageUrl: 'blob:pixel-bound-b',
+        timestamp: new Date(),
+    }, 1, 10 * 1024 * 1024);
+    assert(chatStore.messageHistoryPixels <= 16 * 1024 * 1024
+        && revokedBlobs.includes('blob:pixel-bound-a'),
+    'history evicts images by aggregate decoded-pixel budget');
+    const normalBitmapDecoder = global.createImageBitmap;
+    global.createImageBitmap = async () => ({
+        width: 9000,
+        height: 9000,
+        close() {},
+    });
+    let oversizedDimensionsRejected = false;
+    try {
+        await chatStore._validateImageBlob(
+            new Blob([new Uint8Array([1])], { type: 'image/png' }),
+        );
+    } catch (error) {
+        oversizedDimensionsRejected =
+            error.message.includes('dimensions exceed');
+    }
+    global.createImageBitmap = normalBitmapDecoder;
+    assert(oversizedDimensionsRejected,
+        'image decoder dimensions are capped before retaining a Blob URL');
 
     chatStore.mlsReady = true;
     chatStore._handleMlsEvent({

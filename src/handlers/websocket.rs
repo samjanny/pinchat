@@ -10,11 +10,11 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
 use sha2::{Digest, Sha256};
-use std::collections::{HashSet, VecDeque};
 use tokio::time::{Duration, Instant, interval};
 use uuid::Uuid;
 
 use crate::jwt::{WsResumeTokenClaims, sign_resume_token, verify_token};
+use crate::models::message::MessageHeader;
 use crate::models::{IncomingMessage, Message, RoomType};
 use crate::state::{AppState, ConnectionAdmission};
 
@@ -241,6 +241,28 @@ fn mls_envelope_replay_hash(
     );
     hash_replay_field(&mut hasher, key_package_ref.unwrap_or_default().as_bytes());
     hash_replay_field(&mut hasher, commit_ref.unwrap_or_default().as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+/// Bind the advisory relay replay identity to the complete one-to-one
+/// ciphertext envelope. Hashing only `payload` lets an attacker race the same
+/// ciphertext with a corrupted header, causing the later authentic header to
+/// be discarded before the client can verify it.
+fn one_to_one_envelope_replay_hash(
+    msg_type: &str,
+    payload: &str,
+    header: &MessageHeader,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"pinchat-double-ratchet-relay-envelope-v1");
+    hash_replay_field(&mut hasher, msg_type.as_bytes());
+    hash_replay_field(&mut hasher, payload.as_bytes());
+    hasher.update([header.v]);
+    hash_replay_field(&mut hasher, header.dh.as_bytes());
+    hasher.update(header.pn.to_be_bytes());
+    hasher.update(header.n.to_be_bytes());
+    hasher.update(header.rc.to_be_bytes());
+    hash_replay_field(&mut hasher, header.sig.as_bytes());
     hex::encode(hasher.finalize())
 }
 
@@ -571,10 +593,8 @@ async fn handle_socket(
             participant_count,
             control_seq: None,
         };
-        if let Ok(json) = serde_json::to_string(&join_msg)
-            && let Some(tx) = state.broadcast_channels.get(&room_id)
-        {
-            let _ = tx.send(json);
+        if let Ok(json) = serde_json::to_string(&join_msg) {
+            let _ = state.broadcast_room_message(&room_id, json);
         }
     }
 
@@ -668,7 +688,11 @@ async fn handle_socket(
     // broadcast_rx and therefore follow MlsSync without a sequence gap.
     if let Some(stream) = mls_control_stream {
         for json in stream.replay {
-            if sender.send(WsMessage::Text(json)).await.is_err() {
+            if sender
+                .send(WsMessage::Text(json.as_str().to_owned()))
+                .await
+                .is_err()
+            {
                 break;
             }
         }
@@ -681,7 +705,7 @@ async fn handle_socket(
 
     // Direct responses (currently Commit rate-limit rejections) share the
     // single socket writer with room broadcasts.
-    let (direct_tx, mut direct_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let (direct_tx, mut direct_rx) = tokio::sync::mpsc::channel::<String>(8);
 
     // Task that receives broadcast messages and forwards them to the client
     // Also sends heartbeat pings every 30 seconds to keep the connection alive,
@@ -703,7 +727,11 @@ async fn handle_socket(
                 result = broadcast_rx.recv() => {
                     match result {
                         Ok(msg) => {
-                            if sender.send(WsMessage::Text(msg)).await.is_err() {
+                            if sender
+                                .send(WsMessage::Text(msg.as_str().to_owned()))
+                                .await
+                                .is_err()
+                            {
                                 break;
                             }
                         }
@@ -959,30 +987,20 @@ async fn handle_socket(
                                             "ECDH message serialized, attempting broadcast..."
                                         );
 
-                                        // Broadcast to all participants in the room
-                                        if let Some(tx) =
-                                            state_clone.broadcast_channels.get(&room_id)
-                                        {
-                                            match tx.send(json) {
-                                                Ok(receiver_count) => {
-                                                    tracing::info!(
-                                                        "✅ ECDH public key broadcasted to {} receivers in room={}",
-                                                        receiver_count,
-                                                        room_id
-                                                    );
-                                                }
-                                                Err(e) => {
-                                                    tracing::error!(
-                                                        "❌ Failed to broadcast ECDH message: {}",
-                                                        e
-                                                    );
-                                                }
+                                        match state_clone.broadcast_room_message(&room_id, json) {
+                                            Ok(receiver_count) => {
+                                                tracing::info!(
+                                                    "✅ ECDH public key broadcasted to {} receivers in room={}",
+                                                    receiver_count,
+                                                    room_id
+                                                );
                                             }
-                                        } else {
-                                            tracing::error!(
-                                                "❌ Broadcast channel not found for room={}",
-                                                room_id
-                                            );
+                                            Err(e) => {
+                                                tracing::error!(
+                                                    "❌ Failed to broadcast ECDH message: {:?}",
+                                                    e
+                                                );
+                                            }
                                         }
                                     }
                                     Err(e) => {
@@ -1083,7 +1101,7 @@ async fn handle_socket(
                             let mut timestamps = state_clone
                                 .connection_message_timestamps
                                 .entry(connection_id)
-                                .or_insert_with(VecDeque::new);
+                                .or_default();
                             let rate_cutoff = now - chrono::Duration::seconds(rate_window_secs);
                             timestamps.retain(|&ts| ts > rate_cutoff);
                             if timestamps.len() >= max_messages {
@@ -1109,7 +1127,7 @@ async fn handle_socket(
                                 let mut commit_ts = state_clone
                                     .connection_commit_timestamps
                                     .entry(connection_id)
-                                    .or_insert_with(VecDeque::new);
+                                    .or_default();
                                 let commit_cutoff = now - chrono::Duration::seconds(commit_window);
                                 commit_ts.retain(|&ts| ts > commit_cutoff);
                                 if commit_ts.len() >= max_commits {
@@ -1126,11 +1144,53 @@ async fn handle_socket(
                                             .unwrap_or(60),
                                     };
                                     if let Ok(json) = serde_json::to_string(&rejection) {
-                                        let _ = recv_direct_tx.send(json);
+                                        let _ = recv_direct_tx.try_send(json);
                                     }
                                     continue;
                                 }
                                 commit_ts.push_back(now);
+                            } else if validated.public_kind == Some(PublicMessageKind::Proposal) {
+                                let max_proposals = state_clone.config.proposal_rate_limit;
+                                let proposal_window = state_clone.config.proposal_rate_window_secs;
+                                let mut proposal_ts = state_clone
+                                    .connection_proposal_timestamps
+                                    .entry(connection_id)
+                                    .or_default();
+                                let proposal_cutoff =
+                                    now - chrono::Duration::seconds(proposal_window);
+                                proposal_ts.retain(|&ts| ts > proposal_cutoff);
+                                if proposal_ts.len() >= max_proposals {
+                                    tracing::warn!(
+                                        "Connection {} exceeded MLS Proposal rate limit ({}/{}s), disconnecting",
+                                        connection_id,
+                                        max_proposals,
+                                        proposal_window
+                                    );
+                                    break;
+                                }
+                                proposal_ts.push_back(now);
+                            }
+
+                            let traffic_bytes = validated.payload_bytes.len().saturating_add(
+                                validated
+                                    .ratchet_tree_bytes
+                                    .as_ref()
+                                    .map(Vec::len)
+                                    .unwrap_or(0),
+                            );
+                            if !state_clone.admit_room_traffic(
+                                room_id,
+                                now,
+                                traffic_bytes,
+                                state_clone.config.msg_rate_window_secs,
+                                state_clone.config.room_msg_rate_limit,
+                                state_clone.config.room_byte_rate_limit,
+                            ) {
+                                tracing::warn!(
+                                    "Room {} exceeded aggregate traffic budget",
+                                    room_id
+                                );
+                                break;
                             }
 
                             // Record replay identity only after every quota
@@ -1138,31 +1198,23 @@ async fn handle_socket(
                             // must remain retryable after the window instead of
                             // poisoning the replay cache despite never having
                             // been broadcast.
-                            let mut seen_hashes = state_clone
-                                .seen_message_hashes
-                                .entry(room_id)
-                                .or_insert_with(HashSet::new);
+                            let mut seen_hashes =
+                                state_clone.seen_message_hashes.entry(room_id).or_default();
                             let room_ttl_minutes = state_clone
                                 .rooms
                                 .get(&room_id)
                                 .map(|r| r.ttl_minutes)
                                 .unwrap_or(60);
                             let cutoff = now - chrono::Duration::minutes(room_ttl_minutes as i64);
-                            seen_hashes.retain(|(_, ts)| *ts > cutoff);
-                            if seen_hashes.iter().any(|(h, _)| h == &payload_hash) {
+                            let max_entries = state_clone.config.replay_cache_max_per_room;
+                            if !seen_hashes.insert_if_new(
+                                payload_hash.clone(),
+                                now,
+                                cutoff,
+                                max_entries,
+                            ) {
                                 continue;
                             }
-                            let max_entries = state_clone.config.replay_cache_max_per_room;
-                            if seen_hashes.len() >= max_entries {
-                                let mut entries: Vec<_> = seen_hashes.iter().cloned().collect();
-                                entries.sort_by(|a, b| b.1.cmp(&a.1));
-                                entries.truncate(max_entries - 1);
-                                seen_hashes.clear();
-                                for entry in entries {
-                                    seen_hashes.insert(entry);
-                                }
-                            }
-                            seen_hashes.insert((payload_hash, now));
 
                             if wire_format == WIRE_PRIVATE_MESSAGE {
                                 let broadcast_msg = Message::Mls {
@@ -1174,10 +1226,28 @@ async fn handle_socket(
                                     control_seq: None,
                                     sender_id: connection_id,
                                 };
-                                if let Ok(json) = serde_json::to_string(&broadcast_msg)
-                                    && let Some(tx) = state_clone.broadcast_channels.get(&room_id)
-                                {
-                                    let _ = tx.send(json);
+                                match serde_json::to_string(&broadcast_msg) {
+                                    Ok(json) => {
+                                        if state_clone
+                                            .broadcast_room_message(&room_id, json)
+                                            .is_err()
+                                        {
+                                            seen_hashes.remove(&payload_hash);
+                                            tracing::warn!(
+                                                "Room {} broadcast byte budget exhausted",
+                                                room_id
+                                            );
+                                            break;
+                                        }
+                                    }
+                                    Err(error) => {
+                                        seen_hashes.remove(&payload_hash);
+                                        tracing::error!(
+                                            "Failed to serialize MLS PrivateMessage: {}",
+                                            error
+                                        );
+                                        break;
+                                    }
                                 }
                             } else {
                                 let append_result = state_clone.append_and_broadcast_mls_control(
@@ -1196,6 +1266,7 @@ async fn handle_socket(
                                     },
                                 );
                                 if let Err(error) = append_result {
+                                    seen_hashes.remove(&payload_hash);
                                     tracing::error!(
                                         "Failed to append MLS control envelope in room {}: {:?}",
                                         room_id,
@@ -1252,73 +1323,24 @@ async fn handle_socket(
                                     }
                                 };
 
-                                // ANTI-REPLAY: Calculate SHA-256 hash of encrypted payload
-                                let payload_hash = {
-                                    let mut hasher = Sha256::new();
-                                    hasher.update(payload.as_bytes());
-                                    format!("{:x}", hasher.finalize())
-                                };
+                                let payload_hash = one_to_one_envelope_replay_hash(
+                                    &incoming.msg_type,
+                                    &payload,
+                                    &hdr,
+                                );
 
-                                // Get or create hash set for this room
-                                let mut seen_hashes = state_clone
-                                    .seen_message_hashes
-                                    .entry(room_id)
-                                    .or_insert_with(HashSet::new);
-
-                                // Cleanup old hashes (beyond room TTL)
-                                let room_ttl_minutes = state_clone
-                                    .rooms
-                                    .get(&room_id)
-                                    .map(|r| r.ttl_minutes)
-                                    .unwrap_or(60);
-                                let cutoff =
-                                    Utc::now() - chrono::Duration::minutes(room_ttl_minutes as i64);
-                                seen_hashes.retain(|(_, ts)| *ts > cutoff);
-
-                                // Check for duplicate (replay attack)
                                 let now = Utc::now();
-                                if seen_hashes.iter().any(|(hash, _)| hash == &payload_hash) {
-                                    // REPLAY DETECTED - Ignore silently (don't broadcast)
-                                    #[cfg(debug_assertions)]
-                                    tracing::debug!(
-                                        "Replay attack detected (duplicate payload hash)"
-                                    );
-                                    continue;
-                                }
-
-                                // MEMORY CAP: Evict oldest entries if cache exceeds limit
-                                // Prevents memory exhaustion from malicious clients
-                                let max_entries = state_clone.config.replay_cache_max_per_room;
-                                if seen_hashes.len() >= max_entries {
-                                    // Rebuild set keeping only the newest entries
-                                    let mut entries: Vec<_> = seen_hashes.iter().cloned().collect();
-                                    entries.sort_by(|a, b| b.1.cmp(&a.1)); // Sort by timestamp descending (newest first)
-                                    entries.truncate(max_entries - 1); // Keep max_entries - 1 to make room for new one
-                                    seen_hashes.clear();
-                                    for entry in entries {
-                                        seen_hashes.insert(entry);
-                                    }
-                                }
-
-                                // Store hash with timestamp
-                                seen_hashes.insert((payload_hash, now));
-
-                                // RATE LIMITING: Enforce per-connection message rate limit
-                                // Prevents bandwidth exhaustion and client-side decryption DoS
+                                // RATE LIMITING: enforce per-connection first,
+                                // then aggregate room count/bytes. Rejected
+                                // traffic must not poison the replay cache.
                                 let max_messages = state_clone.config.msg_rate_limit;
                                 let rate_window_secs = state_clone.config.msg_rate_window_secs;
-
-                                // Get or create timestamp queue for this connection
                                 let mut timestamps = state_clone
                                     .connection_message_timestamps
                                     .entry(connection_id)
-                                    .or_insert_with(VecDeque::new);
-
-                                // Remove old timestamps outside the rate window
+                                    .or_default();
                                 let rate_cutoff = now - chrono::Duration::seconds(rate_window_secs);
                                 timestamps.retain(|&ts| ts > rate_cutoff);
-
-                                // Check if rate limit exceeded
                                 if timestamps.len() >= max_messages {
                                     tracing::warn!(
                                         "Connection {} exceeded rate limit ({}/{}s), disconnecting",
@@ -1326,14 +1348,48 @@ async fn handle_socket(
                                         timestamps.len(),
                                         rate_window_secs
                                     );
+                                    break;
+                                }
+                                timestamps.push_back(now);
+                                drop(timestamps);
 
-                                    // Disconnect immediately (break recv loop)
-                                    // Client will see WebSocket close event
+                                if !state_clone.admit_room_traffic(
+                                    room_id,
+                                    now,
+                                    payload.len(),
+                                    rate_window_secs,
+                                    state_clone.config.room_msg_rate_limit,
+                                    state_clone.config.room_byte_rate_limit,
+                                ) {
+                                    tracing::warn!(
+                                        "Room {} exceeded aggregate traffic budget",
+                                        room_id
+                                    );
                                     break;
                                 }
 
-                                // Record this message timestamp
-                                timestamps.push_back(now);
+                                let room_ttl_minutes = state_clone
+                                    .rooms
+                                    .get(&room_id)
+                                    .map(|r| r.ttl_minutes)
+                                    .unwrap_or(60);
+                                let cutoff =
+                                    now - chrono::Duration::minutes(room_ttl_minutes as i64);
+                                let mut seen_hashes =
+                                    state_clone.seen_message_hashes.entry(room_id).or_default();
+                                if !seen_hashes.insert_if_new(
+                                    payload_hash.clone(),
+                                    now,
+                                    cutoff,
+                                    state_clone.config.replay_cache_max_per_room,
+                                ) {
+                                    // REPLAY DETECTED - Ignore silently (don't broadcast)
+                                    #[cfg(debug_assertions)]
+                                    tracing::debug!(
+                                        "Replay attack detected (duplicate payload hash)"
+                                    );
+                                    continue;
+                                }
 
                                 // Create the message to broadcast based on type
                                 // Signal Protocol: Include header for DH ratchet on receive
@@ -1351,10 +1407,27 @@ async fn handle_socket(
                                     }
                                 };
 
-                                if let Ok(json) = serde_json::to_string(&broadcast_msg) {
-                                    // Broadcast to all participants in the room
-                                    if let Some(tx) = state_clone.broadcast_channels.get(&room_id) {
-                                        let _ = tx.send(json);
+                                match serde_json::to_string(&broadcast_msg) {
+                                    Ok(json) => {
+                                        if state_clone
+                                            .broadcast_room_message(&room_id, json)
+                                            .is_err()
+                                        {
+                                            seen_hashes.remove(&payload_hash);
+                                            tracing::warn!(
+                                                "Room {} broadcast byte budget exhausted",
+                                                room_id
+                                            );
+                                            break;
+                                        }
+                                    }
+                                    Err(error) => {
+                                        seen_hashes.remove(&payload_hash);
+                                        tracing::error!(
+                                            "Failed to serialize relay message: {}",
+                                            error
+                                        );
+                                        break;
                                     }
                                 }
 
@@ -1445,10 +1518,8 @@ async fn handle_socket(
                         participant_count,
                         control_seq: None,
                     };
-                    if let Ok(json) = serde_json::to_string(&leave_msg)
-                        && let Some(tx) = grace_state.broadcast_channels.get(&detached_room_id)
-                    {
-                        let _ = tx.send(json);
+                    if let Ok(json) = serde_json::to_string(&leave_msg) {
+                        let _ = grace_state.broadcast_room_message(&detached_room_id, json);
                     }
                 }
                 None => {}
@@ -1491,6 +1562,7 @@ mod tests {
     use crate::jwt::{WsTokenClaims, sign_token};
     use crate::models::{Room, RoomConfig, RoomType};
     use axum::{Router, routing::get};
+    use std::collections::VecDeque;
     use std::net::SocketAddr;
     use uuid::Uuid;
 
@@ -1699,6 +1771,27 @@ mod tests {
             "tree/correlation metadata participates in anti-replay identity"
         );
 
+        let header = MessageHeader {
+            v: crate::models::PINCHAT_PROTOCOL_VERSION,
+            dh: "dh".into(),
+            pn: 1,
+            n: 2,
+            rc: 3,
+            sig: "sig".into(),
+        };
+        let mut altered_header = header.clone();
+        altered_header.sig = "altered".into();
+        assert_ne!(
+            one_to_one_envelope_replay_hash("message", "ciphertext", &header),
+            one_to_one_envelope_replay_hash("message", "ciphertext", &altered_header),
+            "a corrupted header cannot poison the authentic ciphertext replay identity"
+        );
+        assert_ne!(
+            one_to_one_envelope_replay_hash("message", "ciphertext", &header),
+            one_to_one_envelope_replay_hash("image", "ciphertext", &header),
+            "one-to-one message types are domain-separated in the replay cache"
+        );
+
         assert!(room_accepts_client_message(RoomType::Group, "mls"));
         assert!(room_accepts_client_message(RoomType::Group, "mlsack"));
         assert!(!room_accepts_client_message(RoomType::Group, "message"));
@@ -1727,8 +1820,12 @@ mod tests {
             room_token_period_secs: 600,
             msg_rate_limit: 30,
             msg_rate_window_secs: 1,
+            room_msg_rate_limit: 120,
+            room_byte_rate_limit: 8 * 1024 * 1024,
             commit_rate_limit: 12,
             commit_rate_window_secs: 60,
+            proposal_rate_limit: 8,
+            proposal_rate_window_secs: 60,
             frame_rate_limit: 120,
             protocol_error_limit: 10,
             pow_min_difficulty: 12,
@@ -2115,12 +2212,11 @@ mod tests {
             })
             .expect("append ordered join");
         assert_eq!(join_seq, 1);
-        let live_join: serde_json::Value = serde_json::from_str(
-            &bob_rx
-                .try_recv()
-                .expect("fresh participant receives live join"),
-        )
-        .expect("live join JSON");
+        let live_join_payload = bob_rx
+            .try_recv()
+            .expect("fresh participant receives live join");
+        let live_join: serde_json::Value =
+            serde_json::from_str(live_join_payload.as_str()).expect("live join JSON");
         assert_eq!(live_join["type"], "userjoined");
         assert_eq!(live_join["control_seq"], 1);
         assert!(state.acknowledge_mls_control(&room_id, alice, 1));
@@ -2170,14 +2266,14 @@ mod tests {
         assert_eq!(replay.through_seq, 3);
         assert_eq!(replay.replay.len(), 3);
         let replayed_join: serde_json::Value =
-            serde_json::from_str(&replay.replay[0]).expect("replayed join JSON");
+            serde_json::from_str(replay.replay[0].as_ref()).expect("replayed join JSON");
         assert_eq!(replayed_join["type"], "userjoined");
         assert_eq!(replayed_join["control_seq"], 1);
         let replayed_mls: serde_json::Value =
-            serde_json::from_str(&replay.replay[1]).expect("replayed MLS JSON");
+            serde_json::from_str(replay.replay[1].as_ref()).expect("replayed MLS JSON");
         assert_eq!(replayed_mls["control_seq"], 2);
         let replayed_leave: serde_json::Value =
-            serde_json::from_str(&replay.replay[2]).expect("replayed lifecycle JSON");
+            serde_json::from_str(replay.replay[2].as_ref()).expect("replayed lifecycle JSON");
         assert_eq!(replayed_leave["type"], "userleft");
         assert_eq!(replayed_leave["user_id"], departed.to_string());
         assert_eq!(replayed_leave["control_seq"], 3);
@@ -2190,6 +2286,79 @@ mod tests {
         assert!(
             state.validate_mls_control_cursor(&room_id, 0).is_err(),
             "a cursor older than the fully-acknowledged retained window fails closed"
+        );
+    }
+
+    #[test]
+    fn room_traffic_and_broadcast_memory_are_byte_bounded() {
+        let state = AppState::new(1000, test_config());
+        let room = Room::new(RoomConfig {
+            room_type: RoomType::Group,
+            ttl_minutes: 60,
+            max_participants: 4,
+        });
+        let room_id = room.id;
+        state.try_create_room(room).unwrap();
+
+        let now = Utc::now();
+        assert!(state.admit_room_traffic(room_id, now, 512, 1, 2, 1024));
+        assert!(state.admit_room_traffic(room_id, now, 512, 1, 2, 1024));
+        assert!(
+            !state.admit_room_traffic(room_id, now, 1, 1, 2, 1024),
+            "aggregate count/byte budget rejects the next room message"
+        );
+
+        let _receiver = state
+            .broadcast_channels
+            .get(&room_id)
+            .expect("room broadcast sender")
+            .subscribe();
+        for _ in 0..4 {
+            assert!(
+                state
+                    .broadcast_room_message(&room_id, "x".repeat(1024 * 1024))
+                    .is_ok()
+            );
+        }
+        assert!(
+            state
+                .broadcast_room_message(&room_id, "y".repeat(1024 * 1024))
+                .is_err(),
+            "per-room retained broadcast bytes are capped independently of count"
+        );
+        state.remove_room(&room_id);
+    }
+
+    #[test]
+    fn mls_control_log_never_evicts_unacknowledged_history_to_make_room() {
+        let state = AppState::new(1000, test_config());
+        let room = Room::new(RoomConfig {
+            room_type: RoomType::Group,
+            ttl_minutes: 60,
+            max_participants: 4,
+        });
+        let room_id = room.id;
+        state.try_create_room(room).unwrap();
+
+        for expected in 1..=256u64 {
+            let seq = state
+                .append_and_broadcast_mls_control(&room_id, |seq| {
+                    Some(format!(r#"{{"type":"test","control_seq":{seq}}}"#))
+                })
+                .expect("entry within hard control-log count");
+            assert_eq!(seq, expected);
+        }
+        assert!(
+            state
+                .append_and_broadcast_mls_control(&room_id, |seq| {
+                    Some(format!(r#"{{"type":"test","control_seq":{seq}}}"#))
+                })
+                .is_err(),
+            "the 257th unacknowledged control is rejected, not silently evicted"
+        );
+        assert!(
+            state.validate_mls_control_cursor(&room_id, 0).is_ok(),
+            "the oldest unacknowledged cursor remains replayable"
         );
     }
 }

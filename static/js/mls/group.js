@@ -103,6 +103,12 @@
     const CIPHERSUITE = 0x0002;
     const CREATOR_LEAF_INDEX = 0;
     const BOOTSTRAP_PIN_BYTES = 32;
+    // PinChat's creator-centric group profile and relay admission layer are
+    // both intentionally capped at 20 members. Enforce the same bound inside
+    // the cryptographic state machine so a modified creator cannot hand an
+    // honest member an arbitrarily large tree and force unbounded TreeKEM /
+    // SecretTree work.
+    const MAX_GROUP_LEAVES = 20;
     const MAX_KEY_PACKAGE_LIFETIME_SECONDS = 24n * 60n * 60n;
 
     function getCrypto() {
@@ -233,9 +239,15 @@
         }
         const encryptionSecret = epochSecrets.encryptionSecret;
         let leafRatchetRoots;
+        const activeLeafIndices = new Set();
+        for (let leafIndex = 0; leafIndex < nLeaves; leafIndex += 1) {
+            if (RatchetTree.leafFor(ratchetTree, leafIndex)) {
+                activeLeafIndices.add(leafIndex);
+            }
+        }
         try {
             leafRatchetRoots = await SecretTree.consumeEncryptionSecret(
-                encryptionSecret, nLeaves,
+                encryptionSecret, nLeaves, activeLeafIndices,
             );
         } catch (err) {
             // A partially-derived schedule must never survive a failed
@@ -248,18 +260,18 @@
         try {
             for (let leafIndex = 0; leafIndex < nLeaves; leafIndex += 1) {
                 const roots = leafRatchetRoots[leafIndex];
+                if (!RatchetTree.leafFor(ratchetTree, leafIndex)) {
+                    if (roots) {
+                        throw new Error(
+                            `group: SecretTree derived roots for blank leaf ${leafIndex}`,
+                        );
+                    }
+                    continue;
+                }
                 if (!roots) {
                     throw new Error(
                         `group: SecretTree did not derive roots for leaf ${leafIndex}`,
                     );
-                }
-                if (!RatchetTree.leafFor(ratchetTree, leafIndex)) {
-                    // Blank ratchet-tree leaves cannot authenticate epoch
-                    // traffic, so retaining their symmetric roots only
-                    // broadens compromise impact.
-                    roots.application.fill(0);
-                    roots.handshake.fill(0);
-                    continue;
                 }
                 chainStates.set(`${leafIndex}:application`, {
                     nextGeneration: 0,
@@ -318,6 +330,12 @@
 
     class Group {
         constructor(state) {
+            if (!state || !Number.isInteger(state.nLeaves)
+                || state.nLeaves < 1 || state.nLeaves > MAX_GROUP_LEAVES) {
+                throw new Error(
+                    `group: nLeaves must be in [1,${MAX_GROUP_LEAVES}]`,
+                );
+            }
             Object.assign(this, state);
             // Replay protection: per-epoch set of (leafIndex, generation)
             // pairs we have already accepted. Reset on every epoch
@@ -1146,6 +1164,52 @@
             verifyTreeKeyUniqueness(tree, operation);
         };
 
+    function nextAddPosition(tree, nLeaves, operation) {
+        for (let leafIndex = 0; leafIndex < nLeaves; leafIndex += 1) {
+            if (!RatchetTree.leafFor(tree, leafIndex)) {
+                return { leafIndex, nLeaves };
+            }
+        }
+        if (nLeaves >= MAX_GROUP_LEAVES) {
+            throw new Error(
+                `${operation}: group is at the ${MAX_GROUP_LEAVES}-leaf limit`,
+            );
+        }
+        return { leafIndex: nLeaves, nLeaves: nLeaves + 1 };
+    }
+
+    /**
+     * Read-only admission gate used by MLSSession before it durably queues a
+     * KeyPackage behind an in-flight PendingCommit. This validates every
+     * deterministic property which could otherwise make the later Add fail:
+     * KeyPackage/LeafNode bindings, the structural leaf cap, and collisions
+     * with the current tree. The actual Commit still repeats these checks.
+     */
+    Group.prototype.validateKeyPackageForAdd =
+        async function validateKeyPackageForAdd(keyPackageBytes) {
+            const kp = KeyPackage.parseKeyPackage(keyPackageBytes);
+            await verifyKeyPackageBindings(kp, 'validateKeyPackageForAdd');
+            const position = nextAddPosition(
+                this.ratchetTree, this.nLeaves, 'validateKeyPackageForAdd',
+            );
+            const candidateTree = Nodes.padRatchetTree(
+                this.ratchetTree.slice(),
+                TreeMath.nodeWidth(position.nLeaves),
+            );
+            candidateTree[TreeMath.leafToNode(position.leafIndex)] = {
+                nodeType: Nodes.NodeType.LEAF,
+                leaf: kp.leafNode,
+            };
+            verifyTreeKeyUniqueness(
+                candidateTree, 'validateKeyPackageForAdd',
+            );
+            return {
+                keyPackage: kp,
+                addedLeafIndex: position.leafIndex,
+                nLeaves: position.nLeaves,
+            };
+        };
+
     /**
      * Validate the complete proposal list against the pre-Commit tree and
      * return the RFC 9420 §12.3 application phases.  The proposal vector's
@@ -1256,8 +1320,15 @@
         await verifyKeyPackageBindings(kp, 'commitAddMember');
 
         // ---- 1. Compute new tree shape, insert new leaf ----
-        const newLeafIndex = this.nLeaves;
-        const newNLeaves = this.nLeaves + 1;
+        // RFC tree slots are stable, but a blank leaf left by Remove is
+        // immediately reusable. Reusing the leftmost blank prevents harmless
+        // membership churn from growing the logical tree toward the profile
+        // cap while preserving every still-live leaf index.
+        const addPosition = nextAddPosition(
+            this.ratchetTree, this.nLeaves, 'commitAddMember',
+        );
+        const newLeafIndex = addPosition.leafIndex;
+        const newNLeaves = addPosition.nLeaves;
         const newWidth = TreeMath.nodeWidth(newNLeaves);
         const newTree = Nodes.padRatchetTree(this.ratchetTree, newWidth);
         newTree[TreeMath.leafToNode(newLeafIndex)] = {
@@ -1550,7 +1621,7 @@
         this.consumedByLeaf = new Map();
         wipeTreeKemSecrets(leafSecret, leafNodePair, chain);
 
-        return { commitMessage, welcomeMessage };
+        return { commitMessage, welcomeMessage, addedLeafIndex: newLeafIndex };
     };
 
     /**
@@ -2306,6 +2377,8 @@
      * path_secret chain, and advances the local epoch state.
      */
     Group.prototype.processCommit = async function processCommit(commitMessageBytes, opts = {}) {
+        let authenticatedCreatorCommit = false;
+        try {
         // pendingSelfUpdate: the { publicKeyBytes, privateKey, ... } keypair
         // we generated for an Update proposal that may be folded into this
         // Commit. If the Commit installs our new leaf, we decrypt the
@@ -2375,6 +2448,13 @@
                 `processCommit: only creator leaf 0 may commit (got leaf ${senderLeafIndex})`,
             );
         }
+        // Everything below is controlled by a creator whose FramedContent
+        // signature and membership_tag have both been verified for the
+        // current group/epoch. Surface that distinction to the orchestration
+        // layer: a deterministic unauthenticated forgery may be dropped, but
+        // failure to apply an authenticated creator Commit means this member
+        // can no longer safely advance its ordered control cursor.
+        authenticatedCreatorCommit = true;
 
         const commit = content.parsed;
         const resolvedProposals = await this._resolveCommitProposalList(
@@ -2439,8 +2519,11 @@
             await verifyKeyPackageBindings(
                 entry.proposal.keyPackage, 'processCommit',
             );
-            const addLeafIndex = newNLeaves;
-            newNLeaves += 1;
+            const addPosition = nextAddPosition(
+                newTree, newNLeaves, 'processCommit',
+            );
+            const addLeafIndex = addPosition.leafIndex;
+            newNLeaves = addPosition.nLeaves;
             const newWidth = TreeMath.nodeWidth(newNLeaves);
             newTree = Nodes.padRatchetTree(newTree, newWidth);
             newTree[TreeMath.leafToNode(addLeafIndex)] = {
@@ -2797,6 +2880,13 @@
                 (entry) => Uint8Array.from(entry.reference),
             ),
         };
+        } catch (err) {
+            if (authenticatedCreatorCommit && err
+                && (typeof err === 'object' || typeof err === 'function')) {
+                err.authenticatedMlsControl = true;
+            }
+            throw err;
+        }
     };
 
     /**
@@ -2955,7 +3045,18 @@
         // node_width(nLeaves) entries (no trailing-blank truncation), so
         // the wire length tells us nLeaves directly.
         const parsedTree = Nodes.parseRatchetTree(ratchetTreeBytes);
+        if (parsedTree.length === 0 || (parsedTree.length & 1) === 0
+            || parsedTree.length > TreeMath.nodeWidth(MAX_GROUP_LEAVES)) {
+            throw new Error(
+                `group.join: ratchet_tree exceeds the ${MAX_GROUP_LEAVES}-leaf profile limit`,
+            );
+        }
         const nLeaves = TreeMath.numLeaves(parsedTree.length);
+        if (nLeaves > MAX_GROUP_LEAVES) {
+            throw new Error(
+                `group.join: ratchet_tree has ${nLeaves} leaves; maximum is ${MAX_GROUP_LEAVES}`,
+            );
+        }
         const tree = Nodes.padRatchetTree(parsedTree, TreeMath.nodeWidth(nLeaves));
 
         // Verify GroupInfo signature with the signer's signature_key.
@@ -4023,6 +4124,7 @@
         Group,
         PROTOCOL_VERSION,
         CIPHERSUITE,
+        MAX_GROUP_LEAVES,
         // Exposed for tests / future add-member path
         buildSelfLeaf,
         signLeafNodeForKeyPackage,

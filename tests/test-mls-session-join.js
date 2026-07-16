@@ -232,6 +232,27 @@ function parseCommitEnvelope(envelope) {
     );
 }
 
+function wrapPublicEnvelope(envelope) {
+    return global.MLS.MLSMessage.serializeMLSMessage(
+        WireFormat.MLS_PUBLIC_MESSAGE,
+        global.MLS.Codec.base64UrlToBytes(envelope.payload),
+    );
+}
+
+async function mutatePreWelcomeCandidate(envelope, mask) {
+    const pm = parseCommitEnvelope(envelope);
+    pm.auth.signature = Uint8Array.from(pm.auth.signature);
+    pm.auth.signature[0] ^= mask;
+    const body = global.MLS.PublicMessage.publicMessageBytes(pm);
+    return {
+        ...envelope,
+        payload: global.MLS.Codec.bytesToBase64Url(body),
+        commit_ref: global.MLS.Codec.bytesToBase64Url(
+            await global.MLS.Labeled.sha256(body),
+        ),
+    };
+}
+
 async function rewriteCommitEnvelope(session, envelope, rewriteCommit) {
     const pm = parseCommitEnvelope(envelope);
     const rewrittenCommit = rewriteCommit(pm.content.parsed);
@@ -293,7 +314,10 @@ async function completeExchangeJoin(exchange, senderId = 'creator-test') {
 }
 
 async function createExchange({
-    acceptCommit = true, creatorSend = null, pskSecret = null,
+    acceptCommit = true,
+    creatorSend = null,
+    pskSecret = null,
+    expectKeyPackageError = false,
 } = {}) {
     const creatorOut = [];
     const joinerOut = [];
@@ -324,7 +348,16 @@ async function createExchange({
     const keyPackage = joinerOut.find(
         (envelope) => envelope.wire_format === WireFormat.MLS_KEY_PACKAGE,
     );
-    await creator.onRelayEnvelope({ ...keyPackage, sender_id: 'joiner-1' });
+    let keyPackageError = null;
+    try {
+        await creator.onRelayEnvelope({
+            ...keyPackage,
+            sender_id: 'joiner-1',
+        });
+    } catch (err) {
+        keyPackageError = err;
+        if (!expectKeyPackageError) throw err;
+    }
 
     const commit = creatorOut.find(
         (envelope) => envelope.wire_format === WireFormat.MLS_PUBLIC_MESSAGE,
@@ -341,6 +374,7 @@ async function createExchange({
         creatorEvents,
         joinerEvents,
         beforeAdd,
+        keyPackageError,
         commit,
         welcome: creatorOut.find(
             (envelope) => envelope.wire_format === WireFormat.MLS_WELCOME,
@@ -409,6 +443,7 @@ async function main() {
     let rejectedCandidateSecretRefs = [];
     const sendFailure = await createExchange({
         acceptCommit: false,
+        expectKeyPackageError: true,
         creatorSend: (envelope, creator) => {
             if (envelope.wire_format !== WireFormat.MLS_PUBLIC_MESSAGE) return true;
             rejectedCandidate = creator._pendingCommit.candidateGroup;
@@ -446,6 +481,49 @@ async function main() {
     );
     assert(Boolean(sendFailureError),
         'transport-rejected Commit surfaces a fail-closed error');
+    assert(sendFailure.keyPackageError?.mlsRetryControl === true,
+        'transport-rejected Add leaves its KeyPackage unacknowledged for replay');
+
+    // Once the KeyPackage has passed deterministic admission validation, a
+    // transient local candidate-construction failure must not turn into an
+    // ACK-compatible success. Reconnect/replay can then retry the same
+    // ordered KeyPackage from the unchanged relay cursor.
+    const retryCreatorOut = [];
+    const retryJoinerOut = [];
+    const retryCreator = new MLSSession({
+        role: 'creator',
+        send: (envelope) => retryCreatorOut.push(envelope),
+    });
+    await retryCreator.start();
+    const retryPins = retryCreator.bootstrapPins;
+    const retryJoiner = new MLSSession({
+        role: 'joiner',
+        send: (envelope) => retryJoinerOut.push(envelope),
+        expectedGroupId: retryPins.groupId,
+        expectedCreatorKeyHash: retryPins.creatorKeyHash,
+    });
+    await retryJoiner.start();
+    const retryKeyPackage = retryJoinerOut.find(
+        (envelope) => envelope.wire_format === WireFormat.MLS_KEY_PACKAGE,
+    );
+    const originalKeyPackageHandler =
+        retryCreator._handleIncomingKeyPackage.bind(retryCreator);
+    retryCreator._handleIncomingKeyPackage = async () => false;
+    let retryControlError = null;
+    try {
+        await retryCreator.onRelayEnvelope({
+            ...retryKeyPackage,
+            sender_id: 'joiner-retry',
+        });
+    } catch (err) {
+        retryControlError = err;
+    }
+    retryCreator._handleIncomingKeyPackage = originalKeyPackageHandler;
+    assert(retryControlError?.mlsRetryControl === true
+        && retryCreator.group.epoch === 0n
+        && retryCreator._pendingCommit === null
+        && retryCreatorOut.length === 0,
+    'validated KeyPackage staging failure requires replay without state advance');
 
     // A Commit can pass WebSocket.send yet be refused by a tighter relay
     // quota. The direct rejection must destroy the same isolated candidate;
@@ -585,6 +663,64 @@ async function main() {
     );
     assert(!retryRemoval.creator._leafBySenderId.has('joiner-1'),
         'retried lifecycle Remove applies after its acceptance echo');
+
+    const poisonExchange = await createExchange({ acceptCommit: false });
+    const poisonA = await mutatePreWelcomeCandidate(
+        poisonExchange.commit, 0x01,
+    );
+    const poisonB = await mutatePreWelcomeCandidate(
+        poisonExchange.commit, 0x02,
+    );
+    await poisonExchange.joiner.onRelayEnvelope({
+        ...poisonA, sender_id: 'attacker-route',
+    });
+    await poisonExchange.joiner.onRelayEnvelope({
+        ...poisonB, sender_id: 'attacker-route',
+    });
+    assert(poisonExchange.joiner._pendingWelcomeCommits.size === 1
+        && poisonExchange.joiner._pendingWelcomeCommitBySender
+            .get('attacker-route') === poisonB.commit_ref,
+    'one relay sender can occupy only one pre-Welcome candidate slot');
+    await poisonExchange.joiner.onRelayEnvelope({
+        ...poisonExchange.commit, sender_id: 'creator-route',
+    });
+    assert(poisonExchange.joiner._pendingWelcomeCommits.size === 2
+        && poisonExchange.joiner._pendingWelcomeCommits
+            .has(poisonExchange.commit.commit_ref),
+    'attacker candidate replacement cannot starve the creator candidate');
+
+    const proposalQuotaExchange = await createExchange();
+    await completeExchangeJoin(proposalQuotaExchange, 'creator-quota');
+    const quotaProposals = [];
+    const quotaReferenceKeys = [];
+    for (let index = 0; index < 3; index += 1) {
+        const before = proposalQuotaExchange.joinerOut.length;
+        await proposalQuotaExchange.joiner.proposeUpdate();
+        const proposal = proposalQuotaExchange.joinerOut
+            .slice(before)
+            .find((envelope) =>
+                envelope.wire_format === WireFormat.MLS_PUBLIC_MESSAGE);
+        quotaProposals.push(proposal);
+        quotaReferenceKeys.push(
+            proposalQuotaExchange.joiner._pendingSelfUpdate.referenceKey,
+        );
+        await proposalQuotaExchange.creator.onRelayEnvelope({
+            ...proposal,
+            sender_id: 'joiner-1',
+        });
+    }
+    assert(proposalQuotaExchange.creator._proposalStore.size === 2
+        && proposalQuotaExchange.joiner._proposalStore.size === 2
+        && proposalQuotaExchange.creator._proposalRefsBySender
+            .get(1).length === 2,
+    'one member retains at most two current-epoch ProposalRefs');
+    assert(!proposalQuotaExchange.creator._proposalStore
+        .has(quotaReferenceKeys[0])
+        && proposalQuotaExchange.creator._proposalStore
+            .has(quotaReferenceKeys[1])
+        && proposalQuotaExchange.creator._proposalStore
+            .has(quotaReferenceKeys[2]),
+    'per-sender quota evicts only the oldest ProposalRef deterministically');
 
     const unrelatedRef = global.MLS.Codec.bytesToBase64Url(
         new Uint8Array(32).fill(0x5a),
@@ -1008,16 +1144,17 @@ async function main() {
         }],
     );
     const joinerBeforeUnknownReference = captureLiveGroup(exchange.joiner);
-    const unknownReferenceEventsBefore = exchange.joinerEvents.length;
-    await exchange.joiner.onRelayEnvelope({
-        ...staleReferencedCommit,
-        sender_id: 'creator-1',
-    });
-    const unknownReferenceError = exchange.joinerEvents
-        .slice(unknownReferenceEventsBefore)
-        .find((event) => event.kind === 'error');
+    let unknownReferenceError = null;
+    try {
+        await exchange.joiner.group.processCommit(
+            wrapPublicEnvelope(staleReferencedCommit),
+            { proposalStore: exchange.joiner._proposalStore },
+        );
+    } catch (err) {
+        unknownReferenceError = err;
+    }
     assert(Boolean(unknownReferenceError)
-        && unknownReferenceError.reason.includes('unknown ProposalRef'),
+        && unknownReferenceError.message.includes('unknown ProposalRef'),
     'consumed ProposalRef is one-shot and rejected as unknown');
     assert(liveGroupMatches(exchange.joiner, joinerBeforeUnknownReference)
         && exchange.joiner._proposalStore.size === 0,
@@ -1030,18 +1167,19 @@ async function main() {
         authoredReferenceKey, authoredProposalEntry,
     );
     const joinerBeforeStaleReference = captureLiveGroup(exchange.joiner);
-    const staleReferenceEventsBefore = exchange.joinerEvents.length;
-    await exchange.joiner.onRelayEnvelope({
-        ...staleReferencedCommit,
-        sender_id: 'creator-1',
-    });
-    const staleReferenceError = exchange.joinerEvents
-        .slice(staleReferenceEventsBefore)
-        .find((event) => event.kind === 'error');
+    let staleReferenceError = null;
+    try {
+        await exchange.joiner.group.processCommit(
+            wrapPublicEnvelope(staleReferencedCommit),
+            { proposalStore: exchange.joiner._proposalStore },
+        );
+    } catch (err) {
+        staleReferenceError = err;
+    }
     assert(Boolean(staleReferenceError)
-        && staleReferenceError.reason.includes('wrong epoch'),
+        && staleReferenceError.message.includes('wrong epoch'),
     'fresh creator-signed Commit cannot replay an old authenticated ProposalRef',
-    staleReferenceError ? staleReferenceError.reason : 'no error event');
+    staleReferenceError ? staleReferenceError.message : 'no error');
     assert(liveGroupMatches(exchange.joiner, joinerBeforeStaleReference)
         && exchange.joiner._proposalStore.get(authoredReferenceKey)
             === authoredProposalEntry,
@@ -1059,21 +1197,61 @@ async function main() {
         }],
     );
     const joinerBeforeInlineUpdate = captureLiveGroup(exchange.joiner);
-    const inlineUpdateEventsBefore = exchange.joinerEvents.length;
-    await exchange.joiner.onRelayEnvelope({
-        ...inlineUpdateCommit,
-        sender_id: 'creator-1',
-    });
-    const inlineUpdateError = exchange.joinerEvents
-        .slice(inlineUpdateEventsBefore)
-        .find((event) => event.kind === 'error');
+    let inlineUpdateError = null;
+    try {
+        await exchange.joiner.group.processCommit(
+            wrapPublicEnvelope(inlineUpdateCommit),
+            { proposalStore: exchange.joiner._proposalStore },
+        );
+    } catch (err) {
+        inlineUpdateError = err;
+    }
     assert(Boolean(inlineUpdateError)
-        && inlineUpdateError.reason.includes('inline Update proposals are not permitted'),
+        && inlineUpdateError.message.includes('inline Update proposals are not permitted'),
     'creator-signed inline Update targeting another member is rejected');
     assert(liveGroupMatches(exchange.joiner, joinerBeforeInlineUpdate)
         && exchange.joiner._proposalStore.get(authoredReferenceKey)
             === authoredProposalEntry,
     'rejected inline Update leaves MLS and proposal-store state unchanged');
+
+    // At the orchestrator boundary, the same class of failure has stronger
+    // semantics: once creator signature + membership_tag authenticate a
+    // sequenced Commit, inability to apply it means the member cannot ACK and
+    // continue in the old epoch. The session becomes terminally desynchronised
+    // and drops all cryptographic capabilities.
+    const fatalExchange = await createExchange();
+    await completeExchangeJoin(fatalExchange, 'creator-fatal');
+    const fatalOutBefore = fatalExchange.creatorOut.length;
+    await fatalExchange.creator.commitUpdate();
+    const validFatalBase = fatalExchange.creatorOut
+        .slice(fatalOutBefore)
+        .find((envelope) =>
+            envelope.wire_format === WireFormat.MLS_PUBLIC_MESSAGE);
+    const authenticatedMalformedCommit = await rewriteCommitEnvelope(
+        fatalExchange.creator,
+        validFatalBase,
+        (commit) => ({
+            ...commit,
+            path: { ...commit.path, nodes: [] },
+        }),
+    );
+    let terminalCommitError = null;
+    try {
+        await fatalExchange.joiner.onRelayEnvelope({
+            ...authenticatedMalformedCommit,
+            sender_id: 'creator-1',
+        });
+    } catch (err) {
+        terminalCommitError = err;
+    }
+    assert(terminalCommitError?.mlsFatalState === true
+        && fatalExchange.joiner.state === 'desynced'
+        && fatalExchange.joiner.group === null,
+    'authenticated creator Commit failure makes MLSSession terminal');
+    assert(fatalExchange.joinerEvents.some(
+        (event) => event.kind === 'desynced'
+            && event.reason.includes('UpdatePath nodes'),
+    ), 'terminal Commit failure is surfaced without ACK-compatible success');
 
     await echoPendingCommit(exchange.creator, replayGuardCommit);
     await exchange.joiner.onRelayEnvelope({
@@ -1114,16 +1292,22 @@ async function main() {
         }),
     );
     const joinerBeforeMalformedRemove = captureLiveGroup(exchange.joiner);
-    const malformedRemoveEventsBefore = exchange.joinerEvents.length;
-    await exchange.joiner.onRelayEnvelope({
-        ...malformedRemove,
-        sender_id: 'creator-1',
-    });
-    const malformedRemoveError = exchange.joinerEvents
-        .slice(malformedRemoveEventsBefore)
-        .find((event) => event.kind === 'error');
+    let malformedRemoveError = null;
+    try {
+        await exchange.joiner.group.processCommit(
+            wrapPublicEnvelope(malformedRemove),
+            {
+                pendingSelfUpdate: exchange.joiner._pendingSelfUpdate
+                    ? exchange.joiner._pendingSelfUpdate.keyPair : null,
+                pendingSelfUpdates: exchange.joiner._pendingSelfUpdates,
+                proposalStore: exchange.joiner._proposalStore,
+            },
+        );
+    } catch (err) {
+        malformedRemoveError = err;
+    }
     assert(Boolean(malformedRemoveError)
-        && malformedRemoveError.reason.includes('UpdatePath nodes')
+        && malformedRemoveError.message.includes('UpdatePath nodes')
         && exchange.joiner.state === 'joined'
         && liveGroupMatches(exchange.joiner, joinerBeforeMalformedRemove),
     'creator-authenticated malformed Remove is rejected without teardown');
@@ -1654,6 +1838,39 @@ async function main() {
     ) && rollbackProposal.joiner._proposalStore.size === 1
         && rollbackProposal.joiner._pendingSelfUpdates.size === 1,
     'operation mutex recovers after rejection and accepts the next proposal');
+
+    await rollbackProposal.joiner.proposeUpdate();
+    const storeBeforeEvictingFailure =
+        [...rollbackProposal.joiner._proposalStore.entries()];
+    const refsBeforeEvictingFailure = [
+        ...rollbackProposal.joiner._proposalRefsBySender.entries(),
+    ].map(([leafIndex, references]) => [leafIndex, [...references]]);
+    const keysBeforeEvictingFailure =
+        [...rollbackProposal.joiner._pendingSelfUpdates.entries()];
+    const latestBeforeEvictingFailure =
+        rollbackProposal.joiner._pendingSelfUpdate;
+    rollbackProposal.joiner.send = (envelope) => {
+        if (envelope.wire_format === WireFormat.MLS_PUBLIC_MESSAGE) {
+            return false;
+        }
+        return normalProposalSend(envelope);
+    };
+    await rollbackProposal.joiner.proposeUpdate();
+    assert(
+        storeBeforeEvictingFailure.every(([key, value]) =>
+            rollbackProposal.joiner._proposalStore.get(key) === value)
+        && rollbackProposal.joiner._proposalStore.size
+            === storeBeforeEvictingFailure.length
+        && JSON.stringify([
+            ...rollbackProposal.joiner._proposalRefsBySender.entries(),
+        ]) === JSON.stringify(refsBeforeEvictingFailure)
+        && keysBeforeEvictingFailure.every(([key, value]) =>
+            rollbackProposal.joiner._pendingSelfUpdates.get(key) === value)
+        && rollbackProposal.joiner._pendingSelfUpdates.size
+            === keysBeforeEvictingFailure.length
+        && rollbackProposal.joiner._pendingSelfUpdate
+            === latestBeforeEvictingFailure,
+    'transport failure after quota eviction restores the exact prior ProposalRef state');
 
     const noCommitExchange = await createExchange();
     let noCommitError = '';

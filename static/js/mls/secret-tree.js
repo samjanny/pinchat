@@ -156,7 +156,9 @@
      * Every returned root remains unconsumed at generation 0; callers own
      * it and must erase it as its ratchet advances or the epoch expires.
      */
-    async function consumeEncryptionSecret(encryptionSecret, nLeaves) {
+    async function consumeEncryptionSecret(
+        encryptionSecret, nLeaves, activeLeafIndices = null,
+    ) {
         if (!(encryptionSecret instanceof Uint8Array)
             || encryptionSecret.length !== HPKE.Nh) {
             throw new Error(
@@ -166,17 +168,29 @@
         if (!Number.isInteger(nLeaves) || nLeaves < 1) {
             throw new Error('secret-tree: nLeaves must be a positive integer');
         }
+        if (activeLeafIndices !== null
+            && !(activeLeafIndices instanceof Set)) {
+            throw new Error(
+                'secret-tree: activeLeafIndices must be a Set or null',
+            );
+        }
 
         const ratchetRoots = new Array(nLeaves);
 
         async function visit(nodeIndex, nodeSecret) {
             if (TreeMath.level(nodeIndex) === 0) {
+                const leafIndex = TreeMath.nodeToLeaf(nodeIndex);
+                if (activeLeafIndices
+                    && !activeLeafIndices.has(leafIndex)) {
+                    nodeSecret.fill(0);
+                    return;
+                }
                 let application = null;
                 let handshake = null;
                 try {
                     application = await leafChainRoot(nodeSecret, 'application');
                     handshake = await leafChainRoot(nodeSecret, 'handshake');
-                    ratchetRoots[TreeMath.nodeToLeaf(nodeIndex)] = {
+                    ratchetRoots[leafIndex] = {
                         application,
                         handshake,
                     };

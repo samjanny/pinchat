@@ -28,6 +28,8 @@ function _isValidWsResumeToken(value) {
 const _COMMON_RELAY_MESSAGE_TYPES = new Set([
     'connected', 'userjoined', 'userleft', 'error',
 ]);
+const MAX_INBOUND_QUEUE_MESSAGES = 128;
+const MAX_INBOUND_QUEUE_CHARS = 8 * 1024 * 1024;
 
 function _isMessageAllowedForRoom(roomType, messageType) {
     if (_COMMON_RELAY_MESSAGE_TYPES.has(messageType)) return true;
@@ -68,6 +70,8 @@ class WebSocketManager {
         // ecdhHandshakeStatus, …) and must observe messages in arrival order.
         // Errors do not poison the queue — see the .catch() in onmessage.
         this._inboundQueue = Promise.resolve();
+        this._queuedInboundMessages = 0;
+        this._queuedInboundChars = 0;
 
         // Token caching for reconnection (avoids PoW on every reconnect)
         this.cachedToken = null;
@@ -135,6 +139,38 @@ class WebSocketManager {
                 // A UI callback must not re-enter this failure path through
                 // the outer WebSocket message parser's catch block.
                 console.error('[WS] onError failed during protocol shutdown:', error);
+            }
+        }
+    }
+
+    _failMlsState(reason) {
+        console.error('[WS] Terminal MLS state failure:', reason);
+        this._fatalAuthFailure = true;
+        this.resumeToken = null;
+        try {
+            if (this.ws) this.ws.close(1008, 'MLS state desynchronized');
+        } catch (_) { /* ignore close races */ }
+        if (this.onError) {
+            try {
+                this.onError(new Error('MLS_STATE_DESYNC'));
+            } catch (error) {
+                console.error('[WS] onError failed during MLS shutdown:', error);
+            }
+        }
+    }
+
+    _failInboundQueue(reason) {
+        console.error('[WS] Inbound queue capacity exceeded:', reason);
+        this._fatalAuthFailure = true;
+        this.resumeToken = null;
+        try {
+            if (this.ws) this.ws.close(1009, 'Inbound queue capacity exceeded');
+        } catch (_) { /* ignore close races */ }
+        if (this.onError) {
+            try {
+                this.onError(new Error('INBOUND_QUEUE_OVERFLOW'));
+            } catch (error) {
+                console.error('[WS] onError failed during queue shutdown:', error);
             }
         }
     }
@@ -536,8 +572,11 @@ class WebSocketManager {
         try {
             this.ws = new WebSocket(wsUrl, ['pinchat.v1', `pinchat.v1.jwt.${token}`]);
             this._connectionGeneration += 1;
+            const socketGeneration = this._connectionGeneration;
+            let connectedFrameSeen = false;
 
             this.ws.onopen = () => {
+                if (socketGeneration !== this._connectionGeneration) return;
                 // Subprotocol sanity: server must echo "pinchat.v1" exactly.
                 if (this.ws.protocol !== 'pinchat.v1') {
                     console.error('[WS] Unexpected negotiated subprotocol:', this.ws.protocol);
@@ -565,6 +604,7 @@ class WebSocketManager {
             };
 
             this.ws.onclose = (event) => {
+                if (socketGeneration !== this._connectionGeneration) return;
                 console.log('WebSocket closed:', event.code, event.reason);
                 if (this.roomType === 'group') {
                     this._mlsControlSyncing = true;
@@ -582,6 +622,7 @@ class WebSocketManager {
             };
 
             this.ws.onerror = (error) => {
+                if (socketGeneration !== this._connectionGeneration) return;
                 console.error('WebSocket error:', error);
 
                 if (this.onError) {
@@ -591,6 +632,24 @@ class WebSocketManager {
 
             this.ws.onmessage = (event) => {
                 try {
+                    if (socketGeneration !== this._connectionGeneration
+                        || this._fatalAuthFailure) {
+                        return;
+                    }
+                    if (typeof event.data !== 'string') {
+                        throw new Error('Relay WebSocket frame is not text');
+                    }
+                    const inboundChars = event.data.length;
+                    if (this._queuedInboundMessages
+                            >= MAX_INBOUND_QUEUE_MESSAGES
+                        || this._queuedInboundChars + inboundChars
+                            > MAX_INBOUND_QUEUE_CHARS) {
+                        this._failInboundQueue(
+                            `${this._queuedInboundMessages} messages / `
+                            + `${this._queuedInboundChars} characters already queued`,
+                        );
+                        return;
+                    }
                     const message = JSON.parse(event.data);
                     if (!message || typeof message !== 'object'
                         || typeof message.type !== 'string') {
@@ -603,6 +662,12 @@ class WebSocketManager {
                     // and remove it from the message object so UI/debug code
                     // cannot accidentally retain or render the bearer token.
                     if (message.type === 'connected') {
+                        if (connectedFrameSeen) {
+                            this._failRoomProtocol(
+                                'duplicate Connected frame on one socket',
+                            );
+                            return;
+                        }
                         if (message.room_type !== 'group'
                             && message.room_type !== 'onetoone') {
                             this._failRoomProtocol(
@@ -669,6 +734,13 @@ class WebSocketManager {
                         this.roomType = message.room_type;
                         this.resumeToken = message.resume_token;
                         delete message.resume_token;
+                        connectedFrameSeen = true;
+                    } else if (!connectedFrameSeen
+                        && message.type !== 'error') {
+                        this._failRoomProtocol(
+                            'relay message arrived before Connected',
+                        );
+                        return;
                     } else if (!_isMessageAllowedForRoom(this.roomType, message.type)) {
                         this._failRoomProtocol(
                             `message type ${message.type} is invalid for ${this.roomType || 'uninitialized'} room`,
@@ -729,8 +801,15 @@ class WebSocketManager {
                     // C-01 + MLS control ordering: every application handler
                     // runs serially. The control cursor and ACK advance only
                     // after the handler settles successfully.
+                    this._queuedInboundMessages += 1;
+                    this._queuedInboundChars += inboundChars;
                     this._inboundQueue = this._inboundQueue
                         .then(async () => {
+                            if (this._fatalAuthFailure
+                                || socketGeneration
+                                    !== this._connectionGeneration) {
+                                return;
+                            }
                             if (isOrderedGroupControl) {
                                 const seq = message.control_seq;
                                 if (seq <= this.lastMlsControlSeq) {
@@ -750,6 +829,11 @@ class WebSocketManager {
                                 }
                                 if (this.onMessage) {
                                     await this.onMessage(message);
+                                }
+                                if (this._fatalAuthFailure
+                                    || socketGeneration
+                                        !== this._connectionGeneration) {
+                                    return;
                                 }
                                 this.lastMlsControlSeq = seq;
                                 this._confirmMlsControl(message);
@@ -775,6 +859,11 @@ class WebSocketManager {
                                 if (this.onMessage) {
                                     await this.onMessage(message);
                                 }
+                                if (this._fatalAuthFailure
+                                    || socketGeneration
+                                        !== this._connectionGeneration) {
+                                    return;
+                                }
                                 this._mlsControlSyncing = false;
                                 this._retryPendingMlsControls();
                                 return;
@@ -786,8 +875,18 @@ class WebSocketManager {
                         })
                         .catch((err) => {
                             console.error('[WS] Unhandled error in onMessage:', err);
+                            if (socketGeneration
+                                    !== this._connectionGeneration
+                                || this._fatalAuthFailure) {
+                                return;
+                            }
+                            if (err?.mlsFatalState === true) {
+                                this._failMlsState(err.message);
+                                return;
+                            }
                             if ((isOrderedGroupControl
-                                || message.type === 'mlssync') && this.ws
+                                || message.type === 'mlssync'
+                                || message.type === 'connected') && this.ws
                                 && this.ws.readyState === WebSocket.OPEN) {
                                 // Do not acknowledge or skip this sequence.
                                 // Reconnect replays it from the unchanged
@@ -800,6 +899,14 @@ class WebSocketManager {
                                     );
                                 } catch (_) { /* ignore close races */ }
                             }
+                        })
+                        .finally(() => {
+                            this._queuedInboundMessages = Math.max(
+                                0, this._queuedInboundMessages - 1,
+                            );
+                            this._queuedInboundChars = Math.max(
+                                0, this._queuedInboundChars - inboundChars,
+                            );
                         });
                 } catch (error) {
                     console.error('Failed to parse WebSocket message:', error);
