@@ -34,6 +34,11 @@ const TEST_SUITES = {
         file: 'test-security.js',
         description: 'Key extractability invariants (bootstrap key, identity key)'
     },
+    sasgate: {
+        name: 'Chat SAS Gate',
+        file: 'test-chat-sas-gate.js',
+        description: '1:1 application data is quarantined until an explicit SAS decision'
+    },
     correctness: {
         name: 'Ratchet Correctness',
         file: 'test-ratchet-correctness.js',
@@ -62,7 +67,7 @@ const TEST_SUITES = {
     fuzz: {
         name: 'Fuzz Smoke',
         file: 'test-fuzz-smoke.js',
-        description: 'jazzer-js coverage-guided decrypt-path fuzz, short smoke run (longer: node tests/run-fuzz.js N)'
+        description: 'dependency-free decrypt-path mutation fuzz, short smoke run (longer: node tests/run-fuzz.js N)'
     }
 };
 
@@ -90,8 +95,8 @@ function runTest(suiteName) {
 
         proc.on('close', (code) => {
             // Exit code 77 = SKIPPED (autotools convention). The two
-            // suites that depend on optional npm dev-deps (fast-check,
-            // @jazzer.js/core) emit 77 when their require() throws on a
+            // suites that depend on optional npm dev-deps (fast-check)
+            // emit 77 when their require() throws on a
             // fresh clone without `npm ci`. The runner treats SKIP as
             // non-failing — `npm ci` is required for full coverage but
             // the core suites stay usable offline.

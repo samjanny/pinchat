@@ -13,6 +13,7 @@
 
 const { webcrypto } = require('crypto');
 const { subtle } = webcrypto;
+const assert = require('assert');
 const fs = require('fs');
 const path = require('path');
 
@@ -280,11 +281,11 @@ async function runTests() {
             return match[1];
         };
 
-        const pinsOk = chromeTag === 'v0.6.0'
+        const pinsOk = chromeTag === 'v0.6.1'
             && firefoxTag === chromeTag
             && chromeFloor === signed.data.sequence
             && firefoxFloor === chromeFloor
-            && chromeManifest.version === '1.1.0'
+            && chromeManifest.version === '1.2.0'
             && firefoxManifest.version === chromeManifest.version
             && readPublicKey(chromeBackground) === readPublicKey(firefoxBackground);
         if (!pinsOk) {
@@ -296,6 +297,42 @@ async function runTests() {
         }
         console.log(`  Release ${chromeTag}, sequence floor ${chromeFloor}, extension ${chromeManifest.version}`);
         console.log('PASSED: Chrome and Firefox release pins are aligned');
+        passed++;
+    } catch (e) {
+        console.log('FAILED:', e.message);
+        failed++;
+    }
+    console.log('');
+
+    // -------------------------------------------------------------------------
+    // Test 7: Extension CSP is preventive, pinned, and deterministic
+    // -------------------------------------------------------------------------
+    console.log('--- Test 7: Extension enforces signed script hashes before execution ---');
+    try {
+        const root = path.join(__dirname, '..');
+        const signed = JSON.parse(fs.readFileSync(path.join(root, 'hashes.json.signed'), 'utf8'));
+        const chromeManifest = JSON.parse(fs.readFileSync(path.join(root, 'extensions/chrome/manifest.json'), 'utf8'));
+        const firefoxManifest = JSON.parse(fs.readFileSync(path.join(root, 'extensions/firefox/manifest.json'), 'utf8'));
+        const chromeRules = JSON.parse(fs.readFileSync(path.join(root, 'extensions/chrome/rules.json'), 'utf8'));
+        const firefoxRules = JSON.parse(fs.readFileSync(path.join(root, 'extensions/firefox/rules.json'), 'utf8'));
+        const { buildRules } = require('../extensions/generate-csp-rules');
+        const expectedRules = buildRules(signed);
+
+        for (const manifest of [chromeManifest, firefoxManifest]) {
+            assert(manifest.permissions.includes('declarativeNetRequestWithHostAccess'));
+            assert.strictEqual(manifest.declarative_net_request.rule_resources[0].enabled, true);
+            assert.strictEqual(manifest.declarative_net_request.rule_resources[0].path, 'rules.json');
+        }
+        assert.deepStrictEqual(chromeRules, expectedRules);
+        assert.deepStrictEqual(firefoxRules, expectedRules);
+        assert(chromeRules[0].action.responseHeaders[0].value.includes("script-src 'none'"));
+        for (const rule of chromeRules.slice(1)) {
+            const csp = rule.action.responseHeaders[0].value;
+            assert(!/script-src[^;]*'self'/.test(csp), 'script-src must not trust the origin');
+            assert(csp.includes("'sha256-"), 'page rule must pin at least one signed script');
+        }
+
+        console.log('PASSED: packaged DNR rules replace origin trust with per-page signed hashes');
         passed++;
     } catch (e) {
         console.log('FAILED:', e.message);

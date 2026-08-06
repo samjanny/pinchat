@@ -120,6 +120,21 @@ try {
     `Signed manifest: signature ${signatureStatus}, sequence ${signed.data.sequence}, `
     + `${manifestChecked} files checked, ${manifestBad} bad`,
   );
+
+  // The preventive CSP is another release artifact derived from the same
+  // signed hashes. Reject stale or hand-edited browser rulesets.
+  const { buildRules } = require('../../extensions/generate-csp-rules');
+  const expectedRules = buildRules(signed);
+  for (const browser of ['chrome', 'firefox']) {
+    const rulesPath = `extensions/${browser}/rules.json`;
+    const actualRules = JSON.parse(fs.readFileSync(rulesPath, 'utf8'));
+    if (JSON.stringify(actualRules) !== JSON.stringify(expectedRules)) {
+      console.error(`PREVENTIVE CSP: ${rulesPath} does not match signed manifest`);
+      totalBad++;
+    } else {
+      console.log(`Preventive CSP: ${browser} rules match signed manifest`);
+    }
+  }
 } catch (error) {
   console.error(`SIGNED MANIFEST: ${error.message}`);
   totalBad++;

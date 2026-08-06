@@ -1,10 +1,10 @@
 /**
- * Coverage-guided fuzz target for the Double Ratchet decrypt path.
+ * Mutation-fuzz target for the Double Ratchet decrypt path.
  *
  * Fuzz strategy
  * -------------
- * Each iteration draws bytes from libFuzzer (via @jazzer.js/core's
- * FuzzedDataProvider) and shapes them into a plausible `(header, payload)`
+ * Each iteration draws bytes from the local dependency-free data provider
+ * and shapes them into a plausible `(header, payload)`
  * pair, then drives `bob.decryptMessage(...)` on a warmed-up DR pair.
  *
  * The warm-up runs ONCE at module load: three legitimate in-order
@@ -17,7 +17,7 @@
  * Invariants asserted per iteration
  * ---------------------------------
  *   1. NO uncaught exception / unhandled rejection. Any error must
- *      surface synchronously to libFuzzer through `throw`. Async
+ *      surface synchronously to the campaign runner through `throw`. Async
  *      rejections that escape would mark the JS process unhealthy
  *      and the fuzzer would not see them — `process.on('unhandledRejection')`
  *      below promotes them into thrown findings.
@@ -46,7 +46,7 @@
 
 'use strict';
 
-const { FuzzedDataProvider } = require('@jazzer.js/core');
+const { FuzzedDataProvider } = require('./fuzzed-data-provider');
 const { webcrypto } = require('crypto');
 
 global.debugLog = () => {};
@@ -206,7 +206,7 @@ function buildInputs(fdp) {
 // Promises into local catches. But if the production code accidentally
 // fires-and-forgets a Promise (e.g. a setTimeout micro-task), the
 // rejection would escape to process-level. Wire those into the iteration
-// so jazzer-js sees them as findings.
+// so the campaign runner sees them as findings.
 let pendingUnhandled = null;
 process.on('unhandledRejection', (reason) => {
     pendingUnhandled = reason;

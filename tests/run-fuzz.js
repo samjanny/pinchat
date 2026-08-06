@@ -10,7 +10,7 @@
  *   node tests/run-fuzz.js 86400           # 24-hour campaign
  *
  * Output:
- *   - libFuzzer's standard stats are printed inline.
+ *   - Mutation-runner statistics and the reproducible seed are printed inline.
  *   - Any finding (state divergence, unhandled rejection, unexpected
  *     decrypt success, crash) prints a counter-example bytes-sequence
  *     to stderr and exits non-zero.
@@ -18,83 +18,89 @@
  * The fuzz target lives in tests/fuzz/decrypt-fuzz.js. See its header
  * for the invariants asserted per iteration.
  *
- * Corpus / artifacts directory:
- *   tests/fuzz/corpus/ (auto-created, .gitignored). libFuzzer writes
- *   interesting inputs here and reuses them across runs — re-running
- *   after a long campaign benefits from the saved corpus.
+ * Set PINCHAT_FUZZ_SEED to replay a campaign with the same input stream.
  */
 
 'use strict';
 
-const path = require('path');
-const fs = require('fs');
+const { fuzz } = require('./fuzz/decrypt-fuzz');
 
-// Defensive: when invoked directly by a user on a fresh clone without
-// dev-deps installed, fail with the SKIP exit code (77) and a clear
-// pointer instead of an opaque module-not-found stack trace.
-let startFuzzing;
-try {
-    ({ startFuzzing } = require('@jazzer.js/core'));
-} catch (e) {
-    console.log('SKIPPED: @jazzer.js/core not installed.');
-    console.log('  Install dev-deps with: npm ci');
-    process.exit(77);
+async function runCampaign(seconds, requestedSeed) {
+    if (!(seconds > 0)) throw new RangeError('Fuzz duration must be positive');
+    const seed = Number.isInteger(requestedSeed) ? requestedSeed >>> 0 : Date.now() >>> 0;
+    let prngState = seed || 0x9e3779b9;
+    const nextU32 = () => {
+        // xorshift32: fast and deterministic; cryptographic randomness is not
+        // needed for fuzz input generation.
+        prngState ^= prngState << 13;
+        prngState ^= prngState >>> 17;
+        prngState ^= prngState << 5;
+        return prngState >>> 0;
+    };
+    const nextInput = (iteration) => {
+        // Regularly force boundary lengths; otherwise explore the complete
+        // 0..512-byte range and mutate every byte from the seeded stream.
+        const boundaries = [0, 1, 2, 27, 28, 64, 65, 255, 256, 511, 512];
+        const length = iteration % 16 === 0
+            ? boundaries[(iteration / 16) % boundaries.length]
+            : nextU32() % 513;
+        const data = Buffer.alloc(length);
+        for (let i = 0; i < data.length; i++) data[i] = nextU32() & 0xff;
+        return data;
+    };
+
+    const started = Date.now();
+    const deadline = started + (seconds * 1000);
+    let iterations = 0;
+    do {
+        const data = nextInput(iterations);
+        try {
+            await fuzz(data);
+        } catch (error) {
+            error.fuzzIteration = iterations;
+            error.fuzzInput = data.toString('base64url');
+            error.fuzzSeed = seed;
+            throw error;
+        }
+        iterations++;
+    } while (Date.now() < deadline);
+
+    const elapsedSeconds = Math.max((Date.now() - started) / 1000, 0.001);
+    return { seed, iterations, perSecond: Math.round(iterations / elapsedSeconds) };
 }
 
-const FUZZ_DIR = path.join(__dirname, 'fuzz');
-const CORPUS_DIR = path.join(FUZZ_DIR, 'corpus');
+async function main() {
+    const seconds = parseInt(process.argv[2] || '10', 10);
+    if (!(seconds > 0)) {
+        console.error('Usage: node tests/run-fuzz.js [seconds]');
+        process.exitCode = 2;
+        return;
+    }
+    const configuredSeed = Number.parseInt(process.env.PINCHAT_FUZZ_SEED || '', 10);
+    const requestedSeed = Number.isInteger(configuredSeed) ? configuredSeed : undefined;
 
-if (!fs.existsSync(CORPUS_DIR)) {
-    fs.mkdirSync(CORPUS_DIR, { recursive: true });
-}
-
-const seconds = parseInt(process.argv[2] || '10', 10);
-if (!(seconds > 0)) {
-    console.error('Usage: node tests/run-fuzz.js [seconds]');
-    process.exit(2);
-}
-
-const fuzzerOptions = [
-    `-max_total_time=${seconds}`,
-    `-max_len=512`,
-    `-print_final_stats=1`,
-    `-rss_limit_mb=1024`,
-    CORPUS_DIR,
-];
-
-console.log('PinChat decrypt-path fuzz campaign');
-console.log(`  Target:   tests/fuzz/decrypt-fuzz.js (fuzz)`);
-console.log(`  Duration: ${seconds}s`);
-console.log(`  Corpus:   ${path.relative(process.cwd(), CORPUS_DIR)}`);
-console.log('');
-
-(async () => {
+    console.log('PinChat decrypt-path fuzz campaign');
+    console.log(`  Target:   tests/fuzz/decrypt-fuzz.js (fuzz)`);
+    console.log(`  Duration: ${seconds}s`);
     try {
-        await startFuzzing({
-            fuzzTarget: path.join(FUZZ_DIR, 'decrypt-fuzz.js'),
-            fuzzEntryPoint: 'fuzz',
-            includes: ['static/js/'],
-            excludes: ['node_modules', 'tests/vectors'],
-            customHooks: [],
-            expectedErrors: [],
-            timeout: 10000,
-            sync: false,
-            fuzzerOptions,
-            mode: 'fuzzing',
-            dryRun: false,
-            verbose: false,
-            coverage: false,
-            coverageDirectory: '',
-            coverageReporters: [],
-            disableBugDetectors: [],
-        });
+        const result = await runCampaign(seconds, requestedSeed);
+        console.log(`  Seed:     ${result.seed}`);
+        console.log('');
+        console.log(`stat::number_of_executed_units: ${result.iterations}`);
+        console.log(`stat::average_exec_per_sec: ${result.perSecond}`);
         console.log('');
         console.log(`Fuzz campaign completed cleanly after ${seconds}s — no findings.`);
-        process.exit(0);
     } catch (err) {
         console.error('');
         console.error('FUZZ FINDING (or fatal error):');
+        console.error(`Replay with: PINCHAT_FUZZ_SEED=${err.fuzzSeed} node tests/run-fuzz.js ${seconds}`);
+        if (err && err.fuzzIteration !== undefined) console.error(`Iteration: ${err.fuzzIteration}`);
+        if (err && err.fuzzInput !== undefined) console.error(`Input (base64url): ${err.fuzzInput}`);
         console.error(err && err.stack ? err.stack : err);
-        process.exit(1);
+        process.exitCode = 1;
     }
-})();
+}
+
+if (require.main === module) main();
+
+module.exports = { runCampaign };

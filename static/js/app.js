@@ -82,6 +82,16 @@ document.addEventListener('alpine:init', () => {
         sasCopied: false,           // For copy button feedback
         pendingECDHKey: null,
 
+        // Encrypted application frames received before the user makes an
+        // explicit SAS decision. Keeping ciphertext (rather than decrypted
+        // content) out of the UI prevents an unauthenticated peer/server from
+        // influencing the conversation before verification or an explicit
+        // opt-out. The queue is deliberately bounded to avoid memory DoS.
+        pendingSecureMessages: [],
+        secureMessageReleaseInProgress: false,
+        secureMessageQueueEpoch: 0,
+        maxPendingSecureMessages: 32,
+
         // Emoji picker state
         emojiPickerOpen: false,
         selectedEmojiCategory: 'Smileys',
@@ -367,12 +377,21 @@ document.addEventListener('alpine:init', () => {
          * If this is a NEW key, decryption will trigger DH ratchet automatically.
          */
         async handleIncomingMessage(message) {
-            // A changed peer identity is not trusted until the user confirms
-            // the new SAS. Do not display authenticated-but-unverified
-            // plaintext during that decision window.
-            if (this.sasReverifyRequired) {
+            // 1:1 application data is accepted only after the authenticated
+            // handshake is active. During the SAS decision window, retain the
+            // encrypted frame without decrypting or rendering it.
+            if (this.roomType === 'onetoone' && !this.pfsActive) {
                 return;
             }
+            if (this.shouldQuarantineSecureMessage()) {
+                await this.quarantineSecureMessage('message', message);
+                return;
+            }
+            await this.processIncomingMessage(message);
+        },
+
+        /** Decrypts and renders a message that has passed the SAS gate. */
+        async processIncomingMessage(message) {
             try {
                 // Pass header to decryption (contains DH public key for ratchet)
                 const { text: plaintext, outOfOrder } = await window.cryptoManager.decryptMessage(
@@ -416,7 +435,9 @@ document.addEventListener('alpine:init', () => {
         async sendMessage() {
             const text = this.messageInput.trim();
             // Block sending if image upload is in progress (prevents Double Ratchet race condition)
-            if (!text || !this.connected || this.sendingImage) {
+            // isComposerLocked() is also enforced here so programmatic calls
+            // cannot bypass the disabled controls while SAS is undecided.
+            if (!text || !this.connected || this.sendingImage || this.isComposerLocked()) {
                 return;
             }
 
@@ -527,7 +548,7 @@ document.addEventListener('alpine:init', () => {
          * Sends the pending image
          */
         async sendImage() {
-            if (!this.pendingImage || !this.connected || this.sendingImage) {
+            if (!this.pendingImage || !this.connected || this.sendingImage || this.isComposerLocked()) {
                 return;
             }
 
@@ -598,9 +619,18 @@ document.addEventListener('alpine:init', () => {
          * Handles incoming encrypted image message
          */
         async handleIncomingImage(message) {
-            if (this.sasReverifyRequired) {
+            if (this.roomType === 'onetoone' && !this.pfsActive) {
                 return;
             }
+            if (this.shouldQuarantineSecureMessage()) {
+                await this.quarantineSecureMessage('image', message);
+                return;
+            }
+            await this.processIncomingImage(message);
+        },
+
+        /** Decrypts and renders an image that has passed the SAS gate. */
+        async processIncomingImage(message) {
             try {
                 // Decrypt image data
                 const imageData = await window.cryptoManager.decryptImage(
@@ -951,6 +981,10 @@ document.addEventListener('alpine:init', () => {
         async restartECDHHandshake() {
             debugLog('[RECONNECT] Restarting ECDH handshake to resynchronize Chain Ratchet...');
 
+            // Frames are bound to the old ratchet state and must never cross a
+            // reconnect/rekey boundary.
+            this.clearPendingSecureMessages();
+
             // Check if we had a verified identity before reconnect.
             // Capture the raw bytes (not the CryptoKey) so identity-change
             // detection after reconnect can compare bytes without needing
@@ -1221,6 +1255,8 @@ document.addEventListener('alpine:init', () => {
             if (hardReset === undefined) hardReset = false;
             console.warn('[ECDH] Handshake aborted (hardReset:', hardReset, ')');
 
+            this.clearPendingSecureMessages();
+
             // Cleanup ECDH manager
             this.pfsActive = false;
             if (this.ecdhManager) {
@@ -1276,6 +1312,8 @@ document.addEventListener('alpine:init', () => {
         handleSasMismatch() {
             console.warn('[SECURITY] SAS mismatch — treating as active MITM, aborting session');
 
+            this.clearPendingSecureMessages();
+
             // Destroy ratchet and identity state so the compromised chain cannot be reused.
             // Note: cryptoManager is a module-level singleton on `window`, NOT a property
             // of this Alpine store. The previous `this.cryptoManager` reference was a
@@ -1328,7 +1366,7 @@ document.addEventListener('alpine:init', () => {
         /**
          * Handles SAS verification success (user clicked "Verified")
          */
-        handleSasVerified() {
+        async handleSasVerified() {
             debugLog('[SECURITY] SAS code verified by user - connection is secure');
 
             // Mark SAS as verified in identity manager (persists for session)
@@ -1351,6 +1389,8 @@ document.addEventListener('alpine:init', () => {
                     ? '✅ New key verified - secure connection re-confirmed'
                     : '✅ Key verified - secure connection confirmed'
             );
+
+            await this.releasePendingSecureMessages();
         },
 
         /**
@@ -1362,7 +1402,7 @@ document.addEventListener('alpine:init', () => {
          * Optional"). We require an explicit second confirmation so a stray
          * tap on the skip button doesn't silently downgrade the security model.
          */
-        handleSasSkipped() {
+        async handleSasSkipped() {
             // If this SAS prompt was triggered by a *change* of peer identity
             // after a previous verified handshake, skipping is disabled: the
             // user already committed to verification, allowing a silent
@@ -1401,6 +1441,8 @@ document.addEventListener('alpine:init', () => {
 
             // Show info message
             this.addSystemMessage('ℹ️ Key verification skipped - connection security not confirmed');
+
+            await this.releasePendingSecureMessages();
         },
 
         /**
@@ -1450,6 +1492,68 @@ document.addEventListener('alpine:init', () => {
             }
         },
 
+        /** True while 1:1 ciphertext must remain behind the SAS decision gate. */
+        isSasDecisionPending() {
+            if (this.roomType !== 'onetoone' || !this.pfsActive) return false;
+            if (this.sasReverifyRequired) return true;
+            return this.sasVerificationStatus !== 'verified'
+                && this.sasVerificationStatus !== 'skipped';
+        },
+
+        /**
+         * New frames must also queue while an existing quarantine is draining,
+         * otherwise a fresh WebSocket frame could overtake an older frame at
+         * the Double Ratchet mutex.
+         */
+        shouldQuarantineSecureMessage() {
+            return this.isSasDecisionPending() || this.secureMessageReleaseInProgress;
+        },
+
+        async quarantineSecureMessage(kind, message) {
+            if (this.pendingSecureMessages.length >= this.maxPendingSecureMessages) {
+                this.clearPendingSecureMessages();
+                await this.handleECDHAborted(true);
+                this.ecdhHandshakeStatus = 'failed';
+                this.error = '🔒 Too many messages arrived before identity verification. The secure session was closed; please open a new chat.';
+                if (this.wsManager) {
+                    this.wsManager.disconnectWithError(1008, 'SAS verification queue limit exceeded');
+                }
+                return;
+            }
+            this.pendingSecureMessages.push({ kind, message });
+        },
+
+        /** Releases quarantined ciphertext strictly in arrival order. */
+        async releasePendingSecureMessages() {
+            if (this.secureMessageReleaseInProgress || this.isSasDecisionPending()) return;
+
+            const epoch = this.secureMessageQueueEpoch;
+            this.secureMessageReleaseInProgress = true;
+            try {
+                while (this.pendingSecureMessages.length > 0
+                    && epoch === this.secureMessageQueueEpoch
+                    && !this.isSasDecisionPending()) {
+                    const pending = this.pendingSecureMessages.shift();
+                    if (pending.kind === 'message') {
+                        await this.processIncomingMessage(pending.message);
+                    } else if (pending.kind === 'image') {
+                        await this.processIncomingImage(pending.message);
+                    }
+                }
+            } finally {
+                if (epoch === this.secureMessageQueueEpoch) {
+                    this.secureMessageReleaseInProgress = false;
+                }
+            }
+        },
+
+        /** Invalidates any active drain and forgets ciphertext from that epoch. */
+        clearPendingSecureMessages() {
+            this.secureMessageQueueEpoch++;
+            this.pendingSecureMessages = [];
+            this.secureMessageReleaseInProgress = false;
+        },
+
         /**
          * True while the composer (text input, emoji, image, send) must be
          * disabled: WebSocket not open, not enough participants to talk to,
@@ -1469,6 +1573,7 @@ document.addEventListener('alpine:init', () => {
             // block sends until the new code is re-confirmed (or declared
             // mismatch, which transitions to sasMismatchFatal above).
             if (this.sasReverifyRequired) return true;
+            if (this.isSasDecisionPending()) return true;
             return false;
         },
 
@@ -1479,6 +1584,7 @@ document.addEventListener('alpine:init', () => {
             if (this.participantCount < 2) return 'Waiting for someone to join this room…';
             if (this.roomType === 'onetoone' && !this.pfsActive) return 'Establishing secure connection…';
             if (this.sasReverifyRequired) return 'Re-verify the new security code to continue…';
+            if (this.isSasDecisionPending()) return 'Verify the security code to continue…';
             return 'Write an encrypted message…';
         },
 
@@ -1488,6 +1594,7 @@ document.addEventListener('alpine:init', () => {
             if (this.participantCount < 2) return 'Waiting for peer to join';
             if (this.roomType === 'onetoone' && !this.pfsActive) return 'Waiting for secure connection…';
             if (this.sasReverifyRequired) return 'Re-verify identity to send';
+            if (this.isSasDecisionPending()) return 'Verify identity before sending';
             return 'Send message';
         },
 

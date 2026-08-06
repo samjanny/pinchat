@@ -1,0 +1,128 @@
+[
+  {
+    "id": 1,
+    "priority": 1,
+    "action": {
+      "type": "modifyHeaders",
+      "responseHeaders": [
+        {
+          "header": "content-security-policy",
+          "operation": "set",
+          "value": "script-src 'none'; default-src 'none'; style-src 'self'; img-src 'self' blob:; font-src 'self'; connect-src 'self' wss://pinchat.io wss://www.pinchat.io; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none';"
+        }
+      ]
+    },
+    "condition": {
+      "regexFilter": "^https://(www\\.)?pinchat\\.io/",
+      "resourceTypes": [
+        "main_frame",
+        "sub_frame"
+      ]
+    }
+  },
+  {
+    "id": 2,
+    "priority": 2,
+    "action": {
+      "type": "modifyHeaders",
+      "responseHeaders": [
+        {
+          "header": "content-security-policy",
+          "operation": "set",
+          "value": "script-src 'sha256-vc83MC35lVoXBnYkFcbi+cE5EgJ+drCEfcjEryWT40A=' 'sha256-4jyDkg400LlXkyi0zC+QbIJhh6pEYjneo43JWuFVRZc=' 'sha256-p7E0rA/mvQrZ9DMn8DR/rguB17vQ3i3XBJQ/t7M3WiE=' 'sha256-58hj2liWaS9dR44Q2uCJ5hZP7RxcG2offLv3qbCT8FU=' 'sha256-rvb/bHQ2W2jurmYIKaOUhoCD4mg3w94+UbuljCqwDdI='; default-src 'none'; style-src 'self'; img-src 'self' blob:; font-src 'self'; connect-src 'self' wss://pinchat.io wss://www.pinchat.io; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none';"
+        }
+      ]
+    },
+    "condition": {
+      "regexFilter": "^https://(www\\.)?pinchat\\.io/static/index\\.html(?:\\?.*)?$",
+      "resourceTypes": [
+        "main_frame",
+        "sub_frame"
+      ]
+    }
+  },
+  {
+    "id": 3,
+    "priority": 2,
+    "action": {
+      "type": "modifyHeaders",
+      "responseHeaders": [
+        {
+          "header": "content-security-policy",
+          "operation": "set",
+          "value": "script-src 'sha256-DD4V2qth6q+/FQP66jysQ1s7TA4xfiAo5t6etfb6xog=' 'sha256-vc83MC35lVoXBnYkFcbi+cE5EgJ+drCEfcjEryWT40A=' 'sha256-OZ1in+Y/J5HSZFw2fTUVBNtT5fkGtORNMz8/1yp00Qw=' 'sha256-rvb/bHQ2W2jurmYIKaOUhoCD4mg3w94+UbuljCqwDdI='; default-src 'none'; style-src 'self'; img-src 'self' blob:; font-src 'self'; connect-src 'self' wss://pinchat.io wss://www.pinchat.io; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none';"
+        }
+      ]
+    },
+    "condition": {
+      "regexFilter": "^https://(www\\.)?pinchat\\.io/static/login\\.html(?:\\?.*)?$",
+      "resourceTypes": [
+        "main_frame",
+        "sub_frame"
+      ]
+    }
+  },
+  {
+    "id": 4,
+    "priority": 2,
+    "action": {
+      "type": "modifyHeaders",
+      "responseHeaders": [
+        {
+          "header": "content-security-policy",
+          "operation": "set",
+          "value": "script-src 'sha256-nY3zkFVKF7x6KVbWq1mwcHq4Y/g8O10iOmLAFfiDsJ8=' 'sha256-5P06MLUO1iSKUqlEIw4RCB1jHqIThxEYEgtXv8qTArY=' 'sha256-myf4gfSaxf1+Hyh+dZxXfvdSPr/uVnGtDOP6kHyNOj4=' 'sha256-V3R0zJ6YAvxGYULXKSj5pg1KdJKdlndMz9g2gHK4W6Y=' 'sha256-I6uKHd+us1u+AACTLm7YoW0fUqs2h3W8SbJtoaEMzuU=' 'sha256-ixcpU5MEMEueVzVI9CcM5Z3txpcgSSzL5os4W6fMbyg=' 'sha256-w67zAeAVHFA9AB+RnbDbadBSg6LDd5RS+4mvZksLUv8=' 'sha256-NOljt6QRoI4yE/e1mLCZJgKcbUvsyDD6PaqK7wOuXM0=' 'sha256-58hj2liWaS9dR44Q2uCJ5hZP7RxcG2offLv3qbCT8FU=' 'sha256-rvb/bHQ2W2jurmYIKaOUhoCD4mg3w94+UbuljCqwDdI='; default-src 'none'; style-src 'self'; img-src 'self' blob:; font-src 'self'; connect-src 'self' wss://pinchat.io wss://www.pinchat.io; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none';"
+        }
+      ]
+    },
+    "condition": {
+      "regexFilter": "^https://(www\\.)?pinchat\\.io/static/chat\\.html(?:\\?.*)?$",
+      "resourceTypes": [
+        "main_frame",
+        "sub_frame"
+      ]
+    }
+  },
+  {
+    "id": 5,
+    "priority": 2,
+    "action": {
+      "type": "modifyHeaders",
+      "responseHeaders": [
+        {
+          "header": "content-security-policy",
+          "operation": "set",
+          "value": "script-src 'sha256-vc83MC35lVoXBnYkFcbi+cE5EgJ+drCEfcjEryWT40A=' 'sha256-f+MZEnto3iNJgyWQvKdUA0xcq1YqXHD4LiZ65zdDP/k=' 'sha256-rvb/bHQ2W2jurmYIKaOUhoCD4mg3w94+UbuljCqwDdI='; default-src 'none'; style-src 'self'; img-src 'self' blob:; font-src 'self'; connect-src 'self' wss://pinchat.io wss://www.pinchat.io; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none';"
+        }
+      ]
+    },
+    "condition": {
+      "regexFilter": "^https://(www\\.)?pinchat\\.io/static/terms\\.html(?:\\?.*)?$",
+      "resourceTypes": [
+        "main_frame",
+        "sub_frame"
+      ]
+    }
+  },
+  {
+    "id": 6,
+    "priority": 2,
+    "action": {
+      "type": "modifyHeaders",
+      "responseHeaders": [
+        {
+          "header": "content-security-policy",
+          "operation": "set",
+          "value": "script-src 'sha256-vc83MC35lVoXBnYkFcbi+cE5EgJ+drCEfcjEryWT40A=' 'sha256-f+MZEnto3iNJgyWQvKdUA0xcq1YqXHD4LiZ65zdDP/k=' 'sha256-rvb/bHQ2W2jurmYIKaOUhoCD4mg3w94+UbuljCqwDdI='; default-src 'none'; style-src 'self'; img-src 'self' blob:; font-src 'self'; connect-src 'self' wss://pinchat.io wss://www.pinchat.io; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none';"
+        }
+      ]
+    },
+    "condition": {
+      "regexFilter": "^https://(www\\.)?pinchat\\.io/static/privacy\\.html(?:\\?.*)?$",
+      "resourceTypes": [
+        "main_frame",
+        "sub_frame"
+      ]
+    }
+  }
+]

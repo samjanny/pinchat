@@ -57,7 +57,7 @@ PinChat is not recommended for:
 - **Authenticated DH ratchet:** DH public key rotations are signed with the peer's identity key using ECDSA P-256. A live MITM key swap should trigger a hard session abort.
 - **Subprotocol-based WebSocket auth:** JWTs are carried in `Sec-WebSocket-Protocol`, not in the URL, reducing accidental leakage through proxy access logs, referrer headers, or middlebox caches.
 - **Rate limiting and anti-spam controls:** Configurable WebSocket, login, room-token, message-rate, and proof-of-work controls.
-- **Optional static-asset integrity extension:** Browser extensions can verify signed file hashes for some static asset tampering scenarios.
+- **Optional static-asset integrity extension:** Browser extensions impose a per-page, hash-only script CSP before parsing and verify static assets against a signed manifest.
 
 ## Current Communication Modes
 
@@ -126,7 +126,7 @@ Headline claims like "end-to-end encrypted" describe a *capability*, not a *guar
 
 | Configuration | What you actually get |
 |---|---|
-| **SAS verified + integrity-extension installed** | Client-side AEAD with the Double Ratchet. Server-served JavaScript is checked against a signed manifest. Peer identity has been confirmed out of band. **No external audit** — best-effort assurance only. |
+| **SAS verified + integrity-extension installed** | Client-side AEAD with the Double Ratchet. The extension blocks scripts outside a packaged per-page hash allowlist and checks assets against a signed manifest. Peer identity has been confirmed out of band. **No external audit** — best-effort assurance only. |
 | **SAS verified, no integrity extension** | Client-side AEAD with the Double Ratchet. Peer identity has been confirmed out of band. The server can still serve modified JavaScript on the next reload and you have no automatic way to notice. |
 | **SAS skipped** | Client-side AEAD with the Double Ratchet — the traffic is still encrypted and a passive observer cannot read it. However, the server operator (or anyone with active relay access) could have substituted both parties' identity keys at the ECDH exchange and now sits in the middle as an authenticated peer to each side. This is encryption without peer authentication. |
 
@@ -423,14 +423,13 @@ cargo test                  # Rust server-side tests
 node tests/run-all-tests.js # JavaScript crypto suites
 ```
 
-The JS runner has eight suites. Six (`chain`, `double`, `security`,
-`correctness`, `kat`, `wycheproof`) run without external dependencies.
-Two (`properties`, `fuzz`) require dev-dependencies installed via
-`npm ci` — `fast-check` for randomized property testing, and
-`@jazzer.js/core` for coverage-guided fuzzing of the decrypt path.
+The JS runner has ten suites. Nine (`chain`, `double`, `security`,
+`sasgate`, `correctness`, `pfs`, `kat`, `wycheproof`, and `fuzz`) run
+without external dependencies. Only `properties` requires `npm ci`, for
+`fast-check`; the decrypt-path fuzz harness is dependency-free and seeded.
 
 If the dev-deps are not installed (offline clone, restricted npm
-registry, etc.), the runner reports those two suites as `[SKIP]`
+registry, etc.), the runner reports the property suite as `[SKIP]`
 with an install hint and continues with a clean exit code 0. The
 "core verde, advanced skipped" state is intentional: fresh clones
 without npm access still get the cryptographic primitives test
@@ -656,11 +655,14 @@ PinChat includes browser extensions for Chrome and Firefox that verify files ser
 
 1. The extension fetches a signed hash list from GitHub as an out-of-band source.
 2. It verifies the ECDSA P-256 signature using an embedded public key.
-3. It checks that `<script>` and `<link>` tags have expected `integrity` attributes.
-4. It fetches files listed in the manifest and verifies their SHA-256 hashes.
-5. It displays a warning overlay if an integrity check fails.
+3. Before page parsing, it replaces the response CSP with a packaged per-page script-hash allowlist; unknown paths receive `script-src 'none'`.
+4. It checks that `<script>` and `<link>` tags have expected `integrity` attributes.
+5. It fetches files listed in the manifest and verifies their SHA-256 hashes.
+6. It displays a warning overlay if an integrity check fails.
 
-This can help detect some static-file tampering and some compromised-server scenarios.
+This prevents arbitrary newly injected scripts from running and detects broader
+static-file/HTML tampering. It still does not make the delivered HTML immutable
+or protect against bugs in already trusted client code.
 
 It is not a complete replacement for:
 

@@ -8,8 +8,11 @@ on:
       - 'hashes.json.signed'
       - 'extensions/chrome/background.js'
       - 'extensions/chrome/manifest.json'
+      - 'extensions/chrome/rules.json'
       - 'extensions/firefox/background.js'
       - 'extensions/firefox/manifest.json'
+      - 'extensions/firefox/rules.json'
+      - 'extensions/generate-csp-rules.js'
       - '.github/scripts/verify-sri.js'
       - '.github/workflows/sri-check.yml'
   pull_request:
@@ -18,8 +21,11 @@ on:
       - 'hashes.json.signed'
       - 'extensions/chrome/background.js'
       - 'extensions/chrome/manifest.json'
+      - 'extensions/chrome/rules.json'
       - 'extensions/firefox/background.js'
       - 'extensions/firefox/manifest.json'
+      - 'extensions/firefox/rules.json'
+      - 'extensions/generate-csp-rules.js'
       - '.github/scripts/verify-sri.js'
 
 jobs:

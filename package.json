@@ -7,7 +7,6 @@
     "test": "node tests/run-all-tests.js"
   },
   "devDependencies": {
-    "@jazzer.js/core": "^2.1.0",
-    "fast-check": "^3.23.2"
+    "fast-check": "^4.9.0"
   }
 }

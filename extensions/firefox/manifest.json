@@ -1,11 +1,12 @@
 {
     "manifest_version": 3,
     "name": "PinChat Integrity Verifier",
-    "version": "1.1.0",
-    "description": "Verifies the integrity of files served by pinchat.io against signed hashes",
+    "version": "1.2.0",
+    "description": "Prevents untrusted scripts and verifies pinchat.io files against signed hashes",
     "permissions": [
         "storage",
-        "alarms"
+        "alarms",
+        "declarativeNetRequestWithHostAccess"
     ],
     "host_permissions": [
         "https://pinchat.io/*",
@@ -14,6 +15,15 @@
     ],
     "background": {
         "scripts": ["background.js"]
+    },
+    "declarative_net_request": {
+        "rule_resources": [
+            {
+                "id": "pinchat_preventive_csp",
+                "enabled": true,
+                "path": "rules.json"
+            }
+        ]
     },
     "content_scripts": [
         {
@@ -38,7 +48,7 @@
     "browser_specific_settings": {
         "gecko": {
             "id": "pinchat-verifier@pinchat.io",
-            "strict_min_version": "109.0"
+            "strict_min_version": "113.0"
         }
     },
     "web_accessible_resources": [
