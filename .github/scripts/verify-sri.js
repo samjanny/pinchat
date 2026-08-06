@@ -39,6 +39,46 @@ function sha256NormalizedHex(filePath) {
   return crypto.createHash('sha256').update(Buffer.from(text, 'utf8')).digest('hex');
 }
 
+function verifyExtensionPackage(browser) {
+  const baseDir = path.join('extensions', browser);
+  const manifest = JSON.parse(fs.readFileSync(path.join(baseDir, 'manifest.json'), 'utf8'));
+  const resources = new Set();
+  const add = (value) => {
+    if (typeof value === 'string' && value.length > 0) resources.add(value);
+  };
+
+  add(manifest.background?.service_worker);
+  for (const script of manifest.background?.scripts || []) add(script);
+  for (const contentScript of manifest.content_scripts || []) {
+    for (const script of contentScript.js || []) add(script);
+    for (const stylesheet of contentScript.css || []) add(stylesheet);
+  }
+  add(manifest.action?.default_popup);
+  for (const icon of Object.values(manifest.action?.default_icon || {})) add(icon);
+  for (const icon of Object.values(manifest.icons || {})) add(icon);
+  for (const ruleSet of manifest.declarative_net_request?.rule_resources || []) add(ruleSet.path);
+  for (const group of manifest.web_accessible_resources || []) {
+    for (const resource of group.resources || []) add(resource);
+  }
+
+  let bad = 0;
+  for (const resource of resources) {
+    const segments = resource.split(/[\\/]/);
+    if (path.isAbsolute(resource) || segments.includes('..')) {
+      console.error(`EXTENSION PACKAGE: unsafe ${browser} resource path ${resource}`);
+      bad++;
+      continue;
+    }
+    if (!fs.existsSync(path.join(baseDir, resource))) {
+      console.error(`EXTENSION PACKAGE: missing ${browser}/${resource}`);
+      bad++;
+    }
+  }
+
+  console.log(`Extension package: ${browser} ${resources.size} declared resources, ${bad} bad`);
+  return bad;
+}
+
 let totalChecked = 0;
 let totalBad = 0;
 
@@ -148,6 +188,15 @@ try {
 } catch (error) {
   console.error(`SIGNED MANIFEST: ${error.message}`);
   totalBad++;
+}
+
+for (const browser of ['chrome', 'firefox']) {
+  try {
+    totalBad += verifyExtensionPackage(browser);
+  } catch (error) {
+    console.error(`EXTENSION PACKAGE: ${browser}: ${error.message}`);
+    totalBad++;
+  }
 }
 
 process.exit(totalBad === 0 ? 0 : 1);

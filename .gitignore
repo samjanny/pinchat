@@ -28,10 +28,6 @@ certs/
 Thumbs.db
 .env
 
-# Icons
-/extensions/chrome/icons/
-/extensions/firefox/icons/
-
 # Imported source tree from legacy private repo
 prichat-main/
 
