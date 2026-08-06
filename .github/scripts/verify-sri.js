@@ -7,8 +7,10 @@
  * same CRLF -> LF normalization used by extensions/generate-hashes.js) and
  * compare against the inline integrity attribute. It also verifies the
  * signature on hashes.json.signed with the extension trust anchor and checks
- * every signed file hash against the working tree. Exits non-zero on any
- * mismatch, bad signature, or missing file.
+ * every repository-owned signed file hash against the working tree. The
+ * deployment-specific operator.json is verified when present but may be
+ * absent from a clean checkout. Exits non-zero on any other mismatch, bad
+ * signature, or missing file.
  *
  * Run: node .github/scripts/verify-sri.js
  */
@@ -25,6 +27,7 @@ const HTML_FILES = [
 ];
 
 const SRI_RE = /(?:src|href)="(\/static\/[^"]+)"\s+integrity="sha256-([^"]+)"/g;
+const DEPLOYMENT_SPECIFIC_FILES = new Set(['/static/operator.json']);
 
 function sha256Normalized(filePath) {
   const text = fs.readFileSync(filePath, 'utf8').replace(/\r\n/g, '\n');
@@ -97,9 +100,15 @@ try {
 
   let manifestChecked = 0;
   let manifestBad = 0;
+  let manifestSkipped = 0;
   for (const entry of signed.data.files) {
     const filePath = '.' + entry.path;
     if (!fs.existsSync(filePath)) {
+      if (DEPLOYMENT_SPECIFIC_FILES.has(entry.path)) {
+        console.log(`SIGNED MANIFEST: skipped deployment-specific ${entry.path}`);
+        manifestSkipped++;
+        continue;
+      }
       console.error(`SIGNED MANIFEST: missing ${entry.path}`);
       manifestBad++;
       totalBad++;
@@ -118,7 +127,8 @@ try {
   const signatureStatus = signatureOk ? 'valid' : 'INVALID';
   console.log(
     `Signed manifest: signature ${signatureStatus}, sequence ${signed.data.sequence}, `
-    + `${manifestChecked} files checked, ${manifestBad} bad`,
+    + `${manifestChecked} files checked, ${manifestSkipped} deployment-specific skipped, `
+    + `${manifestBad} bad`,
   );
 
   // The preventive CSP is another release artifact derived from the same
