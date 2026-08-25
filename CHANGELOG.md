@@ -4,7 +4,140 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Dates are the repository-local commit dates; entries are curated for user-visible impact
 rather than being a 1:1 mirror of `git log`.
 
-## [Unreleased] - target v0.6.0, handshake v2
+## [2026-08-25] - v0.7.0
+
+Security release closing an external review of the 1:1 path. Eleven
+findings, no wire-format change: the protocol version stays 1 and a v0.6.x
+client interoperates with this build. Two server responses do change shape,
+neither of them reachable from the shipped UI.
+
+### Fixed - JWT replay window on the WebSocket upgrade
+
+`verify_token` never set `Validation::leeway`, and jsonwebtoken defaults it
+to 60 seconds, so a 30-second ws-token stayed signature-valid for a full
+minute past `exp`. The single-use `jti` record was retained for a fixed TTL
+measured from the moment of consumption, and the cleanup task runs on a 60s
+tick, so the record could be evicted while the signature still verified. A
+stolen token replayed inside that window could not add a third socket while
+both peers were connected, because `add_participant` rejects the duplicate
+connection id, but after a disconnect it took over the slot with the
+original UUID and nickname. Leeway is now pinned to 0, and the `jti`
+retention is derived from the token's own `exp` claim plus a margin covering
+the cleanup interval, so the replay record is guaranteed to outlive every
+instant at which the signature verifies.
+
+### Fixed - room-state rejections no longer burn a valid token
+
+The room existence, expiry and capacity checks ran in `handle_socket`,
+after `consume_token`. A client that lost the race for the second slot, or
+arrived at a room that had just expired, had its token consumed by a
+rejection it did not cause and had to re-run Proof-of-Work to retry. The
+read is hoisted ahead of the burn; `add_participant` remains authoritative
+for capacity, so the residual race costs a token at most once per genuine
+tie.
+
+### Fixed - open redirect and handler panic in the login redirect
+
+The redirect filter was `starts_with('/') && !starts_with("//")`, which
+accepts `/\evil.example`. Per the WHATWG URL specification a relative
+reference beginning `/\` enters the same "special authority ignore slashes"
+state as `//`, so Chrome, Firefox and Safari resolve it to the
+scheme-relative form and navigate off-origin. The same predicate now also
+screens control characters, which closes a second defect in the same path:
+both call sites converted the target with `.parse().unwrap()`, so a form
+field carrying `%0d%0a` decoded to a bare CRLF, passed the filter, and
+panicked the handler task.
+
+### Fixed - peer-controlled values reaching sensitive sinks
+
+Three inputs written by the remote peer were used without validation.
+
+`decryptImage` returned the `mimeType` straight out of the decrypted
+envelope, and it reached `new Blob(..., {type})` and `createObjectURL`. The
+AEAD proves only that the peer wrote that string. A modified client could
+declare `text/html` and produce a same-origin `blob:` document, or
+`image/svg+xml`, which renders inside `<img>` and lets a peer paint content
+imitating application chrome inside a message bubble. One allowlist is now
+enforced on encrypt, on decrypt, and at the file picker.
+
+The Double Ratchet destructured `pn`, `n` and `rc` from the header without
+type checks. `setUint32` coerces through ToUint32 and `BigInt` accepts
+numeric strings, and the two agree, so `n: "0"` verified against the peer's
+genuine signature, matched the AAD, and decrypted. `this.Nr = messageNumber
++ 1` then evaluated to the string `"01"`, and since skipped-key ids are
+built by interpolation, every later out-of-order message was dropped in
+silence for the rest of the session. Only a hostile relay could deliver such
+a header, since the server types the fields as `u32`, but the threat model
+treats the relay as untrusted.
+
+Code-block restoration in the message renderer used a string replacement,
+and `String.prototype.replace` interprets `$&`, `` $` ``, `$'` and `$$`
+inside one. HTML escaping does not touch `$`, so a message like `` `X$'` ``
+spliced in the part of the subject following the match, duplicating and
+reordering the rendered output. Not an XSS, since everything injected was
+already escaped, but it let a sender control how their message rendered.
+
+### Changed - SAS verification survives a peer departure
+
+Membership frames are relay-controlled and unauthenticated, and `userleft`
+destroyed the identity manager along with the SAS verdict. A hostile relay
+could forge one `userleft` to erase an out-of-band verification and let the
+next handshake come up as a first-time, skippable prompt. Departure now
+behaves like reconnect: the identity is retained and the peer's key is
+diffed on return. The result is stricter, not looser, since a different peer
+arriving after a verification now forces re-verification with skipping
+refused. A detected MITM still hard resets.
+
+### Changed - group rooms refused, expired rooms answer 404
+
+`create_room` accepted `room_type: group`. The variant deserialized and
+`Room::new` preserved it while capping participants at two, but the client
+only runs the handshake for `onetoone` and both encrypt and decrypt throw
+without an initialised ratchet, so the room could not carry a message. It is
+now refused with 400 ahead of the Proof-of-Work gate. The creation UI
+already disabled the option, so nothing user-facing changes.
+
+An expired room answered 410 while a missing or full one answered 404, which
+told a caller holding a room id whether the room had ever existed. All three
+states now share one response. No client code branched on 410.
+
+### Fixed - protocol documentation drift
+
+`PROTOCOL.md` still described the v1 DH-header signature, which shipped as
+v2 back in v0.5.0. The canonical sequence, the per-message signing
+behaviour, the `PREVIOUS_CHAIN_LENGTH` AAD field and the backlog were all
+corrected. Two backlog items had partly shipped while still being listed as
+deferred; F-03 is now marked partially shipped, with the part that was never
+implemented spelled out.
+
+### Changed - extension pins move to v0.7.0
+
+The manifest re-signs to sequence 42, so both extensions move
+`MIN_KNOWN_SEQUENCE` to 42 and `GITHUB_TAG` to `v0.7.0`, and the extension
+version goes to 1.2.1. The floor is checked against the manifest fetched
+from the pinned tag, so the two constants must move together: a build
+carrying floor N pointing at a tag whose manifest is below N rejects every
+manifest it can reach. The `v0.7.0` tag must be pushed before users update
+or install the extension.
+
+## [2026-08-06] - v0.6.1
+
+### Changed - SAS gate hardening and dependency-free fuzzing
+
+Further work on the 1:1 verification gate in `static/js/app.js`, with
+`tests/test-chat-sas-gate.js` added as its regression suite. The fuzzing
+harness drops its external dependency in favour of a self-contained
+provider (`tests/fuzz/fuzzed-data-provider.js`), removing the bulk of
+`package-lock.json`.
+
+### Fixed - SRI gate rejected clean checkouts
+
+`verify-sri.js` treated `/static/operator.json` like any other signed file.
+That entry is deployment-specific and absent from a clean checkout, so CI
+failed on a fresh clone. It is now verified when present and skipped when
+not. README security disclosures were clarified in the same release.
+
+## [2026-07-14] - v0.6.0
 
 Breaking E2E handshake change. Wire-incompatible with v1; both endpoints must
 run v2 (a v1 peer is refused fail-closed). The WebSocket subprotocol
@@ -60,6 +193,36 @@ version 1.1.0. The security suite checks these values stay aligned. The SRI CI
 gate now also verifies the manifest's ECDSA signature and all 24 signed file
 hashes, preventing an internally consistent HTML/SRI update from passing with a
 stale release manifest.
+
+## [2026-07-10] - v0.5.0
+
+Backport of the 1:1 Double Ratchet hardening from the experimental group
+branch onto the stable line, without the experimental group feature. Not
+wire- or key-compatible with 0.4.x peers: both sides must run this build.
+
+### Changed - DH header signature v1 to v2
+
+The ECDSA signature over the ratchet header now binds the full semantic
+header (`pn || n || rc`) instead of `rc` alone, so a relay cannot swap `pn`
+or `n` while keeping a valid signature. The canonical tag bumped to
+`"pinchat-drheader-v2"`. `PREVIOUS_CHAIN_LENGTH` (0x08) was added to the
+message AAD in the same change.
+
+### Fixed - chain keys derived from the retained root key
+
+Initial and post-ratchet chain keys are now independent HKDF output rather
+than a second expansion of the retained root key, so a state compromise can
+no longer reconstruct prior messages in the current chain.
+
+### Changed - SAS re-verify gate
+
+While a changed peer identity awaits user confirmation, authenticated but
+unverified plaintext is no longer rendered, for messages and images alike.
+
+### Fixed - per-connection limiter state leaked on room teardown
+
+`remove_room` now also drops the per-connection rate-limiter state, fixing a
+leak across room churn when socket cleanup raced room removal.
 
 ## [2026-07-06] - v0.4.1
 
