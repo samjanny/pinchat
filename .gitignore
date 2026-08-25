@@ -8,6 +8,14 @@ tests/fuzz/leak-*
 tests/fuzz/oom-*
 tests/fuzz/timeout-*
 
+# Chromium writes this when the extension is loaded unpacked: it compiles the
+# declarativeNetRequest rules from rules.json into an indexed ruleset under
+# _metadata/. It is a local browser artifact, regenerated on every load, and
+# is not part of a release package. Matched for both browsers because the
+# directory appears wherever a Chromium build loads the folder, not only in
+# extensions/chrome.
+extensions/*/_metadata/
+
 # Rust
 target/
 **/Cargo.lock
