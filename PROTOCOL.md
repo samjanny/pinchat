@@ -429,17 +429,25 @@ Message Envelope (JSON)
 
 **`header` is mandatory** for `message` and `image` types in v1. Server rejects any envelope with missing, malformed, or `v != 1` header.
 
-### DH Header Signature (v1)
+### DH Header Signature (v2)
 
 To defeat live MITM on the Double Ratchet rotations, every outgoing header carries an ECDSA P-256 signature (`sig`) over the canonical byte sequence:
 
 ```
-canonical = "pinchat-drheader-v1" || len(dh_raw):u16_be || dh_raw || rc:u32_be
+canonical = "pinchat-drheader-v2"
+         || len(dh_raw):u16_be || dh_raw
+         || pn:u32_be || n:u32_be || rc:u32_be
 ```
 
-Binding to `rc` means a signature is valid only for its ratchet round; replayed signatures across rounds are rejected. The signature is produced once per DH keypair generation (initialize, receive-side ratchet, send-side ratchet) and reused on every outgoing message in the same chain.
+The domain tag is the hardcoded literal `pinchat-drheader-v2`. It is NOT derived from `header.v`, which stays `1`: the wire-protocol version and the signature domain tag are independent identifiers. `v` gates the envelope shape; the tag provides domain separation for the signature input.
+
+Every semantic counter carried in the header is inside the signed tuple, so an active relay cannot flip `pn`, `n`, or `rc` in transit without invalidating the signature. Binding to `rc` means a signature is valid only for its ratchet round; binding to `n` means it is valid only for the single message that carries it, so a signature cannot be lifted onto a different message of the same chain.
+
+Because `n` changes on every message, the signature is recomputed per send rather than cached per DH keypair: `encryptMessage` calls `signCurrentDHs(PN, messageNumber)` immediately after reserving the message number and before emitting the header. The calls in `initialize`, `performDHRatchetOnReceive` and `performSendSideDHRatchet` only prime `DHsSignature` so the field is never null between a keypair rotation and the next send.
 
 On receive: verify before touching chain state. On failure, throw `SIGNATURE_INVALID`, tear down identity, close WebSocket with 1008 Policy Violation, suppress auto-reconnect (user must refresh).
+
+**Not covered by the canonical:** `room_id` and the sorted identity public key pair. The signature proves "the identity-key holder produced this DH public key at this ratchet round and message number", not "within this session". See F-03 in the Backlog for the residual gap and why the v2 tag alone did not close it.
 
 ### Payload Structure
 
@@ -464,13 +472,18 @@ AuthTag:   16 bytes (128 bits)
 
 ```
 AAD = TLV([
-    {type: 0x01, value: room_id},        // ROOM_ID
-    {type: 0x02, value: sender_id},      // SENDER_ID
-    {type: 0x05, value: message_number}, // MESSAGE_NUMBER (8 bytes)
-    {type: 0x06, value: "message"},      // MESSAGE_TYPE
-    {type: 0x07, value: ratchet_count}   // RATCHET_COUNT (8 bytes)
+    {type: 0x01, value: room_id},           // ROOM_ID
+    {type: 0x02, value: sender_id},         // SENDER_ID
+    {type: 0x05, value: message_number},    // MESSAGE_NUMBER (8 bytes)
+    {type: 0x06, value: msg_type},          // MESSAGE_TYPE ("message" | "image")
+    {type: 0x07, value: ratchet_count},     // RATCHET_COUNT (8 bytes)
+    {type: 0x08, value: prev_chain_length}  // PREVIOUS_CHAIN_LENGTH (8 bytes)
 ])
 ```
+
+Field order is part of the wire format: the TLV sequence is emitted in exactly the order above, with `PREVIOUS_CHAIN_LENGTH` (0x08) appended last. Image messages use the identical field set with `MESSAGE_TYPE = "image"`; there is no separate image AAD.
+
+`pn` entered the AAD with the F-06 fix (see Backlog). Before that an active relay could flip `pn` in transit, the AEAD tag would still verify, and the receiver would burn up to `MAX_SKIP = 100` skipped-key derivations before rejecting.
 
 ### Image Message Structure
 
@@ -683,18 +696,21 @@ Alice                                    Bob
 | MESSAGE_NUMBER | 0x05 | 8 bytes (BigUint64, **little-endian**) |
 | MESSAGE_TYPE | 0x06 | Variable (UTF-8) |
 | RATCHET_COUNT | 0x07 | 8 bytes (BigUint64, **little-endian**) |
+| PREVIOUS_CHAIN_LENGTH | 0x08 | 8 bytes (BigUint64, **little-endian**) |
 
 **Endianness note.** The current reference implementation produces the
 BigUint64 fields by writing them through `BigUint64Array(...).buffer`,
 which yields the native byte order. On every browser platform PinChat
 runs on today this is little-endian; the wire format is therefore
-little-endian for these three fields. The DH-header signature
-(`pinchat-drheader-v1 || len:u16_be || dh || rc:u32_be`) uses an
-explicit big-endian convention for its `len` and `rc` fields — that is
-a separate canonicalisation and the asymmetry is intentional. A future
-non-JavaScript client MUST emit AAD numeric fields in little-endian to
-remain interoperable. Migrating both structures to a uniform endianness
-is a candidate for the next protocol version bump.
+little-endian for those four fields. The DH-header signature canonical
+(`pinchat-drheader-v2 || len:u16_be || dh || pn:u32_be || n:u32_be ||
+rc:u32_be`) uses an explicit big-endian convention for its `len`, `pn`,
+`n` and `rc` fields; that is a separate canonicalisation and the
+asymmetry is intentional. Note that the same three counters are encoded
+twice with different widths: 8-byte BigUint64 in the AAD, 4-byte u32 in
+the signature canonical. A future non-JavaScript client MUST emit AAD
+numeric fields in little-endian to remain interoperable. Unifying width
+and endianness across both structures is F-09 in the Backlog.
 
 ---
 
@@ -720,42 +736,56 @@ cut bundling six items. Five turned out to be defense-in-depth without a
 concrete current exploit; in v0.3.0 we shipped only the SAS overhaul,
 which is a client-coordinated change and does NOT touch the wire.
 
-The remaining four items are recorded here so the next wire-format break
-(group chat, MLS migration, a non-JS client, a concrete attack against
-one of them) can absorb them at no incremental cost:
+Of the four items that were still open at that point, two have since
+shipped as part of the DH-header signature v2 work. They are kept here
+with their status so the history stays legible and so nobody re-files
+them.
 
-- **F-03** — Extend the DH-header signature canonical to bind
-  `room_id` and the sorted identity public key pair, not just
-  `dh_raw || rc`. Today the signature only proves "the identity-key
-  holder produced this DH public key at this ratchet round"; it does
-  not bind the session context. The canonical tag would bump to
-  `"pinchat-drheader-v2"` for domain separation. Not directly
-  exploitable today (DH keys are uniform over 2^256, so the binding
-  gap is fragile-not-broken), but a future feature that allowed
+### Shipped
+
+- **F-06 (SHIPPED)** - `pn` (previous-chain length) is now in the message
+  AAD as `PREVIOUS_CHAIN_LENGTH = 0x08`, appended last in the TLV
+  sequence. An active relay can no longer flip `pn` in transit: the AEAD
+  tag fails. `pn` is additionally inside the DH-header signature
+  canonical, so the field is now covered twice and independently.
+
+- **F-03 (PARTIALLY SHIPPED)** - the canonical tag was bumped to
+  `"pinchat-drheader-v2"` and the canonical itself widened from
+  `dh_raw || rc` to `dh_raw || pn || n || rc`, which closes the
+  header-counter tampering surface. What F-03 originally asked for was
+  NOT implemented: the canonical still does not bind `room_id`, and it
+  still does not bind the sorted identity public key pair. The signature
+  proves "the identity-key holder produced this DH public key at this
+  ratchet round and message number", not "within this session". Not
+  directly exploitable today (DH keys are uniform over 2^256, so the
+  binding gap is fragile-not-broken), but a future feature that allowed
   parallel sessions sharing an identity could turn it into a
-  cross-session graft.
+  cross-session graft. Note the cost of closing it went up: the `v2`
+  tag is already spent on the narrower canonical, so a full F-03 needs
+  a third domain tag.
 
-- **F-06** — Add `pn` (previous-chain length) to the message AAD.
-  Today an active relay can flip `pn` in transit; AEAD passes
-  because `pn` is not in AAD, and the receiver burns up to
-  `MAX_SKIP=100` skipped-key derivations before rejecting. Bounded
-  DoS, but a free handle. AAD field type: `PREV_CHAIN_LENGTH = 0x08`.
+### Still open
 
-- **F-08** — Add `v` (protocol version) to the message AAD.
+Both remaining items require a wire-format change, so they ship together
+at the next bump (group chat, MLS migration, a non-JS client, or a
+concrete attack against one of them). Neither is rated higher than LOW
+by any audit pass.
+
+- **F-08** - Add `v` (protocol version) to the message AAD.
   Pure defensive: today the outer envelope rejects `header.v != 1`,
   so the version check is fail-closed at the envelope layer. Adding
   it to AAD prevents a future v2-with-same-AAD-shape from
   cross-decrypting v1 ciphertext.
   AAD field type: `PROTOCOL_VERSION = 0x00`.
 
-- **F-09** — Unify endianness on big-endian throughout. Today the
-  message AAD encodes 8-byte numeric fields via JavaScript's
-  `BigUint64Array(...).buffer`, which yields native (little-endian on
-  every browser PinChat runs on). The DH-header signature canonical
-  uses explicit big-endian. The asymmetry is intentional and
-  documented above; the cost is a usability footgun for any future
-  non-JavaScript client. The fix is a one-line change in the AAD
-  encoder + the corresponding PROTOCOL.md table.
-
-All four require a wire-format change, so they ship together at the
-next bump. None is rated higher than LOW by any audit pass.
+- **F-09** - Unify width and endianness throughout. Today the message
+  AAD encodes numeric fields as 8-byte BigUint64 via JavaScript's
+  `BigUint64Array(...).buffer`, which yields native byte order
+  (little-endian on every browser PinChat runs on). The DH-header
+  signature canonical encodes the same counters as 4-byte big-endian
+  u32. The asymmetry is intentional and documented in the appendix; the
+  costs are a usability footgun for any future non-JavaScript client,
+  and a width mismatch in which a header counter at or beyond 2^32
+  wraps in the signature input while the AAD carries it in full. The
+  fix is a one-line change in the AAD encoder plus the corresponding
+  PROTOCOL.md table.
