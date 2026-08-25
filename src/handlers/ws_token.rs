@@ -202,18 +202,20 @@ pub async fn generate_ws_token(
         }
     };
 
+    // Audit L-4: expired, full and missing all answer 404. A 410 here told a
+    // caller holding a room id that the room had once existed, which is the
+    // one bit the UUIDv4 namespace was chosen to withhold. The room is still
+    // removed eagerly instead of waiting for the next cleanup tick.
     if room_is_expired {
         state.remove_room(&room_id);
         return Err((
-            StatusCode::GONE,
-            Json(json!({ "error": "Room has expired" })),
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "Room not found" })),
         )
             .into_response());
     }
 
     if room_is_full {
-        // Return 404 (same as "not found") to avoid leaking room existence to
-        // callers probing UUIDs. See http.rs::room_page for rationale.
         return Err((
             StatusCode::NOT_FOUND,
             Json(json!({ "error": "Room not found" })),

@@ -1,7 +1,7 @@
 use axum::{
     Form,
     extract::{Query, State},
-    http::{HeaderMap, StatusCode, header},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
 };
 use axum_extra::extract::cookie::{Cookie, SameSite};
@@ -54,6 +54,44 @@ fn should_use_secure_cookies(force_secure: bool) -> bool {
     cert_exists && key_exists
 }
 
+/// Returns true when `url` is safe to emit verbatim as a `Location` value.
+///
+/// Audit M-3: the previous test was `starts_with('/') && !starts_with("//")`,
+/// which accepts `/\evil.com`. Per the WHATWG URL specification a relative
+/// reference beginning `/\` enters "special authority ignore slashes" state
+/// exactly as `//` does, so Chrome, Firefox and Safari all resolve it to the
+/// scheme-relative form and navigate off-origin with the address bar showing
+/// the attacker's host. Backslashes are normalised to forward slashes for
+/// special schemes, so the character has to be refused outright rather than
+/// only in the leading position.
+///
+/// Control characters are screened for a second reason. `HeaderValue` refuses
+/// them and the call sites used to `.unwrap()` that conversion, so a form
+/// field carrying `%0d%0a` passed the old filter and panicked the handler
+/// task. Rejecting here means the value is always a legal header value by the
+/// time it reaches the response, and a lax intermediary is never handed a
+/// response-splitting payload either.
+fn is_safe_redirect_target(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix('/') else {
+        return false;
+    };
+
+    // Scheme-relative, in either spelling the URL parser accepts.
+    if rest.starts_with('/') || rest.starts_with('\\') {
+        return false;
+    }
+
+    // A backslash further along cannot reintroduce an authority by itself, but
+    // nothing this application generates contains one and parsers disagree on
+    // how they normalise it. Refuse the whole class.
+    if url.contains('\\') {
+        return false;
+    }
+
+    // CR, LF, TAB, NUL and the rest of C0/C1.
+    !url.chars().any(char::is_control)
+}
+
 /// Login page handler - redirects to static HTML
 /// CSRF token is obtained via /api/csrf endpoint
 pub async fn login_page(
@@ -71,11 +109,11 @@ pub async fn login_page(
         .max_age(time::Duration::ZERO)
         .build();
 
-    // Sanitize redirect URL to prevent open redirect attacks
-    // Only allow relative URLs starting with /
+    // Sanitize redirect URL to prevent open redirect attacks.
+    // Only same-origin relative paths survive; see is_safe_redirect_target.
     let redirect_url = query
         .redirect
-        .filter(|url| url.starts_with('/') && !url.starts_with("//"))
+        .filter(|url| is_safe_redirect_target(url))
         .unwrap_or_default();
 
     let mut headers = HeaderMap::new();
@@ -93,7 +131,14 @@ pub async fn login_page(
             urlencoding::encode(&redirect_url)
         )
     };
-    headers.insert(header::LOCATION, location.parse().unwrap());
+    // is_safe_redirect_target already guarantees this converts, and the
+    // urlencoding pass above guarantees it for the query form. Degrade to the
+    // bare login page rather than panicking should either invariant weaken.
+    headers.insert(
+        header::LOCATION,
+        HeaderValue::from_str(&location)
+            .unwrap_or_else(|_| HeaderValue::from_static("/static/login.html")),
+    );
 
     (StatusCode::SEE_OTHER, headers)
 }
@@ -234,11 +279,11 @@ pub async fn login_submit(
     let session_cookie_str = session_cookie.to_string();
     let clear_csrf_str = clear_csrf.to_string();
 
-    // Determine redirect URL (with security validation)
-    // Only allow relative URLs starting with / to prevent open redirect attacks
+    // Determine redirect URL (with security validation).
+    // Only same-origin relative paths survive; see is_safe_redirect_target.
     let redirect_target = form
         .redirect_url
-        .filter(|url| !url.is_empty() && url.starts_with('/') && !url.starts_with("//"))
+        .filter(|url| !url.is_empty() && is_safe_redirect_target(url))
         .unwrap_or_else(|| "/".to_string());
 
     tracing::debug!("Redirecting to: {}", redirect_target);
@@ -246,7 +291,13 @@ pub async fn login_submit(
     // Redirect to target URL (homepage or original page)
     // Use HeaderMap to properly support multiple Set-Cookie headers
     let mut headers = HeaderMap::new();
-    headers.insert(header::LOCATION, redirect_target.parse().unwrap());
+    // Audit L-6: this was `.parse().unwrap()`. `redirect_target` is now
+    // control-character free by construction, but a fallback beats a panicking
+    // worker task if that ever stops being true.
+    headers.insert(
+        header::LOCATION,
+        HeaderValue::from_str(&redirect_target).unwrap_or_else(|_| HeaderValue::from_static("/")),
+    );
     headers.append(header::SET_COOKIE, session_cookie_str.parse().unwrap());
     headers.append(header::SET_COOKIE, clear_csrf_str.parse().unwrap());
 
@@ -313,4 +364,88 @@ fn login_error_response(
     let location = format!("/static/login.html?error={}", urlencoding::encode(message));
 
     (StatusCode::SEE_OTHER, [(header::LOCATION, location)]).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_safe_redirect_target;
+    use axum::http::HeaderValue;
+
+    #[test]
+    fn accepts_ordinary_relative_paths() {
+        for url in [
+            "/",
+            "/c/2f8a1b3c-0000-4000-8000-000000000000",
+            "/static/chat.html?room=abc",
+            "/logout",
+        ] {
+            assert!(is_safe_redirect_target(url), "{url} should be accepted");
+        }
+    }
+
+    #[test]
+    fn rejects_absolute_and_scheme_relative() {
+        for url in [
+            "//evil.example",
+            "///evil.example",
+            "https://evil.example",
+            "http://evil.example",
+            "evil.example",
+            "",
+        ] {
+            assert!(!is_safe_redirect_target(url), "{url} should be rejected");
+        }
+    }
+
+    #[test]
+    fn rejects_backslash_authority() {
+        // Audit M-3 regression. WHATWG URL parsing enters the same
+        // "special authority ignore slashes" state for a leading `/\` as it
+        // does for `//`, so Chrome, Firefox and Safari all resolve these to an
+        // off-origin scheme-relative URL. The previous filter
+        // (`starts_with('/') && !starts_with("//")`) accepted every one.
+        for url in [
+            r"/\evil.example",
+            r"/\/evil.example",
+            r"/\\evil.example",
+            r"/path\..\evil",
+        ] {
+            assert!(!is_safe_redirect_target(url), "{url} should be rejected");
+        }
+    }
+
+    #[test]
+    fn rejects_control_characters() {
+        // Audit L-6 regression. These used to reach HeaderValue::from_str via
+        // an `.unwrap()` and panic the handler task: a form field carrying
+        // `%0d%0a` decodes to a bare CRLF and passed the old filter untouched.
+        for url in [
+            "/\r\nX-Injected: 1",
+            "/\n/",
+            "/\tfoo",
+            "/\u{0}",
+            "/a\u{7f}b",
+        ] {
+            assert!(!is_safe_redirect_target(url), "{url:?} should be rejected");
+        }
+    }
+
+    #[test]
+    fn accepted_targets_are_always_valid_header_values() {
+        // The property both call sites depend on: everything this predicate
+        // accepts converts cleanly, so the fallbacks are belt-and-braces
+        // rather than live code paths.
+        for url in [
+            "/",
+            "/c/room?x=1",
+            "/static/login.html?redirect=%2Fc%2Fx",
+            "/a b",
+        ] {
+            assert!(is_safe_redirect_target(url), "{url} should be accepted");
+            assert!(
+                HeaderValue::from_str(url).is_ok(),
+                "{url} must be a legal header value"
+            );
+        }
+    }
 }
