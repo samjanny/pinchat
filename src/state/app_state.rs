@@ -8,8 +8,19 @@ use dashmap::mapref::entry::Entry;
 use rand::RngCore;
 use std::collections::{HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
+
+/// Retention margin applied on top of a token's own `exp` when recording a
+/// consumed `jti`.
+///
+/// Audit H-1: the record must outlive every instant at which the signature
+/// still verifies, otherwise the replay guard disappears while the token is
+/// still usable. The margin covers the consumed-token cleanup interval (60s,
+/// so an entry can survive up to a full tick past its nominal expiry) plus
+/// slack for a modest backward step of the wall clock, which `exp` follows
+/// but the monotonic `Instant` used for eviction does not.
+const JTI_RETENTION_MARGIN_SECS: u64 = 120;
 
 /// Error type for room creation failures
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -149,11 +160,25 @@ impl AppState {
     ///
     /// # Arguments
     /// * `jti` - JWT ID to consume
-    /// * `ttl_secs` - Token TTL for cleanup scheduling
-    pub fn consume_token(&self, jti: Uuid, ttl_secs: u64) -> bool {
+    /// * `exp_unix` - The token's own `exp` claim (Unix epoch seconds)
+    ///
+    /// # Retention
+    /// Audit H-1: the record is held until `exp + JTI_RETENTION_MARGIN_SECS`,
+    /// derived from the claim rather than from a fixed TTL. A fixed hold was
+    /// measured from the moment of consumption, so a token redeemed late in
+    /// its life produced a record that could be evicted while the signature
+    /// was still inside the verifier's clock-skew allowance. Anchoring to
+    /// `exp` makes the retention independent of how long the caller waited
+    /// between minting and presenting the token.
+    pub fn consume_token(&self, jti: Uuid, exp_unix: u64) -> bool {
         use std::time::Duration;
 
-        let expiration = Instant::now() + Duration::from_secs(ttl_secs);
+        let now_unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let hold_secs = exp_unix.saturating_sub(now_unix) + JTI_RETENTION_MARGIN_SECS;
+        let expiration = Instant::now() + Duration::from_secs(hold_secs);
 
         // Atomic insert - first writer wins, replays see Occupied immediately
         match self.consumed_tokens.entry(jti) {

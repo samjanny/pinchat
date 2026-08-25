@@ -157,12 +157,63 @@ pub async fn ws_handler(
         return (StatusCode::FORBIDDEN, "Token not valid for this room").into_response();
     }
 
+    // Audit M-2: room-state gate BEFORE the single-use jti is burned.
+    //
+    // The existence / expiry / capacity checks used to live exclusively in
+    // handle_socket, i.e. AFTER consume_token. A client that lost the race for
+    // the second slot, or arrived at a room that had just expired, therefore
+    // had its token consumed by a rejection it did not cause, and had to
+    // re-run Proof-of-Work to try again. Hoisting the read here keeps
+    // consume_token as the last gate (C-07 still holds: every check above it
+    // is a rejection the client can retry with the same token) while removing
+    // the stateful rejections from the burn path.
+    //
+    // add_participant inside handle_socket remains the authoritative capacity
+    // check; this read is advisory and can go stale in the narrow window
+    // between here and the upgrade. That residual race burns a token at most
+    // once per genuine tie, instead of on every full-room arrival.
+    //
+    // The `.map()` keeps the DashMap read guard scoped to this statement.
+    // remove_room write-locks the same shard, so holding the guard across the
+    // expired branch would self-deadlock the worker (cf. the room_page
+    // regression test in handlers/http.rs).
+    let room_state = state
+        .rooms
+        .get(&room_id)
+        .map(|room| (room.is_expired(), room.is_full()));
+    match room_state {
+        Some((false, false)) => {}
+        Some((true, _)) => {
+            // Expired: clean up eagerly rather than waiting for the next
+            // cleanup tick, then answer exactly like a missing room.
+            state.remove_room(&room_id);
+            #[cfg(debug_assertions)]
+            tracing::debug!("WebSocket upgrade rejected: room expired");
+            return (StatusCode::NOT_FOUND, "Room not found").into_response();
+        }
+        Some((false, true)) => {
+            // Audit L-4: full and missing share one response so a caller
+            // holding a room id cannot tell the two apart.
+            #[cfg(debug_assertions)]
+            tracing::debug!("WebSocket upgrade rejected: room full");
+            return (StatusCode::NOT_FOUND, "Room not found").into_response();
+        }
+        None => {
+            #[cfg(debug_assertions)]
+            tracing::debug!("WebSocket upgrade rejected: room not found");
+            return (StatusCode::NOT_FOUND, "Room not found").into_response();
+        }
+    }
+
     // SECURITY: Single-use token enforcement (prevents replay attacks).
-    // C-07: this is the LAST gate before upgrade — every stateless check
-    // above has already passed by the time we mutate state. A failed
-    // upgrade attempt past this point cannot have "wasted" the JTI of a
-    // legitimate client whose Origin / room / signature didn't match.
-    if !state.consume_token(claims.jti, state.config.jwt_token_ttl_secs) {
+    // C-07: this is the LAST gate before upgrade. Every check above has
+    // already passed by the time we mutate state, so a failed upgrade attempt
+    // past this point cannot have "wasted" the JTI of a legitimate client
+    // whose Origin / room / signature didn't match, or whose room was gone.
+    //
+    // Audit H-1: the retention window is derived from `claims.exp`, so the
+    // record outlives every instant at which the signature still verifies.
+    if !state.consume_token(claims.jti, claims.exp) {
         tracing::warn!(
             "JWT token replay attempt detected: jti={}, room={}",
             claims.jti,
@@ -261,15 +312,27 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: Uuid, connec
     // Split the socket into sender and receiver
     let (mut sender, mut receiver) = socket.split();
 
-    // Get validated room configuration from server (prevents URL spoofing)
-    let (room_type, ttl_minutes, max_participants, created_at) = {
-        let room = state.rooms.get(&room_id).expect("Room must exist");
+    // Get validated room configuration from server (prevents URL spoofing).
+    //
+    // This used to be `.expect("Room must exist")`. The invariant is real but
+    // not exclusive: the cleanup task, or a concurrent handler hitting the
+    // expired path, can remove the room between add_connection above and this
+    // read. That is a lost race, not a bug, and panicking the connection task
+    // over it is the wrong response. Unwind cleanly instead, releasing the
+    // participant slot we just took.
+    let room_config = state.rooms.get(&room_id).map(|room| {
         (
             room.room_type,
             room.ttl_minutes,
             room.max_participants,
             room.created_at,
         )
+    });
+    let Some((room_type, ttl_minutes, max_participants, created_at)) = room_config else {
+        #[cfg(debug_assertions)]
+        tracing::debug!("Room disappeared between add_connection and config read");
+        state.remove_connection(&connection_id);
+        return;
     };
 
     // Send connection confirmation message with validated room config
@@ -612,6 +675,17 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: Uuid, connec
                                             incoming.msg_type,
                                             connection_id
                                         );
+                                        // Audit L-6: a malformed header is the
+                                        // same class of misbehaviour as an
+                                        // unknown msg_type or unparseable JSON,
+                                        // and a well-behaved v1 client never
+                                        // emits one. Without this the only
+                                        // ceiling was frame_rate_limit (120/s),
+                                        // so a peer could sit just under it and
+                                        // stream junk headers indefinitely.
+                                        if bump_protocol_error(&state_clone, connection_id) {
+                                            break;
+                                        }
                                         continue;
                                     }
                                 };
@@ -980,6 +1054,58 @@ mod tests {
         assert!(
             !state.consumed_tokens.contains_key(&jti),
             "JTI must NOT be consumed on Origin rejection (C-07)"
+        );
+    }
+
+    #[tokio::test]
+    async fn full_room_preserves_jti() {
+        // Audit M-2: the room-state gate now runs BEFORE consume_token, so a
+        // client that arrives at a room whose second slot was already taken
+        // keeps its token instead of having it burned by a rejection it did
+        // not cause. Before the fix the capacity check lived in handle_socket,
+        // i.e. after the jti had been recorded, and the loser of the race had
+        // to re-run Proof-of-Work to try again.
+        let (addr, state, room_id) = spawn_test_server().await;
+
+        // Fill both slots; Room::new hard-codes max_participants to 2.
+        assert!(state.add_connection(Uuid::new_v4(), room_id));
+        assert!(state.add_connection(Uuid::new_v4(), room_id));
+
+        let claims = WsTokenClaims::new(room_id, 30, &state.config.jwt_issuer);
+        let jti = claims.jti;
+        let token = sign_token(&claims, &state.jwt_secret).unwrap();
+        let sp = format!("pinchat.v1, pinchat.v1.jwt.{}", token);
+        let path = format!("/ws/{}", room_id);
+
+        let status = raw_upgrade(addr, &path, Some(&sp)).await;
+        assert_eq!(
+            status, 404,
+            "a full room must answer 404, indistinguishable from a missing room (audit L-4)"
+        );
+        assert!(
+            !state.consumed_tokens.contains_key(&jti),
+            "JTI must NOT be consumed when the room is full (audit M-2)"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_room_preserves_jti() {
+        // Same conservation property for a room that never existed. The token
+        // stays spendable and the response is the same 404 a full or expired
+        // room produces, so the status code carries no existence signal.
+        let (addr, state, _room_id) = spawn_test_server().await;
+        let unknown_room = Uuid::new_v4();
+        let claims = WsTokenClaims::new(unknown_room, 30, &state.config.jwt_issuer);
+        let jti = claims.jti;
+        let token = sign_token(&claims, &state.jwt_secret).unwrap();
+        let sp = format!("pinchat.v1, pinchat.v1.jwt.{}", token);
+        let path = format!("/ws/{}", unknown_room);
+
+        let status = raw_upgrade(addr, &path, Some(&sp)).await;
+        assert_eq!(status, 404);
+        assert!(
+            !state.consumed_tokens.contains_key(&jti),
+            "JTI must NOT be consumed when the room does not exist (audit M-2)"
         );
     }
 

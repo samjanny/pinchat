@@ -130,6 +130,16 @@ pub fn verify_token(
     let mut validation = Validation::new(Algorithm::HS256);
     validation.set_required_spec_claims(&["exp", "aud", "iss"]);
 
+    // Audit H-1: pin the clock-skew allowance to zero. `Validation::new`
+    // defaults to `leeway: 60`, which keeps a signature verifiable for a full
+    // minute past `exp`. The single-use `jti` record is retained relative to
+    // the token's own expiry, so that extra minute was a window in which the
+    // signature still checked out while the replay guard had already been
+    // garbage-collected by the consumed-token cleanup task. Tokens live 30s
+    // by design and are minted and redeemed by the same client within a
+    // single page interaction; no honest caller needs a minute of skew on top.
+    validation.leeway = 0;
+
     // Audit C-2: pin both audience and issuer. set_audience accepts the
     // expected `aud` value(s); set_issuer accepts expected `iss` value(s).
     // A token signed with the same secret but issued by another component
@@ -356,6 +366,38 @@ mod tests {
             result.is_err(),
             "Token missing `exp` must be rejected (set_required_spec_claims gate)"
         );
+    }
+
+    // Audit H-1 regression: `Validation::new` ships `leeway: 60`, so without
+    // an explicit pin a token stays verifiable for a minute past `exp`. The
+    // jti replay record is not held that long, which opened a real replay
+    // window. verify_token MUST reject a token that is already expired, even
+    // by less than the default leeway.
+    #[test]
+    fn test_token_rejects_expired_within_default_leeway() {
+        let secret = [23u8; 32];
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        for seconds_past_exp in [1u64, 30, 59] {
+            let claims = WsTokenClaims {
+                room_id: Uuid::new_v4(),
+                connection_id: Uuid::new_v4(),
+                exp: now - seconds_past_exp,
+                jti: Uuid::new_v4(),
+                aud: WS_TOKEN_AUDIENCE.to_string(),
+                iss: TEST_ISS.to_string(),
+            };
+            let token = sign_token(&claims, &secret).expect("sign");
+
+            assert!(
+                verify_token(&token, &secret, TEST_ISS).is_err(),
+                "token expired {}s ago must be rejected; leeway is not pinned to 0",
+                seconds_past_exp
+            );
+        }
     }
 
     #[test]
