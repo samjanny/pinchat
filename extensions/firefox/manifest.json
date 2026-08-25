@@ -1,7 +1,7 @@
 {
     "manifest_version": 3,
     "name": "PinChat Integrity Verifier",
-    "version": "1.2.0",
+    "version": "1.2.1",
     "description": "Prevents untrusted scripts and verifies pinchat.io files against signed hashes",
     "permissions": [
         "storage",
