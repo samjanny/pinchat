@@ -245,10 +245,26 @@ mod tests {
 
     #[test]
     fn test_invalid_nonce_rejected() {
-        let challenge = PowChallenge::new(8);
+        // `PowChallenge::new` embeds a random UUID, so with 8-bit difficulty
+        // any given nonce had a 1-in-256 chance of being accepted. Asserting
+        // that nonce 0 is rejected therefore failed roughly once every 256
+        // CI runs. Pin the challenge string so the outcome is exact.
+        let challenge = PowChallenge {
+            challenge: "pow-test-fixed-challenge-d8".to_string(),
+            mask: PowChallenge::generate_mask(8),
+            difficulty: 8,
+        };
 
-        // Nonce 0 is extremely unlikely to be valid for 8-bit difficulty
-        assert!(!challenge.verify(0));
+        let solution = (0..=u32::MAX as u64)
+            .find(|nonce| challenge.verify(*nonce))
+            .expect("an 8-bit challenge must be solvable");
+
+        // The fixture is only meaningful if it rejects something first.
+        assert!(solution > 0, "fixture must not be solved by nonce 0");
+        for nonce in 0..solution {
+            assert!(!challenge.verify(nonce), "nonce {nonce} must be rejected");
+        }
+        assert!(challenge.verify(solution));
     }
 
     // Audit H-1 regression tests ---------------------------------------------
