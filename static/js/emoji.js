@@ -184,9 +184,22 @@ class EmojiManager {
             });
         }
 
-        // Restore code blocks
+        // Restore code blocks.
+        //
+        // Audit F-3: the function form of the replacement is mandatory here.
+        // With a STRING replacement, String.prototype.replace interprets the
+        // `$` patterns inside it -- $&, $`, $', $$ -- and codeBlocks[i] is
+        // built from peer-controlled message text. escapeHtml does not touch
+        // `$`, so a message such as "`X$\'`" makes the replacement splice in
+        // the portion of the subject string that FOLLOWS the match, duplicating
+        // and reordering the rendered output and exposing the internal
+        // \x00CODE_BLOCK_N\x00 sentinel in the UI. Not an XSS (everything
+        // injected is already escaped), but it lets a sender control how their
+        // own message renders in a way that diverges from the plaintext.
+        // A replacer function receives the match and returns the string
+        // verbatim, with no `$` interpretation.
         for (let i = 0; i < codeBlocks.length; i++) {
-            processedText = processedText.replace(`\x00CODE_BLOCK_${i}\x00`, codeBlocks[i]);
+            processedText = processedText.replace(`\x00CODE_BLOCK_${i}\x00`, () => codeBlocks[i]);
         }
 
         return processedText;
@@ -240,9 +253,11 @@ class EmojiManager {
         // Escape HTML in the rest of the text
         processedText = escapeHtml(processedText);
 
-        // Restore code blocks (already have HTML)
+        // Restore code blocks (already have HTML).
+        // Audit F-3: function form, for the same `$`-pattern reason documented
+        // in substituteEmoticons above.
         for (let i = 0; i < codeBlocks.length; i++) {
-            processedText = processedText.replace(`\x00CODE_BLOCK_${i}\x00`, codeBlocks[i]);
+            processedText = processedText.replace(`\x00CODE_BLOCK_${i}\x00`, () => codeBlocks[i]);
         }
 
         // Convert newlines to <br> (but not inside <pre> blocks)

@@ -1,8 +1,8 @@
 {
   "data": {
     "version": "1.2.0",
-    "sequence": 41,
-    "generated": "2026-08-06T08:11:45.957Z",
+    "sequence": 42,
+    "generated": "2026-08-25T10:49:53.721Z",
     "site": "https://pinchat.io",
     "files": [
       {
@@ -15,7 +15,7 @@
       },
       {
         "path": "/static/js/app.js",
-        "hash": "34e963b7a411a08e3213f7b598b09926029c6d4becc830fa3daa8aef03ae5ccd"
+        "hash": "0e865eb1041d1c169ccaeda472e7995088768aa58d566b4197a466149554bb4c"
       },
       {
         "path": "/static/js/cookie-notice.js",
@@ -23,11 +23,11 @@
       },
       {
         "path": "/static/js/crypto.js",
-        "hash": "e4fd3a30b50ed6248a52a944230e11081d631ea213871118120b57bfca9302b6"
+        "hash": "01253d888cbe9bbb56d7fe382b4c372fae0f17e9cd083ea4c1beabccb6ed46db"
       },
       {
         "path": "/static/js/double-ratchet.js",
-        "hash": "577474cc9e9802fc466142d72928f9a60d4a74929d96774ccfd8368072b85ba6"
+        "hash": "6d38b23f598de875c1aa7d883a04c2bf5e7efa6e7205d635baf924da761a217b"
       },
       {
         "path": "/static/js/ecdh.js",
@@ -35,7 +35,7 @@
       },
       {
         "path": "/static/js/emoji.js",
-        "hash": "c3aef301e0151c503d001f919db0db69d05283a2c3779452fb89af664b0b52ff"
+        "hash": "5c81fdf83976defb74505038b5aeea556f72eb76eae67d411e0b32d71abb5240"
       },
       {
         "path": "/static/js/homepage.js",
@@ -87,7 +87,7 @@
       },
       {
         "path": "/static/chat.html",
-        "hash": "1fab6d220ae781521be774cadd3e940951b9d6a19a0a76f6d7bf1c61dc9cb6ca"
+        "hash": "12d343199d1e98ad324df8cc38151f57c7f947d31bccfd050f10a1903fa4206b"
       },
       {
         "path": "/static/terms.html",
@@ -103,5 +103,5 @@
       }
     ]
   },
-  "signature": "MEUCIAtqtXQFANDt2mnlHbOLeAXubB7dgfHWwUQncMWA4PfTAiEA0ZcazAdUlCoCVncn5ChpDcwNAJJUv5xybjNuUa++Fvk="
+  "signature": "MEQCIHkyRC98lYfFzJBWsRaq4Yy+7KdgWClEH5IVswc2Ewm4AiAA7Lfc4D75o/OD9fgPKmlKG1tlu+kjLWvIUqiEizS9YQ=="
 }

@@ -325,15 +325,20 @@ document.addEventListener('alpine:init', () => {
                     // When participant count drops below 2, cleanup ECDH state
                     if (this.participantCount < 2) {
                         if (this.ecdhHandshakeStatus === 'waiting') {
-                            // Handshake was in progress → hard abort (peer left)
-                            debugLog('[ECDH] Resetting status to none (handshake aborted, peer left)');
-                            await this.handleECDHAborted(true);  // hardReset: peer is gone
+                            // Handshake was in progress: tear it down, but keep
+                            // the identity manager (audit M-1, see
+                            // handlePeerDeparted for why).
+                            debugLog('[ECDH] Peer left mid-handshake, tearing down (identity retained)');
+                            await this.handlePeerDeparted();
                             // Reset status to 'none' so handshake can restart when room becomes ready again
                             this.ecdhHandshakeStatus = 'none';
                         } else if (this.pfsActive) {
-                            // PFS was active → hard abort (peer left, need fresh identity with new peer)
-                            debugLog('[ECDH] PFS was active, peer left → hard reset');
-                            await this.handleECDHAborted(true);  // hardReset: peer is gone
+                            // PFS was active: tear down the session but keep the
+                            // identity, so a peer that comes back is diffed
+                            // against the one the user verified rather than
+                            // silently re-trusted (audit M-1).
+                            debugLog('[ECDH] PFS was active, peer left, retaining identity for re-verify');
+                            await this.handlePeerDeparted();
                             this.ecdhHandshakeStatus = 'none';
                             this.sasBackup = null;
                             this.addSystemMessage('⚠️ Secure connection lost (other participant left)');
@@ -491,9 +496,13 @@ document.addEventListener('alpine:init', () => {
             const file = event.target.files[0];
             if (!file) return;
 
-            // Validate file type
-            if (!file.type.startsWith('image/')) {
-                this.error = '⚠️ Please select an image file.';
+            // Validate file type against the same allowlist crypto.js enforces
+            // on both encrypt and decrypt (audit F-1 / L-1). The old test was
+            // `startsWith('image/')`, which let image/svg+xml through. Checking
+            // here as well as in encryptImage gives the user a specific error
+            // at pick time instead of an opaque encryption failure at send.
+            if (!isAllowedImageMimeType(file.type)) {
+                this.error = '⚠️ Unsupported image type. Use PNG, JPEG, GIF or WebP.';
                 return;
             }
 
@@ -739,6 +748,15 @@ document.addEventListener('alpine:init', () => {
                     break;
                 case 'SENDER_AUTH_FAILED':
                     warningMessage += 'Message authentication failed (sender impersonation or tampering detected)';
+                    break;
+                case 'UNSUPPORTED_IMAGE_TYPE':
+                    warningMessage += 'Image rejected (declared type is not an allowed image format)';
+                    break;
+                case 'PROTOCOL_MISMATCH':
+                    warningMessage += 'Malformed message header (rejected before decryption)';
+                    break;
+                case 'CHAIN_COUNTER_REGRESSION':
+                    warningMessage += 'Ratchet counter went backwards (message rejected)';
                     break;
                 default:
                     warningMessage += 'Message could not be verified (possible attack)';
@@ -1241,14 +1259,70 @@ document.addEventListener('alpine:init', () => {
         // happens on RECEIVE, not via separate messages.
 
         /**
+         * Peer-departure teardown that PRESERVES the identity manager.
+         *
+         * Audit M-1: `userleft` used to call handleECDHAborted(true), which
+         * destroys the identity manager and, with it, sasVerificationStatus and
+         * sasReverifyRequired. Membership frames are relay-controlled and
+         * carry no authentication, so a hostile relay could forge a single
+         * `userleft` to erase every trace of the user's out-of-band
+         * verification and let the next handshake come up as a first-time,
+         * freely-skippable SAS prompt. The reconnect path
+         * (restartECDHHandshake) already handled this correctly by keeping the
+         * identity alive; the leave path did not.
+         *
+         * This mirrors that reconnect handling: stash the peer's identity bytes
+         * so the next completed handshake runs hasPeerIdentityChanged(), and
+         * leave sasVerified intact. What the peer's return then produces:
+         *
+         *   - same identity key: SAS carries over, no re-prompt (this is the
+         *     ordinary case, since identities persist in IndexedDB for 24h).
+         *   - different identity key, previously verified: sasReverifyRequired
+         *     is set, the composer stays locked, and skipping is refused until
+         *     the user confirms the new code out of band. Strictly stronger
+         *     than the old behaviour, which offered a skippable prompt.
+         *   - different identity key, never verified: a warning plus a normal
+         *     first-time prompt, unchanged from before.
+         *
+         * Genuine MITM detection (SIGNATURE_INVALID) and quarantine overflow
+         * still call handleECDHAborted(true). Destroying the identity is the
+         * right answer there; a peer walking out of the room is not.
+         */
+        async handlePeerDeparted() {
+            // Capture raw bytes, not the CryptoKey: peer identities are
+            // imported non-extractable, so the cached *Raw copy is the only
+            // way to diff them after the fact.
+            const previousPeerIdentityRaw =
+                this.identityManager && this.identityManager.peerIdentityPublicKeyRaw
+                    ? new Uint8Array(this.identityManager.peerIdentityPublicKeyRaw)
+                    : null;
+
+            // Soft abort: clears the ratchet, the ECDH manager and the pending
+            // quarantine, re-reads the bootstrap key, and leaves the identity
+            // manager (and therefore the SAS verdict) untouched.
+            await this.handleECDHAborted(false);
+
+            if (this.identityManager) {
+                this.identityManager.previousPeerIdentityRaw = previousPeerIdentityRaw;
+                debugLog(
+                    '[ECDH] Peer departed, identity retained (SAS verified:',
+                    this.identityManager.isSASVerified(),
+                    ')'
+                );
+            }
+        },
+
+        /**
          * Handles ECDH handshake aborted
          *
          * Cleans up ECDH state but does NOT permanently set status to 'aborted'.
          * The caller should reset status to 'none' when appropriate to allow
          * handshake to restart when room becomes ready again.
          *
-         * @param {boolean} hardReset - If true, destroys identity manager and SAS verification.
-         *                              Use for: user leave, peer change, MITM detection.
+         * @param {boolean} hardReset - If true, destroys identity manager and SAS
+         *                              verification. Use for MITM detection and
+         *                              quarantine overflow. A departing peer uses
+         *                              handlePeerDeparted() instead (audit M-1).
          *                              Default false preserves identity for retry.
          */
         async handleECDHAborted(hardReset) {

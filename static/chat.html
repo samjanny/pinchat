@@ -242,9 +242,15 @@
                 <svg class="icon" aria-hidden="true"><use href="#i-lock"/></svg> Establishing secure end-to-end encryption… Please wait.
             </div>
 
-            <!-- Group Chat Security Warning (3+ participants OR non-1:1 room types) -->
+            <!-- Legacy non-1:1 room. Group creation is refused by the API
+                 (audit M-4). A room of this type predates that gate and cannot
+                 carry messages at all: the ECDH + Double Ratchet handshake only
+                 runs for `onetoone`, and encryptMessage/decryptMessage throw
+                 without an initialised ratchet. The previous copy here claimed
+                 these rooms fell back to bootstrap encryption, which was never
+                 true of the shipped client. -->
             <div x-show="connected && roomType !== 'onetoone'" class="group-chat-warning">
-                <svg class="icon" aria-hidden="true"><use href="#i-info"/></svg> <strong>Group chats</strong> currently use bootstrap encryption. Perfect Forward Secrecy for group chats is planned for future implementation.
+                <svg class="icon" aria-hidden="true"><use href="#i-info"/></svg> <strong>Group chats are not available yet.</strong> This room cannot send or receive encrypted messages. Please open a new 1:1 chat.
             </div>
 
             <!-- Image Preview (shown when image is selected or being sent) -->
@@ -441,13 +447,13 @@
 
     <!-- Include JS modules -->
     <script src="/static/js/debug.js" integrity="sha256-nY3zkFVKF7x6KVbWq1mwcHq4Y/g8O10iOmLAFfiDsJ8=" crossorigin="anonymous" ></script>
-    <script src="/static/js/crypto.js" integrity="sha256-5P06MLUO1iSKUqlEIw4RCB1jHqIThxEYEgtXv8qTArY=" crossorigin="anonymous" ></script>
+    <script src="/static/js/crypto.js" integrity="sha256-ASU9iIy+m7tW1/44K0w3L64PF+nNCD6kwb6rzLbtRts=" crossorigin="anonymous" ></script>
     <script src="/static/js/identity.js" integrity="sha256-myf4gfSaxf1+Hyh+dZxXfvdSPr/uVnGtDOP6kHyNOj4=" crossorigin="anonymous" ></script>
-    <script src="/static/js/double-ratchet.js" integrity="sha256-V3R0zJ6YAvxGYULXKSj5pg1KdJKdlndMz9g2gHK4W6Y=" crossorigin="anonymous" ></script>
+    <script src="/static/js/double-ratchet.js" integrity="sha256-bTiyP1mN6HXBqn2IOgTCv15++m5yBdY1uvkk2nYaIXs=" crossorigin="anonymous" ></script>
     <script src="/static/js/ecdh.js" integrity="sha256-I6uKHd+us1u+AACTLm7YoW0fUqs2h3W8SbJtoaEMzuU=" crossorigin="anonymous" ></script>
     <script src="/static/js/websocket.js" integrity="sha256-ixcpU5MEMEueVzVI9CcM5Z3txpcgSSzL5os4W6fMbyg=" crossorigin="anonymous" ></script>
-    <script src="/static/js/emoji.js" integrity="sha256-w67zAeAVHFA9AB+RnbDbadBSg6LDd5RS+4mvZksLUv8=" crossorigin="anonymous" ></script>
-    <script src="/static/js/app.js" integrity="sha256-NOljt6QRoI4yE/e1mLCZJgKcbUvsyDD6PaqK7wOuXM0=" crossorigin="anonymous" ></script>
+    <script src="/static/js/emoji.js" integrity="sha256-XIH9+Dl23vt0UFA4ta7qVW9y63bq5n1BHgsy1xq7UkA=" crossorigin="anonymous" ></script>
+    <script src="/static/js/app.js" integrity="sha256-DoZesQQdHBacyu2kcueZUIh2iqWNVmtBl6RmFJVUu0w=" crossorigin="anonymous" ></script>
     <script src="/static/js/alpine-csp.min.js" integrity="sha256-58hj2liWaS9dR44Q2uCJ5hZP7RxcG2offLv3qbCT8FU=" crossorigin="anonymous" defer></script>
 
     <!-- Lucide icon sprite (ISC license, https://lucide.dev) -->

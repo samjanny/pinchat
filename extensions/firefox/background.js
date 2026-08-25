@@ -56,12 +56,25 @@ const GITHUB_REPO = 'samjanny/pinchat';
 // reinforces the trust anchor.
 const GITHUB_TAG = 'v0.6.1';
 
-// Minimum acceptable manifest sequence — hardcoded floor to defeat replay
-// attacks against fresh installs (where lastKnownSequence in storage is 0).
-// Bump this on every extension release to match (or stay below) the latest
-// signed manifest sequence at the time of release. A manifest with a lower
-// sequence than this constant is rejected even on first install.
-const MIN_KNOWN_SEQUENCE = 41;
+// Minimum acceptable manifest sequence: a hardcoded floor that defeats replay
+// attacks against fresh installs, where lastKnownSequence in storage is 0.
+// A manifest whose sequence is below this constant is rejected even on a
+// first install.
+//
+// COUPLING, read before changing either constant. This floor is checked
+// against the manifest fetched from GITHUB_TAG above, NOT against the
+// working tree. Setting the floor higher than the sequence of the manifest
+// at that tag makes this build reject every manifest it can fetch, which
+// disables verification for everyone running it. The two constants must
+// therefore move together: a build carrying floor N must point at a tag
+// whose hashes.json.signed is at sequence N or higher.
+//
+// tests/test-security.js pins the floor to the sequence in the working-tree
+// manifest, so a server-side re-sign bumps this number. That is safe for
+// already-installed builds (they carry their own baked-in floor and tag) but
+// it means the NEXT extension release must cut a tag containing the current
+// manifest and update GITHUB_TAG in the same commit.
+const MIN_KNOWN_SEQUENCE = 42;
 
 // Configuration
 const CONFIG = {

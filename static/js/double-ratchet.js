@@ -459,6 +459,37 @@ class DoubleRatchet {
         if (!header.sig || typeof header.sig !== 'string') {
             throw new Error('MISSING_SIGNATURE');
         }
+        if (typeof header.dh !== 'string' || header.dh.length === 0) {
+            throw new Error('PROTOCOL_MISMATCH');
+        }
+
+        // Audit F-2: pn / n / rc must be genuine uint32 values before anything
+        // downstream reads them. Two primitives coerce silently AND in
+        // agreement, so a non-number can satisfy both integrity checks at once:
+        //
+        //   _buildCanonicalBytes -> DataView.setUint32 -> ToUint32
+        //   encodeAADWithLengthPrefix -> BigInt(value)  -> accepts "0", false
+        //
+        // n: "0" therefore verifies against the peer's genuine ECDSA signature
+        // (ToUint32("0") === 0) and matches the AAD (BigInt("0") === 0n), the
+        // AEAD tag passes, and the message decrypts. The damage lands after
+        // that, at `this.Nr = messageNumber + 1`, which becomes the string
+        // concatenation "0" + 1 === "01". Relational comparisons keep working
+        // numerically so nothing throws, but skipped-key ids are built by
+        // interpolation (`${dh}:${this.Nr}`) and "...:01" never matches the
+        // "...:1" a numeric counter produces. Out-of-order messages are then
+        // dropped in silence, permanently, for the rest of the session.
+        //
+        // Only a hostile relay can deliver such a header: the Rust server
+        // types these three fields as u32 (models/message.rs) and
+        // re-serializes, so an honest deployment cannot forward a string. The
+        // threat model treats the relay as untrusted, and this guard turns a
+        // silent permanent desync into a clean fail-closed.
+        const isUint32 = (value) =>
+            Number.isInteger(value) && value >= 0 && value <= 0xFFFFFFFF;
+        if (!isUint32(header.pn) || !isUint32(header.n) || !isUint32(header.rc)) {
+            throw new Error('PROTOCOL_MISMATCH');
+        }
 
         // Extract header fields
         const { dh: dhPublicKeyBase64, pn: prevChainLength, n: messageNumber, rc: ratchetCount } = header;

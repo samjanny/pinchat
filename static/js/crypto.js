@@ -61,6 +61,43 @@ const AAD_FIELD_TYPES = {
 };
 
 /**
+ * Image MIME types this client will encrypt or render.
+ *
+ * Audit F-1 / L-1: the sender-side check was `file.type.startsWith('image/')`,
+ * which admits image/svg+xml, and the RECEIVER had no check at all --
+ * decryptImage returned the peer-controlled mimeType straight out of the
+ * decrypted envelope, and app.js fed it to `new Blob(..., {type})` plus
+ * URL.createObjectURL. What the AEAD guarantees is only that the PEER wrote
+ * that string, not that it is safe to build an object URL from.
+ *
+ * Two consequences. A modified client could declare text/html and produce a
+ * same-origin blob: document; our CSP is inherited by blob: documents so
+ * inline script stays blocked, but "open image in new tab" lands the viewer on
+ * attacker-authored markup under the real origin. SVG is the subtler one: it
+ * renders inside <img>, so a peer could paint arbitrary vector content that
+ * imitates application chrome directly inside a message bubble.
+ *
+ * The list mirrors the file picker's accept attribute in chat.html and is
+ * enforced on BOTH ends: on send so the user gets an immediate, specific
+ * error, and on receive because that is the side the local user cannot vouch
+ * for.
+ */
+const ALLOWED_IMAGE_MIME_TYPES = Object.freeze([
+    'image/png',
+    'image/jpeg',
+    'image/gif',
+    'image/webp',
+]);
+
+/**
+ * @param {unknown} mimeType
+ * @returns {boolean} true when the type is in ALLOWED_IMAGE_MIME_TYPES
+ */
+function isAllowedImageMimeType(mimeType) {
+    return typeof mimeType === 'string' && ALLOWED_IMAGE_MIME_TYPES.includes(mimeType);
+}
+
+/**
  * Encodes AAD fields using TLV (Type-Length-Value) format
  *
  * TLV Format: [type:1][length:2][value:n]
@@ -241,8 +278,20 @@ class ChainRatchet {
             throw new Error('Chain ratchet not initialized');
         }
 
-        // Calculate how many ratchet steps ahead this counter is
+        // Calculate how many ratchet steps ahead this counter is.
+        //
+        // Audit F-2: a negative or non-integer result used to skip the loop
+        // below silently and then derive a key from the CURRENT chain position
+        // while labelling it with the requested counter -- the wrong key, with
+        // no error raised. The Double Ratchet keeps Nr and
+        // receivingChain.messageNumber aligned on every receive path, so this
+        // is unreachable today. Assert the invariant rather than assume it, so
+        // a future refactor fails loudly here instead of producing a session
+        // whose messages simply stop decrypting.
         const stepsAhead = counter - currentCounter;
+        if (!Number.isInteger(stepsAhead) || stepsAhead < 0) {
+            throw new Error('CHAIN_COUNTER_REGRESSION');
+        }
 
         // Simulate ratcheting forward (without modifying actual chain state)
         let simulatedChainKey = new Uint8Array(this.chainKeyMaterial);
@@ -706,6 +755,12 @@ class CryptoManager {
             throw new Error('Double Ratchet not initialized - cannot encrypt');
         }
 
+        // Audit F-1: refuse to put a type on the wire that the receiving side
+        // will reject anyway. Keeps both ends on one allowlist.
+        if (!isAllowedImageMimeType(mimeType)) {
+            throw new Error('UNSUPPORTED_IMAGE_TYPE');
+        }
+
         debugLog('[CRYPTO] Encrypting image with Double Ratchet...');
 
         // Create image envelope with metadata
@@ -770,6 +825,14 @@ class CryptoManager {
             throw new Error('Expected image message but got: ' + imageEnvelope.type);
         }
 
+        // Audit F-1: screen the peer-controlled mimeType BEFORE the caller can
+        // build a Blob and an object URL from it. This is the gate that
+        // matters -- the sender-side check protects the sender's own UX, this
+        // one protects us from a peer running a modified client.
+        if (!isAllowedImageMimeType(imageEnvelope.mimeType)) {
+            throw new Error('UNSUPPORTED_IMAGE_TYPE');
+        }
+
         // Convert base64 back to ArrayBuffer
         const imageData = this.base64ToArrayBuffer(imageEnvelope.data);
 
@@ -821,6 +884,8 @@ if (typeof module !== 'undefined' && module.exports) {
     globalThis.AAD_FIELD_TYPES = AAD_FIELD_TYPES;
     globalThis.encodeAADWithLengthPrefix = encodeAADWithLengthPrefix;
     globalThis.ChainRatchet = ChainRatchet;
+    globalThis.ALLOWED_IMAGE_MIME_TYPES = ALLOWED_IMAGE_MIME_TYPES;
+    globalThis.isAllowedImageMimeType = isAllowedImageMimeType;
     module.exports = {
         CryptoManager,
         ChainRatchet,
@@ -828,6 +893,8 @@ if (typeof module !== 'undefined' && module.exports) {
         encodeAADWithLengthPrefix,
         base64ToBase64url,
         base64urlToBase64,
+        ALLOWED_IMAGE_MIME_TYPES,
+        isAllowedImageMimeType,
     };
 } else {
     window.cryptoManager = new CryptoManager();
