@@ -4,6 +4,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Dates are the repository-local commit dates; entries are curated for user-visible impact
 rather than being a 1:1 mirror of `git log`.
 
+## [2026-08-27] - v0.7.2
+
+Comment-only change to a signed asset. No behaviour change anywhere;
+protocol version stays 1.
+
+### Changed - legal.js header no longer misdescribes the manifest
+
+The header comment in `static/js/legal.js` said `operator.json` was
+intentionally outside the signed manifest. It has been listed there since
+the manifest covered `/static/**`, and `verify-sri.js` checks the deployed
+copy when present, so the comment now says that changing the file on the
+server requires a re-sign like any other static asset. Because the script
+is itself a signed asset, its hash moved: manifest sequence 44, inline SRI
+in `terms.html` and `privacy.html` refreshed, extension CSP rules
+regenerated, `MIN_KNOWN_SEQUENCE` 44 and `GITHUB_TAG` v0.7.2 in both
+extensions, extension version 1.2.3.
+
 ## [2026-08-27] - v0.7.1
 
 Legal-text release. No code change on the server or in the chat client;
