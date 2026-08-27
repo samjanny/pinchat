@@ -54,7 +54,7 @@ const GITHUB_REPO = 'samjanny/pinchat';
 // release. A server-side release that does NOT ship a new extension keeps
 // using the previous pinned manifest — that is the intended behaviour and
 // reinforces the trust anchor.
-const GITHUB_TAG = 'v0.7.0';
+const GITHUB_TAG = 'v0.7.1';
 
 // Minimum acceptable manifest sequence: a hardcoded floor that defeats replay
 // attacks against fresh installs, where lastKnownSequence in storage is 0.
@@ -74,7 +74,7 @@ const GITHUB_TAG = 'v0.7.0';
 // already-installed builds (they carry their own baked-in floor and tag) but
 // it means the NEXT extension release must cut a tag containing the current
 // manifest and update GITHUB_TAG in the same commit.
-const MIN_KNOWN_SEQUENCE = 42;
+const MIN_KNOWN_SEQUENCE = 43;
 
 // Configuration
 const CONFIG = {

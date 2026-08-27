@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Privacy Policy — PinChat</title>
+    <title>Privacy Policy - PinChat</title>
     <meta name="robots" content="noindex, nofollow">
     <link rel="stylesheet" href="/static/css/style.css" integrity="sha256-I7jppwH+0/qRDZPZftMjmb3TS6Ou3wlt+aZx9qF6oZ0=" crossorigin="anonymous" >
     <script src="/static/js/theme.js" integrity="sha256-vc83MC35lVoXBnYkFcbi+cE5EgJ+drCEfcjEryWT40A=" crossorigin="anonymous" ></script>
@@ -18,70 +18,104 @@
 
         <main>
             <div class="card">
-                <p>This policy explains what personal data is processed when you use PinChat ("the Service"), for what purposes, and on what legal basis under the EU General Data Protection Regulation (Regulation (EU) 2016/679, "GDPR").</p>
+                <p>This policy explains what personal data is processed when you use PinChat ("the Service"), for what purposes, on what legal basis, and for how long, in accordance with Regulation (EU) 2016/679 ("GDPR") and Legislative Decree 196/2003 as amended ("Italian Privacy Code").</p>
 
                 <h2>1. Data Controller</h2>
-                <p><strong><span data-legal="OPERATOR_NAME">the Operator</span></strong> (the "Controller") operates the Service as a natural person based in <span data-legal="OPERATOR_COUNTRY">the Operator's country</span>. General contact: <a data-legal-mailto="OPERATOR_EMAIL_SUPPORT" href="#"><span data-legal="OPERATOR_EMAIL_SUPPORT">(support contact not configured)</span></a>. For formal or legally binding communications (including data-subject requests under GDPR Chapter III), please use the Controller's certified electronic mail channel, where available: <a data-legal-mailto="OPERATOR_PEC" href="#"><span data-legal="OPERATOR_PEC">(no certified contact configured)</span></a>.</p>
+                <p>The controller is <strong><span data-legal="OPERATOR_NAME">the Operator</span></strong>, a natural person resident in <span data-legal="OPERATOR_COUNTRY">the Operator's country</span> (the "Controller"), who operates the Service in a personal, non-commercial capacity.</p>
+                <ul>
+                    <li>General contact: <a data-legal-mailto="OPERATOR_EMAIL_SUPPORT" href="#"><span data-legal="OPERATOR_EMAIL_SUPPORT">(support contact not configured)</span></a></li>
+                    <li>Formal communications, including data-subject requests under Chapter III GDPR: <a data-legal-mailto="OPERATOR_PEC" href="#"><span data-legal="OPERATOR_PEC">(no certified contact configured)</span></a> (certified email). Requests sent to the general contact are handled in the same way; the certified channel simply gives you legally certified proof of delivery.</li>
+                </ul>
                 <p><span data-legal="OPERATOR_DPO_NOTE">No Data Protection Officer is believed to be required under Article 37 GDPR for this Service as it is currently operated.</span></p>
 
-                <h2>2. Data We Process, and Data We Do Not</h2>
-                <p>PinChat is designed to minimise data processing. What the Service processes and for how long:</p>
+                <h2>2. Data We Process</h2>
+                <p>PinChat is designed to process as little data as possible, and to keep none of it on disk. In the normal operation of the Service, the following data is processed:</p>
                 <ul>
-                    <li><strong>IP address and User-Agent string</strong> — unavoidable technical metadata exposed by any HTTPS request. <span data-legal="OPERATOR_LOG_RETENTION">(log retention policy not configured)</span> <span data-legal="OPERATOR_HOSTING_PROVIDER_LOG_NOTE">(hosting provider log note not configured)</span></li>
-                    <li><strong>Session cookie (<code>pinchat_session</code>)</strong> — a random, server-side session identifier set after successful login. Strictly necessary for authenticated access; not shared with third parties. HttpOnly, Secure, SameSite=Strict.</li>
-                    <li><strong>CSRF cookie</strong> — a short-lived, HMAC-signed token used to protect the login form against cross-site request forgery. Strictly necessary; cleared immediately after login.</li>
-                    <li><strong>Room metadata</strong> (room UUID, type, time-to-live, max participants, participant count) — held exclusively in server memory for the life of the room; never written to disk. Deleted automatically when the room expires or becomes empty.</li>
-                    <li><strong>Proof-of-Work challenge cache</strong> — an HMAC over your IP address, stored in memory for a few minutes, used to rate-limit room creation and WebSocket token issuance. Deleted on challenge consumption or expiry.</li>
+                    <li><strong>IP address and User-Agent string.</strong> Technical metadata that any HTTPS request exposes. <span data-legal="OPERATOR_LOG_RETENTION">(log retention policy not configured)</span> Your IP address in the clear is held in server memory only for the duration of each request or active connection. For rate limiting, the server also keeps a keyed hash (HMAC-SHA256) of your IP address in memory for the length of the relevant rate-limit window, at most 15 minutes after your last request; the key is generated at random every time the server starts, so the hashes cannot be correlated across restarts. See Section 4 for what the hosting provider may retain independently.</li>
+                    <li><strong>Beta access password.</strong> During the beta phase, access is gated by an access password shared by the beta participants. The password is not linked to any person by the Service and is stored only as an Argon2id hash. The Controller hands the password to beta participants directly, through the channel on which they were already in contact (for example email or an instant-messaging application); the Controller therefore knows who received it, but the Service itself does not, and nothing you do on the Service is associated with that channel. That correspondence is treated as described under "Correspondence" below.</li>
+                    <li><strong>Session cookie (<code>pinchat_session</code>).</strong> A random, server-side session identifier set after the beta password is accepted. HttpOnly, Secure, SameSite=Strict. Strictly necessary to keep you authenticated; not shared with anyone.</li>
+                    <li><strong>CSRF cookie (<code>csrf_token</code>).</strong> A short-lived (15 minutes), HMAC-signed token that protects the access form against cross-site request forgery. Strictly necessary; cleared immediately after access is granted.</li>
+                    <li><strong>Proof-of-work cookie (<code>pc_pow</code>).</strong> A random identifier, valid for 5 minutes, HttpOnly, Secure, SameSite=Strict, that ties a proof-of-work challenge to your browser so that people sharing the same public IP address do not overwrite each other's challenges. Strictly necessary; it carries no information about you and is not used for tracking.</li>
+                    <li><strong>Room metadata.</strong> Room identifier (UUID), room type, time-to-live, creation and last-activity timestamps, maximum and current number of participants. Held exclusively in server memory for the life of the room, never written to disk, deleted automatically when the room expires.</li>
+                    <li><strong>Proof-of-work challenge cache.</strong> A record keyed by the hash of your IP address combined with the <code>pc_pow</code> cookie value, kept in memory for at most 5 minutes, used to rate-limit room creation and WebSocket token issuance. Deleted when the challenge is consumed or expires.</li>
+                    <li><strong>Encrypted messages in transit.</strong> The server relays ciphertext (messages and images) between participants. It holds each encrypted message in memory only for the time needed to forward it to the other connected participant; nothing is queued for a participant who is not connected, and nothing is written to disk. The server cannot decrypt it (see Section 3). To detect replayed messages, the server keeps in memory a SHA-256 hash of each relayed ciphertext for the life of the room; the hash reveals nothing about the content.</li>
+                    <li><strong>Correspondence.</strong> If you write to the support or abuse addresses below, or if you receive the beta password from the Controller, the Controller processes your email address or messaging contact and the content of the exchange in order to reply, to distribute the password and, for abuse reports, to investigate.</li>
                 </ul>
+                <p>The cookies and browser-storage entries described in this policy are strictly necessary to provide the service you request, or store a preference you have expressed, and therefore do not require your consent under Article 122 of the Italian Privacy Code and Article 5(3) of Directive 2002/58/EC.</p>
+
                 <p>What the Service does <strong>not</strong> process:</p>
                 <ul>
-                    <li><strong>Message content.</strong> Messages are end-to-end encrypted in your browser with a symmetric key that never leaves your device (it is transmitted to other participants only through the room URL fragment, which is never sent to the server by design). The Controller cannot read your messages and does not store them on disk; they live only in server memory for the milliseconds needed to relay them.</li>
-                    <li><strong>Accounts or profile data.</strong> No registration, no name, no phone, no email collected from users of the Service.</li>
-                    <li><strong>Analytics, trackers, or advertising cookies.</strong> None are used.</li>
+                    <li><strong>Message content in the clear.</strong> Messages are encrypted end-to-end in your browser. The Controller cannot read them.</li>
+                    <li><strong>Accounts or profile data.</strong> There is no registration. No name, email address, phone number, or other identifier is collected from users of the Service.</li>
+                    <li><strong>Analytics, trackers, advertising cookies, or fingerprinting.</strong> None are used.</li>
                 </ul>
 
-                <p>What is stored <strong>locally in your browser</strong> (never transmitted to the Controller):</p>
+                <p>What is stored <strong>in your browser</strong> and never sent to the Controller:</p>
                 <ul>
-                    <li><strong>Identity keypair (IndexedDB <code>pinchat_identity_v1</code>).</strong> An ECDSA P-256 keypair generated on first chat and persisted for up to 24 hours (matching your session lifetime). After expiry it is silently discarded and a fresh one is generated on next use. The private side is created as <em>non-extractable</em>: it remains an opaque handle inside the WebCrypto API and cannot be exported, even by malicious scripts running in the page. Used exclusively in your browser to sign your ephemeral Diffie-Hellman public keys (MITM defence — Signal Protocol). Persisted so that the Short Authentication String (SAS) you verify with your contact stays the same across reconnects and tab refreshes within the same 24-hour window, instead of resetting every page load.</li>
-                    <li><strong>Bootstrap-key transit cache (sessionStorage).</strong> The room URL fragment is moved from the address bar into tab-scoped <code>sessionStorage</code> immediately after page load and erased from the URL bar, so the secret stops appearing in browser history, screen-shares, or window-title overlays for the rest of the chat session.</li>
+                    <li><strong>Identity keypair</strong> (IndexedDB, <code>pinchat_identity_v1</code>). An ECDSA P-256 keypair generated in your browser on first use and kept for up to 24 hours, matching the session lifetime; after that it is discarded and a fresh one is generated on next use. The private key is created as <em>non-extractable</em> inside the WebCrypto API, so it cannot be exported as raw bytes; note that a compromised page could still invoke it to produce signatures, which is why the Controller recommends verifying the Short Authentication String (SAS) with your contact out of band. The key is used only to sign your ephemeral Diffie-Hellman public keys, so that the SAS you verify with your contact remains stable across reconnects and tab refreshes within the same 24-hour window.</li>
+                    <li><strong>Bootstrap-key transit cache</strong> (sessionStorage). Immediately after the page loads, the room link's fragment (which carries the room bootstrap key) is moved from the address bar into tab-scoped <code>sessionStorage</code> and removed from the URL, so that the secret does not appear in browser history, screen shares, or window titles for the rest of the session. The same tab-scoped storage briefly holds the single-use WebSocket token between the moment a room is created and the moment the chat page connects.</li>
+                    <li><strong>Preferences</strong> (localStorage). Your light/dark theme choice and the fact that you dismissed the cookie notice. Both are plain flags with no identifier.</li>
                 </ul>
-                <p>This local data lives on your device, not on the server. You can erase it at any time from your browser's site-settings panel (Application → Storage → IndexedDB / Session Storage for Chromium-based browsers, or the equivalent in Firefox/Safari). The identity entry also expires automatically after 24 hours and is regenerated on next use.</p>
+                <p>You can erase all of the above at any time from your browser's site-data settings. The identity entry also expires on its own after 24 hours, and the sessionStorage entries disappear when the tab is closed.</p>
 
-                <h2>3. Purposes and Legal Bases</h2>
-                <ul>
-                    <li>Operating the Service and protecting it against abuse (rate limiting, PoW, session authentication) — legal basis: <strong>legitimate interest</strong> (Art. 6(1)(f) GDPR) in providing a functional and secure service.</li>
-                    <li>Responding to abuse reports and valid legal requests — legal basis: <strong>legitimate interest</strong> (Art. 6(1)(f) GDPR) and, where applicable, <strong>legal obligation</strong> (Art. 6(1)(c) GDPR).</li>
-                </ul>
+                <h2>3. How Encryption Works, in Brief</h2>
+                <p>The room link's fragment carries a 256-bit bootstrap key generated in the creator's browser. Browsers never send URL fragments to servers, so the Controller never receives it. Participants use the bootstrap key to encrypt and authenticate an initial Diffie-Hellman exchange, sign their ephemeral public keys with their local identity key, and derive per-message keys with a Double Ratchet, so that session keys rotate continuously and a compromised key does not expose past messages. Once the ratchet is running, the bootstrap key is discarded from memory. The SAS shown in the interface lets you confirm with your contact, over another channel, that no third party sits in between.</p>
+                <p>This design means the server only ever handles ciphertext. It also means the security of the scheme depends on the JavaScript delivered to your browser by pinchat.io: a compromised or malicious server could serve modified code. The source is published (see the Terms of Service) so that this can be audited, and an optional browser extension, published in the same repository, checks the files served by pinchat.io against a signed manifest before they run. Without the extension, the Controller cannot technically prove to you that the code served at any given moment matches a published revision.</p>
 
                 <h2>4. Recipients and International Transfers</h2>
-                <p>The only third party that receives technical metadata in the normal course of operation is the <strong>hosting provider</strong> of the virtual machine running the Service: <span data-legal="OPERATOR_HOSTING_PROVIDER">(hosting provider not configured)</span>. <span data-legal="OPERATOR_HOSTING_NOTE">Details about the hosting location, transfer mechanism and, where applicable, the applicable Standard Contractual Clauses or adequacy decision, are provided by the Operator on request.</span> <span data-legal="OPERATOR_HOSTING_PROVIDER_LOG_NOTE">(hosting provider log note not configured)</span> Should the hosting infrastructure change in a way that involves transfers outside the EEA, this policy will be updated accordingly.</p>
-                <p>No data is shared with advertising networks, analytics providers, or profiling services, because none are in use.</p>
+                <p>No data is shared with advertising networks, analytics providers, or profiling services, because none are used.</p>
+                <p>The only third party involved in the normal operation of the Service is the <strong>hosting provider</strong> of the virtual machine running it, <strong><span data-legal="OPERATOR_HOSTING_PROVIDER">(hosting provider not configured)</span></strong>. <span data-legal="OPERATOR_HOSTING_NOTE">Details about the hosting location and any transfer mechanism are provided by the Controller on request.</span> The personal data concerned is limited to the transient connection metadata described in Section 2.</p>
+                <p><span data-legal="OPERATOR_HOSTING_PROVIDER_LOG_NOTE">(hosting provider log note not configured)</span></p>
+                <p>Should the hosting infrastructure change, this policy will be updated.</p>
+                <p>Competent authorities may receive data held at the time of a valid legal request, as described in the Terms of Service.</p>
 
-                <h2>5. Retention</h2>
+                <h2>5. Purposes and Legal Bases</h2>
                 <ul>
-                    <li>Rooms and their in-memory metadata: until the TTL you configure (15 minutes to 24 hours) or the last participant disconnects, whichever comes first. No on-disk persistence.</li>
-                    <li>Session cookie: valid for the session duration configured by the Operator (default 24 hours, sliding window), cleared on logout.</li>
-                    <li><strong>Local identity keypair (IndexedDB):</strong> 24 hours from creation, then automatically discarded and regenerated. Cleared immediately if you erase site data for the origin.</li>
-                    <li><strong>Reverse-proxy and application logs:</strong> <span data-legal="OPERATOR_LOG_RETENTION">(log retention policy not configured)</span> <span data-legal="OPERATOR_HOSTING_PROVIDER_LOG_NOTE">(hosting provider log note not configured)</span></li>
-                    <li><strong>Abuse report correspondence:</strong> retained for up to <span data-legal="OPERATOR_ABUSE_REPORT_RETENTION">(abuse report retention not configured)</span> from resolution of the report, then deleted.</li>
+                    <li><strong>Operating the Service and protecting it from abuse</strong> (rate limiting, proof-of-work, session authentication). Data: IP address and its keyed hash, User-Agent, cookies, PoW cache, room metadata, encrypted messages in transit and their hashes. Legal basis: legitimate interest, Art. 6(1)(f) GDPR, in providing a functional and secure service.</li>
+                    <li><strong>Distributing the beta access password.</strong> Data: email address or messaging contact of beta participants. Legal basis: legitimate interest, Art. 6(1)(f) GDPR, in running a closed beta.</li>
+                    <li><strong>Replying to support requests.</strong> Data: email address, message content. Legal basis: legitimate interest, Art. 6(1)(f) GDPR, in responding to people who contact the Controller.</li>
+                    <li><strong>Handling abuse reports and enforcing the Terms.</strong> Data: email address, report content, room metadata available at the time. Legal basis: legitimate interest, Art. 6(1)(f) GDPR, in keeping the Service safe and lawful.</li>
+                    <li><strong>Complying with valid legal requests.</strong> Data: whatever is held at the time. Legal basis: legal obligation, Art. 6(1)(c) GDPR.</li>
+                </ul>
+                <p>Providing the technical data in the first item is not a contractual requirement, but it is technically unavoidable: the Service cannot be used without it.</p>
+
+                <h2>6. Retention</h2>
+                <ul>
+                    <li><strong>Rooms and in-memory metadata:</strong> until the time-to-live you configure (5 minutes to 24 hours) elapses, counted from the room's creation. A room that all participants have left is kept, empty, until that moment and then removed. Never written to disk.</li>
+                    <li><strong>IP address:</strong> in the clear, for the duration of the request or connection only; as a keyed hash, for the rate-limit window, at most 15 minutes after your last request. No persistent logs.</li>
+                    <li><strong>Proof-of-work cookie and challenge cache:</strong> 5 minutes.</li>
+                    <li><strong>CSRF cookie:</strong> 15 minutes, or until access is granted.</li>
+                    <li><strong>Session cookie:</strong> 24 hours by default (sliding window), or until logout.</li>
+                    <li><strong>Ciphertext replay hashes:</strong> for the life of the room.</li>
+                    <li><strong>Local identity keypair (your browser):</strong> 24 hours from creation, or until you clear site data.</li>
+                    <li><strong>Beta password correspondence:</strong> for the duration of the beta phase, then deleted.</li>
+                    <li><strong>Support correspondence:</strong> up to 12 months from the last exchange, then deleted.</li>
+                    <li><strong>Abuse-report correspondence:</strong> up to <span data-legal="OPERATOR_ABUSE_REPORT_RETENTION">(abuse report retention not configured)</span> from resolution of the report, then deleted, unless a longer period is required by a pending legal proceeding.</li>
                 </ul>
 
-                <h2>6. Your Rights</h2>
-                <p>Under GDPR you have the right to access your personal data, to rectify it, to request erasure, to restrict or object to its processing, to data portability, and to lodge a complaint with a supervisory authority. Given that the Service processes very little personal data and retains none of it persistently, in practice there is typically no stored record of your usage that can be retrieved or ported.</p>
-                <p>To exercise your rights, contact <a data-legal-mailto="OPERATOR_EMAIL_SUPPORT" href="#"><span data-legal="OPERATOR_EMAIL_SUPPORT">(support contact not configured)</span></a>, or — for a request you want to send through a legally-recognised channel — the Controller's certified mail address <a data-legal-mailto="OPERATOR_PEC" href="#"><span data-legal="OPERATOR_PEC">(no certified contact configured)</span></a>. The competent data-protection supervisory authority for <span data-legal="OPERATOR_COUNTRY">the Operator's country</span> is <a data-legal-href="OPERATOR_DPA_URL" href="#" target="_blank" rel="noopener noreferrer"><span data-legal="OPERATOR_DPA_NAME">(data protection authority not configured)</span></a>.</p>
+                <h2>7. Your Rights</h2>
+                <p>Under Articles 15 to 22 GDPR you have the right to access your personal data, to have it rectified or erased, to restrict its processing, and to receive it in a portable format where the legal basis allows.</p>
+                <p><strong>Right to object.</strong> Because most processing described here relies on legitimate interest, you have the right at any time to object to it on grounds relating to your particular situation (Article 21 GDPR). Note that objecting to the processing of your connection metadata means the Service can no longer be provided to you.</p>
+                <p>In practice, because the Service keeps no persistent record of your usage, there is usually nothing stored that can be retrieved, corrected, ported, or erased, other than correspondence you have sent to the Controller. Requests will be answered within one month.</p>
+                <p>To exercise your rights, write to <a data-legal-mailto="OPERATOR_EMAIL_SUPPORT" href="#"><span data-legal="OPERATOR_EMAIL_SUPPORT">(support contact not configured)</span></a> or, if you want certified proof of delivery, to <a data-legal-mailto="OPERATOR_PEC" href="#"><span data-legal="OPERATOR_PEC">(no certified contact configured)</span></a>.</p>
+                <p>You also have the right to lodge a complaint with a supervisory authority, in particular in the EU member state of your habitual residence, place of work, or place of the alleged infringement. The authority competent for the Controller is the <a data-legal-href="OPERATOR_DPA_URL" href="#" target="_blank" rel="noopener noreferrer"><span data-legal="OPERATOR_DPA_NAME">(data protection authority not configured)</span></a>.</p>
 
-                <h2>7. Automated Decision-Making</h2>
-                <p>The Service does not perform profiling or automated decision-making with legal or similarly significant effects within the meaning of Article 22 GDPR.</p>
+                <h2>8. Automated Decision-Making</h2>
+                <p>The Service does not carry out profiling or automated decision-making producing legal or similarly significant effects within the meaning of Article 22 GDPR. Rate limiting and proof-of-work challenges are applied uniformly and do not evaluate personal characteristics.</p>
 
-                <h2>8. Security</h2>
-                <p>Technical measures in place include: HTTPS/TLS, Argon2id password hashing for beta access, HMAC-signed CSRF tokens with constant-time verification, single-use short-lived JWT tokens for WebSocket upgrade, proof-of-work to limit automated abuse, rate limiting, and end-to-end encryption of message content. The application runs in a container with non-root privileges and dropped Linux capabilities. Despite these measures, as noted on the homepage, the Service has not undergone a formal third-party security audit and may contain vulnerabilities.</p>
+                <h2>9. Security</h2>
+                <p>Technical measures in place include: HTTPS/TLS; Argon2id hashing of the beta access password; HMAC-signed CSRF tokens with constant-time verification; single-use, short-lived (30 seconds) JWT tokens for WebSocket upgrade; proof-of-work and rate limiting against automated abuse; end-to-end encryption of message content as described in Section 3; and a container running without root privileges, with all Linux capabilities dropped and a read-only root filesystem.</p>
+                <p>The Service has not undergone a formal third-party security audit and may contain vulnerabilities. Do not rely on it for anything you cannot afford to have exposed.</p>
 
-                <h2>9. Changes to This Policy</h2>
-                <p>This policy may be updated to reflect changes in the Service or in applicable law. The "Last updated" date at the top reflects the latest revision. Material changes will be highlighted on the homepage for a reasonable period.</p>
+                <h2>10. Changes to This Policy</h2>
+                <p>This policy may be updated to reflect changes in the Service or in applicable law. The "Last updated" date at the top reflects the latest revision. Material changes will be announced on the homepage for a reasonable period.</p>
 
-                <h2>10. Contact</h2>
-                <p>Privacy questions and data subject requests: <a data-legal-mailto="OPERATOR_EMAIL_SUPPORT" href="#"><span data-legal="OPERATOR_EMAIL_SUPPORT">(support contact not configured)</span></a>.<br>
-                Abuse reports: <a data-legal-mailto="OPERATOR_EMAIL_ABUSE" href="#"><span data-legal="OPERATOR_EMAIL_ABUSE">(abuse contact not configured)</span></a>.</p>
+                <h2>11. Contact</h2>
+                <ul>
+                    <li>Privacy questions and data-subject requests: <a data-legal-mailto="OPERATOR_EMAIL_SUPPORT" href="#"><span data-legal="OPERATOR_EMAIL_SUPPORT">(support contact not configured)</span></a></li>
+                    <li>Abuse reports: <a data-legal-mailto="OPERATOR_EMAIL_ABUSE" href="#"><span data-legal="OPERATOR_EMAIL_ABUSE">(abuse contact not configured)</span></a></li>
+                    <li>Certified email: <a data-legal-mailto="OPERATOR_PEC" href="#"><span data-legal="OPERATOR_PEC">(no certified contact configured)</span></a></li>
+                </ul>
             </div>
         </main>
 
@@ -90,7 +124,7 @@
         </footer>
     </div>
 
-    <!-- Cookie notice (informational, dismissible — see static/js/cookie-notice.js) -->
+    <!-- Cookie notice (informational, dismissible; see static/js/cookie-notice.js) -->
     <div id="cookie-notice" class="cookie-notice hidden" role="region" aria-label="Cookie notice">
         <span class="cookie-notice-text">This site uses only strictly necessary cookies (session, CSRF). No tracking, no analytics. <a href="/static/privacy.html">Privacy</a></span>
         <button type="button" class="cookie-notice-ok">OK</button>

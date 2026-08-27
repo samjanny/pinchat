@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Terms of Service — PinChat</title>
+    <title>Terms of Service - PinChat</title>
     <meta name="robots" content="noindex, nofollow">
     <link rel="stylesheet" href="/static/css/style.css" integrity="sha256-I7jppwH+0/qRDZPZftMjmb3TS6Ou3wlt+aZx9qF6oZ0=" crossorigin="anonymous" >
     <script src="/static/js/theme.js" integrity="sha256-vc83MC35lVoXBnYkFcbi+cE5EgJ+drCEfcjEryWT40A=" crossorigin="anonymous" ></script>
@@ -18,53 +18,63 @@
 
         <main>
             <div class="card">
-                <p>These Terms of Service ("Terms") govern your use of PinChat ("the Service"), an experimental, end-to-end encrypted, ephemeral chat application operated by <strong><span data-legal="OPERATOR_NAME">the Operator</span></strong> (the "Operator"). By using the Service, you agree to these Terms. If you do not agree, do not use the Service.</p>
+                <p>These Terms of Service ("Terms") govern your use of PinChat ("the Service"), an experimental, end-to-end encrypted, ephemeral chat application operated by <strong><span data-legal="OPERATOR_NAME">the Operator</span></strong>, a natural person resident in <span data-legal="OPERATOR_COUNTRY">the Operator's country</span> (the "Operator"). By using the Service you agree to these Terms. If you do not agree, do not use the Service.</p>
 
                 <h2>1. Nature of the Service</h2>
-                <p>PinChat is an <strong>experimental prototype</strong> provided strictly for educational and research purposes. It is not designed, intended, or warranted for production use, the protection of real-world sensitive, personal, financial, or confidential data, or for safety-critical, life-critical, or mission-critical communications. Although it uses modern cryptographic techniques, the Service has not undergone a formal security review or audit and may contain serious vulnerabilities.</p>
+                <p>PinChat is an <strong>experimental prototype</strong> provided for educational and research purposes. It is not designed, intended, or warranted for production use, for the protection of sensitive, personal, financial, or confidential data, or for safety-critical, life-critical, or mission-critical communications. Although the Service uses modern cryptographic techniques, it has not undergone a formal third-party security audit and may contain serious vulnerabilities.</p>
                 <p><span data-legal="OPERATOR_LEGAL_CLASSIFICATION_NOTE">(legal classification not configured)</span></p>
 
                 <h2>2. Eligibility</h2>
-                <p>You must be at least <span data-legal="OPERATOR_MIN_AGE">16</span> years old to use the Service, or the age of digital consent in your jurisdiction if higher. By using the Service you represent that you meet this requirement.</p>
+                <p>You must be at least <span data-legal="OPERATOR_MIN_AGE">18</span> years old to use the Service. By using the Service you represent that you meet this requirement. The Operator does not verify age.</p>
 
-                <h2>3. No Accounts, No Identity Verification</h2>
-                <p>The Service does not require registration and does not verify the identity of any user. Rooms are ephemeral and protected by a cryptographic key embedded in the room link. You are solely responsible for how you share that link.</p>
+                <h2>3. Access; No Accounts; No Identity Verification</h2>
+                <p>The Service does not offer user accounts and does not verify the identity of any user. No name, email address, phone number, or other identifier is requested or stored by the Service.</p>
+                <p>During the current beta phase, access to the Service is gated by an access password shared by the beta participants. The password identifies nobody: it does not create an account and is not linked to any person by the Service. The Operator hands the password to beta participants directly, through the channel on which they were already in contact (for example email or an instant-messaging application). That channel exists outside the Service; the Privacy Policy describes how the Operator treats the correspondence it involves.</p>
+                <p>Rooms are ephemeral and protected by a cryptographic bootstrap key embedded in the fragment of the room link. Anyone holding the link can join the room while it exists and has a free seat. You are solely responsible for how you share that link.</p>
 
                 <h2>4. End-to-End Encryption and Content Responsibility</h2>
-                <p>Messages exchanged through the Service are end-to-end encrypted. <strong>The Operator cannot read the content of your messages</strong> and therefore cannot proactively moderate it. You are solely responsible for any content you transmit through the Service. You agree not to use the Service to transmit, request, or facilitate any of the following:</p>
+                <p>Messages and images exchanged through the Service are encrypted end-to-end in your browser. <strong>The Operator cannot read the content of your messages</strong> and therefore cannot proactively moderate it. End-to-end encryption protects message content in transit and on the server; it does not protect you against a compromised device, a compromised browser, or a participant who chooses to disclose the conversation.</p>
+                <p>You are solely responsible for any content you transmit through the Service. You agree not to use the Service to transmit, request, or facilitate any of the following:</p>
                 <ul>
-                    <li>content that is unlawful under applicable laws, including but not limited to child sexual abuse material (CSAM), non-consensual intimate imagery, terrorism-related content, or incitement to violence;</li>
+                    <li>content that is unlawful under applicable law, including child sexual abuse material (CSAM), non-consensual intimate imagery, terrorism-related content, or incitement to violence;</li>
                     <li>harassment, threats, stalking, doxxing, or coordinated abuse;</li>
                     <li>unsolicited commercial communications (spam), phishing, malware, or fraudulent activity;</li>
                     <li>impersonation of another person or entity;</li>
-                    <li>content that infringes intellectual property or trade secret rights of third parties;</li>
-                    <li>any attempt to circumvent rate limits, proof-of-work challenges, authentication, or other technical protections of the Service.</li>
+                    <li>content that infringes intellectual property or trade-secret rights of third parties;</li>
+                    <li>any attempt to circumvent rate limits, proof-of-work challenges, access controls, or other technical protections of the Service.</li>
                 </ul>
 
-                <h2>5. Abuse Reporting and Enforcement</h2>
-                <p>Although the Operator cannot read message content, the Operator retains the technical ability to terminate specific rooms and block network addresses in real time. If you believe the Service is being used to transmit illegal content or to harass you, report it to <a data-legal-mailto="OPERATOR_EMAIL_ABUSE" href="#"><span data-legal="OPERATOR_EMAIL_ABUSE">(abuse contact not configured)</span></a> with sufficient context for investigation (e.g., room URL, nature of the violation, relevant timestamps).</p>
-                <p>The Operator does not ordinarily retain persistent access or application logs. Enforcement actions are carried out based on information available at the time of the report. The Operator reserves the right to terminate any room or connection suspected of violating these Terms, and to cooperate with valid legal process to the extent technically feasible given the data actually held at the time of the request.</p>
+                <h2>5. Abuse Reporting, Enforcement, and Contesting a Decision</h2>
+                <p>Although the Operator cannot read message content, the Operator retains the technical ability to terminate rooms and to block network addresses.</p>
+                <p>If you believe the Service is being used to transmit illegal content or to harass you, report it to <a data-legal-mailto="OPERATOR_EMAIL_ABUSE" href="#"><span data-legal="OPERATOR_EMAIL_ABUSE">(abuse contact not configured)</span></a> with enough context for an investigation (for example: room URL, nature of the violation, relevant timestamps). Because the Service does not retain persistent access or application logs, enforcement actions are based on the information available at the time of the report; the Operator may be unable to act on reports concerning rooms that have already expired.</p>
+                <p>The Operator may terminate any room or connection, and block any network address, that is reasonably suspected of violating these Terms. No automated content-moderation tools are used. If you believe a room or connection was terminated in error, write to <a data-legal-mailto="OPERATOR_EMAIL_SUPPORT" href="#"><span data-legal="OPERATOR_EMAIL_SUPPORT">(support contact not configured)</span></a>; the Operator will review the decision and reply within a reasonable time.</p>
+                <p>The Operator cooperates with competent judicial and administrative authorities and complies with valid legal process, to the extent technically feasible given the data actually held at the time of the request.</p>
 
                 <h2>6. Service Availability; No SLA</h2>
-                <p>The Service is provided "as is" and "as available", without any warranty, express or implied, including without limitation warranties of merchantability, fitness for a particular purpose, or non-infringement. The Operator does not commit to any service-level, uptime, or data-preservation guarantee. Rooms auto-destruct at their configured TTL; messages cannot be recovered thereafter.</p>
+                <p>The Service is provided "as is" and "as available", without any warranty, express or implied, including warranties of merchantability, fitness for a particular purpose, and non-infringement. The Operator makes no commitment as to uptime, continuity, or data preservation, and may modify, suspend, or discontinue the Service at any time. Rooms self-destruct when their configured time-to-live elapses; messages cannot be recovered afterwards.</p>
 
                 <h2>7. Limitation of Liability</h2>
-                <p>To the maximum extent permitted by applicable law, the Operator shall not be liable for any indirect, incidental, special, consequential, or punitive damages, or for any loss of data, loss of profit, loss of goodwill, or business interruption, arising out of or in connection with your use of the Service, even if the Operator has been advised of the possibility of such damages. Nothing in these Terms excludes or limits liability that cannot be excluded or limited under applicable law.</p>
-                <p data-legal-optional="OPERATOR_LIABILITY_LOCAL_LAW_NOTE"><span data-legal="OPERATOR_LIABILITY_LOCAL_LAW_NOTE"></span></p>
+                <p>To the maximum extent permitted by applicable law, the Operator shall not be liable for any indirect, incidental, special, consequential, or punitive damages, or for any loss of data, loss of profit, loss of goodwill, or business interruption, arising out of or in connection with your use of the Service, even if the Operator has been advised of the possibility of such damages.</p>
+                <p>Nothing in these Terms excludes or limits liability for wilful misconduct or gross negligence (Article 1229 of the Italian Civil Code), for death or personal injury, or any other liability that cannot be excluded or limited under applicable law. If you are a consumer, nothing in these Terms affects the rights you are granted by Legislative Decree 206/2005 (Italian Consumer Code) or by the mandatory consumer-protection law of your country of residence.</p>
 
                 <h2>8. Changes to the Terms</h2>
-                <p>The Operator may revise these Terms at any time by updating this page. Material changes will be reflected by updating the "Last updated" date at the top. Continued use of the Service after a change constitutes acceptance of the revised Terms.</p>
+                <p>The Operator may revise these Terms to reflect changes in the Service or in applicable law. The "Last updated" date at the top reflects the latest revision. Material changes will be announced on the Service's homepage for a reasonable period before or upon taking effect. Continued use of the Service after a change constitutes acceptance of the revised Terms; if you do not accept them, stop using the Service.</p>
 
                 <h2>9. Severability</h2>
-                <p>If any provision of these Terms is held to be invalid or unenforceable by a court of competent jurisdiction, the remaining provisions shall continue in full force and effect.</p>
+                <p>If any provision of these Terms is held invalid or unenforceable by a court of competent jurisdiction, the remaining provisions continue in full force and effect.</p>
 
                 <h2>10. Governing Law and Jurisdiction</h2>
-                <p>These Terms are governed by the laws of <span data-legal="OPERATOR_COUNTRY">the Operator's country</span>, without regard to its conflict-of-laws rules. Any dispute arising out of or relating to these Terms shall be subject to the exclusive jurisdiction of the competent courts of the Operator's place of residence, without prejudice to any non-derogable rights granted to consumers under the laws of their country of residence.</p>
+                <p>These Terms are governed by the laws of <span data-legal="OPERATOR_COUNTRY">the Operator's country</span>, without regard to its conflict-of-laws rules. Any dispute arising out of or relating to these Terms is subject to the exclusive jurisdiction of the <span data-legal="OPERATOR_COUNTRY_ADJECTIVE">competent</span> court having jurisdiction over the Operator's place of residence, without prejudice to any non-derogable rights granted to consumers by Regulation (EU) 1215/2012 or by the law of their country of residence, including the right to bring or defend proceedings before the courts of that country.</p>
 
-                <h2>11. Contact</h2>
-                <p>Questions or requests related to these Terms: <a data-legal-mailto="OPERATOR_EMAIL_SUPPORT" href="#"><span data-legal="OPERATOR_EMAIL_SUPPORT">(support contact not configured)</span></a>.<br>
-                Abuse reports and takedown notices: <a data-legal-mailto="OPERATOR_EMAIL_ABUSE" href="#"><span data-legal="OPERATOR_EMAIL_ABUSE">(abuse contact not configured)</span></a>.<br>
-                Formal / legally binding correspondence (certified mail equivalent, where available): <a data-legal-mailto="OPERATOR_PEC" href="#"><span data-legal="OPERATOR_PEC">(no certified contact configured)</span></a>.</p>
+                <h2>11. Source Code and Licence</h2>
+                <p>The Service's source code is published at <a href="https://github.com/samjanny/pinchat" target="_blank" rel="noopener noreferrer">github.com/samjanny/pinchat</a> under the Apache License, Version 2.0. These Terms govern your use of the hosted Service at pinchat.io only; use of the source code is governed by that licence. The Operator makes no representation that the code running on pinchat.io is identical to any given published revision. An optional browser extension, published in the same repository, lets you check the files served by pinchat.io against a signed manifest; using it is your choice and it does not extend the Operator's warranties.</p>
+
+                <h2>12. Contact</h2>
+                <ul>
+                    <li>Questions about these Terms: <a data-legal-mailto="OPERATOR_EMAIL_SUPPORT" href="#"><span data-legal="OPERATOR_EMAIL_SUPPORT">(support contact not configured)</span></a></li>
+                    <li>Abuse reports and takedown notices: <a data-legal-mailto="OPERATOR_EMAIL_ABUSE" href="#"><span data-legal="OPERATOR_EMAIL_ABUSE">(abuse contact not configured)</span></a></li>
+                    <li>Formal or legally binding correspondence (certified email, where available): <a data-legal-mailto="OPERATOR_PEC" href="#"><span data-legal="OPERATOR_PEC">(no certified contact configured)</span></a></li>
+                </ul>
             </div>
         </main>
 
@@ -73,7 +83,7 @@
         </footer>
     </div>
 
-    <!-- Cookie notice (informational, dismissible — see static/js/cookie-notice.js) -->
+    <!-- Cookie notice (informational, dismissible; see static/js/cookie-notice.js) -->
     <div id="cookie-notice" class="cookie-notice hidden" role="region" aria-label="Cookie notice">
         <span class="cookie-notice-text">This site uses only strictly necessary cookies (session, CSRF). No tracking, no analytics. <a href="/static/privacy.html">Privacy</a></span>
         <button type="button" class="cookie-notice-ok">OK</button>

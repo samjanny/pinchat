@@ -4,6 +4,45 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Dates are the repository-local commit dates; entries are curated for user-visible impact
 rather than being a 1:1 mirror of `git log`.
 
+## [2026-08-27] - v0.7.1
+
+Legal-text release. No code change on the server or in the chat client;
+the protocol version stays 1 and a v0.7.0 client interoperates with this
+build. The signed manifest moves to sequence 43 because two static pages
+and the deployment-specific `operator.json` changed.
+
+### Changed - Terms of Service and Privacy Policy rewritten
+
+Both pages were rewritten against the code rather than from memory, and
+several statements the previous text made were corrected. Room lifetime
+is 5 minutes to 24 hours, not 15 minutes; a room that everyone has left
+is kept until its time-to-live elapses rather than being deleted on the
+last disconnect; the rate limiter keeps a keyed hash of the client IP for
+up to 15 minutes after the last request; the `pc_pow` cookie, the
+ciphertext replay hashes, the browser-side theme and cookie-notice flags
+and the WebSocket token stash are now disclosed. The beta access
+password, its distribution and the correspondence it involves have their
+own entries, with a legal basis and a retention period each. The hosting
+provider is described as a company incorporated in the United Arab
+Emirates operating from a data centre in the Netherlands, and the
+arrangement is treated as a potential Chapter V transfer instead of
+"no transfer applies". New sections cover how the encryption works in
+brief, the optional integrity extension, the right to object, contesting
+an enforcement decision, the source licence and the governing court.
+The purposes table lists a separate legal-obligation row for legal
+requests. The `operator.json` keys read by the templates changed
+accordingly (`OPERATOR_HOSTING_NOTE`, `OPERATOR_LOG_RETENTION`,
+`OPERATOR_LEGAL_CLASSIFICATION_NOTE`, `OPERATOR_JUDICIAL_COOPERATION_NOTE`,
+`LAST_UPDATED`); `operator.example.json` follows and its comment no longer
+claims the deployed file is outside the signed manifest.
+
+### Changed - extension repointed at v0.7.1
+
+`MIN_KNOWN_SEQUENCE` moves to 43 and `GITHUB_TAG` to v0.7.1 in both
+extensions, in the same commit that carries the sequence-43 manifest, so
+a build made from this tag fetches a manifest it accepts. Extension
+version goes to 1.2.2 so installed copies pick up the new pins.
+
 ## [2026-08-25] - v0.7.0
 
 Security release closing an external review of the 1:1 path. Eleven
