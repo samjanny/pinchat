@@ -29,18 +29,6 @@ let overlayPersistentState = {
 let overlayWatchdogTimer = null;
 
 /**
- * Escape HTML special characters to prevent XSS
- * @param {string} text - Text to escape
- * @returns {string} - HTML-safe escaped text
- */
-function escapeHtml(text) {
-    if (text === null || text === undefined) return '';
-    const div = document.createElement('div');
-    div.textContent = String(text);
-    return div.innerHTML;
-}
-
-/**
  * Extract pathname from a URL
  */
 function getPathFromUrl(url) {
@@ -922,9 +910,11 @@ async function showWarningOverlay(mismatches = [], isUnauthorized = false) {
     const cssUrl = browser.runtime.getURL('warning.css');
 
     // Build DOM structure with external stylesheet link
-    // Using <link> is CSP-safe and works with Firefox Xray wrappers (unlike adoptedStyleSheets)
+    // Using <link> is CSP-safe and works with Firefox Xray wrappers (unlike adoptedStyleSheets).
+    // The skeleton is a string literal with no interpolation; every dynamic
+    // value below goes in through DOM properties, never through markup.
     shadow.innerHTML = `
-        <link rel="stylesheet" href="${cssUrl}">
+        <link rel="stylesheet">
         <div class="overlay">
             <div class="icon">⚠️</div>
             <h1></h1>
@@ -940,10 +930,16 @@ async function showWarningOverlay(mismatches = [], isUnauthorized = false) {
             <p class="footer">This warning is shown by the PinChat Integrity Verifier extension.</p>
         </div>
     `;
+    shadow.querySelector('link').setAttribute('href', cssUrl);
 
-    // Set text content safely (prevents XSS)
+    // Text goes in as text
     shadow.querySelector('h1').textContent = title;
-    shadow.querySelector('.description').innerHTML = escapeHtml(description) + '<br><strong>Do not enter any sensitive information.</strong>';
+    const descriptionEl = shadow.querySelector('.description');
+    descriptionEl.textContent = description;
+    descriptionEl.appendChild(document.createElement('br'));
+    const emphasis = document.createElement('strong');
+    emphasis.textContent = 'Do not enter any sensitive information.';
+    descriptionEl.appendChild(emphasis);
     shadow.querySelector('.file-list h3').textContent = listTitle;
 
     // Build file list with proper sanitization

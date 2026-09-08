@@ -6,13 +6,16 @@ rather than being a 1:1 mirror of `git log`.
 
 ## [Unreleased]
 
-### Changed - extension 1.3.5 declares that it collects no data
+### Changed - extension 1.3.6 declares that it collects no data
 
 addons.mozilla.org rejected the 1.3.4 upload: since November 2025 a Firefox
 manifest must carry `data_collection_permissions`. It now declares
-`required: ["none"]`, which is what the extension does. Both extensions move
-to 1.3.5 with the same manifest pin (v0.8.4, sequence 51); no site file
-changed, so nothing was re-signed.
+`required: ["none"]`, which is what the extension does. The warning overlay
+no longer puts any dynamic value through `innerHTML` (the stylesheet URL and
+the description go in through DOM properties), so Mozilla's linter reports
+no errors and no code warnings. Both extensions move to 1.3.6 with the same
+manifest pin (v0.8.4, sequence 51); no site file changed, so nothing was
+re-signed.
 
 ## [2026-09-08] - v0.8.4
 
