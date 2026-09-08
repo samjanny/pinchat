@@ -365,11 +365,14 @@ fn room_accepts_client_message(room_type: RoomType, msg_type: &str) -> bool {
 /// Used as floor even for small image configs to support text messages and handshakes
 const MIN_WS_SIZE: usize = 524288;
 
-/// Calculates maximum image payload size from raw image size
-/// Accounts for ~37% overhead from base64 encoding + encryption
+/// Images are Base64 inside an image JSON string, wrapped in the ratchet's
+/// plaintext JSON, encrypted, then Base64url encoded again. Reserve 1 KiB
+/// for both JSON envelopes (including escaping), the IV and the GCM tag.
+/// Integer ceilings cover padding at each encoding boundary. Configuration
+/// caps raw images at 2 MiB, so these operations are bounded.
 fn max_image_payload_size(max_image_size: usize) -> usize {
-    // Base64 adds ~33% overhead, encryption adds ~4% more
-    (max_image_size as f64 * 1.37) as usize
+    let inner_base64_size = max_image_size.div_ceil(3) * 4;
+    (inner_base64_size + 1024).div_ceil(3) * 4
 }
 
 /// Calculates maximum WebSocket message/frame size based on max_image_size
@@ -1262,9 +1265,9 @@ async fn handle_socket(
                         break;
                     }
                     // Hard cap on connection lifetime: even an active client is
-                    // forced to reconnect, which re-runs PoW + JWT issuance and
-                    // restarts the Double Ratchet handshake. Bounds resource
-                    // usage from clients that heartbeat indefinitely.
+                    // forced to reconnect, which re-runs PoW + JWT issuance.
+                    // Stable resume retains the browser's Double Ratchet.
+                    // Bounds resource usage from clients that heartbeat indefinitely.
                     if connected_at.elapsed() > max_connection_age {
                         #[cfg(debug_assertions)]
                         tracing::debug!("Connection exceeded max age, closing");
@@ -1915,6 +1918,20 @@ async fn handle_socket(
                                         payload.len(),
                                         max_size
                                     );
+                                    // A WebSocket write only confirms local
+                                    // buffering. Tell the sender explicitly
+                                    // when a payload was refused by the relay.
+                                    let error = Message::Error {
+                                        message: format!(
+                                            "The {} was not sent because it exceeds the server size limit.",
+                                            incoming.msg_type
+                                        ),
+                                    };
+                                    if let Ok(json) = serde_json::to_string(&error)
+                                        && recv_direct_tx.try_send(json).is_err()
+                                    {
+                                        break;
+                                    }
                                     continue;
                                 }
 
@@ -2142,6 +2159,142 @@ mod tests {
     use std::collections::VecDeque;
     use std::net::SocketAddr;
     use uuid::Uuid;
+
+    // Reproduce the browser's nested image/ratchet JSON and two Base64
+    // encodings. Ciphertext bytes are opaque to the relay; AES-GCM preserves
+    // plaintext length and adds a 16-byte tag, with a 12-byte IV prepended.
+    fn browser_image_envelope(raw_size: usize) -> serde_json::Value {
+        let image = serde_json::json!({
+            "type": "image", "mimeType": "image/jpeg",
+            "data": base64::engine::general_purpose::STANDARD.encode(vec![0u8; raw_size]),
+            "ts": 1788877773000u64,
+        });
+        let plaintext = serde_json::to_vec(&serde_json::json!({
+            "ts": 1788877773000u64,
+            "text": serde_json::to_string(&image).unwrap(),
+        }))
+        .unwrap();
+        serde_json::json!({
+            "type": "image",
+            "payload": URL_SAFE_NO_PAD.encode(vec![0u8; plaintext.len() + 12 + 16]),
+            "header": { "v": 1, "dh": "A".repeat(87), "pn": 0, "n": 0,
+                "rc": 0, "sig": "A".repeat(86) },
+        })
+    }
+
+    #[test]
+    fn image_limits_cover_browser_encoding_at_configured_boundaries() {
+        // Remainders modulo three exercise both Base64 padding boundaries.
+        for raw_size in [1, 2, 3, 300 * 1024, 300 * 1024 + 1, 2 * 1024 * 1024] {
+            let envelope = browser_image_envelope(raw_size);
+            assert!(
+                envelope["payload"].as_str().unwrap().len() <= max_image_payload_size(raw_size),
+                "an image at the configured raw limit {raw_size} must fit its wire payload budget",
+            );
+            assert!(serde_json::to_vec(&envelope).unwrap().len() <= max_ws_size(raw_size));
+        }
+    }
+
+    #[tokio::test]
+    async fn image_relay_accepts_limit_sized_images_and_reports_oversized_payloads() {
+        use tokio_tungstenite::tungstenite::{Message as ClientMessage, client::IntoClientRequest};
+
+        async fn next_json(
+            socket: &mut tokio_tungstenite::WebSocketStream<
+                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+            >,
+        ) -> serde_json::Value {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    match socket
+                        .next()
+                        .await
+                        .expect("socket closed")
+                        .expect("valid frame")
+                    {
+                        ClientMessage::Text(text) => return serde_json::from_str(&text).unwrap(),
+                        ClientMessage::Ping(_) | ClientMessage::Pong(_) => continue,
+                        other => panic!("unexpected frame: {other:?}"),
+                    }
+                }
+            })
+            .await
+            .expect("relay must answer, not silently drop the image")
+        }
+
+        for raw_size in [300 * 1024, 2 * 1024 * 1024] {
+            let mut config = test_config();
+            config.max_image_size = raw_size;
+            let state = AppState::new(1, config);
+            let room_id = state
+                .try_create_room(Room::new(RoomConfig {
+                    room_type: RoomType::OneToOne,
+                    ttl_minutes: 5,
+                    max_participants: 2,
+                }))
+                .unwrap();
+            let token = sign_token(
+                &WsTokenClaims::new(room_id, 30, &state.config.jwt_issuer),
+                &state.jwt_secret,
+            )
+            .unwrap();
+            let app = Router::new()
+                .route("/ws/:room_id", get(ws_handler))
+                .with_state(state);
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let mut request = format!("ws://{addr}/ws/{room_id}")
+                .into_client_request()
+                .unwrap();
+            request
+                .headers_mut()
+                .insert("origin", "https://localhost:3000".parse().unwrap());
+            request.headers_mut().insert(
+                "sec-websocket-protocol",
+                format!("pinchat.v1, pinchat.v1.jwt.{token}")
+                    .parse()
+                    .unwrap(),
+            );
+            let (mut socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+            assert_eq!(next_json(&mut socket).await["type"], "connected");
+
+            let image = browser_image_envelope(raw_size);
+            socket
+                .send(ClientMessage::Text(image.to_string()))
+                .await
+                .unwrap();
+            let echoed = next_json(&mut socket).await;
+            assert_eq!(echoed["type"], "image");
+            assert_eq!(echoed["payload"], image["payload"]);
+            assert_eq!(echoed["header"], image["header"]);
+
+            let mut oversized = image;
+            oversized["payload"] =
+                serde_json::Value::String("A".repeat(max_image_payload_size(raw_size) + 1));
+            socket
+                .send(ClientMessage::Text(oversized.to_string()))
+                .await
+                .unwrap();
+            let rejected = next_json(&mut socket).await;
+            assert_eq!(rejected["type"], "error");
+            assert!(rejected["message"].as_str().unwrap().contains("not sent"));
+
+            // A rejected image must not sever the connection or prevent a
+            // subsequent valid message from reaching the relay stream.
+            let mut text = browser_image_envelope(1);
+            text["type"] = serde_json::json!("message");
+            socket
+                .send(ClientMessage::Text(text.to_string()))
+                .await
+                .unwrap();
+            assert_eq!(next_json(&mut socket).await["type"], "message");
+            socket.close(None).await.unwrap();
+            server.abort();
+        }
+    }
 
     #[test]
     fn mls_correlation_ref_shape_is_bounded() {

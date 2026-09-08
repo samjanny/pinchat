@@ -432,11 +432,21 @@ update.
 
 **Implementation**:
 1. DH ratchet triggered on communication direction change
-2. New ECDH keypair generated
+2. New ECDH keypair generated on every receive-side ratchet
 3. New root key derived from fresh DH output
 4. Both chains re-initialized
 
-**Guarantee**: If an attacker compromises the current session state, security is restored after the next DH ratchet.
+**Guarantee**: If an attacker copies the current session state, security is
+restored after one full round trip, not after the next DH ratchet. The copy
+includes the victim's current DH private key, so the peer's next ratchet
+step is derived against a key the attacker holds and that whole chain stays
+readable, as does the rest of the victim's current sending chain. The
+victim's next receive-side ratchet generates a fresh keypair the attacker
+does not have: from that point the victim's messages are unreadable, and the
+peer's following ratchet step closes the other direction. Recovery therefore
+needs both endpoints to send at least once after the compromise; an idle
+direction stays exposed until it does. This is inherent to the Double
+Ratchet design and matches the Signal specification.
 
 ### Zero Knowledge Architecture
 

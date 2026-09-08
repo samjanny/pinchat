@@ -400,6 +400,8 @@ document.addEventListener('alpine:init', () => {
         async handleWebSocketMessage(message) {
             switch (message.type) {
                 case 'connected':
+                    const stableOneToOneResume = message.resumed === true
+                        && message.user_id === this.userId;
                     // MLS state is bound to both the authenticated leaf and
                     // this stable relay identity. A reconnect must explicitly
                     // reclaim the same ID; silently accepting a fresh one would
@@ -455,12 +457,15 @@ document.addEventListener('alpine:init', () => {
                         this.maxImageSize = message.max_image_size;
                     }
 
-                    // For 1:1 rooms a reconnect may intentionally fall back to
-                    // a fresh relay ID after the grace window. Restart only now,
-                    // after userId has been updated from the Connected frame.
+                    // A resumed 1:1 socket keeps its ratchet and SAS decision.
+                    // The peer receives no leave/join on stable resume and
+                    // cannot participate in a unilateral handshake restart.
+                    // Only fresh admission needs new keys, after userId has
+                    // been updated for the new AEAD sender binding.
                     if (this.transportReconnectPending
-                        && message.room_type === 'onetoone' && this.pfsActive) {
-                        debugLog('[RECONNECT] Stable/fresh relay admission confirmed -> restarting 1:1 handshake');
+                        && message.room_type === 'onetoone' && this.pfsActive
+                        && !stableOneToOneResume) {
+                        debugLog('[RECONNECT] Fresh relay admission -> restarting 1:1 handshake');
                         await this.restartECDHHandshake();
                     }
                     this.transportReconnectPending = false;

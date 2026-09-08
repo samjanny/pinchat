@@ -44,6 +44,11 @@ const TEST_SUITES = {
         file: 'test-chat-sas-gate.js',
         description: '1:1 application data is quarantined until an explicit SAS decision'
     },
+    'chat-reconnect': {
+        name: 'Chat reconnect with real cryptography',
+        file: 'test-chat-reconnect.js',
+        description: 'Stable resume, lost messages, SAS preservation and fresh-identity rekey'
+    },
     correctness: {
         name: 'Ratchet Correctness',
         file: 'test-ratchet-correctness.js',

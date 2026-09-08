@@ -6,6 +6,25 @@ rather than being a 1:1 mirror of `git log`.
 
 ## [Unreleased]
 
+### Fixed - 1:1 reconnection and image relay limits
+
+A reconnect that resumes the same relay identity now preserves the existing
+Double Ratchet and SAS decision. Previously only the reconnecting participant
+restarted the handshake while the peer ignored it, leaving the chat stuck.
+Fresh admission still establishes new keys for the new sender identity.
+
+The image payload limit now accounts for both Base64 encoding layers and the
+encrypted JSON envelopes. Images up to the configured raw size (including
+the default 300 KiB and maximum 2 MiB) fit the relay budget. Oversized text
+or image payloads produce an explicit error instead of being silently dropped.
+
+The chat page and its script changed, so the site manifest was re-signed
+at sequence 52 and the preventive CSP rules shipped inside both extensions
+now list the new `app.js` hash. An installed 1.3.6 still enforces the
+previous hash list and would block the updated script, so the next release
+must rebuild and republish both extensions, raise their sequence floor to
+52 and move their manifest pin to the new tag in the same commit.
+
 ### Changed - extension 1.3.6 declares that it collects no data
 
 addons.mozilla.org rejected the 1.3.4 upload: since November 2025 a Firefox

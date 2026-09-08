@@ -36,6 +36,8 @@ urlencoding = "2"
 # Enable tower's "util" feature in tests for `ServiceExt::oneshot`, used by
 # integration-style tests that drive the router without a real listener.
 tower = { version = "0.4", features = ["util"] }
+# Same version already used by axum; exercise real WebSocket relay frames.
+tokio-tungstenite = "0.24"
 
 [[bin]]
 name = "generate_hash"
