@@ -51,6 +51,24 @@ pub struct Config {
     // Per-connection message rate limiting
     pub msg_rate_limit: usize,
     pub msg_rate_window_secs: i64,
+    // Aggregate per-room traffic caps prevent many individually compliant
+    // members from multiplying broadcast/decryption work.
+    pub room_msg_rate_limit: usize,
+    pub room_byte_rate_limit: usize,
+
+    // Per-connection MLS Commit rate limit. Commits are broadcast to every
+    // member and trigger TreeKEM verification + transcript hash + signature
+    // checks on each receiver, so they're far more expensive than regular
+    // application messages. Defaults: 24 commits / 60 seconds. This permits
+    // the creator to fill every slot in a 20-member room in one legitimate
+    // admission burst while still bounding sustained TreeKEM work.
+    pub commit_rate_limit: usize,
+    pub commit_rate_window_secs: i64,
+    // Standalone MLS Update Proposal rate. Honest clients emit these only
+    // during periodic PCS rotation; a much tighter bucket prevents one member
+    // from monopolising every recipient's bounded ProposalRef store.
+    pub proposal_rate_limit: usize,
+    pub proposal_rate_window_secs: i64,
 
     // Per-connection global frame rate limit (applies to EVERY text frame,
     // including handshakes, unknown types, and malformed JSON, not just
@@ -93,6 +111,13 @@ pub struct Config {
     // reconnect (and thus restart the handshake) after this duration. Bounds
     // resource usage from clients that keep heartbeating indefinitely.
     pub max_ws_connection_age_secs: u64,
+
+    // Time for which a disconnected participant ID remains reserved. A client
+    // presenting its server-signed resume credential can reconnect during this
+    // window without producing UserLeft/UserJoined or changing its relay ID.
+    // After the window, normal departure processing resumes and MLS removes the
+    // member fail-closed.
+    pub ws_reconnect_grace_secs: u64,
 
     // Cleanup intervals
     pub room_cleanup_interval_secs: u64,
@@ -142,6 +167,9 @@ pub struct Config {
     // Used both for the CorsLayer (HTTP responses) and the WebSocket Origin check.
     // Default: "https://localhost:3000"
     pub cors_allowed_origins: Vec<String>,
+
+    // Fail-closed deployment gate for the experimental custom MLS feature.
+    pub group_chat_enabled: bool,
 }
 
 impl Config {
@@ -190,6 +218,34 @@ impl Config {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(1),
+            room_msg_rate_limit: env::var("ROOM_MSG_RATE_LIMIT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(120),
+            room_byte_rate_limit: env::var("ROOM_BYTE_RATE_LIMIT")
+                .ok()
+                .and_then(|v| parse_size_with_suffix(&v))
+                .unwrap_or(8 * 1024 * 1024),
+
+            // MLS Commit rate limit (default: 24 commits per 60 seconds).
+            // A fresh 20-member room requires 19 Add commits, so the former
+            // default of 12 rejected a valid full-room admission burst.
+            commit_rate_limit: env::var("COMMIT_RATE_LIMIT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(24),
+            commit_rate_window_secs: env::var("COMMIT_RATE_WINDOW_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(60),
+            proposal_rate_limit: env::var("PROPOSAL_RATE_LIMIT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(8),
+            proposal_rate_window_secs: env::var("PROPOSAL_RATE_WINDOW_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(60),
 
             // Global frame rate limit (default: 4x msg_rate_limit, same window).
             // Applied to every text frame regardless of msg_type so ECDH,
@@ -244,6 +300,14 @@ impl Config {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(30 * 60),
+
+            // Stable-identity reconnect grace (default: 20 seconds). This is
+            // long enough for the normal PoW/JWT retry path while keeping the
+            // delay before a genuine MLS Remove bounded.
+            ws_reconnect_grace_secs: env::var("WS_RECONNECT_GRACE_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(20),
 
             // ECDH burst (default: 8 frames per 60 seconds).
             ecdh_burst_limit: env::var("ECDH_BURST_LIMIT")
@@ -307,18 +371,20 @@ impl Config {
 
             // Anti-replay cache max entries per room (default: 1000).
             //
-            // Memory budget (worst-case, all rooms at full cache):
-            //   HashSet<(String,DateTime<Utc>)> overhead per entry ≈ 136 bytes
-            //   (64-byte hex SHA-256 + 24 bytes String header + 16 bytes
-            //   DateTime + ~32 bytes HashSet slot/load-factor amortised).
-            //   1000 entries × 1000 rooms × 136 B ≈ 136 MB worst case.
+            // The cache is a hash lookup plus a FIFO insertion queue, so
+            // expiry and capacity eviction are O(1) amortized: no
+            // attacker-controlled sort or full-set scan runs on the message
+            // path. The validation cap below stops an operator from
+            // multiplying this advisory cache into unbounded room memory.
             //
-            // The previous default was 10000, which extrapolated to ~1.4 GB
-            // worst case on a VPS - disproportionate given the cache is an
-            // advisory anti-replay layer (the authoritative defence is the
-            // Double Ratchet monotone counter, checked client-side). 1000
-            // entries still tolerate ~17 minutes at the msg_rate_limit of
-            // 30 msg/s before eviction starts mattering for a busy room.
+            // 1000 is chosen for the memory budget, not the algorithm: at
+            // roughly 136 bytes per entry across 1000 rooms that is about
+            // 136 MB worst case. The previous default of 10000 extrapolated
+            // to ~1.4 GB on a VPS, disproportionate for a layer that is
+            // advisory anyway, since the authoritative anti-replay defence is
+            // the client-side Double Ratchet counter. 1000 entries still
+            // tolerate ~17 minutes at the 30 msg/s rate limit before eviction
+            // starts mattering for a busy room.
             replay_cache_max_per_room: env::var("REPLAY_CACHE_MAX_PER_ROOM")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -368,6 +434,10 @@ impl Config {
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
                 .collect(),
+            group_chat_enabled: env::var("GROUP_CHAT_ENABLED")
+                .ok()
+                .map(|v| matches!(v.to_lowercase().as_str(), "true" | "1" | "yes"))
+                .unwrap_or(false),
         };
 
         // Validate configuration
@@ -418,6 +488,18 @@ impl Config {
         if self.msg_rate_limit == 0 {
             panic!("MSG_RATE_LIMIT must be greater than 0");
         }
+        if self.commit_rate_limit == 0 {
+            panic!("COMMIT_RATE_LIMIT must be greater than 0");
+        }
+        if self.room_msg_rate_limit == 0 {
+            panic!("ROOM_MSG_RATE_LIMIT must be greater than 0");
+        }
+        if self.room_byte_rate_limit < 64 * 1024 || self.room_byte_rate_limit > 64 * 1024 * 1024 {
+            panic!("ROOM_BYTE_RATE_LIMIT must be between 64KB and 64MB");
+        }
+        if self.proposal_rate_limit == 0 {
+            panic!("PROPOSAL_RATE_LIMIT must be greater than 0");
+        }
         if self.frame_rate_limit == 0 {
             panic!("FRAME_RATE_LIMIT must be greater than 0");
         }
@@ -441,16 +523,25 @@ impl Config {
         if self.msg_rate_window_secs <= 0 {
             panic!("MSG_RATE_WINDOW_SECS must be greater than 0");
         }
+        if self.commit_rate_window_secs <= 0 {
+            panic!("COMMIT_RATE_WINDOW_SECS must be greater than 0");
+        }
+        if self.proposal_rate_window_secs <= 0 {
+            panic!("PROPOSAL_RATE_WINDOW_SECS must be greater than 0");
+        }
 
         // Validate TTLs are non-zero
         if self.challenge_ttl_secs == 0 {
             panic!("CHALLENGE_TTL_SECS must be greater than 0");
         }
-        if self.jwt_token_ttl_secs == 0 {
-            panic!("JWT_TOKEN_TTL_SECS must be greater than 0");
+        if !(1..=300).contains(&self.jwt_token_ttl_secs) {
+            panic!("JWT_TOKEN_TTL_SECS must be between 1 and 300");
         }
         if self.max_ws_connection_age_secs == 0 {
             panic!("MAX_WS_CONNECTION_AGE_SECS must be greater than 0");
+        }
+        if self.ws_reconnect_grace_secs == 0 || self.ws_reconnect_grace_secs > 120 {
+            panic!("WS_RECONNECT_GRACE_SECS must be between 1 and 120");
         }
         if self.ecdh_burst_limit == 0 {
             panic!("ECDH_BURST_LIMIT must be greater than 0");
@@ -484,18 +575,155 @@ impl Config {
         if self.replay_cache_max_per_room == 0 {
             panic!("REPLAY_CACHE_MAX_PER_ROOM must be greater than 0");
         }
+        if self.replay_cache_max_per_room > 10_000 {
+            panic!("REPLAY_CACHE_MAX_PER_ROOM cannot exceed 10000");
+        }
 
-        // Validate max image size (reasonable bounds: 1KB to 50MB)
+        // A 2MB raw image expands to roughly 2.8MB after encryption and
+        // Base64url framing, remaining below the relay's 4MB per-room
+        // retained-broadcast ceiling and the browser's 8MB history/decode
+        // budgets. Larger configured values would be accepted at startup but
+        // deterministically rejected by the bounded transport.
         if self.max_image_size < 1024 {
             panic!("MAX_IMAGE_SIZE must be at least 1KB (1024 bytes)");
         }
-        if self.max_image_size > 50 * 1024 * 1024 {
-            panic!("MAX_IMAGE_SIZE cannot exceed 50MB");
+        if self.max_image_size > 2 * 1024 * 1024 {
+            panic!("MAX_IMAGE_SIZE cannot exceed 2MB");
         }
+        if self.room_byte_rate_limit < self.max_image_size.saturating_mul(2) {
+            panic!("ROOM_BYTE_RATE_LIMIT must be at least twice MAX_IMAGE_SIZE");
+        }
+    }
+
+    /// Preconditions that only make sense together with `FORCE_HTTP=true`,
+    /// i.e. when a reverse proxy terminates TLS in front of this process.
+    ///
+    /// Returns `Some(message)` describing the first violated precondition,
+    /// or `None` when the reverse-proxy configuration is coherent. `main`
+    /// treats `Some` as fatal outside development mode.
+    ///
+    /// Why `TRUSTED_PROXIES` is mandatory here: behind a proxy every request
+    /// reaches this process from the proxy's own address. With no trusted
+    /// proxy configured, `X-Forwarded-For` is ignored by design and every
+    /// visitor collapses into a single rate-limit bucket and a single PoW
+    /// challenge-cache key. One client can then exhaust the shared room-token
+    /// budget for everyone. This was found live in production on 2026-09-08.
+    pub fn reverse_proxy_misconfiguration(&self) -> Option<&'static str> {
+        if !self.force_http {
+            return None;
+        }
+        if !self.force_secure_cookies {
+            return Some(
+                "FORCE_HTTP=true requires FORCE_SECURE_COOKIES=true in production. \
+                 This prevents session cookies from being sent over insecure transport.",
+            );
+        }
+        if self.trusted_proxies.is_empty() {
+            return Some(
+                "FORCE_HTTP=true requires TRUSTED_PROXIES to name the reverse proxy. \
+                 Without it X-Forwarded-For is ignored and every visitor shares one \
+                 rate-limit bucket, so a single client can lock everyone out of room \
+                 creation. Set it to the address the proxy connects from, as seen by \
+                 this process (for docker-compose behind nginx on the host this is the \
+                 compose network gateway, e.g. TRUSTED_PROXIES=172.18.0.1, not 127.0.0.1).",
+            );
+        }
+        None
     }
 
     /// Returns true if authentication is enabled (password hashes are configured)
     pub fn is_auth_enabled(&self) -> bool {
         !self.password_hashes.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A coherent non-proxy baseline; tests flip only the fields they are about.
+    fn base() -> Config {
+        Config {
+            host: [127, 0, 0, 1],
+            port: 3000,
+            ws_conn_burst_size: 100,
+            ws_conn_period_secs: 60,
+            room_token_burst_size: 100,
+            room_token_period_secs: 600,
+            msg_rate_limit: 30,
+            msg_rate_window_secs: 1,
+            room_msg_rate_limit: 120,
+            room_byte_rate_limit: 8 * 1024 * 1024,
+            commit_rate_limit: 12,
+            commit_rate_window_secs: 60,
+            proposal_rate_limit: 8,
+            proposal_rate_window_secs: 60,
+            frame_rate_limit: 120,
+            protocol_error_limit: 10,
+            pow_min_difficulty: 12,
+            pow_max_difficulty: 18,
+            challenge_ttl_secs: 300,
+            jwt_token_ttl_secs: 30,
+            jwt_issuer: crate::jwt::DEFAULT_JWT_ISSUER.to_string(),
+            max_ws_connection_age_secs: 1800,
+            ws_reconnect_grace_secs: 20,
+            ecdh_burst_limit: 8,
+            ecdh_burst_window_secs: 60,
+            room_cleanup_interval_secs: 60,
+            challenge_cleanup_interval_secs: 60,
+            password_hashes: vec![],
+            session_ttl_secs: 86400,
+            login_burst_size: 5,
+            login_period_secs: 900,
+            trusted_proxies: vec![],
+            replay_cache_max_per_room: 1000,
+            force_secure_cookies: false,
+            max_image_size: 300 * 1024,
+            force_http: false,
+            website_dir: None,
+            allow_anonymous: true,
+            cors_allowed_origins: vec!["https://localhost:3000".to_string()],
+            group_chat_enabled: false,
+        }
+    }
+
+    #[test]
+    fn direct_tls_mode_has_no_proxy_preconditions() {
+        // Without FORCE_HTTP there is no proxy, so an empty TRUSTED_PROXIES
+        // and non-forced cookies are both fine.
+        assert_eq!(base().reverse_proxy_misconfiguration(), None);
+    }
+
+    #[test]
+    fn proxy_mode_requires_secure_cookies_first() {
+        let mut c = base();
+        c.force_http = true;
+        let msg = c.reverse_proxy_misconfiguration().expect("must be flagged");
+        assert!(msg.contains("FORCE_SECURE_COOKIES"), "got: {msg}");
+    }
+
+    #[test]
+    fn proxy_mode_requires_a_trusted_proxy() {
+        // The production misconfiguration of 2026-09-08: proxy mode, cookies
+        // forced, but nobody trusted for X-Forwarded-For, so every visitor
+        // shared one rate-limit bucket.
+        let mut c = base();
+        c.force_http = true;
+        c.force_secure_cookies = true;
+        let msg = c.reverse_proxy_misconfiguration().expect("must be flagged");
+        assert!(msg.contains("TRUSTED_PROXIES"), "got: {msg}");
+        assert!(
+            msg.contains("172.18.0.1"),
+            "must name the docker-compose value: {msg}"
+        );
+    }
+
+    #[test]
+    fn coherent_proxy_mode_passes() {
+        let mut c = base();
+        c.force_http = true;
+        c.force_secure_cookies = true;
+        c.trusted_proxies = vec!["172.18.0.1".to_string()];
+        assert_eq!(c.reverse_proxy_misconfiguration(), None);
     }
 }

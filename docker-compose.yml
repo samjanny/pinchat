@@ -27,3 +27,15 @@ services:
     # tmpfs above; no other write path is needed (certs are read-only volume,
     # static files are baked into the image, logs go to stdout).
     read_only: true
+
+# Pin the compose network so the gateway address nginx connects from is the
+# same after every `docker compose down`/`up`. TRUSTED_PROXIES in .env names
+# this gateway (172.18.0.1); had Docker picked another pool the server would
+# silently ignore X-Forwarded-For and every visitor would share one
+# rate-limit bucket.
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: 172.18.0.0/16
+          gateway: 172.18.0.1

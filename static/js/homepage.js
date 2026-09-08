@@ -1,6 +1,22 @@
 /**
  * Homepage - Room creation form (Alpine.js CSP-compatible Global Store)
  */
+
+/**
+ * Fetch a fresh CSRF token from /api/csrf and return it. The endpoint
+ * also sets the csrf_token cookie, so the X-CSRF-Token header we send
+ * back will match the cookie when the API verifies the double-submit.
+ */
+async function fetchCsrfToken() {
+    const r = await fetch('/api/csrf', { credentials: 'same-origin' });
+    if (!r.ok) throw new Error(`CSRF token fetch failed: ${r.status}`);
+    const data = await r.json();
+    if (!/^[a-f0-9]{32}\.[a-f0-9]{64}$/.test(data.csrf_token)) {
+        throw new Error('CSRF token format invalid');
+    }
+    return data.csrf_token;
+}
+
 document.addEventListener('alpine:init', () => {
     Alpine.store('homepage', {
         // State
@@ -20,8 +36,14 @@ document.addEventListener('alpine:init', () => {
             this.loadingMessage = 'Creating...';
             this.powProgress = '';
             this.error = '';
+            const storedKeys = [];
 
             try {
+                const requestedRoomType = this.roomType;
+                const store = (key, value) => {
+                    sessionStorage.setItem(key, value);
+                    storedKeys.push(key);
+                };
                 // Generate the encryption key
                 const key = await crypto.subtle.generateKey(
                     { name: 'AES-GCM', length: 256 },
@@ -42,10 +64,19 @@ document.addEventListener('alpine:init', () => {
 
                 // Call the API to create the room (with PoW retry logic)
                 const roomData = await this.createRoomWithPoW({
-                    room_type: this.roomType,
+                    room_type: requestedRoomType,
                     ttl_minutes: this.ttlMinutes,
                     max_participants: this.maxParticipants
                 });
+                if (!roomData
+                    || roomData.room_type !== requestedRoomType
+                    || typeof roomData.room_id !== 'string'
+                    || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+                        .test(roomData.room_id)) {
+                    throw new Error(
+                        'Server room response does not match the requested room type',
+                    );
+                }
 
                 // Save WebSocket token if provided (creator optimization).
                 // Also persist the v1 protocol metadata alongside the token so
@@ -53,33 +84,62 @@ document.addEventListener('alpine:init', () => {
                 // fresh tokens from /api/ws-token (otherwise a v0 server that
                 // omits these fields could still reach the upgrade attempt).
                 if (roomData.ws_token && roomData.connection_id) {
-                    sessionStorage.setItem(`ws_token_${roomData.room_id}`, roomData.ws_token);
-                    sessionStorage.setItem(`ws_connection_${roomData.room_id}`, roomData.connection_id);
+                    if (roomData.room_type === 'group'
+                        && (typeof roomData.creator_bootstrap_token !== 'string'
+                            || !/^[A-Za-z0-9_-]{43}$/.test(
+                                roomData.creator_bootstrap_token,
+                            ))) {
+                        throw new Error(
+                            'Server did not provide a valid group creator bootstrap credential',
+                        );
+                    }
+                    store(`ws_token_${roomData.room_id}`, roomData.ws_token);
+                    store(`ws_connection_${roomData.room_id}`, roomData.connection_id);
+                    store(
+                        `ws_room_type_${roomData.room_id}`,
+                        roomData.room_type,
+                    );
+                    if (roomData.creator_bootstrap_token) {
+                        // Separate from the 30-second, single-use upgrade JWT.
+                        // websocket.js retains this tab-scoped bearer only
+                        // until the first authenticated Connected frame, so a
+                        // slow navigation or pre-Connected transport failure
+                        // can re-mint the same stable creator relay identity.
+                        store(
+                            `ws_creator_bootstrap_${roomData.room_id}`,
+                            roomData.creator_bootstrap_token,
+                        );
+                    }
                     if (roomData.protocol_version !== undefined) {
-                        sessionStorage.setItem(
+                        store(
                             `ws_protocol_version_${roomData.room_id}`,
                             String(roomData.protocol_version)
                         );
                     }
                     if (Array.isArray(roomData.supported_subprotocols)) {
-                        sessionStorage.setItem(
+                        store(
                             `ws_subprotocols_${roomData.room_id}`,
                             JSON.stringify(roomData.supported_subprotocols)
                         );
                     }
-                    // Safety-net cleanup: the JWT TTL is 30s server-side and the
-                    // happy-path consumer (websocket.js connect()) already calls
-                    // clearCreatorMetadata() on success/failure. If the user
-                    // never navigates (or stays on the homepage), the token
-                    // would otherwise sit in sessionStorage until the tab
-                    // closes, exposing it to any same-origin script that runs
-                    // in the meantime. Clear it after the JWT has unconditionally
-                    // expired (60s ≫ 30s TTL, with margin).
+                    // Safety-net cleanup for the short-lived upgrade JWT and
+                    // protocol metadata. Keep the separate creator bootstrap
+                    // credential + expected connection ID until chat receives
+                    // Connected; deleting those on the JWT timer would recreate
+                    // the pre-Connected lockout this credential is designed to
+                    // prevent.
                     setTimeout(() => {
                         sessionStorage.removeItem(`ws_token_${roomData.room_id}`);
-                        sessionStorage.removeItem(`ws_connection_${roomData.room_id}`);
                         sessionStorage.removeItem(`ws_protocol_version_${roomData.room_id}`);
                         sessionStorage.removeItem(`ws_subprotocols_${roomData.room_id}`);
+                        if (roomData.room_type !== 'group') {
+                            sessionStorage.removeItem(
+                                `ws_connection_${roomData.room_id}`,
+                            );
+                            sessionStorage.removeItem(
+                                `ws_room_type_${roomData.room_id}`,
+                            );
+                        }
                     }, 60000);
                     console.log('✅ WebSocket token saved for room creator (no second PoW needed)');
                 }
@@ -93,6 +153,7 @@ document.addEventListener('alpine:init', () => {
                 window.location.href = roomUrl.toString();
 
             } catch (err) {
+                for (const key of storedKeys) sessionStorage.removeItem(key);
                 this.error = err.message;
                 this.loading = false;
                 this.powProgress = '';
@@ -103,11 +164,13 @@ document.addEventListener('alpine:init', () => {
          * Creates a room with automatic PoW challenge handling
          */
         async createRoomWithPoW(config, powHeaders = {}) {
+            const csrfToken = await fetchCsrfToken();
             const response = await fetch('/api/rooms', {
                 method: 'POST',
                 credentials: 'same-origin',
                 headers: {
                     'Content-Type': 'application/json',
+                    'X-CSRF-Token': csrfToken,
                     ...powHeaders
                 },
                 body: JSON.stringify(config)

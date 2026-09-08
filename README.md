@@ -44,6 +44,10 @@ replacement for Signal, WhatsApp, Matrix, Session, or SimpleX.
 - **Encrypted media.** Images use the same client-side encryption path as text.
 - **SAS verification.** A Short Authentication String lets participants
   authenticate the session out of band and detect an active MITM.
+- **Group chat, behind a flag.** Rooms of up to 20 members use an MLS
+  (RFC 9420) group built from scratch, validated against the IETF test
+  vectors. Off by default (`GROUP_CHAT_ENABLED`); see the section below for
+  what it does and does not provide.
 - **Double-Ratchet-inspired key progression.** Message keys advance and old
   keys are deleted where possible. This is not a claim of Signal Protocol
   equivalence.
@@ -57,11 +61,23 @@ replacement for Signal, WhatsApp, Matrix, Session, or SimpleX.
   hash-only script CSP before parsing and verify static assets against a
   signed manifest.
 
-Only 1:1 chat is available. Group chat is deliberately disabled: the bootstrap
-key approach is not adequate for group key management, and it should stay off
-until the protocol has a real design for membership changes, sender
-authentication, transcript consistency, forward secrecy, post-compromise
-recovery, and removed-member exclusion.
+Group chat ships disabled and is enabled per deployment with
+`GROUP_CHAT_ENABLED=true`. It is a separate protocol from the 1:1 path: an MLS
+group (RFC 9420, ciphersuite 0x0002) in which the room creator, at leaf 0, is
+the only member that commits membership changes. Members are admitted with
+KeyPackages bound to the room's bootstrap key, every Commit and Welcome is
+signed and verified before any state changes, forward secrecy comes from
+per-epoch secret trees with consumed keys deleted, and post-compromise
+security from periodic re-keying. The relay stays blind to content but, unlike
+1:1, sees the group's public key material and its membership changes.
+
+Two limits are structural and worth knowing before enabling it. The creator's
+group state lives only in its open tab: if the creator reloads or closes it,
+existing members can keep talking in the current epoch but nobody can join or
+be removed until a new room is created (the page now warns before unloading).
+And there is no out-of-band verification ceremony for groups: admission rests
+on the link being the capability plus authenticated leaf keys, not on members
+comparing fingerprints. The full list is in `static/js/mls/README.md`.
 
 ## What "encrypted" means in practice
 

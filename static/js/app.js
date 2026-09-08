@@ -5,11 +5,33 @@
 // Read room ID from URL (only parameter needed)
 // Room configuration (type, ttl, max) will be provided by server via WebSocket
 const urlParams = new URLSearchParams(window.location.search);
-
+const MAX_CHAT_HISTORY_ENTRIES = 250;
+const MAX_CHAT_HISTORY_BYTES = 8 * 1024 * 1024;
+const MAX_CHAT_HISTORY_PIXELS = 16 * 1024 * 1024;
+const MAX_IMAGE_DIMENSION = 8192;
+const MAX_IMAGE_PIXELS = 8 * 1024 * 1024;
+const MAX_PENDING_IMAGE_DECODES = 2;
+const MAX_PENDING_IMAGE_DECODE_BYTES = 4 * 1024 * 1024;
 window.ROOM_CONFIG = {
     roomId: urlParams.get('room')
     // roomType, ttlMinutes, maxParticipants will be set by server via WebSocket
 };
+
+// app.js relies on two globals that other classic scripts define:
+// isAllowedImageMimeType from crypto.js (the one audited image allowlist,
+// enforced on both encrypt and decrypt) and generateNickname from
+// nicknames.js. chat.html loads both first. If either is missing, fail here
+// and now: a ReferenceError raised later inside the decrypt path would be
+// caught by handleSecurityError and reported as message tampering, which is
+// the wrong diagnosis and, for the image path, a silently rejected image.
+for (const [name, source] of [
+    ['isAllowedImageMimeType', 'crypto.js'],
+    ['generateNickname', 'nicknames.js'],
+]) {
+    if (typeof globalThis[name] !== 'function') {
+        throw new Error(`app.js requires ${source} to be loaded first (${name} is missing)`);
+    }
+}
 
 // Validate room ID is present
 if (!window.ROOM_CONFIG.roomId) {
@@ -32,12 +54,20 @@ document.addEventListener('alpine:init', () => {
         userId: null,
         peerUserId: null,       // UUID of the other participant in 1:1 rooms (null when alone)
         peerNickname: null,     // Derived display name from peerUserId via generateNickname()
+        // Group rooms: authenticated MLS roster excluding our own leaf.
+        // Entries come only from ratchet-tree signature keys ({ leafIndex,
+        // fingerprint, displayName }); relay connection IDs never populate or
+        // name this list. 1:1 rooms ignore it.
+        groupPeers: [],
         myNickname: null,  // User's own nickname (generated from userId)
         initialized: false,
         wasConnectedBefore: false,  // Track if we've connected at least once (for reconnection detection)
+        transportReconnectPending: false,
 
         // Messages
         messages: [],
+        messageHistoryBytes: 0,
+        messageHistoryPixels: 0,
         messageInput: '',
         nextMessageId: 0,
 
@@ -52,10 +82,13 @@ document.addEventListener('alpine:init', () => {
         copied: false,
 
         // Image sharing
-        pendingImage: null,      // {dataUrl, name, size, mimeType, arrayBuffer}
+        pendingImage: null,      // {previewUrl, name, size, mimeType, arrayBuffer}
         sendingImage: false,
         fullscreenImage: null,   // URL for fullscreen viewer
         maxImageSize: 300 * 1024,  // Default 300KB, will be overridden by server config
+        _incomingImageDecodeQueue: Promise.resolve(),
+        _pendingImageDecodeCount: 0,
+        _pendingImageDecodeBytes: 0,
 
         // TTL timer
         timeRemaining: null,
@@ -63,6 +96,36 @@ document.addEventListener('alpine:init', () => {
 
         // WebSocket Manager
         wsManager: null,
+
+        // Set when a creator tab is found to have lost its group state (page
+        // reload or its own invite link re-opened). The composer locks and
+        // the page says to create a new room instead of silently minting a
+        // second group behind the same link.
+        mlsGroupEnded: false,
+        // The group trust notice (no SAS ceremony for groups) is shown once
+        // per page; dismissing it is a per-tab, in-memory choice.
+        groupTrustNoticeDismissed: false,
+        // MLS session (only used when roomType === 'group'; null otherwise).
+        // The MLSSession wrapper holds the stateful Group, KeyPackage
+        // bundle and dispatches incoming `mls` envelopes.
+        mlsSession: null,
+        mlsReady: false,   // true once we've joined (creator after commit, joiner after welcome)
+        // Ordered group departures received before MLSSession startup. The
+        // control cursor may advance once they are durably retained here; the
+        // creator drains them into session tombstones at `mlssync`.
+        mlsPendingDepartures: [],
+        // True only after the server's ordered MLS control replay reaches its
+        // authenticated resume cursor. Crypto state may exist while false,
+        // but application sending remains disabled.
+        mlsTransportSynced: false,
+        mlsRosterValid: false,
+        // Our own authenticated ratchet-tree identity. Null while a joiner is
+        // only connected to the relay but not yet admitted by a Welcome.
+        mlsSelfIdentity: null,
+        // Captured at init() before wsManager.connect() consumes the creator
+        // token from sessionStorage. 'creator' | 'joiner' | null.
+        mlsRole: null,
+        mlsUpdateTimer: null,  // creator-only PCS rotation interval handle
 
         // ECDH Key Exchange (for 1:1 rooms with PFS)
         identityManager: null,      // Identity key manager used for authenticated handshakes
@@ -111,11 +174,40 @@ document.addEventListener('alpine:init', () => {
 
             debugLog('Initializing chat room:', this.roomId);
 
+            // Capture MLS role BEFORE wsManager.connect() - the WS layer
+            // clears `ws_token_<roomId>` from sessionStorage on first use
+            // (single-use creator token), so reading it later loses the
+            // creator signal. Note: we capture unconditionally because
+            // `this.roomType` is set later by the server's 'connected'
+            // message; checking it here would always see null.
+            this.mlsRole = (
+                sessionStorage.getItem(`ws_token_${this.roomId}`)
+                || sessionStorage.getItem(
+                    `ws_creator_bootstrap_${this.roomId}`,
+                )
+            )
+                ? 'creator' : 'joiner';
+            const creatorExpectedRoomType = sessionStorage.getItem(
+                `ws_room_type_${this.roomId}`,
+            );
+            debugLog('[MLS] Role captured at init:', this.mlsRole);
+
             // Best-effort cleanup of decrypted image blob URLs when the tab
             // is closed. Browser GC frees them eventually, but explicit revoke
             // shortens the window in which the references stay enumerable.
-            window.addEventListener('beforeunload', () => {
+            window.addEventListener('beforeunload', (event) => {
                 this.cleanupImageBlobs();
+                // The creator's MLS group state lives only in this page. A
+                // reload silently ends the group's ability to admit or remove
+                // anyone (see static/js/mls/README.md, known gaps), so make
+                // the browser ask first once there is a group to lose.
+                if (this.roomType === 'group'
+                    && this.mlsSession
+                    && this.mlsSession.role === 'creator'
+                    && this.groupPeers.length > 0) {
+                    event.preventDefault();
+                    event.returnValue = '';
+                }
             });
 
             // Initialize emoji picker categories
@@ -139,28 +231,42 @@ document.addEventListener('alpine:init', () => {
             }, 1000);
 
             // Initialize WebSocket
-            this.wsManager = new WebSocketManager(this.roomId);
+            const invitePinsGroup = Boolean(
+                window.cryptoManager.mlsExpectedGroupId
+                && window.cryptoManager.mlsExpectedCreatorKeyHash,
+            );
+            const expectedRoomType = invitePinsGroup
+                ? 'group'
+                : (creatorExpectedRoomType === 'group'
+                    || creatorExpectedRoomType === 'onetoone'
+                    ? creatorExpectedRoomType : null);
+            this.wsManager = new WebSocketManager(this.roomId, {
+                expectedRoomType,
+            });
 
             this.wsManager.onConnected = async () => {
                 // Detect if this is a reconnection (vs initial connection)
                 const isReconnection = this.wasConnectedBefore;
                 this.wasConnectedBefore = true;
+                this.transportReconnectPending = isReconnection;
 
                 this.connected = true;
                 this.connecting = false;
                 this.error = '';
 
-                // If PFS was active and this is a reconnection, restart handshake to resync Chain Ratchet
-                // This prevents permanent desynchronization when messages are lost during disconnection
-                if (isReconnection && this.pfsActive) {
-                    debugLog('[RECONNECT] Detected reconnection with active PFS -> restarting handshake to resync Chain Ratchet');
-                    await this.restartECDHHandshake();
-                }
+                // Secure-protocol recovery waits for the server's Connected
+                // frame. That frame authenticates whether the relay identity
+                // was resumed and supplies the current user_id; restarting a
+                // handshake here would race ahead using stale routing state.
             };
 
             this.wsManager.onDisconnected = () => {
                 this.connected = false;
                 this.connecting = false;
+                if (this.roomType === 'group') {
+                    this.mlsTransportSynced = false;
+                    this.mlsReady = false;
+                }
 
                 // Warn user about potential message loss if PFS is active
                 // Messages sent during disconnection will be lost (ephemeral design)
@@ -180,6 +286,17 @@ document.addEventListener('alpine:init', () => {
                     this.error = '⚠️ PinChat has been updated. Please refresh the page.';
                     return;
                 }
+                if (msg === 'CREATOR_BOOTSTRAP_INVALID'
+                    || msg === 'CREATOR_BOOTSTRAP_REJECTED'
+                    || msg === 'CREATOR_IDENTITY_MISMATCH'
+                    || msg === 'CREATOR_BOOTSTRAP_CURSOR_INVALID') {
+                    this.mlsTransportSynced = false;
+                    this.mlsReady = false;
+                    this._stopMlsUpdateTimer();
+                    this.error = '⚠️ The group creator identity could not be recovered safely. '
+                        + 'This tab stopped; refresh and create a new room.';
+                    return;
+                }
                 // Transient transport failure after N retries: distinct message
                 // ("check network", not "protocol mismatch").
                 if (msg === 'CONNECTION_EXHAUSTED') {
@@ -190,8 +307,68 @@ document.addEventListener('alpine:init', () => {
                     this.error = '⚠️ Internal error establishing secure session. Please refresh.';
                     return;
                 }
+                if (msg === 'RESUME_REJECTED') {
+                    this.mlsReady = false;
+                    this.error = this.roomType === 'group'
+                        ? '⚠️ Secure group reconnect window expired. Refresh to request a fresh MLS join; the original creator must create a new room.'
+                        : '⚠️ Secure reconnect expired. Please refresh to establish a new session.';
+                    return;
+                }
+                if (msg === 'MLS_CONTROL_RESYNC_REQUIRED') {
+                    this.mlsTransportSynced = false;
+                    this.mlsReady = false;
+                    this.error = '⚠️ Secure group replay history is no longer available. '
+                        + 'This tab cannot safely continue; refresh and create a new room.';
+                    return;
+                }
+                if (msg === 'MLS_STATE_DESYNC') {
+                    this.mlsTransportSynced = false;
+                    this.mlsReady = false;
+                    this.mlsRosterValid = false;
+                    this.mlsSelfIdentity = null;
+                    this.groupPeers = [];
+                    this._stopMlsUpdateTimer();
+                    this.error = '⚠️ An authenticated group update could not be applied. '
+                        + 'This session stopped before acknowledging it; refresh and create a new room.';
+                    return;
+                }
+                if (msg === 'INBOUND_QUEUE_OVERFLOW') {
+                    this.mlsTransportSynced = false;
+                    this.mlsReady = false;
+                    this._stopMlsUpdateTimer();
+                    this.error = '⚠️ Incoming traffic exceeded the browser safety budget. '
+                        + 'The connection was stopped instead of dropping ordered secure state.';
+                    return;
+                }
+                if (msg === 'RESUME_TOKEN_INVALID') {
+                    this.mlsReady = false;
+                    this.error = '⚠️ Server returned an invalid reconnect credential. Connection stopped.';
+                    return;
+                }
+                if (msg === 'ROOM_PROTOCOL_VIOLATION') {
+                    this.mlsReady = false;
+                    this.error = '⚠️ The relay sent a message for the wrong room protocol. Connection stopped.';
+                    return;
+                }
                 this.error = '⚠️ Connection error. Retrying automatically...';
             };
+
+            this.wsManager.onTerminalSecurityFailure = (reason) => {
+                this.mlsTransportSynced = false;
+                this.mlsReady = false;
+                this.mlsRosterValid = false;
+                this.mlsSelfIdentity = null;
+                this.groupPeers = [];
+                this._stopMlsUpdateTimer();
+                if (this.mlsSession) {
+                    this.mlsSession.destroy(
+                        `terminal relay/transport failure: ${reason}`,
+                    );
+                    this.mlsSession = null;
+                }
+            };
+
+            this.wsManager.onResumeRejected = () => this.roomType !== 'group';
 
             this.wsManager.onPowProgress = (attempts) => {
                 if (attempts === 0) {
@@ -213,6 +390,26 @@ document.addEventListener('alpine:init', () => {
         async handleWebSocketMessage(message) {
             switch (message.type) {
                 case 'connected':
+                    // MLS state is bound to both the authenticated leaf and
+                    // this stable relay identity. A reconnect must explicitly
+                    // reclaim the same ID; silently accepting a fresh one would
+                    // cause peers to Remove the old leaf while this tab keeps
+                    // using its stale epoch state.
+                    if (this.userId && message.room_type === 'group'
+                        && (message.user_id !== this.userId || message.resumed !== true)) {
+                        this.mlsReady = false;
+                        this.error = '⚠️ Group relay identity was not resumed safely. Refresh to rejoin.';
+                        if (this.wsManager) {
+                            this.wsManager.disconnectWithError(
+                                1008, 'Group relay identity changed during reconnect',
+                            );
+                        }
+                        return;
+                    }
+                    if (message.room_type === 'group') {
+                        this.mlsTransportSynced = false;
+                        this.mlsReady = false;
+                    }
                     this.userId = message.user_id;
                     this.myNickname = generateNickname(message.user_id).display;  // Generate user's own nickname
                     this.participantCount = message.participant_count;
@@ -248,6 +445,21 @@ document.addEventListener('alpine:init', () => {
                         this.maxImageSize = message.max_image_size;
                     }
 
+                    // For 1:1 rooms a reconnect may intentionally fall back to
+                    // a fresh relay ID after the grace window. Restart only now,
+                    // after userId has been updated from the Connected frame.
+                    if (this.transportReconnectPending
+                        && message.room_type === 'onetoone' && this.pfsActive) {
+                        debugLog('[RECONNECT] Stable/fresh relay admission confirmed -> restarting 1:1 handshake');
+                        await this.restartECDHHandshake();
+                    }
+                    this.transportReconnectPending = false;
+
+                    // Group MLSSession startup is deliberately deferred to
+                    // the ordered `mlssync` marker. On resume, every missed
+                    // Proposal/Commit/Welcome must be applied before this tab
+                    // is allowed to publish new control or application data.
+
                     // Use the validated room type for ECDH logic
                     if (this.roomType === 'onetoone' && this.participantCount === 2) {
                         // Reset ECDH status if it was stuck on 'aborted' from previous failed handshake
@@ -268,6 +480,64 @@ document.addEventListener('alpine:init', () => {
                     await this.handleECDHPublicKey(message);
                     break;
 
+                case 'mls':
+                    // Group-room MLS envelope. Ignore our own echoes except
+                    // the exact locally-pending Commit: that echo is the
+                    // relay ACK which atomically installs the candidate MLS
+                    // epoch and (for Add) releases its Welcome.
+                    if (this.mlsSession) {
+                        const isOwnEnvelope = message.sender_id === this.userId;
+                        const isPendingCommitAck
+                            = this.mlsSession.shouldHandleOwnEnvelope(message);
+                        if (isOwnEnvelope && !isPendingCommitAck) break;
+                        try {
+                            await this.mlsSession.onRelayEnvelope(message);
+                        } catch (err) {
+                            console.error('[MLS] Failed to process envelope:', err);
+                            this.error = '⚠️ Group crypto error: ' + err.message;
+                            // Every ordered MLS failure must reach the
+                            // transport queue. Typed deterministic rejections
+                            // are ACKed there; transient or unexpected errors
+                            // retain the cursor and consume the bounded replay
+                            // budget instead of being silently acknowledged.
+                            throw err;
+                        }
+                    }
+                    break;
+
+                case 'mlssync':
+                    if (this.roomType !== 'group') break;
+                    await this._ensureMlsSession();
+                    while (this.mlsSession
+                        && this.mlsPendingDepartures.length > 0) {
+                        const senderId = this.mlsPendingDepartures[0];
+                        await this.mlsSession.requestRemovalAfterLivenessCheck(senderId);
+                        this.mlsPendingDepartures.shift();
+                    }
+                    if (this.mlsSession) {
+                        await this.mlsSession.flushDeferredMembershipChanges();
+                    }
+                    this.mlsTransportSynced = true;
+                    this.mlsReady = Boolean(
+                        this.mlsSession
+                        && this.mlsSession.state === 'joined'
+                        && this.mlsRosterValid,
+                    );
+                    if (this.mlsReady) this._startMlsUpdateTimer();
+                    break;
+
+                case 'mlsrejected':
+                    if (message.retry_after_secs > 0 && this.wsManager) {
+                        this.wsManager.deferPendingMlsControl(
+                            message.commit_ref,
+                            message.retry_after_secs,
+                        );
+                    }
+                    if (this.mlsSession) {
+                        await this.mlsSession.onTransportRejection(message);
+                    }
+                    break;
+
                 // NOTE: dh_ratchet message type removed - Signal Protocol
                 // DH ratchet now happens automatically when receiving a message
                 // with a new DH public key in the header
@@ -286,11 +556,18 @@ document.addEventListener('alpine:init', () => {
 
                 case 'userjoined':
                     this.participantCount = message.participant_count;
-                    this.addSystemMessage('👋 A participant joined the chat');
+                    if (message.user_id !== this.userId) {
+                        this.addSystemMessage(this.roomType === 'group'
+                            ? '👋 A relay participant connected; waiting for MLS authentication'
+                            : '👋 A participant joined the chat');
+                    }
 
-                    // Record peer identity up-front so the sidebar can show the
-                    // correct nickname before the peer's first message arrives.
-                    if (message.user_id && message.user_id !== this.userId) {
+                    // In 1:1 rooms the relay identifier is bound into the
+                    // authenticated handshake and remains the UI nickname
+                    // seed. Group identities come only from MLSSession roster
+                    // events after the ratchet tree has been authenticated.
+                    if (this.roomType === 'onetoone'
+                        && message.user_id && message.user_id !== this.userId) {
                         this.peerUserId = message.user_id;
                         this.peerNickname = generateNickname(message.user_id).display;
                     }
@@ -308,18 +585,47 @@ document.addEventListener('alpine:init', () => {
                             await this.startECDHHandshake();
                         }
                     }
+
+                    // Group rooms: spin up / announce presence once the
+                    // session exists. Joiner publishes its KeyPackage on
+                    // first start; creator starts listening at connect.
+                    if (this.roomType === 'group'
+                        && this.mlsTransportSynced
+                        && message.user_id !== this.userId) {
+                        await this._ensureMlsSession();
+                    }
                     break;
 
                 case 'userleft':
                     this.participantCount = message.participant_count;
                     if (message.user_id !== this.userId) {
-                        this.addSystemMessage('👋 A participant left the chat');
+                        this.addSystemMessage(this.roomType === 'group'
+                            ? '👋 The relay reports a participant disconnected; checking whether they are still reachable before changing group membership'
+                            : '👋 A participant left the chat');
                     }
 
                     // Clear peer identity when they actually leave
                     if (message.user_id === this.peerUserId) {
                         this.peerUserId = null;
                         this.peerNickname = null;
+                    }
+                    if (this.roomType === 'group' && message.user_id) {
+                        // Creator-only. `userleft` comes from the relay and
+                        // is not authenticated, so it must not drive a Remove
+                        // on its own (issue #1). The session challenges the
+                        // member over MLS first and removes only if it stays
+                        // silent for the grace window. Await the staging so
+                        // the ordered relay cursor cannot ACK and forget this
+                        // lifecycle event first.
+                        if (this.mlsSession) {
+                            await this.mlsSession.requestRemovalAfterLivenessCheck(
+                                message.user_id,
+                            );
+                        } else if (!this.mlsPendingDepartures.includes(
+                            message.user_id,
+                        )) {
+                            this.mlsPendingDepartures.push(message.user_id);
+                        }
                     }
 
                     // When participant count drops below 2, cleanup ECDH state
@@ -375,6 +681,127 @@ document.addEventListener('alpine:init', () => {
             }
         },
 
+        _messageRetainedBytes(message, explicitBytes = null) {
+            if (Number.isSafeInteger(explicitBytes) && explicitBytes >= 0) {
+                return explicitBytes + 512;
+            }
+            let bytes = 512;
+            if (typeof message?.text === 'string') {
+                bytes += message.text.length * 2;
+            }
+            if (typeof message?.nickname === 'string') {
+                bytes += message.nickname.length * 2;
+            }
+            return bytes;
+        },
+
+        _releaseMessageResources(message, { revokeImage = true } = {}) {
+            if (!message) return;
+            const retainedBytes = Number.isSafeInteger(message.retainedBytes)
+                ? message.retainedBytes : 0;
+            this.messageHistoryBytes = Math.max(
+                0, this.messageHistoryBytes - retainedBytes,
+            );
+            const retainedPixels = Number.isSafeInteger(message.retainedPixels)
+                ? message.retainedPixels : 0;
+            this.messageHistoryPixels = Math.max(
+                0, this.messageHistoryPixels - retainedPixels,
+            );
+            if (revokeImage && message.type === 'image'
+                && typeof message.imageUrl === 'string'
+                && message.imageUrl.startsWith('blob:')) {
+                if (this.fullscreenImage === message.imageUrl) {
+                    this.fullscreenImage = null;
+                }
+                try { URL.revokeObjectURL(message.imageUrl); } catch (_) {}
+                message.imageUrl = null;
+            }
+        },
+
+        _appendMessage(
+            message, explicitBytes = null, explicitPixels = 0,
+        ) {
+            const retainedBytes = this._messageRetainedBytes(
+                message, explicitBytes,
+            );
+            const retainedPixels =
+                Number.isSafeInteger(explicitPixels) && explicitPixels >= 0
+                    ? explicitPixels : 0;
+            const entry = {
+                ...message,
+                retainedBytes,
+                retainedPixels,
+            };
+            this.messages.push(entry);
+            this.messageHistoryBytes += retainedBytes;
+            this.messageHistoryPixels += retainedPixels;
+            while (this.messages.length > MAX_CHAT_HISTORY_ENTRIES
+                || this.messageHistoryBytes > MAX_CHAT_HISTORY_BYTES
+                || this.messageHistoryPixels > MAX_CHAT_HISTORY_PIXELS) {
+                const expired = this.messages.shift();
+                this._releaseMessageResources(expired);
+            }
+            return entry;
+        },
+
+        _removeMessageById(messageId, options = {}) {
+            const index = this.messages.findIndex(
+                (message) => message.id === messageId,
+            );
+            if (index === -1) return false;
+            const [removed] = this.messages.splice(index, 1);
+            this._releaseMessageResources(removed, options);
+            return true;
+        },
+
+        async _validateImageBlob(blob) {
+            if (!(blob instanceof Blob)
+                || !isAllowedImageMimeType(blob.type)) {
+                throw new Error('unsupported image format');
+            }
+            let width;
+            let height;
+            if (typeof createImageBitmap === 'function') {
+                const bitmap = await createImageBitmap(blob);
+                try {
+                    width = bitmap.width;
+                    height = bitmap.height;
+                } finally {
+                    if (typeof bitmap.close === 'function') bitmap.close();
+                }
+            } else {
+                const objectUrl = URL.createObjectURL(blob);
+                try {
+                    const dimensions = await new Promise((resolve, reject) => {
+                        const image = new Image();
+                        image.onload = () => resolve({
+                            width: image.naturalWidth,
+                            height: image.naturalHeight,
+                        });
+                        image.onerror = () => reject(
+                            new Error('image decoder rejected the file'),
+                        );
+                        image.src = objectUrl;
+                    });
+                    width = dimensions.width;
+                    height = dimensions.height;
+                } finally {
+                    URL.revokeObjectURL(objectUrl);
+                }
+            }
+            if (!Number.isSafeInteger(width) || !Number.isSafeInteger(height)
+                || width < 1 || height < 1
+                || width > MAX_IMAGE_DIMENSION
+                || height > MAX_IMAGE_DIMENSION
+                || width * height > MAX_IMAGE_PIXELS) {
+                throw new Error(
+                    `image dimensions exceed ${MAX_IMAGE_DIMENSION}px / `
+                    + `${MAX_IMAGE_PIXELS} pixels`,
+                );
+            }
+            return { width, height };
+        },
+
         /**
          * Handles an incoming encrypted message
          *
@@ -411,7 +838,7 @@ document.addEventListener('alpine:init', () => {
                 // Generate nickname from sender UUID (for display)
                 const nicknameData = generateNickname(message.sender_id);
 
-                this.messages.push({
+                this._appendMessage({
                     id: this.nextMessageId++,
                     type: 'message',
                     text: plaintext,
@@ -419,6 +846,7 @@ document.addEventListener('alpine:init', () => {
                     isOwn: isOwn,
                     nickname: nicknameData.display,        // "Cosmic Fox"
                     senderId: message.sender_id,           // Full UUID (for tooltip)
+                    senderTitle: message.sender_id,
                     outOfOrder: outOfOrder === true        // True if a later counter was already seen
                 });
 
@@ -446,15 +874,57 @@ document.addEventListener('alpine:init', () => {
                 return;
             }
 
+            // Group room: route through MLSSession. Requires the MLS
+            // handshake to have completed ('joined' state).
+            if (this.roomType === 'group') {
+                if (!this.mlsSession || !this.mlsReady) {
+                    this.error = '⚠️ Secure group not yet ready. Please wait.';
+                    return;
+                }
+                const ownIdentity = this.mlsSelfIdentity;
+                if (!ownIdentity) {
+                    this.error = '⚠️ Authenticated MLS self identity is unavailable.';
+                    return;
+                }
+                let localMessageId = null;
+                try {
+                    localMessageId = this.nextMessageId++;
+                    this._appendMessage({
+                        id: localMessageId,
+                        type: 'message',
+                        text,
+                        timestamp: new Date(),
+                        isOwn: true,
+                        nickname: ownIdentity.displayName,
+                        senderFingerprint: ownIdentity.fingerprint,
+                        senderTitle: this.mlsIdentityTitle(ownIdentity),
+                    });
+                    this.messageInput = '';
+                    requestAnimationFrame(() => this.scrollToBottom());
+                    await this.mlsSession.sendMessage(text);
+                } catch (error) {
+                    console.error('[MLS] Failed to send:', error);
+                    if (localMessageId !== null) {
+                        this._removeMessageById(localMessageId);
+                    }
+                    this.messageInput = text;
+                    this.error = '⚠️ Unable to send the group message: ' + error.message;
+                }
+                return;
+            }
+
+            let localMessageId = null;
             try {
-                this.messages.push({
-                    id: this.nextMessageId++,
+                localMessageId = this.nextMessageId++;
+                this._appendMessage({
+                    id: localMessageId,
                     type: 'message',
                     text: text,
                     timestamp: new Date(),
                     isOwn: true,
                     nickname: this.myNickname,  // Add user's own nickname
-                    senderId: this.userId        // Add user's own UUID
+                    senderId: this.userId,       // Full UUID for 1:1 routing
+                    senderTitle: this.userId,
                 });
 
                 this.messageInput = '';
@@ -478,15 +948,393 @@ document.addEventListener('alpine:init', () => {
                 });
 
                 if (!sent) {
-                    this.messages.pop();
+                    this._removeMessageById(localMessageId);
                     this.messageInput = text;
                     this.error = '⚠️ Unable to send the message. Please try again.';
                 }
 
             } catch (error) {
                 console.error('Failed to send message:', error);
+                if (localMessageId !== null) {
+                    this._removeMessageById(localMessageId);
+                }
+                this.messageInput = text;
                 this.error = '⚠️ Error encrypting the message.';
             }
+        },
+
+        /**
+         * Initialise the MLSSession on first use for a group room. Role
+         * was captured at init() time - WebSocketManager.connect() wipes
+         * the ws_token side-channel on first use, so reading it here would
+         * always resolve to 'joiner'.
+         *
+         * Idempotent - safe to call from 'connected' and 'userjoined'.
+         */
+        async _ensureMlsSession() {
+            if (this.mlsSession || this.mlsGroupEnded) return;
+
+            const role = this.mlsRole || 'joiner';
+
+            // Bind MLS to the URL invite fragment via the derived PSK.
+            // Without this, MLS would happily admit any party who can
+            // talk to the relay; with it, the AES-GCM tag on every
+            // Welcome and the commit_secret derivation depend on the
+            // joiner having the same fragment as the creator.
+            const pskSecret = window.cryptoManager
+                ? window.cryptoManager.mlsPskSecret
+                : null;
+            if (!pskSecret) {
+                this.error = '⚠️ MLS bootstrap PSK missing - cannot start group session securely';
+                return;
+            }
+
+            const expectedGroupId = window.cryptoManager
+                ? window.cryptoManager.mlsExpectedGroupId
+                : null;
+            const expectedCreatorKeyHash = window.cryptoManager
+                ? window.cryptoManager.mlsExpectedCreatorKeyHash
+                : null;
+            if (role === 'joiner' && (!expectedGroupId || !expectedCreatorKeyHash)) {
+                this.error = '⚠️ Group invite is missing its authenticated creator pins. '
+                    + 'Ask the creator to copy and resend the complete link.';
+                return;
+            }
+            if (role === 'creator' && expectedGroupId && expectedCreatorKeyHash) {
+                // A creator arrives from the homepage with a bare key fragment;
+                // the group pins are attached to it only after this tab has
+                // minted the group. Pins already present on a creator start
+                // therefore mean the page was reloaded (or its own invite link
+                // re-opened) and the group state that lived in it is gone.
+                // Minting a fresh group here would split the room in two: the
+                // link already shared rejects new joiners and the existing
+                // members can no longer read the creator. Stop instead and say
+                // so; the creator role in sessionStorage is intentionally not
+                // enough to resume a group (static/js/mls/README.md).
+                this.mlsGroupEnded = true;
+                this.mlsReady = false;
+                this._stopMlsUpdateTimer();
+                this.error = '⚠️ This tab created the group and was reloaded. '
+                    + 'The group keys lived only in the page, so this group has ended: '
+                    + 'members still connected can read each other, but nobody can join '
+                    + 'or be removed. Create a new room and share its link.';
+                return;
+            }
+
+            const self = this;
+            const session = new window.MLSSession({
+                role,
+                send: (envelope) => self.wsManager.send(envelope),
+                cancelPendingControl: (envelope) =>
+                    self.wsManager.cancelPendingMlsControl(envelope),
+                onEvent: (event) => self._handleMlsEvent(event),
+                pskSecret,
+                expectedGroupId,
+                expectedCreatorKeyHash,
+                relaySenderId: this.userId,
+            });
+            try {
+                await session.start();
+                if (role === 'creator') {
+                    const pins = session.bootstrapPins;
+                    if (!pins) {
+                        throw new Error('creator failed to produce MLS bootstrap pins');
+                    }
+                    window.cryptoManager.setMlsBootstrapPins(
+                        pins.groupId, pins.creatorKeyHash,
+                    );
+                }
+                this.mlsSession = session;
+                debugLog('[MLS] Session started, role=', role);
+            } catch (err) {
+                console.error('[MLS] Failed to start session:', err);
+                this.error = '⚠️ Unable to start the group session: ' + err.message;
+            }
+        },
+
+        /**
+         * PCS cadence (every 10 minutes): the creator re-keys its own
+         * path with a path-only Commit that also folds in any pending
+         * member Update proposals; each member periodically proposes an
+         * Update that re-keys its own leaf (the fresh key an attacker who
+         * compromised the old leaf key does not hold). Together these
+         * heal both epoch-secret leakage and per-member leaf compromise.
+         *
+         * The session methods no-op off-role / before joined, so the
+         * timer is safe to leave running. Jitter avoids every member
+         * proposing on the same tick.
+         */
+        _startMlsUpdateTimer() {
+            if (this.mlsUpdateTimer) return;
+            if (!this.mlsSession) return;
+            const BASE_MS = 10 * 60 * 1000;
+            const jitter = () => BASE_MS + Math.floor(Math.random() * 60 * 1000);
+            const self = this;
+            const tick = () => {
+                if (self.mlsSession && self.connected
+                    && self.mlsTransportSynced && self.mlsReady) {
+                    if (self.mlsSession.role === 'creator') {
+                        void self.mlsSession.commitUpdate();
+                    } else {
+                        void self.mlsSession.proposeUpdate();
+                    }
+                }
+                self.mlsUpdateTimer = setTimeout(tick, jitter());
+            };
+            this.mlsUpdateTimer = setTimeout(tick, jitter());
+        },
+
+        _stopMlsUpdateTimer() {
+            if (!this.mlsUpdateTimer) return;
+            clearTimeout(this.mlsUpdateTimer);
+            this.mlsUpdateTimer = null;
+        },
+
+        _handleMlsEvent(event) {
+            switch (event.kind) {
+                case 'roster': {
+                    const members = Array.isArray(event.members) ? event.members : [];
+                    const fingerprints = new Set();
+                    const leafIndices = new Set();
+                    const valid = Number.isInteger(event.myLeafIndex)
+                        && members.every((member) => {
+                            if (!this.isValidMlsIdentity(member, member?.leafIndex)
+                                || member.isSelf !== (member.leafIndex === event.myLeafIndex)
+                                || fingerprints.has(member.fingerprint)
+                                || leafIndices.has(member.leafIndex)) return false;
+                            fingerprints.add(member.fingerprint);
+                            leafIndices.add(member.leafIndex);
+                            return true;
+                        });
+                    const selfIdentity = members.find(
+                        (member) => member.leafIndex === event.myLeafIndex
+                            && member.isSelf === true,
+                    );
+                    if (!valid || !selfIdentity) {
+                        this.mlsReady = false;
+                        this.mlsRosterValid = false;
+                        this.mlsSelfIdentity = null;
+                        this.groupPeers = [];
+                        this.error = '⚠️ Authenticated MLS roster is malformed';
+                        break;
+                    }
+                    this.mlsRosterValid = true;
+                    this.mlsSelfIdentity = { ...selfIdentity };
+                    this.groupPeers = members
+                        .filter((member) => member.leafIndex !== event.myLeafIndex)
+                        .map((member) => ({
+                            leafIndex: member.leafIndex,
+                            fingerprint: member.fingerprint,
+                            shortFingerprint: member.shortFingerprint,
+                            displayName: member.displayName,
+                            nickname: member.displayName,
+                            isCreator: member.isCreator === true,
+                            identityTitle: this.mlsIdentityTitle(member),
+                        }));
+                    break;
+                }
+                case 'keypackage-published':
+                    this.addSystemMessage('🔑 KeyPackage published; waiting for Welcome...');
+                    break;
+                case 'welcome-sent':
+                    if (!this.mlsRosterValid) {
+                        this.mlsReady = false;
+                        this.error = '⚠️ Secure group established without an authenticated roster';
+                        break;
+                    }
+                    this.mlsReady = this.mlsTransportSynced;
+                    if (!this.mlsReady) break;
+                    this.addSystemMessage('✅ Secure group established');
+                    this.addSystemMessage(
+                        'ℹ️ Keep this tab open: the group lives in this page. If you reload or close it, no one can join or be removed until a new room is created',
+                    );
+                    this._startMlsUpdateTimer();
+                    break;
+                case 'update-committed':
+                    // Periodic PCS rotation; intentionally silent in the
+                    // chat (a system message every interval would be noise).
+                    debugLog('[MLS] Path re-keyed (Update commit), epoch', event.epoch);
+                    break;
+                case 'joined':
+                    if (!this.mlsRosterValid) {
+                        this.mlsReady = false;
+                        this.error = '⚠️ Joined group without an authenticated roster';
+                        break;
+                    }
+                    this.mlsReady = this.mlsTransportSynced;
+                    if (!this.mlsReady) break;
+                    this.addSystemMessage('✅ Joined secure group');
+                    this._startMlsUpdateTimer();
+                    break;
+                case 'update-proposed':
+                    debugLog('[MLS] Sent self Update proposal (PCS)');
+                    break;
+                case 'update-proposal-received':
+                    debugLog('[MLS] Buffered member Update proposal, leaf', event.senderLeafIndex);
+                    break;
+                case 'message': {
+                    const identity = event.senderIdentity;
+                    if (!this.isValidMlsIdentity(
+                        identity, event.senderLeafIndex,
+                    )) {
+                        this.error = '⚠️ MLS message omitted its authenticated sender identity';
+                        break;
+                    }
+                    if (event.attributionWarning) {
+                        this.addSystemMessage('🔐 Security warning: relay routing ID changed for an authenticated MLS member; the displayed key fingerprint is unchanged');
+                    }
+                    this._appendMessage({
+                        id: this.nextMessageId++,
+                        type: 'message',
+                        text: event.text,
+                        timestamp: new Date(),
+                        isOwn: false,
+                        nickname: identity.displayName,
+                        senderFingerprint: identity.fingerprint,
+                        senderTitle: this.mlsIdentityTitle(identity),
+                        senderLeafIndex: event.senderLeafIndex,
+                    });
+                    requestAnimationFrame(() => this.scrollToBottom());
+                    break;
+                }
+                case 'image': {
+                    const identity = event.senderIdentity;
+                    if (!this.isValidMlsIdentity(
+                        identity, event.senderLeafIndex,
+                    )) {
+                        this.error = '⚠️ MLS image omitted its authenticated sender identity';
+                        break;
+                    }
+                    if (event.attributionWarning) {
+                        this.addSystemMessage('🔐 Security warning: relay routing ID changed for an authenticated MLS member; the displayed key fingerprint is unchanged');
+                    }
+                    this._queueIncomingMlsImage(event, identity);
+                    break;
+                }
+                case 'commit-applied':
+                    if (event.removedLeafIndex !== null
+                        && event.removedLeafIndex !== undefined) {
+                        this.addSystemMessage('🔁 A participant was removed; group re-keyed');
+                    }
+                    break;
+                case 'liveness-check-started':
+                    this.addSystemMessage(
+                        `🔎 Verifying a reported departure over the encrypted channel (${Math.round(event.graceMs / 1000)}s)`,
+                    );
+                    break;
+                case 'liveness-confirmed':
+                    // The relay said this member left; the member just proved
+                    // otherwise with an authenticated message. Membership is
+                    // unchanged and the user should know the relay was wrong.
+                    this.addSystemMessage(
+                        '🔐 Security notice: the relay reported a departure for a member who is still reachable; no one was removed',
+                    );
+                    break;
+                case 'liveness-timeout':
+                    this.addSystemMessage(
+                        '⏱️ A reported departure went unanswered; removing the member and re-keying',
+                    );
+                    break;
+                case 'remove-committed':
+                    this.addSystemMessage('🔁 Group re-keyed (departing member removed)');
+                    break;
+                case 'removed':
+                    this._stopMlsUpdateTimer();
+                    this.mlsReady = false;
+                    this.mlsRosterValid = false;
+                    this.mlsSelfIdentity = null;
+                    this.groupPeers = [];
+                    this.addSystemMessage('🔒 You were removed from this secure group');
+                    this.error = '⚠️ You were removed from this group. Sending is disabled.';
+                    break;
+                case 'desynced':
+                    this._stopMlsUpdateTimer();
+                    this.mlsTransportSynced = false;
+                    this.mlsReady = false;
+                    this.mlsRosterValid = false;
+                    this.mlsSelfIdentity = null;
+                    this.groupPeers = [];
+                    this.error = '⚠️ ' + event.reason;
+                    break;
+                case 'error':
+                    console.error('[MLS]', event.reason);
+                    if (event.fatalIdentity === true) {
+                        this.mlsReady = false;
+                        this.mlsRosterValid = false;
+                        this.mlsSelfIdentity = null;
+                        this.groupPeers = [];
+                    }
+                    this.error = '⚠️ ' + event.reason;
+                    break;
+            }
+        },
+
+        async _appendIncomingMlsImage(event, identity) {
+            try {
+                if (!(event.data instanceof Uint8Array)
+                    || event.data.byteLength > this.maxImageSize) {
+                    throw new Error('decrypted MLS image exceeds the room size limit');
+                }
+                const blob = new Blob(
+                    [event.data], { type: event.mimeType },
+                );
+                const dimensions = await this._validateImageBlob(blob);
+                const imageUrl = URL.createObjectURL(blob);
+                this._appendMessage({
+                    id: this.nextMessageId++,
+                    type: 'image',
+                    imageUrl,
+                    timestamp: new Date(),
+                    isOwn: false,
+                    nickname: identity.displayName,
+                    senderFingerprint: identity.fingerprint,
+                    senderTitle: this.mlsIdentityTitle(identity),
+                    senderLeafIndex: event.senderLeafIndex,
+                }, blob.size, dimensions.width * dimensions.height);
+                requestAnimationFrame(() => this.scrollToBottom());
+            } catch (error) {
+                console.error('[MLS] Rejected image payload:', error);
+                this.error = '⚠️ Rejected unsafe or oversized group image.';
+            }
+        },
+
+        _queueIncomingMlsImage(event, identity) {
+            const byteLength = event?.data instanceof Uint8Array
+                ? event.data.byteLength : -1;
+            if (byteLength < 0 || byteLength > this.maxImageSize
+                || this._pendingImageDecodeCount
+                    >= MAX_PENDING_IMAGE_DECODES
+                || this._pendingImageDecodeBytes + byteLength
+                    > MAX_PENDING_IMAGE_DECODE_BYTES) {
+                this.error = '⚠️ Incoming group image decode queue is full.';
+                return false;
+            }
+
+            // MLSSession emits a view into its authenticated plaintext.
+            // Copy only after passing the quota so the asynchronous browser
+            // decoder owns a stable, bounded buffer.
+            const queuedEvent = {
+                ...event,
+                data: Uint8Array.from(event.data),
+            };
+            const queuedIdentity = { ...identity };
+            this._pendingImageDecodeCount += 1;
+            this._pendingImageDecodeBytes += byteLength;
+            const decodeTask = this._incomingImageDecodeQueue
+                .then(() => this._appendIncomingMlsImage(
+                    queuedEvent, queuedIdentity,
+                ))
+                .finally(() => {
+                    this._pendingImageDecodeCount = Math.max(
+                        0, this._pendingImageDecodeCount - 1,
+                    );
+                    this._pendingImageDecodeBytes = Math.max(
+                        0, this._pendingImageDecodeBytes - byteLength,
+                    );
+                });
+            this._incomingImageDecodeQueue =
+                decodeTask.catch(() => undefined);
+            return true;
         },
 
         /**
@@ -513,6 +1361,7 @@ document.addEventListener('alpine:init', () => {
             }
 
             try {
+                const dimensions = await this._validateImageBlob(file);
                 // Read file as ArrayBuffer for encryption
                 const arrayBuffer = await file.arrayBuffer();
 
@@ -522,12 +1371,18 @@ document.addEventListener('alpine:init', () => {
                 // allowed and avoid the base64 round-trip in memory.
                 const previewUrl = URL.createObjectURL(file);
 
+                if (this.pendingImage?.previewUrl) {
+                    try {
+                        URL.revokeObjectURL(this.pendingImage.previewUrl);
+                    } catch (_) {}
+                }
                 this.pendingImage = {
                     previewUrl,           // blob: URL (CSP-compatible)
                     name: file.name,
                     size: file.size,
                     mimeType: file.type,
-                    arrayBuffer: arrayBuffer
+                    arrayBuffer: arrayBuffer,
+                    pixelCount: dimensions.width * dimensions.height,
                 };
 
                 this.error = '';
@@ -554,70 +1409,92 @@ document.addEventListener('alpine:init', () => {
         },
 
         /**
-         * Sends the pending image
+         * Sends the pending image. For 1:1 rooms this goes through the
+         * Double Ratchet path (encryptImage); for group rooms it gets
+         * wrapped as an MLS application_data with PAYLOAD_IMAGE tag and
+         * delivered via the MLSSession transport.
          */
         async sendImage() {
             if (!this.pendingImage || !this.connected || this.sendingImage || this.isComposerLocked()) {
                 return;
             }
+            if (this.roomType === 'group' && (!this.mlsSession || !this.mlsReady)) {
+                this.error = '⚠️ Secure group not yet ready. Please wait.';
+                return;
+            }
 
             this.sendingImage = true;
 
+            // Optimistic UI: append locally before the network round-trip
+            // so the sender sees their own image immediately. Use the blob
+            // URL (CSP-compliant: img-src forbids data:); the underlying
+            // Blob is shared with the preview and freed on tab close or
+            // next upload.
+            const localImageUrl = this.pendingImage.previewUrl;
+            const ownMlsIdentity = this.roomType === 'group'
+                ? this.mlsSelfIdentity : null;
+            if (this.roomType === 'group' && !ownMlsIdentity) {
+                this.sendingImage = false;
+                this.error = '⚠️ Authenticated MLS self identity is unavailable.';
+                return;
+            }
+            const localMessageId = this.nextMessageId++;
+            this._appendMessage({
+                id: localMessageId,
+                type: 'image',
+                imageUrl: localImageUrl,
+                timestamp: new Date(),
+                isOwn: true,
+                nickname: ownMlsIdentity
+                    ? ownMlsIdentity.displayName : this.myNickname,
+                senderId: ownMlsIdentity ? null : this.userId,
+                senderFingerprint: ownMlsIdentity
+                    ? ownMlsIdentity.fingerprint : null,
+                senderTitle: ownMlsIdentity
+                    ? this.mlsIdentityTitle(ownMlsIdentity) : this.userId,
+            }, this.pendingImage.size, this.pendingImage.pixelCount);
+            requestAnimationFrame(() => this.scrollToBottom());
+
             try {
-                // Add image message to local list immediately. We hand over the
-                // existing preview blob URL - both the preview and the local
-                // history entry can share the same object URL (the underlying
-                // Blob is not freed until every reference goes away). This
-                // means we DO NOT revoke it here; it will be released when the
-                // tab closes or when handleImageUpload creates a new one.
-                const localImageUrl = this.pendingImage.previewUrl;
-                this.messages.push({
-                    id: this.nextMessageId++,
-                    type: 'image',
-                    imageUrl: localImageUrl,
-                    timestamp: new Date(),
-                    isOwn: true,
-                    nickname: this.myNickname,
-                    senderId: this.userId
-                });
-
-                // Scroll to bottom
-                requestAnimationFrame(() => this.scrollToBottom());
-
-                // Encrypt image data
-                const encrypted = await window.cryptoManager.encryptImage(
-                    this.pendingImage.arrayBuffer,
-                    this.pendingImage.mimeType,
-                    this.roomId,
-                    this.userId
-                );
-
-                // Send via WebSocket
-                const sent = this.wsManager.send({
-                    type: 'image',
-                    payload: encrypted.payload,
-                    header: encrypted.header
-                });
-
-                if (!sent) {
-                    // Remove local message on failure - the only reference to
-                    // the blob URL goes with it, so revoke to free the blob.
-                    this.messages.pop();
-                    try { URL.revokeObjectURL(localImageUrl); } catch {}
-                    this.error = '⚠️ Unable to send image. Please try again.';
+                if (this.roomType === 'group') {
+                    await this.mlsSession.sendImage(
+                        new Uint8Array(this.pendingImage.arrayBuffer),
+                        this.pendingImage.mimeType,
+                    );
+                } else {
+                    const encrypted = await window.cryptoManager.encryptImage(
+                        this.pendingImage.arrayBuffer,
+                        this.pendingImage.mimeType,
+                        this.roomId,
+                        this.userId
+                    );
+                    const sent = this.wsManager.send({
+                        type: 'image',
+                        payload: encrypted.payload,
+                        header: encrypted.header
+                    });
+                    if (!sent) {
+                        // Remove local message on failure - the only reference
+                        // to the blob URL goes with it, so revoke to free it.
+                        this._removeMessageById(
+                            localMessageId, { revokeImage: false },
+                        );
+                        this.error = '⚠️ Unable to send image. Please try again.';
+                        return;
+                    }
                 }
-
                 // Clear pending image (do NOT revoke previewUrl here on the
                 // happy path - it is now owned by the local message entry).
                 this.pendingImage = null;
-
             } catch (error) {
                 console.error('Failed to send image:', error);
                 // Encrypt threw: drop the local echo only. Do NOT revoke the
                 // blob URL here: pendingImage still owns it (it is cleared
                 // only on the happy path above), so the composer preview
                 // stays usable for a retry.
-                this.messages.pop();
+                this._removeMessageById(
+                    localMessageId, { revokeImage: false },
+                );
                 this.error = '⚠️ Error encrypting image.';
             } finally {
                 this.sendingImage = false;
@@ -648,15 +1525,20 @@ document.addEventListener('alpine:init', () => {
                     this.roomId,
                     message.sender_id
                 );
+                if (!(imageData.data instanceof Uint8Array)
+                    || imageData.data.byteLength > this.maxImageSize) {
+                    throw new Error('decrypted image exceeds the room size limit');
+                }
 
                 // Create blob URL from decrypted data
                 const blob = new Blob([imageData.data], { type: imageData.mimeType });
+                const dimensions = await this._validateImageBlob(blob);
                 const imageUrl = URL.createObjectURL(blob);
 
                 // Generate nickname from sender UUID
                 const nicknameData = generateNickname(message.sender_id);
 
-                this.messages.push({
+                this._appendMessage({
                     id: this.nextMessageId++,
                     type: 'image',
                     imageUrl: imageUrl,
@@ -664,8 +1546,9 @@ document.addEventListener('alpine:init', () => {
                     isOwn: false,
                     nickname: nicknameData.display,
                     senderId: message.sender_id,
+                    senderTitle: message.sender_id,
                     outOfOrder: imageData.outOfOrder === true
-                });
+                }, blob.size, dimensions.width * dimensions.height);
 
                 // Scroll to bottom
                 requestAnimationFrame(() => this.scrollToBottom());
@@ -691,11 +1574,66 @@ document.addEventListener('alpine:init', () => {
             return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
         },
 
+        isValidMlsIdentity(identity, leafIndex) {
+            if (!identity || !Number.isInteger(leafIndex)
+                || identity.leafIndex !== leafIndex
+                || typeof identity.fingerprint !== 'string'
+                || !/^[0-9a-f]{64}$/.test(identity.fingerprint)) return false;
+            const short = identity.fingerprint.slice(0, 20)
+                .match(/.{1,4}/g).join(' ');
+            const isCreator = leafIndex === 0;
+            return identity.shortFingerprint === short
+                && identity.isCreator === isCreator
+                && identity.displayName
+                    === `${isCreator ? 'Creator' : 'Member'} · ${short}`;
+        },
+
+        /** Full tooltip for an MLS identity; never includes relay metadata. */
+        mlsIdentityTitle(identity) {
+            if (!identity || !identity.fingerprint) return 'Authenticated MLS member';
+            return `Authenticated MLS signature key SHA-256: ${identity.fingerprint}`;
+        },
+
+        ownDisplayName() {
+            if (this.roomType === 'group') {
+                return this.mlsSelfIdentity
+                    ? this.mlsSelfIdentity.displayName : 'Authenticating...';
+            }
+            return this.myNickname || '...';
+        },
+
+        ownIdentityTitle() {
+            if (this.roomType === 'group') {
+                return this.mlsIdentityTitle(this.mlsSelfIdentity);
+            }
+            return this.userId || '';
+        },
+
+        ownAvatarLetter() {
+            const name = this.ownDisplayName();
+            return name && name !== 'Authenticating...'
+                ? name.charAt(0).toUpperCase() : '?';
+        },
+
+        securityStatusLabel() {
+            if (this.roomType === 'group') {
+                return this.mlsReady ? 'MLS · authenticated' : 'MLS · setup';
+            }
+            const status = this.sasVerificationStatus === 'verified'
+                ? 'verified' : (this.pfsActive ? 'encrypted' : 'setup');
+            return `protocol v1 · ${status}`;
+        },
+
+        authenticatedMemberCount() {
+            if (this.roomType !== 'group') return this.participantCount;
+            return this.groupPeers.length + (this.mlsSelfIdentity ? 1 : 0);
+        },
+
         /**
          * Adds a system message
          */
         addSystemMessage(text) {
-            this.messages.push({
+            this._appendMessage({
                 id: this.nextMessageId++,
                 type: 'system',
                 text: text,
@@ -713,6 +1651,14 @@ document.addEventListener('alpine:init', () => {
          * this method (see handleIncomingMessage / handleIncomingImage).
          */
         async handleSecurityError(error, senderId) {
+            // A ReferenceError or TypeError here is a bug in this page, not
+            // evidence about the peer. Say so, and do not let it wear the
+            // tamper-detection label or trigger the MITM tear-down below.
+            if (error instanceof ReferenceError || error instanceof TypeError) {
+                console.error('[BUG] Exception in the message path (not a security event):', error);
+                this.error = '⚠️ An internal error occurred while processing a message. Reload the page.';
+                return;
+            }
             console.error('[SECURITY] Message authentication failed:', error);
 
             // Protocol v1 authenticated ratchet: a signature failure means the
@@ -773,9 +1719,24 @@ document.addEventListener('alpine:init', () => {
             // C-06: the bootstrap secret was moved from window.location.hash
             // to sessionStorage on page load. window.location.href therefore
             // no longer carries the #key=... fragment that recipients need.
-            // Reconstruct it from the stash.
+            // Reconstruct it from the stash. Group links additionally require
+            // the creator-generated group_id + creator-key pins; never copy a
+            // PSK-only group link because it permits alternative-group joins.
             let link = window.location.href;
-            if (!window.location.hash) {
+            if (window.cryptoManager
+                && typeof window.cryptoManager.getInviteFragment === 'function') {
+                const fragment = window.cryptoManager.getInviteFragment({
+                    requireMlsPins: this.roomType === 'group',
+                });
+                if (!fragment && this.roomType === 'group') {
+                    this.error = '⚠️ Secure group invite is not ready yet. Please wait.';
+                    return;
+                }
+                if (fragment) {
+                    link = window.location.origin + window.location.pathname
+                        + window.location.search + fragment;
+                }
+            } else if (!window.location.hash) {
                 try {
                     const stash = sessionStorage.getItem(`pinchat_hash:${window.location.pathname}`);
                     if (stash) {
@@ -1640,6 +2601,7 @@ document.addEventListener('alpine:init', () => {
          */
         isComposerLocked() {
             if (this.sasMismatchFatal) return true;
+            if (this.mlsGroupEnded) return true;
             if (!this.connected) return true;
             if (this.participantCount < 2) return true;
             if (this.roomType === 'onetoone' && !this.pfsActive) return true;
@@ -1654,6 +2616,7 @@ document.addEventListener('alpine:init', () => {
         /** Placeholder copy that mirrors the current lock reason. */
         composerPlaceholder() {
             if (this.sasMismatchFatal) return 'Session destroyed - open a new chat.';
+            if (this.mlsGroupEnded) return 'Group ended - create a new room.';
             if (!this.connected) return 'Connecting...';
             if (this.participantCount < 2) return 'Waiting for someone to join this room...';
             if (this.roomType === 'onetoone' && !this.pfsActive) return 'Establishing secure connection...';
@@ -1664,12 +2627,18 @@ document.addEventListener('alpine:init', () => {
 
         /** Short tooltip shown on the send button in blocked states. */
         composerLockedLabel() {
+            if (this.mlsGroupEnded) return 'Group ended';
             if (!this.connected) return 'Not connected';
             if (this.participantCount < 2) return 'Waiting for peer to join';
             if (this.roomType === 'onetoone' && !this.pfsActive) return 'Waiting for secure connection...';
             if (this.sasReverifyRequired) return 'Re-verify identity to send';
             if (this.isSasDecisionPending()) return 'Verify identity before sending';
             return 'Send message';
+        },
+
+        /** Hide the group trust notice for the rest of this page's life. */
+        dismissGroupTrustNotice() {
+            this.groupTrustNoticeDismissed = true;
         },
 
         /**

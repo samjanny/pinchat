@@ -181,6 +181,12 @@ mod tests {
             room_token_period_secs: 600,
             msg_rate_limit: 30,
             msg_rate_window_secs: 1,
+            room_msg_rate_limit: 120,
+            room_byte_rate_limit: 8 * 1024 * 1024,
+            commit_rate_limit: 12,
+            commit_rate_window_secs: 60,
+            proposal_rate_limit: 8,
+            proposal_rate_window_secs: 60,
             frame_rate_limit: 120,
             protocol_error_limit: 10,
             pow_min_difficulty: 12,
@@ -189,6 +195,7 @@ mod tests {
             jwt_token_ttl_secs: 30,
             jwt_issuer: crate::jwt::DEFAULT_JWT_ISSUER.to_string(),
             max_ws_connection_age_secs: 1800,
+            ws_reconnect_grace_secs: 20,
             ecdh_burst_limit: 8,
             ecdh_burst_window_secs: 60,
             room_cleanup_interval_secs: 60,
@@ -205,6 +212,7 @@ mod tests {
             website_dir: None,
             allow_anonymous: false,
             cors_allowed_origins: vec!["https://localhost:3000".to_string()],
+            group_chat_enabled: true,
         }
     }
 

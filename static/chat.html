@@ -20,20 +20,20 @@
                 <b>PinChat</b>
             </a>
 
-            <div class="sidebar-group">Participants <span class="sidebar-group-count" x-text="'(' + participantCount + '/' + (maxParticipants !== null ? maxParticipants : '-') + ')'">(0/-)</span></div>
+            <div class="sidebar-group"><span x-text="roomType === 'group' ? 'MLS members' : 'Participants'">Participants</span> <span class="sidebar-group-count" x-text="'(' + authenticatedMemberCount() + '/' + (maxParticipants !== null ? maxParticipants : '-') + ')'">(0/-)</span></div>
 
             <!-- You (current user) -->
-            <div class="sidebar-item active" :title="userId">
+            <div class="sidebar-item active" :title="ownIdentityTitle()">
                 <span class="dot" :class="connected ? 'on' : 'off'"></span>
-                <span class="sidebar-item-label"><span x-text="myNickname || '...'">...</span></span>
+                <span class="sidebar-item-label"><span x-text="ownDisplayName()">...</span></span>
                 <span class="sidebar-item-badge">you</span>
             </div>
 
-            <!-- Peer (other participant). peerUserId is populated either on the
-                 userjoined event (when we were already in the room) or on the
-                 first ECDH public-key message (when we joined second). The
+            <!-- 1:1 peer. peerUserId is populated either on the userjoined
+                 event (when we were already in the room) or on the first
+                 ECDH public-key message (when we joined second). The
                  nickname is generated deterministically from the userId. -->
-            <template x-if="participantCount >= 2">
+            <template x-if="roomType === 'onetoone' && participantCount >= 2">
                 <div class="sidebar-item" :title="peerUserId || ''">
                     <span class="dot" :class="pfsActive ? 'on' : 'off'"></span>
                     <span class="sidebar-item-label" x-text="peerNickname || 'Peer'">Peer</span>
@@ -41,11 +41,30 @@
                 </div>
             </template>
 
+            <!-- Group peers come only from the cryptographically validated
+                 MLS ratchet tree. Relay sender_id values are routing metadata
+                 and never create, rename, or key these entries. -->
+            <template x-if="roomType === 'group'">
+                <template x-for="p in groupPeers" :key="p.fingerprint">
+                    <div class="sidebar-item" :title="p.identityTitle">
+                        <span class="dot on"></span>
+                        <span class="sidebar-item-label" x-text="p.nickname">Peer</span>
+                        <span class="sidebar-item-badge" x-show="p.isCreator">creator</span>
+                    </div>
+                </template>
+            </template>
+
             <!-- Waiting slot when alone -->
-            <template x-if="participantCount < 2">
+            <template x-if="roomType === 'onetoone' && participantCount < 2">
                 <div class="sidebar-item sidebar-item-muted">
                     <span class="dot off"></span>
                     <span class="sidebar-item-label">Waiting for peer...</span>
+                </div>
+            </template>
+            <template x-if="roomType === 'group' && groupPeers.length === 0">
+                <div class="sidebar-item sidebar-item-muted">
+                    <span class="dot off"></span>
+                    <span class="sidebar-item-label">Waiting for peers...</span>
                 </div>
             </template>
 
@@ -59,16 +78,16 @@
             <div class="sidebar-info">
                 <div class="row"><span class="k">Room</span><b x-text="roomId ? roomId.substring(0,8) + '...' : '-'">-</b></div>
                 <div class="row"><span class="k">Time left</span><b x-text="timeRemaining ? formatTime(timeRemaining).replace('⏱️ ', '') : '-'">-</b></div>
-                <div class="row"><span class="k">Participants</span><b><span x-text="participantCount">0</span>/<span x-text="maxParticipants !== null ? maxParticipants : '-'">-</span></b></div>
+                <div class="row"><span class="k" x-text="roomType === 'group' ? 'MLS members' : 'Participants'">Participants</span><b><span x-text="authenticatedMemberCount()">0</span>/<span x-text="maxParticipants !== null ? maxParticipants : '-'">-</span></b></div>
                 <div class="row"><span class="k">Max image</span><b x-text="maxImageSize ? (Math.round(maxImageSize/1024) + ' KB') : '-'">-</b></div>
             </div>
 
             <div class="sidebar-foot">
-                <div class="you">
-                    <span class="avatar" x-text="myNickname ? myNickname.charAt(0).toUpperCase() : '?'">?</span>
+                <div class="you" :title="ownIdentityTitle()">
+                    <span class="avatar" x-text="ownAvatarLetter()">?</span>
                     <div class="meta">
-                        <b x-text="myNickname || 'You'">You</b>
-                        <small>protocol v1 · <span x-text="sasVerificationStatus === 'verified' ? 'verified' : (pfsActive ? 'encrypted' : 'setup')">setup</span></small>
+                        <b x-text="ownDisplayName()">You</b>
+                        <small x-text="securityStatusLabel()">setup</small>
                     </div>
                 </div>
                 <div class="sidebar-legal">
@@ -97,29 +116,29 @@
                 <div class="room-details">
                     <!-- Show loading state until server sends room config -->
                     <span class="badge" x-text="roomType ? (roomType === 'onetoone' ? '1:1' : 'Group') : 'Loading...'"></span>
-                    <span class="participants"><svg class="icon" aria-hidden="true"><use href="#i-users"/></svg><span x-text="participantCount"></span>/<span x-text="maxParticipants !== null ? maxParticipants : '-'"></span></span>
+                    <span class="participants"><svg class="icon" aria-hidden="true"><use href="#i-users"/></svg><span x-text="authenticatedMemberCount()"></span>/<span x-text="maxParticipants !== null ? maxParticipants : '-'"></span></span>
                     <span class="ttl-countdown" x-show="timeRemaining" x-text="formatTime(timeRemaining).replace('⏱️ ', '')"></span>
 
-                    <!-- User's nickname -->
-                    <span x-show="myNickname" class="badge badge-info" :title="'Your session identifier: ' + userId">
-                        <svg class="icon" aria-hidden="true"><use href="#i-user"/></svg><span x-text="myNickname"></span>
+                    <!-- 1:1 nickname or authenticated MLS key identity -->
+                    <span x-show="roomType === 'group' ? mlsSelfIdentity : myNickname" class="badge badge-info" :title="ownIdentityTitle()">
+                        <svg class="icon" aria-hidden="true"><use href="#i-user"/></svg><span x-text="ownDisplayName()"></span>
                     </span>
 
                     <!-- PFS & PCS Status Badges -->
-                    <span x-show="pfsActive" class="badge badge-success" title="Perfect Forward Secrecy active - Past messages protected">
+                    <span x-show="pfsActive || (roomType === 'group' && mlsReady)" class="badge badge-success" title="Perfect Forward Secrecy active - Past messages protected">
                         <svg class="icon" aria-hidden="true"><use href="#i-lock"/></svg>PFS
                     </span>
-                    <span x-show="pfsActive" class="badge badge-success" title="Post-Compromise Security active - Future messages protected via Double Ratchet">
+                    <span x-show="pfsActive || (roomType === 'group' && mlsReady)" class="badge badge-success" title="Post-Compromise Security: future messages re-keyed on each join (group) / Double Ratchet (1:1)">
                         <svg class="icon" aria-hidden="true"><use href="#i-refresh"/></svg>PCS
                     </span>
                     <!-- Verified Key Badge (subtle indicator when verified) -->
                     <span x-show="sasVerificationStatus === 'verified'" class="badge badge-verified" title="Key verified - Identity confirmed via SAS code">
                         <svg class="icon" aria-hidden="true"><use href="#i-check"/></svg>Verified
                     </span>
-                    <span x-show="roomType === 'onetoone' && participantCount < 2 && connected" class="badge badge-info" title="Waiting for other participant">
+                    <span x-show="connected && participantCount < 2" class="badge badge-info" title="Waiting for other participant">
                         <svg class="icon" aria-hidden="true"><use href="#i-clock"/></svg>Waiting
                     </span>
-                    <span x-show="(roomType !== 'onetoone' && connected) || ecdhHandshakeStatus === 'aborted'" class="badge badge-warning" title="Encrypted, but no Forward Secrecy">
+                    <span x-show="ecdhHandshakeStatus === 'aborted'" class="badge badge-warning" title="Encrypted, but no Forward Secrecy">
                         <svg class="icon" aria-hidden="true"><use href="#i-lock"/></svg>Encrypted
                     </span>
                 </div>
@@ -138,7 +157,7 @@
             <span class="sep"></span>
             <span class="kv"><span class="k">TTL</span> <b x-text="ttlMinutes ? (ttlMinutes < 60 ? ttlMinutes + 'm' : (ttlMinutes % 60 === 0 ? (ttlMinutes/60) + 'h' : Math.floor(ttlMinutes/60) + 'h ' + (ttlMinutes%60) + 'm')) : '-'"></b></span>
             <span class="sep"></span>
-            <span class="kv"><span class="k">Participants</span> <b><span x-text="participantCount"></span>/<span x-text="maxParticipants !== null ? maxParticipants : '-'"></span></b></span>
+            <span class="kv"><span class="k" x-text="roomType === 'group' ? 'MLS members' : 'Participants'">Participants</span> <b><span x-text="authenticatedMemberCount()"></span>/<span x-text="maxParticipants !== null ? maxParticipants : '-'"></span></b></span>
             <span class="sep"></span>
             <span class="kv"><span class="k">Max image</span> <b x-text="maxImageSize ? (Math.round(maxImageSize/1024) + ' KB') : '-'"></b></span>
         </div>
@@ -170,7 +189,7 @@
                         <div x-show="msg.type === 'message'" class="message" :class="msg.isOwn ? 'message-own' : 'message-other'">
                             <div class="message-bubble">
                                 <!-- Show nickname for all messages -->
-                                <div x-show="msg.nickname" class="message-sender" :title="msg.senderId">
+                                <div x-show="msg.nickname" class="message-sender" :title="msg.senderTitle">
                                     <strong x-text="msg.nickname"></strong>
                                 </div>
                                 <p><span x-html="renderMessage(msg.text)"></span><span class="message-time" x-text="formatTimestamp(msg.timestamp)"></span><span x-show="msg.outOfOrder" class="message-late" title="Delivered out of order">late</span></p>
@@ -181,7 +200,7 @@
                         <div x-show="msg.type === 'image'" class="message" :class="msg.isOwn ? 'message-own' : 'message-other'">
                             <div class="message-bubble message-bubble-image">
                                 <!-- Show nickname for all messages -->
-                                <div x-show="msg.nickname" class="message-sender" :title="msg.senderId">
+                                <div x-show="msg.nickname" class="message-sender" :title="msg.senderTitle">
                                     <strong x-text="msg.nickname"></strong>
                                 </div>
                                 <div class="message-image-container">
@@ -232,6 +251,32 @@
                 <button @click="reopenSasVerification()" class="btn btn-verify-now">Verify now</button>
             </div>
 
+            <!-- Group trust notice: groups have no SAS ceremony. Admission is
+                 the link plus authenticated leaf keys, so say so instead of
+                 letting the padlock badges imply more than they verify. -->
+            <div x-show="roomType === 'group' && mlsReady && !groupTrustNoticeDismissed" class="unverified-warning-banner">
+                <div class="unverified-warning-content">
+                    <span class="unverified-warning-icon"><svg class="icon" aria-hidden="true"><use href="#i-unlock"/></svg></span>
+                    <div class="unverified-warning-text">
+                        <strong>Identities not verified</strong>
+                        <p>Anyone with this link can join. Members are authenticated by their key fingerprint (hover a name), not by a security code: compare fingerprints over another channel if it matters.</p>
+                    </div>
+                </div>
+                <button @click="dismissGroupTrustNotice()" class="btn btn-verify-now">Got it</button>
+            </div>
+
+            <!-- Group ended: the creator tab lost its in-page group state -->
+            <div x-show="mlsGroupEnded" class="mitm-warning-banner">
+                <div class="mitm-warning-content">
+                    <span class="mitm-warning-icon"><svg class="icon" aria-hidden="true"><use href="#i-alert"/></svg></span>
+                    <div class="mitm-warning-text">
+                        <strong>Group ended</strong>
+                        <p>This tab created the group and was reloaded; the group keys lived only in the page. Create a new room and share its link.</p>
+                    </div>
+                </div>
+                <a href="/static/index.html" class="btn btn-danger btn-new-chat">New Room</a>
+            </div>
+
             <!-- Waiting-for-peer banner (alone in the room) -->
             <div x-show="connected && participantCount < 2" class="security-status-banner">
                 <svg class="icon" aria-hidden="true"><use href="#i-clock"/></svg> Waiting for another participant to join the room. Share the link to invite someone.
@@ -242,16 +287,6 @@
                 <svg class="icon" aria-hidden="true"><use href="#i-lock"/></svg> Establishing secure end-to-end encryption... Please wait.
             </div>
 
-            <!-- Legacy non-1:1 room. Group creation is refused by the API
-                 (audit M-4). A room of this type predates that gate and cannot
-                 carry messages at all: the ECDH + Double Ratchet handshake only
-                 runs for `onetoone`, and encryptMessage/decryptMessage throw
-                 without an initialised ratchet. The previous copy here claimed
-                 these rooms fell back to bootstrap encryption, which was never
-                 true of the shipped client. -->
-            <div x-show="connected && roomType !== 'onetoone'" class="group-chat-warning">
-                <svg class="icon" aria-hidden="true"><use href="#i-info"/></svg> <strong>Group chats are not available yet.</strong> This room cannot send or receive encrypted messages. Please open a new 1:1 chat.
-            </div>
 
             <!-- Image Preview (shown when image is selected or being sent) -->
             <div x-show="pendingImage || sendingImage" class="image-preview-container">
@@ -447,13 +482,47 @@
 
     <!-- Include JS modules -->
     <script src="/static/js/debug.js" integrity="sha256-nY3zkFVKF7x6KVbWq1mwcHq4Y/g8O10iOmLAFfiDsJ8=" crossorigin="anonymous" ></script>
-    <script src="/static/js/crypto.js" integrity="sha256-cKHkBoV1Ml0HoCBQz9XGtXe4hsltvtcuts39MIvku2w=" crossorigin="anonymous" ></script>
+    <script src="/static/js/crypto.js" integrity="sha256-cMnEaRPD3PKWlcGP/U9WBixeJxjQ7J1l1ZjNc11atgs=" crossorigin="anonymous" ></script>
     <script src="/static/js/identity.js" integrity="sha256-pGHsPP2igLAVOebsIbbOTrxQgUsGCz8ejzU0yQBjUiE=" crossorigin="anonymous" ></script>
     <script src="/static/js/double-ratchet.js" integrity="sha256-0WWGASRwfR87dRsOpbVxQpo5/wnQim/+7Fib3h73yQE=" crossorigin="anonymous" ></script>
     <script src="/static/js/ecdh.js" integrity="sha256-M8sKqyVMg5ezm73wSQcnusiqf26YPnDo8l+NS9D4QsQ=" crossorigin="anonymous" ></script>
-    <script src="/static/js/websocket.js" integrity="sha256-gWPUIZMTAGyUKh7K9gqDLwl9I5/OHZ/HYqBJvEM7OxY=" crossorigin="anonymous" ></script>
+    <!--
+      MLS (RFC 9420) custom implementation - loaded in topological dependency
+      order. Each module attaches its exports to window.MLS. The signed
+      hash manifest under hashes.json.signed is regenerated separately;
+      SRI attributes will be re-added when the branch stabilises.
+    -->
+    <script src="/static/js/mls/codec.js" integrity="sha256-m0OdgMRcOCOEKbBp/7VVvtSVeL8cnvPBGrW07IsOO+o=" crossorigin="anonymous" ></script>
+    <script src="/static/js/mls/tree-math.js" integrity="sha256-WluTsV4UIIPvitdg023iK4CLbJijBUbhxuWKAIiDI04=" crossorigin="anonymous" ></script>
+    <script src="/static/js/mls/p256.js" integrity="sha256-BWcruqQBVKt9bOmKm7XqbGXXmDAchkrIgXUVrVtgw/U=" crossorigin="anonymous" ></script>
+    <script src="/static/js/mls/ciphersuite.js" integrity="sha256-y4OEceiTipBpMqJdlrdVTVWEui1lcE9yDkPRTcxc8sA=" crossorigin="anonymous" ></script>
+    <script src="/static/js/mls/hpke.js" integrity="sha256-Imo8YtiINLfHIiP7bk4ZJuQSB3DmGpn1wGzZCVvB5j0=" crossorigin="anonymous" ></script>
+    <script src="/static/js/mls/signature.js" integrity="sha256-1aVtl6FCAk9I6/aFG0MZJHG15Qwoe8WSzE3rdUs1UJk=" crossorigin="anonymous" ></script>
+    <script src="/static/js/mls/labeled.js" integrity="sha256-1GtpqEULMR5AOoyyLgfFmbl54EHaX7xlkeBvzcDJuyQ=" crossorigin="anonymous" ></script>
+    <script src="/static/js/mls/key-schedule.js" integrity="sha256-oQUK/57A4nDxRsCcNjl1g7fg7wgvhssq5+TDLbzNTOc=" crossorigin="anonymous" ></script>
+    <script src="/static/js/mls/transcript-hashes.js" integrity="sha256-jgxHOdXgjTcaAA/wZ7O53X1KewuLXs4+1fjWKhIYbw0=" crossorigin="anonymous" ></script>
+    <script src="/static/js/mls/nodes.js" integrity="sha256-riqTVRdF5hCtIzc1BL35NdI6gd0r+4L0eJ9m16lVEhA=" crossorigin="anonymous" ></script>
+    <script src="/static/js/mls/tree-hash.js" integrity="sha256-cBc4/DxwBU1NmrXq36zTyNHWMQKlgABymuPI83HwtgU=" crossorigin="anonymous" ></script>
+    <script src="/static/js/mls/parent-hash.js" integrity="sha256-L502mAD06beXqoR6vSjObv2xU2fiB9IGG2wDIYzFDtw=" crossorigin="anonymous" ></script>
+    <script src="/static/js/mls/ratchet-tree.js" integrity="sha256-5L2mDJ65NEotXuqXpFE5WFntyUziU/WdidM3P2vkngw=" crossorigin="anonymous" ></script>
+    <script src="/static/js/mls/tree-kem.js" integrity="sha256-H1QSDYjBX5Pc9jFbVUVegR+nFETizoVDVYc0RStkTg8=" crossorigin="anonymous" ></script>
+    <script src="/static/js/mls/group-context.js" integrity="sha256-jFAqOF2IUfbB9Up7u/cjJs+ZtknvjDPYQjb5gL6okyU=" crossorigin="anonymous" ></script>
+    <script src="/static/js/mls/key-package.js" integrity="sha256-Go/AnXf1VYb8Bm3O0XFFcmCcE5TE4m//cnjlFVSHmhA=" crossorigin="anonymous" ></script>
+    <script src="/static/js/mls/mls-message.js" integrity="sha256-x/TkcEcwigtG0z4/5mL6Avx2hASOTE2TLa/emYy/lHc=" crossorigin="anonymous" ></script>
+    <script src="/static/js/mls/group-info.js" integrity="sha256-tESHTcdaRdYxkK+EBGv8hRWi3+uBKSVqnc+K7xBS6Hc=" crossorigin="anonymous" ></script>
+    <script src="/static/js/mls/welcome.js" integrity="sha256-Zi9RTUX2ffLcfQmu5h88Q0Rvg5WhD586hNxf1/8VOtk=" crossorigin="anonymous" ></script>
+    <script src="/static/js/mls/framing.js" integrity="sha256-WfKEHNh1fnr3RwjTOqFz1TJwTSiAmj7ri/3jL4CHXKk=" crossorigin="anonymous" ></script>
+    <script src="/static/js/mls/proposal.js" integrity="sha256-+6axPcUrAL2wq5gjj85AaVQ1fIvttJTmycUE1+JwNGU=" crossorigin="anonymous" ></script>
+    <script src="/static/js/mls/commit.js" integrity="sha256-KSi+I0Sa4Y2Ipled43RybkDNgRMZMF1zFIVG4xYsTns=" crossorigin="anonymous" ></script>
+    <script src="/static/js/mls/public-message.js" integrity="sha256-lWfq3/8O0dqEtZTOnXSSxllmsxHe1j3N+48TAmmtMeQ=" crossorigin="anonymous" ></script>
+    <script src="/static/js/mls/secret-tree.js" integrity="sha256-60NtGduXj91OJXuES7by5Ly91G+BWC69fgJtPU+N9lQ=" crossorigin="anonymous" ></script>
+    <script src="/static/js/mls/private-message.js" integrity="sha256-9x7GKV808NId+80QDDFlD52VV4YRTuN4EoZZxsl6Gkw=" crossorigin="anonymous" ></script>
+    <script src="/static/js/mls/group.js" integrity="sha256-IDkTa9ZeR7RtsJhSMxRzBB+KNJ9mVIKHtABYNEQ1BQM=" crossorigin="anonymous" ></script>
+    <script src="/static/js/mls-session.js" integrity="sha256-vDpB+gKrLv/6y1NPLLb1ZO/XjNrPr/IjHQFoJQNAaHg=" crossorigin="anonymous" ></script>
+    <!-- end MLS -->
+    <script src="/static/js/websocket.js" integrity="sha256-eGxesUz6eyUCNUX1gvPfdcqbeE6Eui0+zYKvzCdbtVw=" crossorigin="anonymous" ></script>
     <script src="/static/js/emoji.js" integrity="sha256-egqIwLEXWc2dlgP6N1sF7CLYLyMe01fSUy9dO/uLPmg=" crossorigin="anonymous" ></script>
-    <script src="/static/js/app.js" integrity="sha256-4p6yp2g03zWglHDEqaZKhxs224jxEoOQGrCeA9zTFU4=" crossorigin="anonymous" ></script>
+    <script src="/static/js/app.js" integrity="sha256-X6osxBJog6qg34RjRCmxe9bQiD4tzz57tXqNPuRNFKc=" crossorigin="anonymous" ></script>
     <script src="/static/js/alpine-csp.min.js" integrity="sha256-58hj2liWaS9dR44Q2uCJ5hZP7RxcG2offLv3qbCT8FU=" crossorigin="anonymous" defer></script>
 
     <!-- Lucide icon sprite (ISC license, https://lucide.dev) -->

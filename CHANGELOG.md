@@ -4,6 +4,107 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Dates are the repository-local commit dates; entries are curated for user-visible impact
 rather than being a 1:1 mirror of `git log`.
 
+## [2026-09-08] - v0.8.0
+
+Group chat lands on the main line, disabled by default. The signed manifest
+moves to sequence 47 and now covers all 51 served files (the MLS bundle
+included); the extensions ship as 1.3.0 pinned at this tag, with the
+sequence floor raised to 47.
+
+### Added - MLS group chat behind GROUP_CHAT_ENABLED
+
+Rooms of up to 20 members use an MLS (RFC 9420, ciphersuite 0x0002) group
+implemented from scratch and validated against the IETF test vectors. The
+room creator at leaf 0 is the only committer; every Commit and Welcome is
+signature-verified before any state changes; per-epoch secret trees give
+forward secrecy and periodic re-keying gives post-compromise security. The
+flag defaults to false, so nothing changes for an existing deployment until
+an operator turns it on. The server refuses group rooms with 404 while it is
+off, so a disabled feature is not described to callers.
+
+The group branch had been cut before v0.5.0. Merging main into it recovered
+everything since, and in particular the SAS quarantine gate, which the branch
+did not have: 1:1 ciphertext was being decrypted and shown before the user had
+made a SAS decision. In the other direction the branch brings main a
+ReplayCache with O(1) amortized expiry and eviction, replacing the per-message
+sort of the full anti-replay set that the September audit had flagged, plus
+CSRF verification on /api/rooms.
+
+### Changed - a relay-reported departure is challenged before anyone is removed
+
+`userleft` comes from the relay and is unauthenticated, yet the creator used
+to commit an MLS Remove on it directly, so a malicious relay could evict any
+live member permanently with one forged frame (issue #1). The creator now
+sends the reported member a liveness ping as an MLS application message and
+removes only if no authenticated reply, or any other authenticated message
+from that leaf, arrives within a 20-second grace window. Only the creator may
+ask and only the addressed leaf answers; the ping is never shown as a chat
+message. A relay can still suppress the reply for the whole window, which is
+indistinguishable from a real departure and is the residual with an untrusted
+relay, but it can no longer land a permanent eviction in one move, and the
+creator is told when a "departed" member answers. Deferred removals and every
+existing Remove code path are unchanged; the challenge sits in front of them.
+
+### Changed - the creator is warned before losing the group
+
+The creator's group state lives only in its open tab; a reload mints a new
+group that existing members and the pinned invite reject, after which nobody
+can join or be removed. The page now installs a `beforeunload` prompt for a
+creator with members and says so when the group is established. Surviving a
+reload for real would mean persisting epoch secrets and the creator's
+signature key, which is a product decision this release does not make.
+
+### Changed - one image allowlist
+
+The group branch's picker accepted image/avif from a local set while main's
+crypto layer enforces an audited PNG/JPEG/GIF/WebP allowlist on both encrypt
+and decrypt. app.js now consults that single list everywhere, so AVIF is no
+longer offered; adding it back is a deliberate change to the audited list.
+
+### Documentation
+
+README describes group chat and its two structural limits instead of stating
+it is disabled. The Privacy Policy discloses the MLS control traffic the relay
+sees in group rooms: public keys, signatures, membership size and changes,
+never content. The MLS module README records the reload guard and the
+liveness challenge under known gaps.
+
+### Changed - the server refuses a proxy setup that cannot see clients
+
+Outside `PRIVACY_MODE=development`, `FORCE_HTTP=true` now requires a non-empty
+`TRUSTED_PROXIES` as well as `FORCE_SECURE_COOKIES=true`, and the process
+exits at startup naming the missing one. With the proxy untrusted every
+visitor was seen as the proxy's own address and shared one rate-limit bucket,
+so a single client could lock everyone out of room creation; that state used
+to be silent. `docker-compose.yml` pins the compose network so the gateway the
+proxy connects from is always `172.18.0.1`, the value `.env.example` now
+documents for the bundled setup.
+
+### Changed - a reloaded group creator ends the group instead of splitting it
+
+The creator's group state lives only in its page. A creator start that already
+sees group pins on its invite fragment (a fresh creator has none) is a reload,
+and it no longer mints a second group behind the same link, which left the
+shared link rejecting new joiners while the members could not read the
+creator. The composer locks, the page says the group has ended and offers a
+new room.
+
+### Added - group rooms say that identities are not verified
+
+Groups have no security-code ceremony: admission is the link plus
+authenticated leaf keys, and members are told apart by key fingerprint. The
+chat page now says so in a dismissible notice once the group is established,
+so the padlock badges never imply a check that did not happen.
+
+### Added - one command from signature to green CI
+
+`extensions/finish-release.sh <tag> <extension-version>` sets `GITHUB_TAG` and
+`MIN_KNOWN_SEQUENCE` in both extensions, the manifest versions, the release-pin
+test and the README from the freshly signed manifest, then runs verify-sri,
+the Node suite, the typographic scan, fmt, clippy, the Rust tests and cargo
+audit, and prints the commit, merge, tag and package commands. The signature
+with the offline key is the only step left by hand.
+
 ## [2026-09-08] - v0.7.5
 
 Browser-extension only. No server, client or protocol change, and no re-sign:

@@ -54,6 +54,12 @@ function loadChatStore() {
         setInterval,
         requestAnimationFrame: (callback) => callback(),
         generateNickname: () => ({ display: 'Test Peer' }),
+        // The real helper from crypto.js: app.js consults the audited image
+        // allowlist and refuses to load without it.
+        isAllowedImageMimeType: require(path.join(__dirname, '..', 'static', 'js', 'crypto.js')).isAllowedImageMimeType,
+        // Minimal Image so the image branch app.js reaches incidentally does not
+        // throw inside the sandbox; this suite asserts on the SAS gate only.
+        Image: class { set src(_) { if (this.onload) this.onload(); } },
         debugLog() {},
         sessionStorage: { getItem: () => null, setItem() {} },
         navigator: { clipboard: { writeText: async () => {} } }

@@ -9,6 +9,7 @@ use serde_json::json;
 use std::net::SocketAddr;
 use uuid::Uuid;
 
+use crate::handlers::auth::verify_csrf_for_api;
 use crate::ip_hash::{extract_client_ip_with_proxy, hash_ip};
 use crate::jwt::{WsTokenClaims, sign_token};
 use crate::models::{CreateRoomResponse, Room, RoomConfig, RoomType};
@@ -56,7 +57,19 @@ pub async fn create_room(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(config): Json<RoomConfig>,
-) -> Result<Json<CreateRoomResponse>, Response> {
+) -> Result<Response, Response> {
+    // CSRF: defence-in-depth on top of SameSite=Strict + session auth.
+    // Required because /api/rooms is a state-creating endpoint reachable
+    // from any authenticated context (XSS, sibling-subdomain takeover, ...).
+    verify_csrf_for_api(&headers, &state.csrf_secret)?;
+    if config.room_type == RoomType::Group && !state.config.group_chat_enabled {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "Group chat is not enabled on this server" })),
+        )
+            .into_response());
+    }
+
     // Extract and hash client IP for challenge cache lookup
     // Considers trusted proxies for X-Forwarded-For when configured
     let client_ip =
@@ -77,25 +90,6 @@ pub async fn create_room(
         return Err(pow_error_response(
             StatusCode::BAD_REQUEST,
             json!({ "error": "TTL must be between 1 and 1440 minutes" }),
-            fresh_cookie,
-        ));
-    }
-
-    // Audit M-4: refuse `group` until a group key exchange exists.
-    //
-    // The wire type still carries the variant, and Room::new caps every room
-    // at two participants while preserving the requested type. The client only
-    // runs the ECDH + Double Ratchet handshake for `onetoone`, and both
-    // encryptMessage and decryptMessage throw without an initialised ratchet.
-    // A `group` room is therefore a room in which nobody can send anything:
-    // the failure surfaces as an opaque encryption error at first send rather
-    // than at creation. Reject it here instead of handing out a dead room, and
-    // remove the footgun of a half-wired code path that a future change could
-    // accidentally complete into a bootstrap-key-only downgrade.
-    if config.room_type != RoomType::OneToOne {
-        return Err(pow_error_response(
-            StatusCode::BAD_REQUEST,
-            json!({ "error": "Group rooms are not supported yet" }),
             fresh_cookie,
         ));
     }
@@ -209,42 +203,67 @@ pub async fn create_room(
 
     // Layer 3: Atomic room creation with capacity check
     // Uses mutex to prevent race condition where concurrent requests exceed max_rooms
-    let room = Room::new(config);
+    let (room, creator_bootstrap_token) = Room::new_with_creator_bootstrap(config);
     let room_id = room.id;
     let room_type = room.room_type;
     let ttl_minutes = room.ttl_minutes;
     let max_participants = room.max_participants;
+    let creator_connection_id = room.creator_connection_id();
+    let creator_bootstrap_generation = room.creator_bootstrap_generation();
+
+    // Allocate and sign the creator's WebSocket identity before publishing
+    // the room. Group rooms fail closed here: inserting a room without a
+    // usable token for its stored creator identity would permanently strand
+    // the creator-only MLS administration invariant. One-to-one rooms retain
+    // the legacy fallback where a later PoW-minted WebSocket token can be used.
+    let ws_claims = match creator_connection_id {
+        Some(connection_id) => WsTokenClaims::for_creator_bootstrap(
+            room_id,
+            connection_id,
+            state.config.jwt_token_ttl_secs,
+            &state.config.jwt_issuer,
+            creator_bootstrap_generation,
+            false,
+            None,
+        ),
+        None => WsTokenClaims::new(
+            room_id,
+            state.config.jwt_token_ttl_secs,
+            &state.config.jwt_issuer,
+        ),
+    };
+    let connection_id = ws_claims.connection_id;
+    let ws_token = match sign_token(&ws_claims, &state.jwt_secret) {
+        Ok(token) => Some(token),
+        Err(error) if creator_connection_id.is_some() => {
+            tracing::error!(
+                "Failed to generate required WebSocket token for group creator: {}",
+                error
+            );
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "Unable to establish group creator identity" })),
+            )
+                .into_response());
+        }
+        Err(error) => {
+            tracing::error!("Failed to generate WebSocket token for creator: {}", error);
+            None
+        }
+    };
 
     // Atomic check+insert (prevents concurrent requests from exceeding capacity)
     match state.try_create_room(room) {
         Ok(created_room_id) => {
             tracing::info!("Created room id={}...", short_room_id(&created_room_id));
 
-            // Generate WebSocket token for room creator to avoid second PoW
-            // This improves UX by eliminating the second challenge
-            let ws_claims = WsTokenClaims::new(
-                room_id,
-                state.config.jwt_token_ttl_secs,
-                &state.config.jwt_issuer,
-            );
-            let connection_id = ws_claims.connection_id;
-
-            let ws_token = match sign_token(&ws_claims, &state.jwt_secret) {
-                Ok(token) => {
-                    tracing::info!(
-                        "Generated WebSocket token for room creator (room: {}, connection: {})",
-                        room_id,
-                        connection_id
-                    );
-                    Some(token)
-                }
-                Err(e) => {
-                    // Log error but don't fail room creation
-                    // Creator will just need to solve PoW for WebSocket like others
-                    tracing::error!("Failed to generate WebSocket token for creator: {}", e);
-                    None
-                }
-            };
+            if ws_token.is_some() {
+                tracing::info!(
+                    "Generated WebSocket token for room creator (room: {}, connection: {})",
+                    room_id,
+                    connection_id
+                );
+            }
 
             let response = CreateRoomResponse {
                 room_id,
@@ -253,6 +272,7 @@ pub async fn create_room(
                 max_participants,
                 connection_id: ws_token.as_ref().map(|_| connection_id),
                 ws_token,
+                creator_bootstrap_token,
                 // Always advertise protocol version so clients can gate even on
                 // the creator-optimization path (where they would otherwise skip
                 // /api/ws-token and miss the shape check).
@@ -260,7 +280,12 @@ pub async fn create_room(
                 supported_subprotocols: vec!["pinchat.v1".to_string()],
             };
 
-            Ok(Json(response))
+            let mut response = Json(response).into_response();
+            response.headers_mut().insert(
+                header::CACHE_CONTROL,
+                "no-store".parse().expect("static Cache-Control value"),
+            );
+            Ok(response)
         }
         Err(_) => {
             // Server at capacity (checked atomically)
@@ -390,6 +415,12 @@ mod tests {
             room_token_period_secs: 600,
             msg_rate_limit: 30,
             msg_rate_window_secs: 1,
+            room_msg_rate_limit: 120,
+            room_byte_rate_limit: 8 * 1024 * 1024,
+            commit_rate_limit: 12,
+            commit_rate_window_secs: 60,
+            proposal_rate_limit: 8,
+            proposal_rate_window_secs: 60,
             frame_rate_limit: 120,
             protocol_error_limit: 10,
             pow_min_difficulty: 12,
@@ -398,6 +429,7 @@ mod tests {
             jwt_token_ttl_secs: 30,
             jwt_issuer: crate::jwt::DEFAULT_JWT_ISSUER.to_string(),
             max_ws_connection_age_secs: 1800,
+            ws_reconnect_grace_secs: 20,
             ecdh_burst_limit: 8,
             ecdh_burst_window_secs: 60,
             room_cleanup_interval_secs: 60,
@@ -414,6 +446,7 @@ mod tests {
             website_dir: None,
             allow_anonymous: true,
             cors_allowed_origins: vec!["https://localhost:3000".to_string()],
+            group_chat_enabled: true,
         }
     }
 
@@ -480,15 +513,34 @@ mod tests {
     /// cannot carry a single message. Reject at creation, before the PoW gate,
     /// so the caller sees a clear 400 rather than an opaque encryption failure
     /// at first send.
+    /// Build the CSRF cookie + header pair `/api/rooms` requires. The token is
+    /// minted from the state's own secret, so this exercises the real check
+    /// rather than bypassing it.
+    fn csrf_headers(state: &AppState) -> HeaderMap {
+        let token = crate::auth::generate_csrf_token(&state.csrf_secret);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::COOKIE,
+            format!("csrf_token={token}").parse().unwrap(),
+        );
+        headers.insert("x-csrf-token", token.parse().unwrap());
+        headers
+    }
+
     #[tokio::test]
-    async fn create_room_rejects_group_type() {
-        let state = AppState::new(1000, test_config());
+    async fn create_room_refuses_group_when_the_flag_is_off() {
+        // Group rooms are gated behind GROUP_CHAT_ENABLED, which defaults to
+        // false. With the flag off the endpoint answers 404 rather than
+        // describing a feature this deployment does not run.
+        let mut config = test_config();
+        config.group_chat_enabled = false;
+        let state = AppState::new(1000, config);
         let addr: SocketAddr = "127.0.0.1:9999".parse().unwrap();
 
         let result = create_room(
             State(state.clone()),
             ConnectInfo(addr),
-            HeaderMap::new(),
+            csrf_headers(&state),
             Json(RoomConfig {
                 room_type: RoomType::Group,
                 ttl_minutes: 60,
@@ -497,11 +549,11 @@ mod tests {
         )
         .await;
 
-        let response = result.expect_err("group rooms must be refused");
+        let response = result.expect_err("group rooms must be refused while the flag is off");
         assert_eq!(
             response.status(),
-            StatusCode::BAD_REQUEST,
-            "group room creation must yield 400"
+            StatusCode::NOT_FOUND,
+            "a disabled feature must not be described to the caller"
         );
         assert_eq!(state.total_rooms(), 0, "no room may be created");
     }
@@ -518,7 +570,7 @@ mod tests {
         let result = create_room(
             State(state.clone()),
             ConnectInfo(addr),
-            HeaderMap::new(),
+            csrf_headers(&state),
             Json(RoomConfig {
                 room_type: RoomType::OneToOne,
                 ttl_minutes: 60,
@@ -560,6 +612,38 @@ mod tests {
         assert!(
             state.rooms.contains_key(&room_id),
             "live room must NOT be removed"
+        );
+    }
+
+    #[tokio::test]
+    async fn group_room_page_stays_visible_for_reserved_creator_slot() {
+        let state = AppState::new(1000, test_config());
+        let room = Room::new(RoomConfig {
+            room_type: RoomType::Group,
+            ttl_minutes: 60,
+            max_participants: 2,
+        });
+        let room_id = room.id;
+        state.try_create_room(room).unwrap();
+        assert!(
+            state
+                .add_connection(Uuid::new_v4(), room_id, false)
+                .is_none(),
+            "non-creator admission waits for the creator's stream boundary"
+        );
+        {
+            let room = state.rooms.get(&room_id).unwrap();
+            assert!(room.is_full_for_non_creator());
+            assert!(
+                !room.is_full(),
+                "the creator's physical slot remains available"
+            );
+        }
+
+        let result = room_page(State(state), Path(room_id)).await;
+        assert!(
+            result.is_ok(),
+            "room_page must not hide the reserved creator slot"
         );
     }
 }

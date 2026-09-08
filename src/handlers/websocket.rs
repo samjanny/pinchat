@@ -6,21 +6,360 @@ use axum::{
     http::{HeaderMap, StatusCode, header, header::SEC_WEBSOCKET_PROTOCOL},
     response::{IntoResponse, Response},
 };
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
 use sha2::{Digest, Sha256};
-use std::collections::{HashSet, VecDeque};
 use tokio::time::{Duration, Instant, interval};
 use uuid::Uuid;
 
-use crate::jwt::verify_token;
-use crate::models::{IncomingMessage, Message};
-use crate::state::AppState;
+use crate::jwt::{WsResumeTokenClaims, sign_resume_token, verify_token};
+use crate::models::message::MessageHeader;
+use crate::models::{IncomingMessage, Message, RoomType};
+use crate::state::app_state::MlsControlAppendError;
+use crate::state::{AppState, ConnectionAdmission, MlsControlAdmission};
 
 /// Maximum allowed size for ECDH public key payload (8KB)
 /// Typical ECDH payload with P-256: ~500 bytes (65-byte key + encryption overhead + AAD)
 /// 8KB limit prevents DoS attacks with oversized payloads
 const MAX_ECDH_PAYLOAD_SIZE: usize = 8192;
+
+const WIRE_PUBLIC_MESSAGE: u16 = 1;
+const WIRE_PRIVATE_MESSAGE: u16 = 2;
+const WIRE_WELCOME: u16 = 3;
+const WIRE_KEY_PACKAGE: u16 = 5;
+
+const CONTENT_TYPE_PROPOSAL: u8 = 2;
+const CONTENT_TYPE_COMMIT: u8 = 3;
+
+/// Decoded-byte ceilings for the MLS transport envelope. The WebSocket frame
+/// cap is necessarily larger because Base64url expands data by roughly 4/3.
+/// Keeping format-specific limits here prevents a small KeyPackage or Commit
+/// parser from receiving an image-sized allocation.
+const MAX_MLS_CONTROL_BYTES: usize = 128 * 1024;
+const MAX_MLS_KEY_PACKAGE_BYTES: usize = 16 * 1024;
+const MAX_RATCHET_TREE_BYTES: usize = 64 * 1024;
+const MLS_REPLAY_WINDOW_ENTRIES: usize = 16;
+const MAX_MLS_UNACKNOWLEDGED_CONTROLS: u64 = 64;
+const MLS_CONTROL_ACK_TIMEOUT: Duration = Duration::from_secs(60);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PublicMessageKind {
+    Proposal,
+    Commit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplayAckError {
+    Transport,
+    Protocol,
+}
+
+#[derive(Debug)]
+struct ValidatedMlsEnvelope {
+    payload_bytes: Vec<u8>,
+    ratchet_tree_bytes: Option<Vec<u8>>,
+    public_kind: Option<PublicMessageKind>,
+}
+
+/// Convert permanent, sender-correctable MLS admission failures into a direct
+/// typed response. Capacity/rate/transient failures retain their existing
+/// retry-or-close handling.
+fn permanent_mls_append_rejection(
+    error: MlsControlAppendError,
+    commit_ref: Option<String>,
+) -> Option<Message> {
+    let reason = match error {
+        MlsControlAppendError::UnknownKeyPackageRef => "unknown_key_package_ref",
+        MlsControlAppendError::UnauthorizedGroupCreatorControl => "not_group_creator",
+        MlsControlAppendError::CommitCorrelationConflict => "commit_correlation_conflict",
+        MlsControlAppendError::WelcomeNotCorrelated => "welcome_not_correlated",
+        _ => return None,
+    };
+    Some(Message::MlsRejected {
+        commit_ref,
+        reason: reason.to_string(),
+        retry_after_secs: 0,
+    })
+}
+
+/// Decode unpadded Base64url and reject alternate/non-canonical spellings.
+/// The encoded-length check happens before allocation; the decoded check is
+/// retained as defense in depth around integer rounding.
+fn decode_bounded_base64url(
+    value: &str,
+    max_decoded_bytes: usize,
+) -> Result<Vec<u8>, &'static str> {
+    if value.is_empty() {
+        return Err("empty Base64url value");
+    }
+    let max_encoded_bytes = max_decoded_bytes.saturating_mul(4).saturating_add(2) / 3;
+    if value.len() > max_encoded_bytes {
+        return Err("Base64url value exceeds decoded-byte limit");
+    }
+    let decoded = URL_SAFE_NO_PAD
+        .decode(value)
+        .map_err(|_| "invalid Base64url value")?;
+    if decoded.len() > max_decoded_bytes {
+        return Err("decoded value exceeds byte limit");
+    }
+    if URL_SAFE_NO_PAD.encode(&decoded) != value {
+        return Err("non-canonical Base64url value");
+    }
+    Ok(decoded)
+}
+
+fn append_mls_varint(output: &mut Vec<u8>, value: usize) -> Result<(), &'static str> {
+    if value < 64 {
+        output.push(value as u8);
+        return Ok(());
+    }
+    if value < 16_384 {
+        let encoded = (value as u16) | 0x4000;
+        output.extend_from_slice(&encoded.to_be_bytes());
+        return Ok(());
+    }
+    if value < (1usize << 30) {
+        let encoded = (value as u32) | 0x8000_0000;
+        output.extend_from_slice(&encoded.to_be_bytes());
+        return Ok(());
+    }
+    Err("MLS vector length exceeds 2^30-1")
+}
+
+/// RFC 9420 §5.2 RefHash for the fixed KeyPackage reference label. The relay
+/// computes this from the already-bounded opaque KeyPackage body so an Add
+/// Commit can only reserve a Welcome for a KeyPackage it previously accepted.
+fn mls_key_package_ref(key_package_bytes: &[u8]) -> Result<String, &'static str> {
+    const LABEL: &[u8] = b"MLS 1.0 KeyPackage Reference";
+    let mut input = Vec::with_capacity(
+        LABEL
+            .len()
+            .saturating_add(key_package_bytes.len())
+            .saturating_add(6),
+    );
+    append_mls_varint(&mut input, LABEL.len())?;
+    input.extend_from_slice(LABEL);
+    append_mls_varint(&mut input, key_package_bytes.len())?;
+    input.extend_from_slice(key_package_bytes);
+    Ok(URL_SAFE_NO_PAD.encode(Sha256::digest(input)))
+}
+
+/// Read the MLS vector-length varint used by the shallow PublicMessage
+/// classifier. MLS permits canonical 1/2/4-byte encodings only. This parser
+/// deliberately stops before the Proposal/Commit body: the relay remains
+/// cryptographically blind and only needs the signed content_type byte to
+/// select the correct rate-limit bucket.
+fn read_mls_varint(bytes: &[u8], pos: &mut usize) -> Option<usize> {
+    let first = *bytes.get(*pos)?;
+    let encoded_len = 1usize << (first >> 6);
+    if encoded_len == 8 || bytes.len().saturating_sub(*pos) < encoded_len {
+        return None;
+    }
+    let mut value = usize::from(first & 0x3f);
+    for offset in 1..encoded_len {
+        value = value.checked_shl(8)? | usize::from(bytes[*pos + offset]);
+    }
+    if (encoded_len == 2 && value < 64) || (encoded_len == 4 && value < 16_384) {
+        return None;
+    }
+    *pos += encoded_len;
+    Some(value)
+}
+
+fn skip_mls_opaque(bytes: &[u8], pos: &mut usize) -> Option<()> {
+    let len = read_mls_varint(bytes, pos)?;
+    let end = pos.checked_add(len)?;
+    if end > bytes.len() {
+        return None;
+    }
+    *pos = end;
+    Some(())
+}
+
+fn classify_public_message(bytes: &[u8]) -> Result<PublicMessageKind, &'static str> {
+    let mut pos = 0usize;
+    skip_mls_opaque(bytes, &mut pos).ok_or("malformed PublicMessage group_id")?;
+    pos = pos.checked_add(8).ok_or("malformed PublicMessage epoch")?;
+    if pos > bytes.len() {
+        return Err("truncated PublicMessage epoch");
+    }
+
+    let sender_type = *bytes.get(pos).ok_or("missing PublicMessage sender")?;
+    pos += 1;
+    if sender_type != 1 {
+        return Err("unsupported PublicMessage sender type");
+    }
+    pos = pos.checked_add(4).ok_or("malformed PublicMessage sender")?;
+    if pos > bytes.len() {
+        return Err("truncated PublicMessage sender");
+    }
+
+    skip_mls_opaque(bytes, &mut pos).ok_or("malformed PublicMessage authenticated_data")?;
+    let content_type = *bytes.get(pos).ok_or("missing PublicMessage content type")?;
+    pos += 1;
+    if pos >= bytes.len() {
+        return Err("truncated PublicMessage body");
+    }
+    match content_type {
+        CONTENT_TYPE_PROPOSAL => Ok(PublicMessageKind::Proposal),
+        CONTENT_TYPE_COMMIT => Ok(PublicMessageKind::Commit),
+        _ => Err("unsupported PublicMessage content type"),
+    }
+}
+
+fn validate_mls_envelope(
+    payload: &str,
+    wire_format: u16,
+    ratchet_tree: Option<&str>,
+    key_package_ref: Option<&str>,
+    commit_ref: Option<&str>,
+    bootstrap_proof: Option<&str>,
+    max_image_size: usize,
+) -> Result<ValidatedMlsEnvelope, &'static str> {
+    let max_payload_bytes = match wire_format {
+        WIRE_PUBLIC_MESSAGE | WIRE_WELCOME => MAX_MLS_CONTROL_BYTES,
+        WIRE_PRIVATE_MESSAGE => max_image_size.saturating_add(64 * 1024),
+        WIRE_KEY_PACKAGE => MAX_MLS_KEY_PACKAGE_BYTES,
+        _ => return Err("unsupported MLS wire format"),
+    };
+    let payload_bytes = decode_bounded_base64url(payload, max_payload_bytes)?;
+
+    let malformed_ref = key_package_ref
+        .map(|value| !valid_mls_correlation_ref(value))
+        .unwrap_or(false)
+        || commit_ref
+            .map(|value| !valid_mls_correlation_ref(value))
+            .unwrap_or(false)
+        || bootstrap_proof
+            .map(|value| !valid_mls_correlation_ref(value))
+            .unwrap_or(false);
+    if malformed_ref {
+        return Err("malformed MLS correlation reference");
+    }
+
+    let (public_kind, ratchet_tree_bytes) = match wire_format {
+        WIRE_PUBLIC_MESSAGE => {
+            if ratchet_tree.is_some() || bootstrap_proof.is_some() {
+                return Err("PublicMessage carries invalid MLS metadata");
+            }
+            let kind = classify_public_message(&payload_bytes)?;
+            match kind {
+                PublicMessageKind::Proposal => {
+                    if key_package_ref.is_some() || commit_ref.is_some() {
+                        return Err("Proposal cannot carry Commit correlation metadata");
+                    }
+                }
+                PublicMessageKind::Commit => {
+                    let supplied = commit_ref.ok_or("Commit requires commit_ref")?;
+                    let expected = URL_SAFE_NO_PAD.encode(Sha256::digest(&payload_bytes));
+                    if supplied != expected {
+                        return Err("commit_ref does not match Commit payload");
+                    }
+                }
+            }
+            (Some(kind), None)
+        }
+        WIRE_WELCOME => {
+            if key_package_ref.is_none() || commit_ref.is_none() {
+                return Err("Welcome requires KeyPackageRef and CommitRef");
+            }
+            if bootstrap_proof.is_some() {
+                return Err("bootstrap_proof is only valid on KeyPackage");
+            }
+            let tree = ratchet_tree.ok_or("Welcome requires ratchet_tree")?;
+            (
+                None,
+                Some(decode_bounded_base64url(tree, MAX_RATCHET_TREE_BYTES)?),
+            )
+        }
+        WIRE_PRIVATE_MESSAGE => {
+            if ratchet_tree.is_some() || key_package_ref.is_some() || commit_ref.is_some() {
+                return Err("MLS metadata is invalid for this wire format");
+            }
+            if bootstrap_proof.is_some() {
+                return Err("bootstrap_proof is only valid on KeyPackage");
+            }
+            (None, None)
+        }
+        WIRE_KEY_PACKAGE => {
+            if ratchet_tree.is_some() || key_package_ref.is_some() || commit_ref.is_some() {
+                return Err("MLS metadata is invalid for this wire format");
+            }
+            if bootstrap_proof.is_none() {
+                return Err("KeyPackage requires bootstrap_proof");
+            }
+            (None, None)
+        }
+        _ => unreachable!("wire format allowlisted above"),
+    };
+
+    Ok(ValidatedMlsEnvelope {
+        payload_bytes,
+        ratchet_tree_bytes,
+        public_kind,
+    })
+}
+
+fn hash_replay_field(hasher: &mut Sha256, value: &[u8]) {
+    hasher.update((value.len() as u64).to_be_bytes());
+    hasher.update(value);
+}
+
+/// Hash every security-relevant transport field, not just the MLS payload.
+/// This means an attacker who races a bad tree/reference cannot cause the
+/// later authentic envelope with the same payload to be discarded as a
+/// duplicate. Sender ID is intentionally excluded so cross-sender replay of
+/// an otherwise identical envelope remains suppressed.
+fn mls_envelope_replay_hash(
+    wire_format: u16,
+    validated: &ValidatedMlsEnvelope,
+    key_package_ref: Option<&str>,
+    commit_ref: Option<&str>,
+    bootstrap_proof: Option<&str>,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"pinchat-mls-relay-envelope-v1");
+    hasher.update(wire_format.to_be_bytes());
+    hash_replay_field(&mut hasher, &validated.payload_bytes);
+    hash_replay_field(
+        &mut hasher,
+        validated.ratchet_tree_bytes.as_deref().unwrap_or_default(),
+    );
+    hash_replay_field(&mut hasher, key_package_ref.unwrap_or_default().as_bytes());
+    hash_replay_field(&mut hasher, commit_ref.unwrap_or_default().as_bytes());
+    hash_replay_field(&mut hasher, bootstrap_proof.unwrap_or_default().as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+/// Bind the advisory relay replay identity to the complete one-to-one
+/// ciphertext envelope. Hashing only `payload` lets an attacker race the same
+/// ciphertext with a corrupted header, causing the later authentic header to
+/// be discarded before the client can verify it.
+fn one_to_one_envelope_replay_hash(
+    msg_type: &str,
+    payload: &str,
+    header: &MessageHeader,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"pinchat-double-ratchet-relay-envelope-v1");
+    hash_replay_field(&mut hasher, msg_type.as_bytes());
+    hash_replay_field(&mut hasher, payload.as_bytes());
+    hasher.update([header.v]);
+    hash_replay_field(&mut hasher, header.dh.as_bytes());
+    hasher.update(header.pn.to_be_bytes());
+    hasher.update(header.n.to_be_bytes());
+    hasher.update(header.rc.to_be_bytes());
+    hash_replay_field(&mut hasher, header.sig.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+fn room_accepts_client_message(room_type: RoomType, msg_type: &str) -> bool {
+    match room_type {
+        RoomType::Group => matches!(msg_type, "mls" | "mlsack"),
+        RoomType::OneToOne => matches!(msg_type, "ecdh_public_key" | "message" | "image"),
+    }
+}
 
 /// Minimum WebSocket message/frame size (512KB)
 /// Used as floor even for small image configs to support text messages and handshakes
@@ -40,6 +379,25 @@ fn max_ws_size(max_image_size: usize) -> usize {
     // Add 50% margin on top of image payload for protocol overhead and safety
     let image_payload = max_image_payload_size(max_image_size);
     std::cmp::max(MIN_WS_SIZE, (image_payload as f64 * 1.5) as usize)
+}
+
+/// Transport-level MLS references are SHA-256 values encoded as unpadded
+/// base64url (32 bytes -> exactly 43 ASCII characters). Cryptographic
+/// equality is checked by the browser; the relay only rejects malformed
+/// framing before rebroadcasting it.
+fn valid_mls_correlation_ref(value: &str) -> bool {
+    value.len() == 43
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        // A 32-byte input leaves two bytes in the final Base64 quantum.
+        // The low two bits of the last sextet must therefore be zero; this
+        // rejects alternate, non-canonical spellings of the same digest.
+        && matches!(
+            value.as_bytes()[42],
+            b'A' | b'E' | b'I' | b'M' | b'Q' | b'U' | b'Y' | b'c'
+                | b'g' | b'k' | b'o' | b's' | b'w' | b'0' | b'4' | b'8'
+        )
 }
 
 /// Handler for upgrading the WebSocket connection (protocol v1).
@@ -156,6 +514,20 @@ pub async fn ws_handler(
         );
         return (StatusCode::FORBIDDEN, "Token not valid for this room").into_response();
     }
+    if let Some(generation) = claims.creator_bootstrap_generation
+        && !state.creator_bootstrap_claim_is_live(&room_id, claims.connection_id, generation)
+    {
+        tracing::warn!(
+            "Revoked creator-bootstrap JWT rejected for room {} generation {}",
+            room_id,
+            generation
+        );
+        return (
+            StatusCode::FORBIDDEN,
+            "Group creator bootstrap token has been revoked",
+        )
+            .into_response();
+    }
 
     // Audit M-2: room-state gate BEFORE the single-use jti is burned.
     //
@@ -229,6 +601,9 @@ pub async fn ws_handler(
     );
 
     let connection_id = claims.connection_id;
+    let resume_requested = claims.resume;
+    let mls_control_cursor = claims.mls_control_cursor;
+    let creator_bootstrap_generation = claims.creator_bootstrap_generation;
     let ws_size = max_ws_size(state.config.max_image_size);
 
     // Echo only the base subprotocol back (do NOT echo the jwt.* companion -
@@ -237,7 +612,17 @@ pub async fn ws_handler(
     ws.protocols(["pinchat.v1"])
         .max_message_size(ws_size)
         .max_frame_size(ws_size)
-        .on_upgrade(move |socket| handle_socket(socket, state, room_id, connection_id))
+        .on_upgrade(move |socket| {
+            handle_socket(
+                socket,
+                state,
+                room_id,
+                connection_id,
+                resume_requested,
+                mls_control_cursor,
+                creator_bootstrap_generation,
+            )
+        })
 }
 
 /// Increments the per-connection protocol-error counter. Returns true once the
@@ -265,6 +650,156 @@ fn bump_protocol_error(state: &AppState, connection_id: Uuid) -> bool {
     }
 }
 
+fn append_ordered_group_departure(
+    state: &AppState,
+    room_id: Uuid,
+    connection_id: Uuid,
+    participant_count: usize,
+) -> bool {
+    let append_result = state.append_and_broadcast_mls_lifecycle(&room_id, |control_seq| {
+        serde_json::to_string(&Message::UserLeft {
+            user_id: connection_id,
+            participant_count,
+            control_seq: Some(control_seq),
+        })
+        .ok()
+    });
+    if let Err(error) = append_result {
+        tracing::error!(
+            "Failed to append ordered group departure in room {}; closing the room fail-closed: {:?}",
+            room_id,
+            error
+        );
+        state.remove_room(&room_id);
+        return false;
+    }
+    true
+}
+
+fn evict_group_participant(
+    state: &AppState,
+    room_id: Uuid,
+    connection_id: Uuid,
+    reason: &str,
+) -> bool {
+    let closes_room = state
+        .rooms
+        .get(&room_id)
+        .map(|room| {
+            room.room_type == RoomType::Group
+                && room.creator_connection_id() == Some(connection_id)
+                && room.creator_control_ready()
+        })
+        .unwrap_or(false);
+    if closes_room {
+        tracing::warn!(
+            "Closing MLS room {} after definitive creator eviction {}: {}",
+            room_id,
+            connection_id,
+            reason
+        );
+        state.remove_room(&room_id);
+        return true;
+    }
+    let Some(participant_count) = state.evict_participant(&connection_id, room_id) else {
+        return false;
+    };
+    tracing::warn!(
+        "Evicted MLS participant {} in room {}: {}",
+        connection_id,
+        room_id,
+        reason
+    );
+    let _ = append_ordered_group_departure(state, room_id, connection_id, participant_count);
+    true
+}
+
+/// Remove members that are no longer advancing the authenticated control
+/// cursor before accepting more room-wide MLS work. Their stable identity is
+/// evicted atomically, so reconnect cycling cannot keep an obsolete ACK in the
+/// pruning quorum.
+fn evict_lagging_group_participants(state: &AppState, room_id: Uuid) {
+    loop {
+        let lagging = state.lagging_mls_control_participants(
+            &room_id,
+            MAX_MLS_UNACKNOWLEDGED_CONTROLS,
+            MLS_CONTROL_ACK_TIMEOUT,
+        );
+        if lagging.is_empty() {
+            return;
+        }
+
+        let mut removed_any = false;
+        for connection_id in lagging {
+            removed_any |=
+                evict_group_participant(state, room_id, connection_id, "ACK progress stalled");
+        }
+        if !removed_any {
+            return;
+        }
+    }
+}
+
+fn schedule_connection_departure(state: &AppState, connection_id: Uuid) {
+    let Some(detached_room_id) = state.detach_connection(&connection_id) else {
+        return;
+    };
+    let grace_state = state.clone();
+    let grace = Duration::from_secs(state.config.ws_reconnect_grace_secs);
+    tokio::spawn(async move {
+        tokio::time::sleep(grace).await;
+        let room_departure = grace_state.rooms.get(&detached_room_id).map(|room| {
+            (
+                room.room_type,
+                room.room_type == RoomType::Group
+                    && room.creator_connection_id() == Some(connection_id)
+                    && room.creator_control_ready(),
+            )
+        });
+        let Some(participant_count) =
+            grace_state.finalize_disconnection(&connection_id, detached_room_id)
+        else {
+            return;
+        };
+
+        match room_departure {
+            Some((RoomType::Group, true)) => {
+                tracing::warn!(
+                    "Closing MLS room {} after creator reconnect grace expired",
+                    detached_room_id
+                );
+                grace_state.remove_room(&detached_room_id);
+            }
+            Some((RoomType::Group, false)) => {
+                evict_lagging_group_participants(&grace_state, detached_room_id);
+                let _ = append_ordered_group_departure(
+                    &grace_state,
+                    detached_room_id,
+                    connection_id,
+                    participant_count,
+                );
+            }
+            Some((RoomType::OneToOne, _)) => {
+                let leave_msg = Message::UserLeft {
+                    user_id: connection_id,
+                    participant_count,
+                    control_seq: None,
+                };
+                if let Ok(json) = serde_json::to_string(&leave_msg) {
+                    let _ = grace_state.broadcast_room_message(&detached_room_id, json);
+                }
+            }
+            None => {}
+        }
+
+        #[cfg(debug_assertions)]
+        tracing::debug!(
+            "Reconnect grace expired; participant left room ({} remaining)",
+            participant_count
+        );
+    });
+}
+
 /// Handles the WebSocket connection
 ///
 /// # Arguments
@@ -272,7 +807,15 @@ fn bump_protocol_error(state: &AppState, connection_id: Uuid) -> bool {
 /// * `state` - Application state
 /// * `room_id` - Room ID (already validated by ws_handler)
 /// * `connection_id` - Pre-allocated connection ID from JWT token (ensures uniqueness)
-async fn handle_socket(socket: WebSocket, state: AppState, room_id: Uuid, connection_id: Uuid) {
+async fn handle_socket(
+    socket: WebSocket,
+    state: AppState,
+    room_id: Uuid,
+    connection_id: Uuid,
+    resume_requested: bool,
+    mls_control_cursor: Option<u64>,
+    creator_bootstrap_generation: Option<u64>,
+) {
     // Verify that the room exists AND is not expired.
     // Without the is_expired() gate, a room past its hard TTL can still accept
     // new WebSocket connections until the next cleanup tick (default 60s).
@@ -294,23 +837,29 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: Uuid, connec
 
     // connection_id is pre-allocated from JWT token (not generated here)
 
-    // Attempt to add the connection to the room
-    if !state.add_connection(connection_id, room_id) {
-        #[cfg(debug_assertions)]
-        tracing::debug!("Failed to add connection to room (full or unavailable)");
-        // Room is full or another error
-        let _ = send_error(socket, "Room is full or unavailable").await;
-        return;
-    }
+    // Attempt to add the connection to the room. Reclaiming an ID that is
+    // already grace-reserved requires the resume bit from the signed upgrade
+    // JWT; two simultaneously active sockets with the same ID are rejected.
+    let admission = match state.add_connection_with_bootstrap_generation(
+        connection_id,
+        room_id,
+        resume_requested,
+        creator_bootstrap_generation,
+    ) {
+        Some(admission) => admission,
+        None => {
+            #[cfg(debug_assertions)]
+            tracing::debug!("Failed to add connection to room (full, active, or unavailable)");
+            let _ = send_error(socket, "Room is full or reconnect is unavailable").await;
+            return;
+        }
+    };
 
     #[cfg(debug_assertions)]
     tracing::debug!(
         "Connection joined room ({} participants)",
         state.get_participant_count(&room_id)
     );
-
-    // Split the socket into sender and receiver
-    let (mut sender, mut receiver) = socket.split();
 
     // Get validated room configuration from server (prevents URL spoofing).
     //
@@ -335,7 +884,141 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: Uuid, connec
         return;
     };
 
-    // Send connection confirmation message with validated room config
+    // Issue the longer-lived resume credential only after successful room
+    // admission. It is sent in the direct Connected frame and never through
+    // the room broadcast channel. The room's own hard TTL remains the final
+    // authority even if this bearer token's wall-clock lifetime is longer by
+    // a small scheduling margin.
+    let resume_claims = WsResumeTokenClaims::new(
+        room_id,
+        connection_id,
+        u64::from(ttl_minutes).saturating_mul(60),
+        &state.config.jwt_issuer,
+    );
+    let resume_token = match sign_resume_token(&resume_claims, &state.jwt_secret) {
+        Ok(token) => token,
+        Err(err) => {
+            tracing::error!("Failed to sign WebSocket resume credential: {}", err);
+            state.remove_connection(&connection_id);
+            let _ = send_error(socket, "Unable to establish reconnect state").await;
+            return;
+        }
+    };
+
+    // Preserve the legacy one-to-one behavior: announce first admission
+    // before subscribing so that socket does not receive its own transient
+    // join notification. Group joins are sequenced after opening the atomic
+    // control stream below.
+    if admission == ConnectionAdmission::New && room_type == RoomType::OneToOne {
+        let participant_count = state.get_participant_count(&room_id);
+        let join_msg = Message::UserJoined {
+            user_id: connection_id,
+            participant_count,
+            control_seq: None,
+        };
+        if let Ok(json) = serde_json::to_string(&join_msg) {
+            let _ = state.broadcast_room_message(&room_id, json);
+        }
+    }
+
+    // Open the live subscription and MLS replay snapshot atomically with
+    // respect to control-message append+broadcast. Group reconnects replay
+    // strictly after the cursor signed into their one-shot upgrade JWT.
+    // Fresh participants start at the current head and do not consume
+    // pre-admission MLS history.
+    let (mut broadcast_rx, mls_control_stream) = if room_type == RoomType::Group {
+        let resume_cursor = if admission == ConnectionAdmission::Resumed {
+            mls_control_cursor
+        } else {
+            None
+        };
+        match state.open_mls_control_stream(&room_id, connection_id, resume_cursor) {
+            Ok((receiver, stream)) => (receiver, Some(stream)),
+            Err(error) => {
+                tracing::warn!(
+                    "Unable to open MLS control replay for connection {}: {:?}",
+                    connection_id,
+                    error
+                );
+                if admission == ConnectionAdmission::Resumed {
+                    let _ = evict_group_participant(
+                        &state,
+                        room_id,
+                        connection_id,
+                        "invalid or unavailable replay cursor",
+                    );
+                } else {
+                    let _ = state.evict_participant(&connection_id, room_id);
+                }
+                let _ = send_error(socket, "Secure group replay window is unavailable").await;
+                return;
+            }
+        }
+    } else {
+        match state.broadcast_channels.get(&room_id) {
+            Some(tx) => (tx.subscribe(), None),
+            None => {
+                tracing::error!("Broadcast channel not found for room");
+                state.remove_connection(&connection_id);
+                return;
+            }
+        }
+    };
+
+    // A resumed socket is the same MLS member and relay identity, so it must
+    // not generate a synthetic leave/join cycle. For a fresh group member,
+    // append UserJoined only after the live subscription and replay boundary
+    // have been captured. Any control accepted after admission is then
+    // delivered in sequence instead of being skipped as pre-admission history.
+    if room_type == RoomType::Group {
+        evict_lagging_group_participants(&state, room_id);
+        if !state.connection_is_active(&room_id, &connection_id) {
+            let _ = send_error(socket, "Secure group control stream did not advance").await;
+            return;
+        }
+    }
+    if admission == ConnectionAdmission::New && room_type == RoomType::Group {
+        let participant_count = state.get_participant_count(&room_id);
+        let append_result = state.append_and_broadcast_mls_lifecycle(&room_id, |control_seq| {
+            serde_json::to_string(&Message::UserJoined {
+                user_id: connection_id,
+                participant_count,
+                control_seq: Some(control_seq),
+            })
+            .ok()
+        });
+        if let Err(error) = append_result {
+            tracing::error!(
+                "Failed to append ordered group join in room {}: {:?}",
+                room_id,
+                error
+            );
+            // Existing members must never continue in a room whose relay
+            // lifecycle can no longer be represented in the authenticated
+            // control order.
+            state.remove_room(&room_id);
+            let _ = send_error(socket, "Unable to establish secure group lifecycle").await;
+            return;
+        }
+        let creator_needs_handoff = state
+            .rooms
+            .get(&room_id)
+            .map(|room| {
+                room.creator_connection_id() == Some(connection_id) && !room.creator_control_ready()
+            })
+            .unwrap_or(false);
+        if creator_needs_handoff && !state.mark_creator_control_ready(&room_id, connection_id) {
+            state.remove_room(&room_id);
+            let _ = send_error(socket, "Unable to establish group creator control boundary").await;
+            return;
+        }
+    }
+
+    // Split the socket only after every fallible setup step that needs the
+    // unsplit value has completed.
+    let (mut sender, mut receiver) = socket.split();
+
+    // Send connection confirmation message with validated room config.
     let connected_msg = Message::Connected {
         user_id: connection_id,
         room_id,
@@ -345,34 +1028,176 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: Uuid, connec
         max_participants,                            // Validated from server
         max_image_size: state.config.max_image_size, // From server config
         created_at,                                  // Room creation timestamp for countdown
+        resume_token,
+        resumed: admission == ConnectionAdmission::Resumed,
+        mls_control_cursor: mls_control_stream.as_ref().map(|stream| stream.cursor),
     };
 
-    if let Ok(json) = serde_json::to_string(&connected_msg) {
-        let _ = sender.send(WsMessage::Text(json)).await;
+    let connected_sent = match serde_json::to_string(&connected_msg) {
+        Ok(json) => sender.send(WsMessage::Text(json)).await.is_ok(),
+        Err(_) => false,
+    };
+    if !connected_sent {
+        schedule_connection_departure(&state, connection_id);
+        return;
     }
 
-    // Notify other users that someone joined (broadcast BEFORE subscribing)
-    let join_msg = Message::UserJoined {
-        user_id: connection_id,
-        participant_count: state.get_participant_count(&room_id),
-    };
+    // Replay is sent after Connected in bounded windows. The next window is
+    // released only after the browser has authenticated, applied, and
+    // cumulatively ACKed the previous one. This prevents a retained server
+    // backlog from overflowing the browser's serial cryptographic queue.
+    //
+    // After a non-empty snapshot is ACKed, subscribe and snapshot again from
+    // that exact cursor. Controls accepted while replay was in progress are
+    // therefore recovered from the durable log even if the transient
+    // broadcast ring wrapped meanwhile.
+    if let Some(mut stream) = mls_control_stream {
+        loop {
+            for window in stream.replay.chunks(MLS_REPLAY_WINDOW_ENTRIES) {
+                for entry in window {
+                    if sender
+                        .send(WsMessage::Text(entry.json.as_str().to_owned()))
+                        .await
+                        .is_err()
+                    {
+                        schedule_connection_departure(&state, connection_id);
+                        return;
+                    }
+                }
 
-    if let Ok(json) = serde_json::to_string(&join_msg) {
-        if let Some(tx) = state.broadcast_channels.get(&room_id) {
-            let _ = tx.send(json);
+                let target_seq = window.last().expect("replay window is non-empty").seq;
+                let ack_result = tokio::time::timeout(MLS_CONTROL_ACK_TIMEOUT, async {
+                    let mut replay_frames = 0usize;
+                    loop {
+                        let frame = match receiver.next().await {
+                            Some(Ok(frame)) => frame,
+                            Some(Err(_)) | None => return Err(ReplayAckError::Transport),
+                        };
+                        replay_frames = replay_frames.saturating_add(1);
+                        if replay_frames > MLS_REPLAY_WINDOW_ENTRIES.saturating_mul(4) {
+                            return Err(ReplayAckError::Protocol);
+                        }
+                        match frame {
+                            WsMessage::Text(text) => {
+                                if text.len() > max_ws_size(state.config.max_image_size) {
+                                    return Err(ReplayAckError::Protocol);
+                                }
+                                let incoming = serde_json::from_str::<IncomingMessage>(&text)
+                                    .map_err(|_| ReplayAckError::Protocol)?;
+                                let ack_shape_valid = incoming.msg_type == "mlsack"
+                                    && incoming.payload.is_none()
+                                    && incoming.header.is_none()
+                                    && incoming.wire_format.is_none()
+                                    && incoming.ratchet_tree.is_none()
+                                    && incoming.key_package_ref.is_none()
+                                    && incoming.commit_ref.is_none()
+                                    && incoming.bootstrap_proof.is_none();
+                                let Some(ack_seq) = incoming.control_seq.filter(|seq| *seq > 0)
+                                else {
+                                    return Err(ReplayAckError::Protocol);
+                                };
+                                if !ack_shape_valid
+                                    || !state.acknowledge_mls_control(
+                                        &room_id,
+                                        connection_id,
+                                        ack_seq,
+                                    )
+                                {
+                                    return Err(ReplayAckError::Protocol);
+                                }
+                                if ack_seq >= target_seq {
+                                    return Ok(());
+                                }
+                            }
+                            WsMessage::Ping(payload) => {
+                                if sender.send(WsMessage::Pong(payload)).await.is_err() {
+                                    return Err(ReplayAckError::Transport);
+                                }
+                            }
+                            WsMessage::Pong(_) => {}
+                            WsMessage::Close(_) => {
+                                return Err(ReplayAckError::Transport);
+                            }
+                            WsMessage::Binary(_) => {
+                                return Err(ReplayAckError::Protocol);
+                            }
+                        }
+                    }
+                })
+                .await;
+
+                match ack_result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(ReplayAckError::Transport)) => {
+                        schedule_connection_departure(&state, connection_id);
+                        return;
+                    }
+                    Ok(Err(ReplayAckError::Protocol)) => {
+                        let _ = evict_group_participant(
+                            &state,
+                            room_id,
+                            connection_id,
+                            "invalid frame while replay ACK was required",
+                        );
+                        let _ = sender.send(WsMessage::Close(None)).await;
+                        return;
+                    }
+                    Err(_) => {
+                        let _ = evict_group_participant(
+                            &state,
+                            room_id,
+                            connection_id,
+                            "replay ACK deadline expired",
+                        );
+                        let _ = sender.send(WsMessage::Close(None)).await;
+                        return;
+                    }
+                }
+            }
+
+            if stream.replay.is_empty() {
+                let sync_sent = serde_json::to_string(&Message::MlsSync {
+                    through_seq: stream.through_seq,
+                })
+                .ok()
+                .map(|json| sender.send(WsMessage::Text(json)))
+                .expect("MlsSync serialization cannot fail")
+                .await
+                .is_ok();
+                if !sync_sent {
+                    schedule_connection_departure(&state, connection_id);
+                    return;
+                }
+                break;
+            }
+
+            match state.open_mls_control_stream(&room_id, connection_id, Some(stream.through_seq)) {
+                Ok((next_receiver, next_stream)) => {
+                    broadcast_rx = next_receiver;
+                    stream = next_stream;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        "Unable to continue MLS control replay for connection {}: {:?}",
+                        connection_id,
+                        error
+                    );
+                    let _ = evict_group_participant(
+                        &state,
+                        room_id,
+                        connection_id,
+                        "replay cursor became unavailable",
+                    );
+                    let _ = sender.send(WsMessage::Close(None)).await;
+                    return;
+                }
+            }
         }
     }
 
-    // Now subscribe to the broadcast channel (after sending UserJoined)
-    // This ensures the client doesn't receive their own join message
-    let mut broadcast_rx = match state.broadcast_channels.get(&room_id) {
-        Some(tx) => tx.subscribe(),
-        None => {
-            tracing::error!("Broadcast channel not found for room");
-            state.remove_connection(&connection_id);
-            return;
-        }
-    };
+    // Direct responses (currently Commit rate-limit rejections) share the
+    // single socket writer with room broadcasts.
+    let (direct_tx, mut direct_rx) = tokio::sync::mpsc::channel::<String>(8);
 
     // Task that receives broadcast messages and forwards them to the client
     // Also sends heartbeat pings every 30 seconds to keep the connection alive,
@@ -386,10 +1211,27 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: Uuid, connec
 
         loop {
             tokio::select! {
+                Some(msg) = direct_rx.recv() => {
+                    if !send_state.connection_is_active(&room_id, &connection_id) {
+                        break;
+                    }
+                    if sender.send(WsMessage::Text(msg)).await.is_err() {
+                        break;
+                    }
+                }
                 result = broadcast_rx.recv() => {
                     match result {
                         Ok(msg) => {
-                            if sender.send(WsMessage::Text(msg)).await.is_err() {
+                            if !send_state
+                                .connection_is_active(&room_id, &connection_id)
+                            {
+                                break;
+                            }
+                            if sender
+                                .send(WsMessage::Text(msg.as_str().to_owned()))
+                                .await
+                                .is_err()
+                            {
                                 break;
                             }
                         }
@@ -397,6 +1239,13 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: Uuid, connec
                     }
                 }
                 _ = ping_interval.tick() => {
+                    if room_type == RoomType::Group {
+                        evict_lagging_group_participants(&send_state, room_id);
+                    }
+                    if !send_state.connection_is_active(&room_id, &connection_id) {
+                        let _ = sender.send(WsMessage::Close(None)).await;
+                        break;
+                    }
                     // Enforce room TTL at every ping tick (~30s). Without this,
                     // a connection can outlive its room up to the cleanup tick
                     // (default 60s) after the hard expiry.
@@ -436,8 +1285,12 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: Uuid, connec
     // against file-descriptor exhaustion from stale TCP sessions.
     const IDLE_TIMEOUT: Duration = Duration::from_secs(90);
     let state_clone = state.clone();
+    let recv_direct_tx = direct_tx.clone();
     let mut recv_task = tokio::spawn(async move {
         while let Ok(Some(Ok(msg))) = tokio::time::timeout(IDLE_TIMEOUT, receiver.next()).await {
+            if !state_clone.connection_is_active(&room_id, &connection_id) {
+                break;
+            }
             // C-14: classify the frame up front. Close terminates the loop
             // and is not counted against the rate limit. All other frame
             // types (Text, Binary, Ping, Pong) pass through the lifecycle
@@ -528,6 +1381,55 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: Uuid, connec
                 // Parse the incoming message
                 match serde_json::from_str::<IncomingMessage>(&text) {
                     Ok(incoming) => {
+                        // Room types are cryptographic protocol boundaries,
+                        // not a UI preference. A group room accepts only MLS;
+                        // a 1:1 room accepts only the Double-Ratchet transport.
+                        if !room_accepts_client_message(room_type, &incoming.msg_type) {
+                            tracing::warn!(
+                                "message type '{}' is invalid for room type {:?} (connection_id={})",
+                                incoming.msg_type,
+                                room_type,
+                                connection_id
+                            );
+                            if bump_protocol_error(&state_clone, connection_id) {
+                                break;
+                            }
+                            continue;
+                        }
+
+                        // Ordered MLS-control acknowledgement. ACKs are direct
+                        // transport bookkeeping and are never rebroadcast.
+                        if incoming.msg_type == "mlsack" {
+                            let ack_shape_valid = incoming.payload.is_none()
+                                && incoming.header.is_none()
+                                && incoming.wire_format.is_none()
+                                && incoming.ratchet_tree.is_none()
+                                && incoming.key_package_ref.is_none()
+                                && incoming.commit_ref.is_none()
+                                && incoming.bootstrap_proof.is_none();
+                            let acknowledged = incoming
+                                .control_seq
+                                .filter(|seq| *seq > 0)
+                                .map(|seq| {
+                                    state_clone.acknowledge_mls_control(
+                                        &room_id,
+                                        connection_id,
+                                        seq,
+                                    )
+                                })
+                                .unwrap_or(false);
+                            if !ack_shape_valid || !acknowledged {
+                                tracing::warn!(
+                                    "invalid MLS control ACK from connection_id={}",
+                                    connection_id
+                                );
+                                if bump_protocol_error(&state_clone, connection_id) {
+                                    break;
+                                }
+                            }
+                            continue;
+                        }
+
                         // Handle ECDH public key exchange (blind relay, no crypto server-side)
                         if incoming.msg_type == "ecdh_public_key" {
                             // Per-connection ECDH burst limiter. The looser
@@ -596,30 +1498,20 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: Uuid, connec
                                             "ECDH message serialized, attempting broadcast..."
                                         );
 
-                                        // Broadcast to all participants in the room
-                                        if let Some(tx) =
-                                            state_clone.broadcast_channels.get(&room_id)
-                                        {
-                                            match tx.send(json) {
-                                                Ok(receiver_count) => {
-                                                    tracing::info!(
-                                                        "✅ ECDH public key broadcasted to {} receivers in room={}",
-                                                        receiver_count,
-                                                        room_id
-                                                    );
-                                                }
-                                                Err(e) => {
-                                                    tracing::error!(
-                                                        "❌ Failed to broadcast ECDH message: {}",
-                                                        e
-                                                    );
-                                                }
+                                        match state_clone.broadcast_room_message(&room_id, json) {
+                                            Ok(receiver_count) => {
+                                                tracing::info!(
+                                                    "✅ ECDH public key broadcasted to {} receivers in room={}",
+                                                    receiver_count,
+                                                    room_id
+                                                );
                                             }
-                                        } else {
-                                            tracing::error!(
-                                                "❌ Broadcast channel not found for room={}",
-                                                room_id
-                                            );
+                                            Err(e) => {
+                                                tracing::error!(
+                                                    "❌ Failed to broadcast ECDH message: {:?}",
+                                                    e
+                                                );
+                                            }
                                         }
                                     }
                                     Err(e) => {
@@ -634,6 +1526,376 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: Uuid, connec
                                     "⚠️ ECDH message received but payload is missing (connection_id={})",
                                     connection_id
                                 );
+                            }
+                        }
+                        // MLS envelope (RFC 9420). The relay remains blind to
+                        // cryptographic contents, but validates the supported
+                        // transport shape and shallow PublicMessage content
+                        // type before allocating or rebroadcasting it.
+                        else if incoming.msg_type == "mls" {
+                            if incoming.control_seq.is_some() {
+                                tracing::warn!(
+                                    "client attempted to set server MLS control sequence (connection_id={})",
+                                    connection_id
+                                );
+                                if bump_protocol_error(&state_clone, connection_id) {
+                                    break;
+                                }
+                                continue;
+                            }
+                            let payload = match incoming.payload {
+                                Some(p) => p,
+                                None => {
+                                    tracing::warn!(
+                                        "mls envelope without payload from connection_id={}",
+                                        connection_id
+                                    );
+                                    if bump_protocol_error(&state_clone, connection_id) {
+                                        break;
+                                    }
+                                    continue;
+                                }
+                            };
+                            let wire_format = match incoming.wire_format {
+                                Some(w) => w,
+                                None => {
+                                    tracing::warn!(
+                                        "mls envelope without wire_format from connection_id={}",
+                                        connection_id
+                                    );
+                                    if bump_protocol_error(&state_clone, connection_id) {
+                                        break;
+                                    }
+                                    continue;
+                                }
+                            };
+                            let ratchet_tree = incoming.ratchet_tree;
+                            let key_package_ref = incoming.key_package_ref;
+                            let commit_ref = incoming.commit_ref;
+                            let bootstrap_proof = incoming.bootstrap_proof;
+                            let validated = match validate_mls_envelope(
+                                &payload,
+                                wire_format,
+                                ratchet_tree.as_deref(),
+                                key_package_ref.as_deref(),
+                                commit_ref.as_deref(),
+                                bootstrap_proof.as_deref(),
+                                state_clone.config.max_image_size,
+                            ) {
+                                Ok(validated) => validated,
+                                Err(reason) => {
+                                    tracing::warn!(
+                                        "invalid MLS envelope from connection_id={}: {}",
+                                        connection_id,
+                                        reason
+                                    );
+                                    if bump_protocol_error(&state_clone, connection_id) {
+                                        break;
+                                    }
+                                    continue;
+                                }
+                            };
+
+                            // Anti-replay covers the complete canonical relay
+                            // envelope. Hashing only payload lets an attacker
+                            // race altered correlation/tree metadata and cause
+                            // the authentic envelope to be discarded later.
+                            let payload_hash = mls_envelope_replay_hash(
+                                wire_format,
+                                &validated,
+                                key_package_ref.as_deref(),
+                                commit_ref.as_deref(),
+                                bootstrap_proof.as_deref(),
+                            );
+                            let now = Utc::now();
+
+                            // Per-connection rate limit (same cadence).
+                            let max_messages = state_clone.config.msg_rate_limit;
+                            let rate_window_secs = state_clone.config.msg_rate_window_secs;
+                            let mut timestamps = state_clone
+                                .connection_message_timestamps
+                                .entry(connection_id)
+                                .or_default();
+                            let rate_cutoff = now - chrono::Duration::seconds(rate_window_secs);
+                            timestamps.retain(|&ts| ts > rate_cutoff);
+                            if timestamps.len() >= max_messages {
+                                tracing::warn!(
+                                    "Connection {} exceeded rate limit on mls, disconnecting",
+                                    connection_id
+                                );
+                                break;
+                            }
+                            timestamps.push_back(now);
+                            // Release the entry guard before grabbing the
+                            // commit-specific one to avoid holding two
+                            // DashMap shards across an await point.
+                            drop(timestamps);
+
+                            // Tighter per-connection Commit rate limit. A
+                            // PublicMessage Proposal is authenticated but does
+                            // not run TreeKEM/key schedule and must not consume
+                            // the creator's Commit budget.
+                            let is_commit =
+                                validated.public_kind == Some(PublicMessageKind::Commit);
+                            if is_commit {
+                                let max_commits = state_clone.config.commit_rate_limit;
+                                let commit_window = state_clone.config.commit_rate_window_secs;
+                                let mut commit_ts = state_clone
+                                    .connection_commit_timestamps
+                                    .entry(connection_id)
+                                    .or_default();
+                                let commit_cutoff = now - chrono::Duration::seconds(commit_window);
+                                commit_ts.retain(|&ts| ts > commit_cutoff);
+                                if commit_ts.len() >= max_commits {
+                                    tracing::warn!(
+                                        "Connection {} exceeded MLS commit rate limit ({}/{}s), rejecting",
+                                        connection_id,
+                                        max_commits,
+                                        commit_window
+                                    );
+                                    let rejection = Message::MlsRejected {
+                                        commit_ref: commit_ref.clone(),
+                                        reason: "commit_rate_limited".to_string(),
+                                        retry_after_secs: u64::try_from(commit_window)
+                                            .unwrap_or(60),
+                                    };
+                                    if let Ok(json) = serde_json::to_string(&rejection) {
+                                        let _ = recv_direct_tx.try_send(json);
+                                    }
+                                    continue;
+                                }
+                            } else if validated.public_kind == Some(PublicMessageKind::Proposal) {
+                                let max_proposals = state_clone.config.proposal_rate_limit;
+                                let proposal_window = state_clone.config.proposal_rate_window_secs;
+                                let mut proposal_ts = state_clone
+                                    .connection_proposal_timestamps
+                                    .entry(connection_id)
+                                    .or_default();
+                                let proposal_cutoff =
+                                    now - chrono::Duration::seconds(proposal_window);
+                                proposal_ts.retain(|&ts| ts > proposal_cutoff);
+                                if proposal_ts.len() >= max_proposals {
+                                    tracing::warn!(
+                                        "Connection {} exceeded MLS Proposal rate limit ({}/{}s), disconnecting",
+                                        connection_id,
+                                        max_proposals,
+                                        proposal_window
+                                    );
+                                    break;
+                                }
+                                proposal_ts.push_back(now);
+                            }
+
+                            let traffic_bytes = validated.payload_bytes.len().saturating_add(
+                                validated
+                                    .ratchet_tree_bytes
+                                    .as_ref()
+                                    .map(Vec::len)
+                                    .unwrap_or(0),
+                            );
+                            // Every MLS envelope consumes aggregate room
+                            // count/byte budget. Otherwise large Welcome or
+                            // KeyPackage controls can amplify decode, replay,
+                            // and broadcast work on every member while
+                            // bypassing the room-wide limiter.
+                            if !state_clone.admit_room_traffic(
+                                room_id,
+                                connection_id,
+                                now,
+                                traffic_bytes,
+                            ) {
+                                tracing::warn!(
+                                    "Room {} rejected traffic from {} at aggregate/sender budget",
+                                    room_id,
+                                    connection_id,
+                                );
+                                if is_commit {
+                                    let rejection = Message::MlsRejected {
+                                        commit_ref: commit_ref.clone(),
+                                        reason: "room_rate_limited".to_string(),
+                                        retry_after_secs: u64::try_from(
+                                            state_clone.config.msg_rate_window_secs,
+                                        )
+                                        .unwrap_or(1),
+                                    };
+                                    if let Ok(json) = serde_json::to_string(&rejection) {
+                                        let _ = recv_direct_tx.try_send(json);
+                                    }
+                                }
+                                if is_commit {
+                                    // A staged Commit gets a typed retry and
+                                    // remains pending on the browser.
+                                    continue;
+                                }
+                                if wire_format == WIRE_PRIVATE_MESSAGE {
+                                    // Private messages are ephemeral.
+                                    continue;
+                                }
+                                // WebSocketManager retains ordered controls
+                                // until their sequenced own echo. Closing here
+                                // causes the exact KeyPackage/Proposal/Welcome
+                                // to be retried after replay sync rather than
+                                // silently accepting-and-dropping it.
+                                break;
+                            }
+                            if is_commit {
+                                state_clone
+                                    .connection_commit_timestamps
+                                    .entry(connection_id)
+                                    .or_default()
+                                    .push_back(now);
+                            }
+
+                            if wire_format != WIRE_PRIVATE_MESSAGE {
+                                evict_lagging_group_participants(&state_clone, room_id);
+                                if !state_clone.connection_is_active(&room_id, &connection_id) {
+                                    break;
+                                }
+                            }
+
+                            // Record replay identity only after every quota
+                            // gate accepts the envelope. A rate-limited Commit
+                            // must remain retryable after the window instead of
+                            // poisoning the replay cache despite never having
+                            // been broadcast.
+                            let mut seen_hashes =
+                                state_clone.seen_message_hashes.entry(room_id).or_default();
+                            let room_ttl_minutes = state_clone
+                                .rooms
+                                .get(&room_id)
+                                .map(|r| r.ttl_minutes)
+                                .unwrap_or(60);
+                            let cutoff = now - chrono::Duration::minutes(room_ttl_minutes as i64);
+                            let max_entries = state_clone.config.replay_cache_max_per_room;
+                            if !seen_hashes.insert_if_new(
+                                payload_hash.clone(),
+                                now,
+                                cutoff,
+                                max_entries,
+                            ) {
+                                continue;
+                            }
+
+                            if wire_format == WIRE_PRIVATE_MESSAGE {
+                                let broadcast_msg = Message::Mls {
+                                    payload,
+                                    wire_format,
+                                    ratchet_tree,
+                                    key_package_ref,
+                                    commit_ref,
+                                    bootstrap_proof,
+                                    control_seq: None,
+                                    sender_id: connection_id,
+                                };
+                                match serde_json::to_string(&broadcast_msg) {
+                                    Ok(json) => {
+                                        if state_clone
+                                            .broadcast_room_message(&room_id, json)
+                                            .is_err()
+                                        {
+                                            seen_hashes.remove(&payload_hash);
+                                            tracing::warn!(
+                                                "Room {} broadcast byte budget exhausted",
+                                                room_id
+                                            );
+                                            break;
+                                        }
+                                    }
+                                    Err(error) => {
+                                        seen_hashes.remove(&payload_hash);
+                                        tracing::error!(
+                                            "Failed to serialize MLS PrivateMessage: {}",
+                                            error
+                                        );
+                                        break;
+                                    }
+                                }
+                            } else {
+                                let admission = match wire_format {
+                                    WIRE_KEY_PACKAGE => MlsControlAdmission::KeyPackage {
+                                        sender_id: connection_id,
+                                        key_package_ref: mls_key_package_ref(
+                                            &validated.payload_bytes,
+                                        )
+                                        .expect("bounded KeyPackage reference input"),
+                                    },
+                                    WIRE_WELCOME => MlsControlAdmission::Welcome {
+                                        sender_id: connection_id,
+                                        commit_ref: commit_ref
+                                            .clone()
+                                            .expect("Welcome validated with commit_ref"),
+                                        key_package_ref: key_package_ref
+                                            .clone()
+                                            .expect("Welcome validated with key_package_ref"),
+                                    },
+                                    WIRE_PUBLIC_MESSAGE
+                                        if is_commit && key_package_ref.is_some() =>
+                                    {
+                                        MlsControlAdmission::AddCommit {
+                                            sender_id: connection_id,
+                                            commit_ref: commit_ref
+                                                .clone()
+                                                .expect("Commit validated with commit_ref"),
+                                            key_package_ref: key_package_ref
+                                                .clone()
+                                                .expect("guarded by is_some"),
+                                        }
+                                    }
+                                    WIRE_PUBLIC_MESSAGE if is_commit => {
+                                        MlsControlAdmission::Commit {
+                                            sender_id: connection_id,
+                                        }
+                                    }
+                                    _ => MlsControlAdmission::Ordinary,
+                                };
+                                let submitted_commit_ref = commit_ref.clone();
+                                let append_result = state_clone.append_and_broadcast_mls_envelope(
+                                    &room_id,
+                                    admission,
+                                    |control_seq| {
+                                        serde_json::to_string(&Message::Mls {
+                                            payload,
+                                            wire_format,
+                                            ratchet_tree,
+                                            key_package_ref,
+                                            commit_ref,
+                                            bootstrap_proof,
+                                            control_seq: Some(control_seq),
+                                            sender_id: connection_id,
+                                        })
+                                        .ok()
+                                    },
+                                );
+                                if let Err(error) = append_result {
+                                    seen_hashes.remove(&payload_hash);
+                                    tracing::error!(
+                                        "Failed to append MLS control envelope in room {}: {:?}",
+                                        room_id,
+                                        error
+                                    );
+                                    if let Some(rejection) =
+                                        permanent_mls_append_rejection(error, submitted_commit_ref)
+                                    {
+                                        if let Ok(json) = serde_json::to_string(&rejection) {
+                                            if recv_direct_tx.try_send(json).is_ok() {
+                                                continue;
+                                            }
+                                        }
+                                        tracing::warn!(
+                                            "Unable to deliver permanent MLS rejection to connection {}; closing for retry",
+                                            connection_id
+                                        );
+                                    }
+                                    break;
+                                }
+                                evict_lagging_group_participants(&state_clone, room_id);
+                                if !state_clone.connection_is_active(&room_id, &connection_id) {
+                                    break;
+                                }
+                            }
+
+                            if let Some(mut room) = state_clone.rooms.get_mut(&room_id) {
+                                room.update_activity();
                             }
                         }
                         // Handle regular encrypted message (text or image)
@@ -690,73 +1952,24 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: Uuid, connec
                                     }
                                 };
 
-                                // ANTI-REPLAY: Calculate SHA-256 hash of encrypted payload
-                                let payload_hash = {
-                                    let mut hasher = Sha256::new();
-                                    hasher.update(payload.as_bytes());
-                                    format!("{:x}", hasher.finalize())
-                                };
+                                let payload_hash = one_to_one_envelope_replay_hash(
+                                    &incoming.msg_type,
+                                    &payload,
+                                    &hdr,
+                                );
 
-                                // Get or create hash set for this room
-                                let mut seen_hashes = state_clone
-                                    .seen_message_hashes
-                                    .entry(room_id)
-                                    .or_insert_with(HashSet::new);
-
-                                // Cleanup old hashes (beyond room TTL)
-                                let room_ttl_minutes = state_clone
-                                    .rooms
-                                    .get(&room_id)
-                                    .map(|r| r.ttl_minutes)
-                                    .unwrap_or(60);
-                                let cutoff =
-                                    Utc::now() - chrono::Duration::minutes(room_ttl_minutes as i64);
-                                seen_hashes.retain(|(_, ts)| *ts > cutoff);
-
-                                // Check for duplicate (replay attack)
                                 let now = Utc::now();
-                                if seen_hashes.iter().any(|(hash, _)| hash == &payload_hash) {
-                                    // REPLAY DETECTED - Ignore silently (don't broadcast)
-                                    #[cfg(debug_assertions)]
-                                    tracing::debug!(
-                                        "Replay attack detected (duplicate payload hash)"
-                                    );
-                                    continue;
-                                }
-
-                                // MEMORY CAP: Evict oldest entries if cache exceeds limit
-                                // Prevents memory exhaustion from malicious clients
-                                let max_entries = state_clone.config.replay_cache_max_per_room;
-                                if seen_hashes.len() >= max_entries {
-                                    // Rebuild set keeping only the newest entries
-                                    let mut entries: Vec<_> = seen_hashes.iter().cloned().collect();
-                                    entries.sort_by(|a, b| b.1.cmp(&a.1)); // Sort by timestamp descending (newest first)
-                                    entries.truncate(max_entries - 1); // Keep max_entries - 1 to make room for new one
-                                    seen_hashes.clear();
-                                    for entry in entries {
-                                        seen_hashes.insert(entry);
-                                    }
-                                }
-
-                                // Store hash with timestamp
-                                seen_hashes.insert((payload_hash, now));
-
-                                // RATE LIMITING: Enforce per-connection message rate limit
-                                // Prevents bandwidth exhaustion and client-side decryption DoS
+                                // RATE LIMITING: enforce per-connection first,
+                                // then aggregate room count/bytes. Rejected
+                                // traffic must not poison the replay cache.
                                 let max_messages = state_clone.config.msg_rate_limit;
                                 let rate_window_secs = state_clone.config.msg_rate_window_secs;
-
-                                // Get or create timestamp queue for this connection
                                 let mut timestamps = state_clone
                                     .connection_message_timestamps
                                     .entry(connection_id)
-                                    .or_insert_with(VecDeque::new);
-
-                                // Remove old timestamps outside the rate window
+                                    .or_default();
                                 let rate_cutoff = now - chrono::Duration::seconds(rate_window_secs);
                                 timestamps.retain(|&ts| ts > rate_cutoff);
-
-                                // Check if rate limit exceeded
                                 if timestamps.len() >= max_messages {
                                     tracing::warn!(
                                         "Connection {} exceeded rate limit ({}/{}s), disconnecting",
@@ -764,14 +1977,51 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: Uuid, connec
                                         timestamps.len(),
                                         rate_window_secs
                                     );
-
-                                    // Disconnect immediately (break recv loop)
-                                    // Client will see WebSocket close event
                                     break;
                                 }
-
-                                // Record this message timestamp
                                 timestamps.push_back(now);
+                                drop(timestamps);
+
+                                if !state_clone.admit_room_traffic(
+                                    room_id,
+                                    connection_id,
+                                    now,
+                                    payload.len(),
+                                ) {
+                                    tracing::warn!(
+                                        "Room {} rejected traffic from {} at aggregate/sender budget",
+                                        room_id,
+                                        connection_id,
+                                    );
+                                    // Aggregate pressure is not evidence that
+                                    // this sender caused it. Drop this
+                                    // ephemeral frame without severing the
+                                    // authenticated relay identity.
+                                    continue;
+                                }
+
+                                let room_ttl_minutes = state_clone
+                                    .rooms
+                                    .get(&room_id)
+                                    .map(|r| r.ttl_minutes)
+                                    .unwrap_or(60);
+                                let cutoff =
+                                    now - chrono::Duration::minutes(room_ttl_minutes as i64);
+                                let mut seen_hashes =
+                                    state_clone.seen_message_hashes.entry(room_id).or_default();
+                                if !seen_hashes.insert_if_new(
+                                    payload_hash.clone(),
+                                    now,
+                                    cutoff,
+                                    state_clone.config.replay_cache_max_per_room,
+                                ) {
+                                    // REPLAY DETECTED - Ignore silently (don't broadcast)
+                                    #[cfg(debug_assertions)]
+                                    tracing::debug!(
+                                        "Replay attack detected (duplicate payload hash)"
+                                    );
+                                    continue;
+                                }
 
                                 // Create the message to broadcast based on type
                                 // Signal Protocol: Include header for DH ratchet on receive
@@ -789,10 +2039,27 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: Uuid, connec
                                     }
                                 };
 
-                                if let Ok(json) = serde_json::to_string(&broadcast_msg) {
-                                    // Broadcast to all participants in the room
-                                    if let Some(tx) = state_clone.broadcast_channels.get(&room_id) {
-                                        let _ = tx.send(json);
+                                match serde_json::to_string(&broadcast_msg) {
+                                    Ok(json) => {
+                                        if state_clone
+                                            .broadcast_room_message(&room_id, json)
+                                            .is_err()
+                                        {
+                                            seen_hashes.remove(&payload_hash);
+                                            tracing::warn!(
+                                                "Room {} broadcast byte budget exhausted",
+                                                room_id
+                                            );
+                                            break;
+                                        }
+                                    }
+                                    Err(error) => {
+                                        seen_hashes.remove(&payload_hash);
+                                        tracing::error!(
+                                            "Failed to serialize relay message: {}",
+                                            error
+                                        );
+                                        break;
                                     }
                                 }
 
@@ -838,26 +2105,10 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: Uuid, connec
         }
     }
 
-    // Cleanup: remove the connection
-    state.remove_connection(&connection_id);
-
-    // Notify other users that someone left
-    let leave_msg = Message::UserLeft {
-        user_id: connection_id,
-        participant_count: state.get_participant_count(&room_id),
-    };
-
-    if let Ok(json) = serde_json::to_string(&leave_msg) {
-        if let Some(tx) = state.broadcast_channels.get(&room_id) {
-            let _ = tx.send(json);
-        }
-    }
-
-    #[cfg(debug_assertions)]
-    tracing::debug!(
-        "Connection left room ({} participants remaining)",
-        state.get_participant_count(&room_id)
-    );
+    // Detach the socket now, but keep the stable participant ID reserved for a
+    // short grace period. A valid resume reconnect cancels departure simply by
+    // reclaiming the ID before the delayed finalizer runs.
+    schedule_connection_departure(&state, connection_id);
 }
 
 /// Sends an error message and closes the connection
@@ -888,8 +2139,346 @@ mod tests {
     use crate::jwt::{WsTokenClaims, sign_token};
     use crate::models::{Room, RoomConfig, RoomType};
     use axum::{Router, routing::get};
+    use std::collections::VecDeque;
     use std::net::SocketAddr;
     use uuid::Uuid;
+
+    #[test]
+    fn mls_correlation_ref_shape_is_bounded() {
+        let mixed = "_-".repeat(21) + "A";
+        assert!(valid_mls_correlation_ref(&"A".repeat(43)));
+        assert!(valid_mls_correlation_ref(&mixed));
+        assert!(!valid_mls_correlation_ref(&"A".repeat(42)));
+        assert!(!valid_mls_correlation_ref(&"A".repeat(44)));
+        assert!(!valid_mls_correlation_ref(&("A".repeat(42) + "=")));
+        assert!(!valid_mls_correlation_ref(&("A".repeat(42) + "/")));
+        assert!(!valid_mls_correlation_ref(&("A".repeat(42) + "B")));
+    }
+
+    #[test]
+    fn permanent_mls_append_errors_have_typed_zero_retry_rejections() {
+        for (error, expected_reason) in [
+            (
+                MlsControlAppendError::UnknownKeyPackageRef,
+                "unknown_key_package_ref",
+            ),
+            (
+                MlsControlAppendError::UnauthorizedGroupCreatorControl,
+                "not_group_creator",
+            ),
+            (
+                MlsControlAppendError::CommitCorrelationConflict,
+                "commit_correlation_conflict",
+            ),
+            (
+                MlsControlAppendError::WelcomeNotCorrelated,
+                "welcome_not_correlated",
+            ),
+        ] {
+            let rejection = permanent_mls_append_rejection(error, Some("C".repeat(43)))
+                .expect("permanent admission error must produce a typed rejection");
+            let json = serde_json::to_value(rejection).unwrap();
+            assert_eq!(json["type"], "mlsrejected");
+            assert_eq!(json["reason"], expected_reason);
+            assert_eq!(json["retry_after_secs"], 0);
+            assert_eq!(json["commit_ref"], "C".repeat(43));
+        }
+        assert!(
+            permanent_mls_append_rejection(MlsControlAppendError::CapacityExceeded, None,)
+                .is_none(),
+            "capacity pressure is not a permanent semantic rejection"
+        );
+    }
+
+    fn synthetic_public_message(content_type: u8) -> Vec<u8> {
+        let mut body = vec![1, 0xAA]; // group_id opaque<V>, one byte
+        body.extend_from_slice(&0u64.to_be_bytes()); // epoch
+        body.push(1); // SenderType::member
+        body.extend_from_slice(&0u32.to_be_bytes()); // leaf_index
+        body.push(0); // empty authenticated_data opaque<V>
+        body.push(content_type);
+        body.push(0); // enough trailing body for shallow classification
+        body
+    }
+
+    #[test]
+    fn mls_transport_validation_is_canonical_and_format_specific() {
+        let commit_body = synthetic_public_message(CONTENT_TYPE_COMMIT);
+        let commit_payload = URL_SAFE_NO_PAD.encode(&commit_body);
+        let commit_ref = URL_SAFE_NO_PAD.encode(Sha256::digest(&commit_body));
+        let commit = validate_mls_envelope(
+            &commit_payload,
+            WIRE_PUBLIC_MESSAGE,
+            None,
+            None,
+            Some(&commit_ref),
+            None,
+            300 * 1024,
+        )
+        .expect("valid Commit transport");
+        assert_eq!(commit.public_kind, Some(PublicMessageKind::Commit));
+
+        let proposal_body = synthetic_public_message(CONTENT_TYPE_PROPOSAL);
+        let proposal_payload = URL_SAFE_NO_PAD.encode(&proposal_body);
+        let proposal = validate_mls_envelope(
+            &proposal_payload,
+            WIRE_PUBLIC_MESSAGE,
+            None,
+            None,
+            None,
+            None,
+            300 * 1024,
+        )
+        .expect("valid Proposal transport");
+        assert_eq!(proposal.public_kind, Some(PublicMessageKind::Proposal));
+
+        assert!(
+            validate_mls_envelope(
+                &proposal_payload,
+                WIRE_PUBLIC_MESSAGE,
+                None,
+                None,
+                Some(&commit_ref),
+                None,
+                300 * 1024,
+            )
+            .is_err(),
+            "Proposal must not consume or spoof the Commit correlation/rate bucket"
+        );
+        assert!(
+            validate_mls_envelope(
+                &commit_payload,
+                WIRE_PUBLIC_MESSAGE,
+                None,
+                None,
+                Some(&"A".repeat(43)),
+                None,
+                300 * 1024,
+            )
+            .is_err(),
+            "CommitRef must equal SHA-256 of the exact decoded Commit body"
+        );
+
+        let small = URL_SAFE_NO_PAD.encode([0u8]);
+        let reference = "A".repeat(43);
+        let welcome = validate_mls_envelope(
+            &small,
+            WIRE_WELCOME,
+            Some(&small),
+            Some(&reference),
+            Some(&reference),
+            None,
+            300 * 1024,
+        )
+        .expect("valid Welcome transport shape");
+        assert_eq!(welcome.ratchet_tree_bytes.as_deref(), Some(&[0u8][..]));
+        assert!(
+            validate_mls_envelope(
+                &small,
+                WIRE_WELCOME,
+                None,
+                Some(&reference),
+                Some(&reference),
+                None,
+                300 * 1024,
+            )
+            .is_err(),
+            "Welcome must carry its bounded ratchet tree"
+        );
+        assert!(
+            validate_mls_envelope(
+                &small,
+                WIRE_PRIVATE_MESSAGE,
+                Some(&small),
+                None,
+                None,
+                None,
+                300 * 1024,
+            )
+            .is_err(),
+            "ratchet_tree must be rejected outside Welcome"
+        );
+        assert!(
+            validate_mls_envelope(
+                &small,
+                4, // standalone GroupInfo is unsupported by this transport
+                None,
+                None,
+                None,
+                None,
+                300 * 1024,
+            )
+            .is_err(),
+            "unsupported MLS wire formats must be rejected"
+        );
+
+        let oversized_key_package = URL_SAFE_NO_PAD.encode(vec![0u8; 16 * 1024 + 1]);
+        assert!(
+            validate_mls_envelope(
+                &oversized_key_package,
+                WIRE_KEY_PACKAGE,
+                None,
+                None,
+                None,
+                Some(&reference),
+                300 * 1024,
+            )
+            .is_err(),
+            "limits apply to decoded bytes for each wire format"
+        );
+        assert!(
+            validate_mls_envelope(&small, WIRE_KEY_PACKAGE, None, None, None, None, 300 * 1024,)
+                .is_err(),
+            "KeyPackage transport requires an invite-secret possession proof"
+        );
+        assert!(
+            validate_mls_envelope(
+                &small,
+                WIRE_KEY_PACKAGE,
+                None,
+                None,
+                None,
+                Some(&reference),
+                300 * 1024,
+            )
+            .is_ok(),
+            "canonical bootstrap proof is relayed only with KeyPackage"
+        );
+        assert!(decode_bounded_base64url("AA==", 16).is_err());
+        assert!(decode_bounded_base64url("AB", 16).is_err());
+
+        let mut non_minimal = vec![0x40, 0x01]; // length 1 encoded in two bytes
+        non_minimal.extend_from_slice(&commit_body[1..]);
+        assert!(
+            classify_public_message(&non_minimal).is_err(),
+            "shallow classifier rejects non-minimal MLS varints"
+        );
+    }
+
+    #[test]
+    fn mls_shallow_classifier_matches_ietf_public_messages() {
+        let vectors: Vec<serde_json::Value> = serde_json::from_str(include_str!(
+            "../../tests/vectors/mls/message-protection.json"
+        ))
+        .expect("parse vendored IETF message-protection vectors");
+        let vector = vectors
+            .iter()
+            .find(|entry| entry["cipher_suite"].as_u64() == Some(2))
+            .expect("ciphersuite 0x0002 vector");
+
+        for (field, expected) in [
+            ("proposal_pub", PublicMessageKind::Proposal),
+            ("commit_pub", PublicMessageKind::Commit),
+        ] {
+            let framed = hex::decode(vector[field].as_str().expect("hex PublicMessage"))
+                .expect("decode PublicMessage vector");
+            assert_eq!(&framed[..4], &[0, 1, 0, 1]);
+            assert_eq!(
+                classify_public_message(&framed[4..]),
+                Ok(expected),
+                "relay classifier must match the RFC vector's signed content_type"
+            );
+        }
+    }
+
+    #[test]
+    fn mls_replay_hash_binds_metadata_and_room_protocols_are_disjoint() {
+        let payload = URL_SAFE_NO_PAD.encode([7u8]);
+        let first_ref = "A".repeat(43);
+        let second_ref = format!("{}E", "B".repeat(42));
+        let first = validate_mls_envelope(
+            &payload,
+            WIRE_WELCOME,
+            Some(&payload),
+            Some(&first_ref),
+            Some(&first_ref),
+            None,
+            300 * 1024,
+        )
+        .unwrap();
+        let second = validate_mls_envelope(
+            &payload,
+            WIRE_WELCOME,
+            Some(&payload),
+            Some(&second_ref),
+            Some(&first_ref),
+            None,
+            300 * 1024,
+        )
+        .unwrap();
+        assert_ne!(
+            mls_envelope_replay_hash(
+                WIRE_WELCOME,
+                &first,
+                Some(&first_ref),
+                Some(&first_ref),
+                None,
+            ),
+            mls_envelope_replay_hash(
+                WIRE_WELCOME,
+                &second,
+                Some(&second_ref),
+                Some(&first_ref),
+                None,
+            ),
+            "tree/correlation metadata participates in anti-replay identity"
+        );
+        let proof_a = URL_SAFE_NO_PAD.encode([3u8; 32]);
+        let proof_b = URL_SAFE_NO_PAD.encode([4u8; 32]);
+        let key_package = validate_mls_envelope(
+            &payload,
+            WIRE_KEY_PACKAGE,
+            None,
+            None,
+            None,
+            Some(&proof_a),
+            300 * 1024,
+        )
+        .unwrap();
+        assert_ne!(
+            mls_envelope_replay_hash(WIRE_KEY_PACKAGE, &key_package, None, None, Some(&proof_a),),
+            mls_envelope_replay_hash(WIRE_KEY_PACKAGE, &key_package, None, None, Some(&proof_b),),
+            "KeyPackage possession proof participates in anti-replay identity"
+        );
+
+        let header = MessageHeader {
+            v: crate::models::PINCHAT_PROTOCOL_VERSION,
+            dh: "dh".into(),
+            pn: 1,
+            n: 2,
+            rc: 3,
+            sig: "sig".into(),
+        };
+        let mut altered_header = header.clone();
+        altered_header.sig = "altered".into();
+        assert_ne!(
+            one_to_one_envelope_replay_hash("message", "ciphertext", &header),
+            one_to_one_envelope_replay_hash("message", "ciphertext", &altered_header),
+            "a corrupted header cannot poison the authentic ciphertext replay identity"
+        );
+        assert_ne!(
+            one_to_one_envelope_replay_hash("message", "ciphertext", &header),
+            one_to_one_envelope_replay_hash("image", "ciphertext", &header),
+            "one-to-one message types are domain-separated in the replay cache"
+        );
+
+        assert!(room_accepts_client_message(RoomType::Group, "mls"));
+        assert!(room_accepts_client_message(RoomType::Group, "mlsack"));
+        assert!(!room_accepts_client_message(RoomType::Group, "message"));
+        assert!(!room_accepts_client_message(RoomType::Group, "image"));
+        assert!(!room_accepts_client_message(
+            RoomType::Group,
+            "ecdh_public_key"
+        ));
+        assert!(room_accepts_client_message(
+            RoomType::OneToOne,
+            "ecdh_public_key"
+        ));
+        assert!(room_accepts_client_message(RoomType::OneToOne, "message"));
+        assert!(room_accepts_client_message(RoomType::OneToOne, "image"));
+        assert!(!room_accepts_client_message(RoomType::OneToOne, "mls"));
+        assert!(!room_accepts_client_message(RoomType::OneToOne, "mlsack"));
+    }
 
     fn test_config() -> Config {
         Config {
@@ -901,6 +2490,12 @@ mod tests {
             room_token_period_secs: 600,
             msg_rate_limit: 30,
             msg_rate_window_secs: 1,
+            room_msg_rate_limit: 120,
+            room_byte_rate_limit: 8 * 1024 * 1024,
+            commit_rate_limit: 12,
+            commit_rate_window_secs: 60,
+            proposal_rate_limit: 8,
+            proposal_rate_window_secs: 60,
             frame_rate_limit: 120,
             protocol_error_limit: 10,
             pow_min_difficulty: 12,
@@ -909,6 +2504,7 @@ mod tests {
             jwt_token_ttl_secs: 30,
             jwt_issuer: crate::jwt::DEFAULT_JWT_ISSUER.to_string(),
             max_ws_connection_age_secs: 30 * 60,
+            ws_reconnect_grace_secs: 20,
             ecdh_burst_limit: 8,
             ecdh_burst_window_secs: 60,
             room_cleanup_interval_secs: 60,
@@ -925,6 +2521,7 @@ mod tests {
             website_dir: None,
             allow_anonymous: true,
             cors_allowed_origins: vec!["https://localhost:3000".to_string()],
+            group_chat_enabled: true,
         }
     }
 
@@ -1068,8 +2665,16 @@ mod tests {
         let (addr, state, room_id) = spawn_test_server().await;
 
         // Fill both slots; Room::new hard-codes max_participants to 2.
-        assert!(state.add_connection(Uuid::new_v4(), room_id));
-        assert!(state.add_connection(Uuid::new_v4(), room_id));
+        assert!(
+            state
+                .add_connection(Uuid::new_v4(), room_id, false)
+                .is_some()
+        );
+        assert!(
+            state
+                .add_connection(Uuid::new_v4(), room_id, false)
+                .is_some()
+        );
 
         let claims = WsTokenClaims::new(room_id, 30, &state.config.jwt_issuer);
         let jti = claims.jti;
@@ -1137,6 +2742,9 @@ mod tests {
             jti: Uuid::new_v4(),
             aud: crate::jwt::WS_TOKEN_AUDIENCE.to_string(),
             iss: state.config.jwt_issuer.clone(),
+            resume: false,
+            mls_control_cursor: None,
+            creator_bootstrap_generation: None,
         };
         let token = sign_token(&expired, &state.jwt_secret).unwrap();
         let sp = format!("pinchat.v1, pinchat.v1.jwt.{}", token);
@@ -1215,6 +2823,849 @@ mod tests {
         assert!(
             !head.contains("pinchat.v1.jwt."),
             "server must NOT echo the jwt token subprotocol"
+        );
+    }
+
+    #[test]
+    fn reconnect_reservation_is_reclaimed_fail_closed() {
+        let state = AppState::new(1000, test_config());
+        let room = Room::new(RoomConfig {
+            room_type: RoomType::Group,
+            ttl_minutes: 60,
+            max_participants: 4,
+        });
+        let room_id = room.id;
+        let connection_id = room
+            .creator_connection_id()
+            .expect("group room has creator identity");
+        state.try_create_room(room).unwrap();
+
+        assert_eq!(
+            state.add_connection(connection_id, room_id, false),
+            Some(ConnectionAdmission::New)
+        );
+        assert_eq!(state.get_participant_count(&room_id), 1);
+        state
+            .connection_commit_timestamps
+            .insert(connection_id, VecDeque::from([Utc::now()]));
+
+        // Even a valid resume credential cannot open two simultaneously
+        // active sockets for the same relay identity.
+        assert_eq!(state.add_connection(connection_id, room_id, true), None);
+
+        assert_eq!(state.detach_connection(&connection_id), Some(room_id));
+        assert_eq!(state.get_participant_count(&room_id), 1);
+        assert_eq!(
+            state
+                .connection_commit_timestamps
+                .get(&connection_id)
+                .map(|timestamps| timestamps.len()),
+            Some(1),
+            "transport cycling must not reset the stable identity's rate budget"
+        );
+
+        // The reserved ID cannot be reclaimed by a normal fresh-token path.
+        assert_eq!(state.add_connection(connection_id, room_id, false), None);
+        assert_eq!(
+            state.add_connection(connection_id, room_id, true),
+            Some(ConnectionAdmission::Resumed)
+        );
+        assert_eq!(state.get_participant_count(&room_id), 1);
+
+        // An older grace finalizer observes the resumed active socket and
+        // cannot remove its participant reservation.
+        assert_eq!(state.finalize_disconnection(&connection_id, room_id), None);
+        assert_eq!(state.get_participant_count(&room_id), 1);
+
+        assert_eq!(state.detach_connection(&connection_id), Some(room_id));
+        assert_eq!(
+            state.finalize_disconnection(&connection_id, room_id),
+            Some(0)
+        );
+        assert!(
+            !state
+                .connection_commit_timestamps
+                .contains_key(&connection_id),
+            "final departure must erase retained limiter state"
+        );
+
+        // Critical race regression: if grace expires after token issuance but
+        // before upgrade, a resume token must fail rather than be admitted as
+        // a brand-new participant under the old ID.
+        assert_eq!(state.add_connection(connection_id, room_id, true), None);
+        assert_eq!(state.get_participant_count(&room_id), 0);
+        assert_eq!(
+            state.add_connection(connection_id, room_id, false),
+            Some(ConnectionAdmission::New)
+        );
+    }
+
+    #[tokio::test]
+    async fn mls_group_control_log_replays_lifecycle_until_every_participant_acknowledges() {
+        let state = AppState::new(1000, test_config());
+        let room = Room::new(RoomConfig {
+            room_type: RoomType::Group,
+            ttl_minutes: 60,
+            max_participants: 4,
+        });
+        let room_id = room.id;
+        let alice = room
+            .creator_connection_id()
+            .expect("group room has creator identity");
+        state.try_create_room(room).unwrap();
+        let bob = Uuid::new_v4();
+
+        assert_eq!(
+            state.add_connection(alice, room_id, false),
+            Some(ConnectionAdmission::New)
+        );
+        let (_alice_rx, alice_stream) = state
+            .open_mls_control_stream(&room_id, alice, None)
+            .expect("open Alice control stream");
+        assert_eq!(alice_stream.cursor, 0);
+        assert_eq!(alice_stream.through_seq, 0);
+        assert!(state.mark_creator_control_ready(&room_id, alice));
+
+        assert_eq!(
+            state.add_connection(bob, room_id, false),
+            Some(ConnectionAdmission::New)
+        );
+        let (mut bob_rx, bob_stream) = state
+            .open_mls_control_stream(&room_id, bob, None)
+            .expect("open Bob control stream");
+        assert_eq!(bob_stream.cursor, 0);
+
+        // Group admission captures the replay boundary first, then appends
+        // UserJoined. The fresh socket therefore receives its own lifecycle
+        // event live instead of skipping controls accepted after admission.
+        let join_seq = state
+            .append_and_broadcast_mls_control(&room_id, |seq| {
+                serde_json::to_string(&Message::UserJoined {
+                    user_id: bob,
+                    participant_count: 2,
+                    control_seq: Some(seq),
+                })
+                .ok()
+            })
+            .expect("append ordered join");
+        assert_eq!(join_seq, 1);
+        let live_join_payload = bob_rx
+            .try_recv()
+            .expect("fresh participant receives live join");
+        let live_join: serde_json::Value =
+            serde_json::from_str(live_join_payload.as_str()).expect("live join JSON");
+        assert_eq!(live_join["type"], "userjoined");
+        assert_eq!(live_join["control_seq"], 1);
+        assert!(state.acknowledge_mls_control(&room_id, alice, 1));
+
+        let seq = state
+            .append_and_broadcast_mls_control(&room_id, |seq| {
+                Some(
+                    serde_json::json!({
+                        "type": "mls",
+                        "wire_format": WIRE_KEY_PACKAGE,
+                        "payload": "AA",
+                        "sender_id": alice,
+                        "control_seq": seq,
+                    })
+                    .to_string(),
+                )
+            })
+            .expect("append ordered control");
+        assert_eq!(seq, 2);
+        assert!(state.acknowledge_mls_control(&room_id, alice, 2));
+
+        let departed = Uuid::new_v4();
+        let leave_seq = state
+            .append_and_broadcast_mls_control(&room_id, |seq| {
+                serde_json::to_string(&Message::UserLeft {
+                    user_id: departed,
+                    participant_count: 2,
+                    control_seq: Some(seq),
+                })
+                .ok()
+            })
+            .expect("append ordered lifecycle event");
+        assert_eq!(leave_seq, 3);
+        assert!(state.acknowledge_mls_control(&room_id, alice, 3));
+
+        // Bob's lower cursor keeps both MLS and lifecycle controls retained
+        // throughout a transport drop and grace-reserved resume.
+        assert_eq!(state.detach_connection(&bob), Some(room_id));
+        assert_eq!(
+            state.add_connection(bob, room_id, true),
+            Some(ConnectionAdmission::Resumed)
+        );
+        let (_resumed_rx, replay) = state
+            .open_mls_control_stream(&room_id, bob, Some(0))
+            .expect("replay from Bob's signed cursor");
+        assert_eq!(replay.cursor, 0);
+        assert_eq!(replay.through_seq, 3);
+        assert_eq!(replay.replay.len(), 3);
+        let replayed_join: serde_json::Value =
+            serde_json::from_str(replay.replay[0].json.as_ref()).expect("replayed join JSON");
+        assert_eq!(replayed_join["type"], "userjoined");
+        assert_eq!(replayed_join["control_seq"], 1);
+        let replayed_mls: serde_json::Value =
+            serde_json::from_str(replay.replay[1].json.as_ref()).expect("replayed MLS JSON");
+        assert_eq!(replayed_mls["control_seq"], 2);
+        let replayed_leave: serde_json::Value =
+            serde_json::from_str(replay.replay[2].json.as_ref()).expect("replayed lifecycle JSON");
+        assert_eq!(replayed_leave["type"], "userleft");
+        assert_eq!(replayed_leave["user_id"], departed.to_string());
+        assert_eq!(replayed_leave["control_seq"], 3);
+
+        assert!(state.acknowledge_mls_control(&room_id, bob, 3));
+        assert!(
+            state.validate_mls_control_cursor(&room_id, 3).is_ok(),
+            "current head remains a valid resume cursor after pruning"
+        );
+        assert!(
+            state.validate_mls_control_cursor(&room_id, 0).is_err(),
+            "a cursor older than the fully-acknowledged retained window fails closed"
+        );
+
+        assert_eq!(state.detach_connection(&bob), Some(room_id));
+        assert_eq!(
+            state.add_connection(bob, room_id, true),
+            Some(ConnectionAdmission::Resumed)
+        );
+        assert!(matches!(
+            state.open_mls_control_stream(&room_id, bob, Some(2)),
+            Err(crate::state::app_state::MlsControlCursorError::CursorRegressed)
+        ));
+        assert!(
+            state.acknowledge_mls_control(&room_id, bob, 3),
+            "a regressed resume attempt must not lower the server ACK"
+        );
+    }
+
+    #[test]
+    fn non_acknowledging_mls_participant_is_evicted_before_log_capacity() {
+        let state = AppState::new(1000, test_config());
+        let room = Room::new(RoomConfig {
+            room_type: RoomType::Group,
+            ttl_minutes: 60,
+            max_participants: 4,
+        });
+        let room_id = room.id;
+        let alice = room
+            .creator_connection_id()
+            .expect("group room has creator identity");
+        state.try_create_room(room).unwrap();
+        let stalled = Uuid::new_v4();
+
+        assert_eq!(
+            state.add_connection(alice, room_id, false),
+            Some(ConnectionAdmission::New)
+        );
+        state
+            .open_mls_control_stream(&room_id, alice, None)
+            .expect("open Alice stream");
+        assert!(state.mark_creator_control_ready(&room_id, alice));
+        assert_eq!(
+            state.add_connection(stalled, room_id, false),
+            Some(ConnectionAdmission::New)
+        );
+        state
+            .open_mls_control_stream(&room_id, stalled, None)
+            .expect("open stalled stream");
+
+        for expected in 1..=MAX_MLS_UNACKNOWLEDGED_CONTROLS {
+            let seq = state
+                .append_and_broadcast_mls_control(&room_id, |seq| {
+                    Some(format!(r#"{{"type":"test","control_seq":{seq}}}"#))
+                })
+                .expect("append before lag eviction");
+            assert_eq!(seq, expected);
+            assert!(state.acknowledge_mls_control(&room_id, alice, seq));
+            if expected == 1 {
+                assert_eq!(
+                    state.lagging_mls_control_participants(&room_id, u64::MAX, Duration::ZERO,),
+                    vec![stalled],
+                    "an outstanding cursor with an expired progress deadline is evictable",
+                );
+            }
+            evict_lagging_group_participants(&state, room_id);
+        }
+
+        assert!(
+            !state.connection_is_active(&room_id, &stalled)
+                && !state
+                    .rooms
+                    .get(&room_id)
+                    .expect("room survives lag eviction")
+                    .participant_ids
+                    .contains(&stalled),
+            "a participant that withholds every ACK is removed from the room and pruning quorum"
+        );
+
+        // Eviction appends one ordered UserLeft after the 64th test control.
+        let departure_seq = MAX_MLS_UNACKNOWLEDGED_CONTROLS + 1;
+        assert!(state.acknowledge_mls_control(&room_id, alice, departure_seq));
+
+        // Continue well beyond the retained-log count cap. Alice's advancing
+        // ACK must keep pruning history instead of letting the removed peer
+        // freeze all future group control.
+        for expected in (departure_seq + 1)..=(departure_seq + 300) {
+            let seq = state
+                .append_and_broadcast_mls_control(&room_id, |seq| {
+                    Some(format!(r#"{{"type":"test","control_seq":{seq}}}"#))
+                })
+                .expect("ordered control continues after lagger eviction");
+            assert_eq!(seq, expected);
+            assert!(state.acknowledge_mls_control(&room_id, alice, seq));
+        }
+    }
+
+    #[test]
+    fn idle_room_does_not_age_a_future_mls_control_backlog() {
+        let state = AppState::new(1000, test_config());
+        let room = Room::new(RoomConfig {
+            room_type: RoomType::Group,
+            ttl_minutes: 60,
+            max_participants: 4,
+        });
+        let room_id = room.id;
+        let alice = room
+            .creator_connection_id()
+            .expect("group room has creator identity");
+        state.try_create_room(room).unwrap();
+        let bob = Uuid::new_v4();
+
+        assert_eq!(
+            state.add_connection(alice, room_id, false),
+            Some(ConnectionAdmission::New)
+        );
+        state
+            .open_mls_control_stream(&room_id, alice, None)
+            .expect("open synchronized creator MLS stream");
+        assert!(state.mark_creator_control_ready(&room_id, alice));
+        assert_eq!(
+            state.add_connection(bob, room_id, false),
+            Some(ConnectionAdmission::New)
+        );
+        state
+            .open_mls_control_stream(&room_id, bob, None)
+            .expect("open synchronized member MLS stream");
+
+        let opened_at = std::time::Instant::now();
+        let appended_at = opened_at + MLS_CONTROL_ACK_TIMEOUT + Duration::from_secs(1);
+        state
+            .append_and_broadcast_mls_control_at_for_test(&room_id, appended_at, |seq| {
+                Some(format!(r#"{{"type":"test","control_seq":{seq}}}"#))
+            })
+            .expect("append control after an idle interval");
+
+        assert!(
+            state
+                .lagging_mls_control_participants_at_for_test(
+                    &room_id,
+                    u64::MAX,
+                    MLS_CONTROL_ACK_TIMEOUT,
+                    appended_at,
+                )
+                .is_empty(),
+            "time spent fully caught up must not consume a new backlog's ACK deadline"
+        );
+
+        let expired_at = appended_at + MLS_CONTROL_ACK_TIMEOUT;
+        let mut lagging = state.lagging_mls_control_participants_at_for_test(
+            &room_id,
+            u64::MAX,
+            MLS_CONTROL_ACK_TIMEOUT,
+            expired_at,
+        );
+        lagging.sort_unstable();
+        let mut expected = vec![alice, bob];
+        expected.sort_unstable();
+        assert_eq!(
+            lagging, expected,
+            "the same unacknowledged control becomes evictable only after its own deadline"
+        );
+    }
+
+    #[test]
+    fn room_traffic_and_broadcast_memory_are_byte_bounded() {
+        let mut config = test_config();
+        config.msg_rate_window_secs = 1;
+        config.room_msg_rate_limit = 4;
+        config.room_byte_rate_limit = 1024;
+        let state = AppState::new(1000, config);
+        let room = Room::new(RoomConfig {
+            room_type: RoomType::Group,
+            ttl_minutes: 60,
+            max_participants: 4,
+        });
+        let room_id = room.id;
+        let alice = room
+            .creator_connection_id()
+            .expect("group room has creator identity");
+        state.try_create_room(room).unwrap();
+        let bob = Uuid::new_v4();
+        assert_eq!(
+            state.add_connection(alice, room_id, false),
+            Some(ConnectionAdmission::New)
+        );
+        assert!(state.mark_creator_control_ready(&room_id, alice));
+        assert_eq!(
+            state.add_connection(bob, room_id, false),
+            Some(ConnectionAdmission::New)
+        );
+
+        let now = Utc::now();
+        assert!(state.admit_room_traffic(room_id, alice, now, 512));
+        assert!(
+            !state.admit_room_traffic(room_id, alice, now, 1),
+            "one sender cannot consume bytes reserved for its peers"
+        );
+        assert!(
+            state.admit_room_traffic(room_id, bob, now, 512),
+            "another sender retains its share after a peer reaches its cap"
+        );
+        assert!(
+            !state.admit_room_traffic(room_id, bob, now, 1),
+            "aggregate and per-sender byte ceilings remain bounded"
+        );
+
+        let _receiver = state
+            .broadcast_channels
+            .get(&room_id)
+            .expect("room broadcast sender")
+            .subscribe();
+        for _ in 0..4 {
+            assert!(
+                state
+                    .broadcast_room_message(&room_id, "x".repeat(1024 * 1024))
+                    .is_ok()
+            );
+        }
+        assert!(
+            state
+                .broadcast_room_message(&room_id, "y".repeat(1024 * 1024))
+                .is_err(),
+            "per-room retained broadcast bytes are capped independently of count"
+        );
+        state.remove_room(&room_id);
+    }
+
+    #[test]
+    fn mls_control_log_reserves_unacknowledged_capacity_for_lifecycle() {
+        let state = AppState::new(1000, test_config());
+        let room = Room::new(RoomConfig {
+            room_type: RoomType::Group,
+            ttl_minutes: 60,
+            max_participants: 4,
+        });
+        let room_id = room.id;
+        state.try_create_room(room).unwrap();
+
+        let ordinary_limit = (crate::state::app_state::MAX_MLS_CONTROL_LOG_ENTRIES
+            - crate::state::app_state::MLS_LIFECYCLE_RESERVED_ENTRIES)
+            as u64;
+        for expected in 1..=ordinary_limit {
+            let seq = state
+                .append_and_broadcast_mls_control(&room_id, |seq| {
+                    Some(format!(r#"{{"type":"test","control_seq":{seq}}}"#))
+                })
+                .expect("entry within hard control-log count");
+            assert_eq!(seq, expected);
+        }
+        assert!(
+            state
+                .append_and_broadcast_mls_control(&room_id, |seq| {
+                    Some(format!(r#"{{"type":"test","control_seq":{seq}}}"#))
+                })
+                .is_err(),
+            "ordinary controls cannot consume lifecycle-reserved entries"
+        );
+        for offset in 1..=crate::state::app_state::MLS_LIFECYCLE_RESERVED_ENTRIES as u64 {
+            let expected = ordinary_limit + offset;
+            let seq = state
+                .append_and_broadcast_mls_lifecycle(&room_id, |seq| {
+                    Some(format!(r#"{{"type":"userleft","control_seq":{seq}}}"#))
+                })
+                .expect("reserved lifecycle entry remains appendable");
+            assert_eq!(seq, expected);
+        }
+        assert!(
+            state
+                .append_and_broadcast_mls_lifecycle(&room_id, |seq| {
+                    Some(format!(r#"{{"type":"userleft","control_seq":{seq}}}"#))
+                })
+                .is_err(),
+            "the hard log cap still rejects rather than evicting history"
+        );
+        assert!(
+            state.validate_mls_control_cursor(&room_id, 0).is_ok(),
+            "the oldest unacknowledged cursor remains replayable"
+        );
+        assert!(
+            !append_ordered_group_departure(&state, room_id, Uuid::new_v4(), 1,),
+            "an unsequencable departure reports fail-closed",
+        );
+        assert!(
+            !state.rooms.contains_key(&room_id),
+            "failure to durably sequence UserLeft closes the entire MLS room",
+        );
+    }
+
+    #[test]
+    fn creator_slot_and_bootstrap_resume_cursor_preserve_stable_identity() {
+        let state = AppState::new(1000, test_config());
+        let (room, creator_bootstrap) = Room::new_with_creator_bootstrap(RoomConfig {
+            room_type: RoomType::Group,
+            ttl_minutes: 60,
+            max_participants: 2,
+        });
+        let room_id = room.id;
+        let creator = room
+            .creator_connection_id()
+            .expect("group room has stable creator identity");
+        let creator_bootstrap =
+            creator_bootstrap.expect("group room exposes creator bootstrap capability");
+        let bootstrap_generation = room.creator_bootstrap_generation();
+        assert!(room.verify_creator_bootstrap(&creator_bootstrap));
+        state.try_create_room(room).unwrap();
+
+        let first_noncreator = Uuid::new_v4();
+        let second_noncreator = Uuid::new_v4();
+        assert_eq!(
+            state.add_connection(first_noncreator, room_id, false),
+            None,
+            "ordinary admission waits until the creator opens the room"
+        );
+        assert_eq!(
+            state.add_connection(creator, room_id, false),
+            Some(ConnectionAdmission::New),
+            "creator consumes its own reserved slot atomically"
+        );
+        assert_eq!(
+            state.add_connection(first_noncreator, room_id, false),
+            None,
+            "ordinary admission stays closed until durable creator control setup"
+        );
+
+        let (_creator_rx, creator_stream) = state
+            .open_mls_control_stream(&room_id, creator, None)
+            .expect("creator opens initial MLS stream");
+        assert_eq!(creator_stream.cursor, 0);
+        assert_eq!(
+            state
+                .append_and_broadcast_mls_lifecycle(&room_id, |seq| {
+                    Some(format!(r#"{{"type":"userjoined","control_seq":{seq}}}"#))
+                })
+                .expect("append creator lifecycle"),
+            1
+        );
+        assert!(state.mark_creator_control_ready(&room_id, creator));
+        assert_eq!(
+            state.add_connection(first_noncreator, room_id, false),
+            Some(ConnectionAdmission::New),
+            "ordinary admission opens after creator control readiness"
+        );
+        assert_eq!(
+            state.add_connection(second_noncreator, room_id, false),
+            None,
+            "ordinary admission cannot exceed the physical room cap"
+        );
+        assert!(state.acknowledge_mls_control(&room_id, creator, 1));
+        assert!(
+            !state
+                .rooms
+                .get(&room_id)
+                .expect("room remains live")
+                .verify_creator_bootstrap(&creator_bootstrap),
+            "the creator's first authenticated MLS ACK revokes bootstrap recovery"
+        );
+        assert_eq!(state.detach_connection(&creator), Some(room_id));
+        let cursor = state
+            .acknowledged_mls_control_cursor(&room_id, creator)
+            .expect("grace-reserved creator has server-authoritative cursor");
+        assert_eq!(cursor, 1);
+        assert_eq!(
+            state.add_connection_with_bootstrap_generation(
+                creator,
+                room_id,
+                true,
+                Some(bootstrap_generation),
+            ),
+            None,
+            "a JWT minted before bootstrap revocation cannot reclaim the creator"
+        );
+        assert_eq!(
+            state.add_connection_with_bootstrap_generation(creator, room_id, true, None,),
+            Some(ConnectionAdmission::Resumed),
+            "the normal post-ACK resume credential remains valid"
+        );
+
+        let claims =
+            WsTokenClaims::for_resume(room_id, creator, 30, &state.config.jwt_issuer, Some(cursor));
+        assert_eq!(claims.connection_id, creator);
+        assert!(claims.resume);
+        assert_eq!(claims.mls_control_cursor, Some(1));
+    }
+
+    #[test]
+    fn definitive_creator_eviction_closes_established_group_room() {
+        let state = AppState::new(1000, test_config());
+        let room = Room::new(RoomConfig {
+            room_type: RoomType::Group,
+            ttl_minutes: 60,
+            max_participants: 4,
+        });
+        let room_id = room.id;
+        let creator = room.creator_connection_id().unwrap();
+        state.try_create_room(room).unwrap();
+        assert_eq!(
+            state.add_connection(creator, room_id, false),
+            Some(ConnectionAdmission::New),
+        );
+        state
+            .open_mls_control_stream(&room_id, creator, None)
+            .expect("creator stream");
+        state
+            .append_and_broadcast_mls_lifecycle(&room_id, |seq| {
+                Some(format!(r#"{{"type":"userjoined","control_seq":{seq}}}"#))
+            })
+            .expect("creator lifecycle");
+        assert!(state.mark_creator_control_ready(&room_id, creator));
+
+        assert!(evict_group_participant(
+            &state,
+            room_id,
+            creator,
+            "test definitive creator departure",
+        ));
+        assert!(
+            !state.rooms.contains_key(&room_id),
+            "an established creator-centric group cannot survive creator eviction",
+        );
+    }
+
+    #[test]
+    fn relay_correlates_welcome_and_limits_keypackage_per_admission() {
+        use crate::state::app_state::MlsControlAppendError;
+
+        let state = AppState::new(1000, test_config());
+        let room = Room::new(RoomConfig {
+            room_type: RoomType::Group,
+            ttl_minutes: 60,
+            max_participants: 4,
+        });
+        let room_id = room.id;
+        let creator = room
+            .creator_connection_id()
+            .expect("group room has creator binding");
+        state.try_create_room(room).unwrap();
+        let joiner = Uuid::new_v4();
+        let noncreator = Uuid::new_v4();
+        let key_package_ref = mls_key_package_ref(b"accepted-key-package").unwrap();
+        assert_eq!(
+            key_package_ref, "RS0flmwTqm9bsvjt1GZttoE7EkV1iO5FP3xaZxOqNGE",
+            "relay RefHash matches the MLS client implementation",
+        );
+
+        assert_eq!(
+            state
+                .append_and_broadcast_mls_envelope(
+                    &room_id,
+                    MlsControlAdmission::KeyPackage {
+                        sender_id: joiner,
+                        key_package_ref: key_package_ref.clone(),
+                    },
+                    |seq| Some(format!(r#"{{"type":"kp","control_seq":{seq}}}"#)),
+                )
+                .expect("first KeyPackage for stable admission"),
+            1
+        );
+        assert!(matches!(
+            state.append_and_broadcast_mls_envelope(
+                &room_id,
+                MlsControlAdmission::KeyPackage {
+                    sender_id: joiner,
+                    key_package_ref: key_package_ref.clone(),
+                },
+                |seq| Some(format!(r#"{{"type":"kp2","control_seq":{seq}}}"#)),
+            ),
+            Err(MlsControlAppendError::DuplicateKeyPackage),
+        ));
+
+        let serialized = std::cell::Cell::new(false);
+        assert_eq!(
+            state.append_and_broadcast_mls_envelope(
+                &room_id,
+                MlsControlAdmission::Commit {
+                    sender_id: noncreator,
+                },
+                |seq| {
+                    serialized.set(true);
+                    Some(format!(r#"{{"type":"commit-bad","control_seq":{seq}}}"#))
+                },
+            ),
+            Err(MlsControlAppendError::UnauthorizedGroupCreatorControl),
+        );
+        assert!(
+            !serialized.get(),
+            "unauthorized Commit is rejected before sequence allocation/serialization"
+        );
+        assert_eq!(
+            state
+                .append_and_broadcast_mls_envelope(
+                    &room_id,
+                    MlsControlAdmission::Commit { sender_id: creator },
+                    |seq| Some(format!(r#"{{"type":"commit-ok","control_seq":{seq}}}"#)),
+                )
+                .expect("creator ordinary Commit is accepted"),
+            2,
+            "rejected non-creator Commit did not consume a sequence"
+        );
+
+        let commit_ref = "C".repeat(43);
+        assert!(matches!(
+            state.append_and_broadcast_mls_envelope(
+                &room_id,
+                MlsControlAdmission::AddCommit {
+                    sender_id: creator,
+                    commit_ref: "U".repeat(43),
+                    key_package_ref: "X".repeat(43),
+                },
+                |seq| Some(format!(r#"{{"type":"commit0","control_seq":{seq}}}"#)),
+            ),
+            Err(MlsControlAppendError::UnknownKeyPackageRef),
+        ));
+        assert_eq!(
+            state.append_and_broadcast_mls_envelope(
+                &room_id,
+                MlsControlAdmission::AddCommit {
+                    sender_id: noncreator,
+                    commit_ref: commit_ref.clone(),
+                    key_package_ref: key_package_ref.clone(),
+                },
+                |seq| Some(format!(r#"{{"type":"commit-bad","control_seq":{seq}}}"#)),
+            ),
+            Err(MlsControlAppendError::UnauthorizedGroupCreatorControl),
+            "a non-creator cannot consume a valid KeyPackageRef"
+        );
+        assert_eq!(
+            state
+                .append_and_broadcast_mls_envelope(
+                    &room_id,
+                    MlsControlAdmission::AddCommit {
+                        sender_id: creator,
+                        commit_ref: commit_ref.clone(),
+                        key_package_ref: key_package_ref.clone(),
+                    },
+                    |seq| Some(format!(r#"{{"type":"commit","control_seq":{seq}}}"#)),
+                )
+                .expect("creator Add Commit registers one pending Welcome"),
+            3,
+            "rejected Add Commits consumed neither sequence nor KeyPackageRef"
+        );
+        assert!(matches!(
+            state.append_and_broadcast_mls_envelope(
+                &room_id,
+                MlsControlAdmission::KeyPackage {
+                    sender_id: Uuid::new_v4(),
+                    key_package_ref: key_package_ref.clone(),
+                },
+                |seq| Some(format!(r#"{{"type":"kp-replay","control_seq":{seq}}}"#)),
+            ),
+            Err(MlsControlAppendError::DuplicateKeyPackageRef),
+        ));
+
+        assert_eq!(
+            state.append_and_broadcast_mls_envelope(
+                &room_id,
+                MlsControlAdmission::Welcome {
+                    sender_id: noncreator,
+                    commit_ref: commit_ref.clone(),
+                    key_package_ref: key_package_ref.clone(),
+                },
+                |seq| Some(format!(r#"{{"type":"welcome","control_seq":{seq}}}"#)),
+            ),
+            Err(MlsControlAppendError::UnauthorizedGroupCreatorControl),
+            "a non-creator cannot consume the creator's pending Welcome correlation"
+        );
+        assert!(matches!(
+            state.append_and_broadcast_mls_envelope(
+                &room_id,
+                MlsControlAdmission::Welcome {
+                    sender_id: creator,
+                    commit_ref: "M".repeat(43),
+                    key_package_ref: key_package_ref.clone(),
+                },
+                |seq| Some(format!(r#"{{"type":"welcome-bad","control_seq":{seq}}}"#)),
+            ),
+            Err(MlsControlAppendError::WelcomeNotCorrelated),
+        ));
+        assert_eq!(
+            state
+                .append_and_broadcast_mls_envelope(
+                    &room_id,
+                    MlsControlAdmission::Welcome {
+                        sender_id: creator,
+                        commit_ref: commit_ref.clone(),
+                        key_package_ref: key_package_ref.clone(),
+                    },
+                    |seq| Some(format!(r#"{{"type":"welcome","control_seq":{seq}}}"#)),
+                )
+                .expect("matching creator Welcome consumes the correlation"),
+            4,
+            "rejected Welcome controls consumed neither sequence nor correlation"
+        );
+        assert!(matches!(
+            state.append_and_broadcast_mls_envelope(
+                &room_id,
+                MlsControlAdmission::Welcome {
+                    sender_id: creator,
+                    commit_ref,
+                    key_package_ref,
+                },
+                |seq| Some(format!(r#"{{"type":"welcome2","control_seq":{seq}}}"#)),
+            ),
+            Err(MlsControlAppendError::WelcomeNotCorrelated),
+        ));
+
+        let departed_joiner = Uuid::new_v4();
+        let departed_key_package_ref = mls_key_package_ref(b"departed-key-package").unwrap();
+        let departed_commit_ref = "D".repeat(43);
+        state
+            .append_and_broadcast_mls_envelope(
+                &room_id,
+                MlsControlAdmission::KeyPackage {
+                    sender_id: departed_joiner,
+                    key_package_ref: departed_key_package_ref.clone(),
+                },
+                |seq| Some(format!(r#"{{"type":"kp3","control_seq":{seq}}}"#)),
+            )
+            .expect("departing joiner publishes KeyPackage");
+        state
+            .append_and_broadcast_mls_envelope(
+                &room_id,
+                MlsControlAdmission::AddCommit {
+                    sender_id: creator,
+                    commit_ref: departed_commit_ref.clone(),
+                    key_package_ref: departed_key_package_ref.clone(),
+                },
+                |seq| Some(format!(r#"{{"type":"commit3","control_seq":{seq}}}"#)),
+            )
+            .expect("accepted Add registers target-bound Welcome correlation");
+        state.forget_mls_control_participant(room_id, &departed_joiner);
+        assert!(
+            matches!(
+                state.append_and_broadcast_mls_envelope(
+                    &room_id,
+                    MlsControlAdmission::Welcome {
+                        sender_id: creator,
+                        commit_ref: departed_commit_ref,
+                        key_package_ref: departed_key_package_ref,
+                    },
+                    |seq| Some(format!(r#"{{"type":"welcome3","control_seq":{seq}}}"#)),
+                ),
+                Err(MlsControlAppendError::WelcomeNotCorrelated),
+            ),
+            "departure of the Welcome target removes the pending correlation"
         );
     }
 }

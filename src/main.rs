@@ -219,10 +219,16 @@ async fn main() {
         std::process::exit(1);
     }
 
-    // In reverse-proxy HTTP mode, secure cookies must be forced in production.
-    if config.force_http && !config.force_secure_cookies && privacy_mode != "development" {
-        eprintln!("❌ FATAL: FORCE_HTTP=true requires FORCE_SECURE_COOKIES=true in production.");
-        eprintln!("   This prevents session cookies from being sent over insecure transport.");
+    // Reverse-proxy mode has preconditions that are easy to miss and costly
+    // when missed (see Config::reverse_proxy_misconfiguration). Refuse to
+    // start rather than run degraded; development mode stays permissive.
+    let proxy_problem = if privacy_mode == "development" {
+        None
+    } else {
+        config.reverse_proxy_misconfiguration()
+    };
+    if let Some(problem) = proxy_problem {
+        eprintln!("FATAL: {}", problem);
         std::process::exit(1);
     }
 
@@ -281,6 +287,10 @@ async fn main() {
             header::HeaderName::from_static("x-pow-nonce"),
             header::HeaderName::from_static("x-pow-challenge"),
             header::HeaderName::from_static("x-pow-difficulty"),
+            header::HeaderName::from_static("x-csrf-token"),
+            header::HeaderName::from_static("x-pinchat-resume-token"),
+            header::HeaderName::from_static("x-pinchat-creator-bootstrap"),
+            header::HeaderName::from_static("x-pinchat-mls-control-seq"),
         ]);
 
     // Configure rate limiting for login endpoint (brute force protection)
@@ -399,9 +409,12 @@ async fn main() {
         .layer(rate_limiter.clone())
         .with_state(app_state.clone());
 
-    // Apply rate limiting to WebSocket token endpoint (with auth)
+    // Apply rate limiting to WebSocket token endpoint (with auth + CSRF).
+    // POST (not GET) so the request body cannot be forged as a top-level
+    // navigation; CSRF double-submit token gating applied inside the
+    // handler itself.
     let rate_limited_ws_token = Router::new()
-        .route("/api/ws-token/:room_id", get(generate_ws_token))
+        .route("/api/ws-token/:room_id", post(generate_ws_token))
         .layer(middleware::from_fn_with_state(
             app_state.clone(),
             require_auth_api,
