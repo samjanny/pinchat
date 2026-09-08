@@ -1,9 +1,9 @@
 /**
- * PinChat — Cookie notice (informational only).
+ * PinChat - Cookie notice (informational only).
  *
  * The site uses only strictly-necessary cookies (session, CSRF). Under
  * GDPR/ePrivacy these don't require consent, so this is a transparency
- * notice — not a consent banner. Dismissed state lives in localStorage,
+ * notice - not a consent banner. Dismissed state lives in localStorage,
  * never in a cookie, so dismissing it does not itself create tracking.
  *
  * Versioned key (`_v1`) so we can re-show the notice if the cookie set

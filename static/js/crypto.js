@@ -7,7 +7,7 @@
  * Clients before this release are "v0 implicit" and will be rejected.
  */
 const PINCHAT_PROTOCOL_VERSION = 1;
-// Browser path: expose to window. Node test harness has no window — the
+// Browser path: expose to window. Node test harness has no window - the
 // Node export block at the bottom of this file mirrors the value onto
 // globalThis there. The `typeof` guard keeps both runtimes happy.
 if (typeof window !== 'undefined') {
@@ -417,8 +417,8 @@ class CryptoManager {
      * to sessionStorage and scrubs the URL bar (C-06).
      *
      * Sources, in priority order:
-     *   1. window.location.hash — initial page load via the invite link.
-     *   2. sessionStorage[`pinchat_hash:${pathname}`] — post-login restore
+     *   1. window.location.hash - initial page load via the invite link.
+     *   2. sessionStorage[`pinchat_hash:${pathname}`] - post-login restore
      *      (login-stash.js / websocket.js / homepage.js) AND in-tab re-reads
      *      after C-06 has already scrubbed the URL on a previous call.
      *
@@ -440,7 +440,7 @@ class CryptoManager {
 
         // Priority 2: sessionStorage stash (login-stash.js, in-tab re-read,
         // or websocket.js's 401-bounce path). We intentionally do NOT
-        // remove the stash here — the post-import block below rewrites it
+        // remove the stash here - the post-import block below rewrites it
         // anyway, and leaving it in place during the import phase means a
         // crash before the rewrite still keeps the secret recoverable.
         if (!fragment) {
@@ -712,7 +712,7 @@ class CryptoManager {
      * Full reset of ratchet state and re-extraction of the bootstrap key.
      *
      * Tears down the live Double Ratchet instance (the only ratchet at
-     * runtime — the legacy single-chain path was removed in the C-13
+     * runtime - the legacy single-chain path was removed in the C-13
      * hygiene pass) and re-reads the bootstrap key from the URL fragment
      * or sessionStorage. Throws BOOTSTRAP_KEY_LOST when neither source
      * has it any more so the caller can surface "re-open the room link"
@@ -721,7 +721,7 @@ class CryptoManager {
      * @throws {Error} 'BOOTSTRAP_KEY_LOST' if the URL fragment / sessionStorage stash is missing.
      */
     async resetToBootstrapKey() {
-        debugLog('[CRYPTO] Full reset → re-extract bootstrap key');
+        debugLog('[CRYPTO] Full reset -> re-extract bootstrap key');
 
         if (this.doubleRatchet) {
             this.doubleRatchet.destroy();

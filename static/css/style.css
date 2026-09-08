@@ -1,11 +1,11 @@
-/* Design tokens — Linear / SaaS (light by default, dark via [data-theme="dark"]).
+/* Design tokens - Linear / SaaS (light by default, dark via [data-theme="dark"]).
  * Violet primary + cool-blue secondary; surfaces kept slightly cool-tinted so
- * shadows read as "cold blue-grey" rather than pure black — the signature
+ * shadows read as "cold blue-grey" rather than pure black - the signature
  * Linear.app feel. Variable names are unchanged for backward compat with all
  * downstream selectors. */
 :root {
     /* Brand */
-    --primary: #6e5df0;          /* Violet — hero accent */
+    --primary: #6e5df0;          /* Violet - hero accent */
     --primary-dark: #5848d1;     /* hover */
     --primary-light: #b6a8ff;    /* subtle accent fills */
     --accent: #2f6fe8;           /* Secondary blue */
@@ -20,7 +20,7 @@
     --error: #d63a56;
     --error-dark: #a02a40;
 
-    /* Surfaces — cool-neutral greys, not pure whites */
+    /* Surfaces - cool-neutral greys, not pure whites */
     --bg: #ffffff;
     --bg-secondary: #f7f8fb;     /* sidebar / page-bg alt */
     --bg-card: #fbfbfd;          /* elevated card */
@@ -38,7 +38,7 @@
     --border-medium: #d2d5dc;
     --border-strong: #a0a3ad;
 
-    /* Shadows — Linear's signature layered blue-grey tint */
+    /* Shadows - Linear's signature layered blue-grey tint */
     --shadow-sm: 0 1px 2px rgba(17, 20, 45, 0.06);
     --shadow-md: 0 1px 2px rgba(17, 20, 45, 0.06), 0 8px 24px rgba(17, 20, 45, 0.08);
     --shadow-lg: 0 1px 3px rgba(17, 20, 45, 0.06), 0 16px 40px rgba(17, 20, 45, 0.10);
@@ -2094,7 +2094,7 @@ footer::before {
    (rounded corners, 1px cool-grey borders, subtle shadows, sentence-case
    buttons). Every selector below matches an existing rule earlier in this
    file; later-rule-wins in the cascade does the rest. Nothing here touches
-   layout primitives — only visual finish.
+   layout primitives - only visual finish.
    ========================================================================== */
 
 /* Card: rounded, no gradient top-bar, soft border */
@@ -2280,7 +2280,7 @@ input[type="password"]:focus {
     letter-spacing: 0;
 }
 
-/* SAS modal: Linear dialog feel — rounded, soft overlay */
+/* SAS modal: Linear dialog feel - rounded, soft overlay */
 .sas-modal {
     backdrop-filter: blur(6px);
     -webkit-backdrop-filter: blur(6px);
@@ -2299,7 +2299,7 @@ input[type="password"]:focus {
 }
 
 /* ==========================================================================
-   Homepage — Linear hero, 2-col grid, info cards, feature grid
+   Homepage - Linear hero, 2-col grid, info cards, feature grid
    New components introduced by index.html markup refactor in v0.3.0.
    ========================================================================== */
 
@@ -2622,7 +2622,7 @@ input[type="password"]:focus {
 }
 
 /* ==========================================================================
-   Chat page — Linear style (v0.3.0)
+   Chat page - Linear style (v0.3.0)
    Overrides on top of the legacy chat CSS block. Preserves the DOM structure
    that Alpine depends on (all x-*, @click, :class bindings), but swaps the
    "enterprise security" look (uppercase badges, 4px left accent borders,
@@ -3143,7 +3143,7 @@ input[type="password"]:focus {
 .sidebar-item-static .sidebar-item-label { font-weight: 500; }
 
 /* ==========================================================================
-   SAS verification modal — Linear dialog
+   SAS verification modal - Linear dialog
    ========================================================================== */
 
 .sas-modal {
@@ -3427,7 +3427,7 @@ input[type="password"]:focus {
 .sas-modal-content .btn-centered { display: none; }
 
 /* ==========================================================================
-   Legal link rows — footer (homepage, chat sidebar, login)
+   Legal link rows - footer (homepage, chat sidebar, login)
    Shared subtle style: small, muted, underline on hover.
    ========================================================================== */
 .footer-links {
@@ -3478,7 +3478,7 @@ input[type="password"]:focus {
 }
 
 /* ==========================================================================
-   Legal pages (Terms / Privacy) — wider column, proper heading rhythm
+   Legal pages (Terms / Privacy) - wider column, proper heading rhythm
    ========================================================================== */
 
 /* Wider container: 600px is too narrow for legal prose, 760px is the
@@ -3488,7 +3488,7 @@ input[type="password"]:focus {
     padding: 2.5rem 1.5rem 3rem;
 }
 
-/* Legal card — more generous breathing room inside */
+/* Legal card - more generous breathing room inside */
 .page-legal .card {
     padding: 2.25rem 2.25rem 2rem;
 }
@@ -3498,7 +3498,7 @@ input[type="password"]:focus {
 .page-legal .card > p:first-child { margin-top: 0; }
 .page-legal .card p { margin-bottom: 1rem; line-height: 1.65; }
 
-/* Heading rhythm — important: terms.html / privacy.html carry inline
+/* Heading rhythm - important: terms.html / privacy.html carry inline
    style="margin-top:1.75rem" on every h2 (specificity 1000), so we need
    !important to override from the stylesheet. Remove the inline styles
    next time those files get a real refactor. */
@@ -3735,7 +3735,7 @@ input[type="password"]:focus {
 }
 
 /* ==========================================================================
-   Lucide icon system (ISC licensed) — inline SVG sprite via <use href="#i-*">
+   Lucide icon system (ISC licensed) - inline SVG sprite via <use href="#i-*">
    .icon is a bare inline-block; concrete sizes are set per-context below.
    ========================================================================== */
 .icon {
@@ -3760,7 +3760,7 @@ input[type="password"]:focus {
     color: var(--text-light);
 }
 
-/* Feature icons — larger, primary-tinted */
+/* Feature icons - larger, primary-tinted */
 .feature-icon {
     color: var(--primary);
     line-height: 1;
@@ -3861,12 +3861,12 @@ input[type="password"]:focus {
 }
 
 /* ==========================================================================
-   De-box pass — flatten rounded containers / fade top+bottom border strips
+   De-box pass - flatten rounded containers / fade top+bottom border strips
    Applied across homepage, login, legal pages for a consistent Linear look.
    Kept at the bottom of the file so it wins the cascade over earlier rules.
    ========================================================================== */
 
-/* ---- Homepage: create-room card — flatten (no box, no shadow) ---- */
+/* ---- Homepage: create-room card - flatten (no box, no shadow) ---- */
 .card.create-room-card,
 .card.create-room-card:hover {
     background: transparent;
@@ -3895,7 +3895,7 @@ input[type="password"]:focus {
     margin-bottom: 32px;
 }
 
-/* ---- Homepage: info-stack (vertical) — fade top+bottom strips ---- */
+/* ---- Homepage: info-stack (vertical) - fade top+bottom strips ---- */
 .info-stack { gap: 0; }
 .info-card {
     background: transparent;
@@ -3918,7 +3918,7 @@ input[type="password"]:focus {
 .info-card h3 { margin-bottom: 10px; }
 .info-card p { line-height: 1.7; }
 
-/* ---- Homepage: feature grid — flat tiles, no box ---- */
+/* ---- Homepage: feature grid - flat tiles, no box ---- */
 .feature-grid {
     margin-top: 112px;
     gap: 40px;
@@ -3935,7 +3935,7 @@ input[type="password"]:focus {
 .feature-title { margin-bottom: 8px; }
 .feature-desc { line-height: 1.65; }
 
-/* ---- Homepage: disclaimer info-boxes — neutral fade strips ---- */
+/* ---- Homepage: disclaimer info-boxes - neutral fade strips ---- */
 .disclaimer-stack { margin-top: 88px; gap: 0; }
 .info-box.warning,
 [data-theme="dark"] .info-box.warning,
@@ -3986,7 +3986,7 @@ input[type="password"]:focus {
     padding: 0;
 }
 
-/* ---- Legal pages (terms / privacy): remove card box — content IS the page ---- */
+/* ---- Legal pages (terms / privacy): remove card box - content IS the page ---- */
 .page-legal .card,
 .page-legal .card:hover {
     background: transparent;
@@ -3997,7 +3997,7 @@ input[type="password"]:focus {
 }
 .page-legal .card::before { display: none; }
 
-/* Cookie notice — informational, not a consent banner.
+/* Cookie notice - informational, not a consent banner.
  * Floating bottom card, dismissible. Hidden by default; cookie-notice.js
  * removes the .hidden class only if the user has not dismissed it before. */
 .cookie-notice {

@@ -104,8 +104,8 @@ class ProofOfWork {
      * @returns {string} Hexadecimal string representing the 32-byte mask
      *
      * @example
-     * - difficulty = 8  → mask = "ff000000..." (first byte must be 0xff)
-     * - difficulty = 12 → mask = "fff00000..." (first 12 bits must be 1)
+     * - difficulty = 8  -> mask = "ff000000..." (first byte must be 0xff)
+     * - difficulty = 12 -> mask = "fff00000..." (first 12 bits must be 1)
      */
     static generateMask(difficulty) {
         difficulty = Math.min(difficulty, 255); // Cap at SHA-256 output size

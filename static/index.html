@@ -87,7 +87,7 @@
                         <!-- Submit -->
                         <button type="submit" class="btn btn-primary" :disabled="$store.homepage.loading">
                             <span x-show="!$store.homepage.loading">Create room</span>
-                            <span x-show="$store.homepage.loading" x-text="$store.homepage.loadingMessage">Creating…</span>
+                            <span x-show="$store.homepage.loading" x-text="$store.homepage.loadingMessage">Creating...</span>
                         </button>
 
                         <!-- Feedback -->
@@ -100,7 +100,7 @@
                 <aside class="info-stack" id="security">
                     <div class="info-card">
                         <h3>How the link works</h3>
-                        <p>Your room URL looks like <code>/c/&lt;id&gt;#key=&lt;b64&gt;</code>. The fragment after <code>#</code> stays on the client — RFC 3986 — so the server never sees the symmetric key.</p>
+                        <p>Your room URL looks like <code>/c/&lt;id&gt;#key=&lt;b64&gt;</code>. The fragment after <code>#</code> stays on the client - RFC 3986 - so the server never sees the symmetric key.</p>
                     </div>
                     <div class="info-card">
                         <h3>What the server sees</h3>
@@ -108,7 +108,7 @@
                     </div>
                     <div class="info-card">
                         <h3>Identity verification</h3>
-                        <p>Before any message goes through, you'll see a <strong>Short Authentication String</strong> — 8 emoji derived from both parties' identity keys. Confirm it out-of-band to rule out MITM.</p>
+                        <p>Before any message goes through, you'll see a <strong>Short Authentication String</strong> - 8 emoji derived from both parties' identity keys. Confirm it out-of-band to rule out MITM.</p>
                     </div>
                 </aside>
 
@@ -134,7 +134,7 @@
                 <div class="feature">
                     <div class="feature-icon"><svg class="icon" aria-hidden="true"><use href="#i-timer"/></svg></div>
                     <div class="feature-title">Auto-destruction</div>
-                    <div class="feature-desc">Rooms delete themselves at expiration. Short or long — you decide up front.</div>
+                    <div class="feature-desc">Rooms delete themselves at expiration. Short or long - you decide up front.</div>
                 </div>
                 <div class="feature">
                     <div class="feature-icon"><svg class="icon" aria-hidden="true"><use href="#i-code"/></svg></div>
@@ -156,7 +156,7 @@
                 </div>
 
                 <div class="info-box warning">
-                    <h3><svg class="icon" aria-hidden="true"><use href="#i-alert"/></svg>Experimental software — use at your own risk</h3>
+                    <h3><svg class="icon" aria-hidden="true"><use href="#i-alert"/></svg>Experimental software - use at your own risk</h3>
                     <p>PinChat is an experimental prototype provided strictly for educational and research purposes. It is <strong>NOT designed, intended, or warranted</strong> for production use, the protection of real-world sensitive, personal, financial, or confidential data, or safety-critical, life-critical, or mission-critical communications.</p>
                     <p style="margin-top:0.75rem">Although it uses modern cryptographic techniques, it has <strong>not undergone a formal security review or audit</strong>, and may contain serious vulnerabilities. You can audit the code yourself on <a href="https://github.com/samjanny/pinchat" target="_blank" rel="noopener noreferrer">GitHub</a>.</p>
                 </div>
@@ -219,7 +219,7 @@
         </symbol>
     </svg>
 
-    <!-- Cookie notice (informational, dismissible — see static/js/cookie-notice.js) -->
+    <!-- Cookie notice (informational, dismissible - see static/js/cookie-notice.js) -->
     <div id="cookie-notice" class="cookie-notice hidden" role="region" aria-label="Cookie notice">
         <span class="cookie-notice-text">This site uses only strictly necessary cookies (session, CSRF). No tracking, no analytics. <a href="/static/privacy.html">Privacy</a></span>
         <button type="button" class="cookie-notice-ok">OK</button>

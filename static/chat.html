@@ -25,7 +25,7 @@
             <!-- You (current user) -->
             <div class="sidebar-item active" :title="userId">
                 <span class="dot" :class="connected ? 'on' : 'off'"></span>
-                <span class="sidebar-item-label"><span x-text="myNickname || '…'">…</span></span>
+                <span class="sidebar-item-label"><span x-text="myNickname || '...'">...</span></span>
                 <span class="sidebar-item-badge">you</span>
             </div>
 
@@ -45,22 +45,22 @@
             <template x-if="participantCount < 2">
                 <div class="sidebar-item sidebar-item-muted">
                     <span class="dot off"></span>
-                    <span class="sidebar-item-label">Waiting for peer…</span>
+                    <span class="sidebar-item-label">Waiting for peer...</span>
                 </div>
             </template>
 
             <div class="sidebar-group">Room</div>
             <div class="sidebar-item sidebar-item-static">
-                <span class="sidebar-item-label" x-text="roomType === 'onetoone' ? '1 : 1' : (roomType === 'group' ? 'Group' : '…')">1 : 1</span>
-                <span class="sidebar-item-badge" x-text="roomId ? roomId.substring(0,6) + '…' : '—'">—</span>
+                <span class="sidebar-item-label" x-text="roomType === 'onetoone' ? '1 : 1' : (roomType === 'group' ? 'Group' : '...')">1 : 1</span>
+                <span class="sidebar-item-badge" x-text="roomId ? roomId.substring(0,6) + '...' : '-'">-</span>
             </div>
 
             <div class="sidebar-group">Session</div>
             <div class="sidebar-info">
-                <div class="row"><span class="k">Room</span><b x-text="roomId ? roomId.substring(0,8) + '…' : '—'">—</b></div>
-                <div class="row"><span class="k">Time left</span><b x-text="timeRemaining ? formatTime(timeRemaining).replace('⏱️ ', '') : '—'">—</b></div>
+                <div class="row"><span class="k">Room</span><b x-text="roomId ? roomId.substring(0,8) + '...' : '-'">-</b></div>
+                <div class="row"><span class="k">Time left</span><b x-text="timeRemaining ? formatTime(timeRemaining).replace('⏱️ ', '') : '-'">-</b></div>
                 <div class="row"><span class="k">Participants</span><b><span x-text="participantCount">0</span>/<span x-text="maxParticipants !== null ? maxParticipants : '-'">-</span></b></div>
-                <div class="row"><span class="k">Max image</span><b x-text="maxImageSize ? (Math.round(maxImageSize/1024) + ' KB') : '—'">—</b></div>
+                <div class="row"><span class="k">Max image</span><b x-text="maxImageSize ? (Math.round(maxImageSize/1024) + ' KB') : '-'">-</b></div>
             </div>
 
             <div class="sidebar-foot">
@@ -96,7 +96,7 @@
                 </div>
                 <div class="room-details">
                     <!-- Show loading state until server sends room config -->
-                    <span class="badge" x-text="roomType ? (roomType === 'onetoone' ? '1:1' : 'Group') : 'Loading…'"></span>
+                    <span class="badge" x-text="roomType ? (roomType === 'onetoone' ? '1:1' : 'Group') : 'Loading...'"></span>
                     <span class="participants"><svg class="icon" aria-hidden="true"><use href="#i-users"/></svg><span x-text="participantCount"></span>/<span x-text="maxParticipants !== null ? maxParticipants : '-'"></span></span>
                     <span class="ttl-countdown" x-show="timeRemaining" x-text="formatTime(timeRemaining).replace('⏱️ ', '')"></span>
 
@@ -134,19 +134,19 @@
 
         <!-- Context strip: static room metadata shown once handshake is complete -->
         <div class="chat-context-strip" x-show="connected && roomId">
-            <span class="kv"><span class="k">Room</span> <b x-text="roomId ? roomId.substring(0,8) + '…' : ''"></b></span>
+            <span class="kv"><span class="k">Room</span> <b x-text="roomId ? roomId.substring(0,8) + '...' : ''"></b></span>
             <span class="sep"></span>
-            <span class="kv"><span class="k">TTL</span> <b x-text="ttlMinutes ? (ttlMinutes < 60 ? ttlMinutes + 'm' : (ttlMinutes % 60 === 0 ? (ttlMinutes/60) + 'h' : Math.floor(ttlMinutes/60) + 'h ' + (ttlMinutes%60) + 'm')) : '—'"></b></span>
+            <span class="kv"><span class="k">TTL</span> <b x-text="ttlMinutes ? (ttlMinutes < 60 ? ttlMinutes + 'm' : (ttlMinutes % 60 === 0 ? (ttlMinutes/60) + 'h' : Math.floor(ttlMinutes/60) + 'h ' + (ttlMinutes%60) + 'm')) : '-'"></b></span>
             <span class="sep"></span>
             <span class="kv"><span class="k">Participants</span> <b><span x-text="participantCount"></span>/<span x-text="maxParticipants !== null ? maxParticipants : '-'"></span></b></span>
             <span class="sep"></span>
-            <span class="kv"><span class="k">Max image</span> <b x-text="maxImageSize ? (Math.round(maxImageSize/1024) + ' KB') : '—'"></b></span>
+            <span class="kv"><span class="k">Max image</span> <b x-text="maxImageSize ? (Math.round(maxImageSize/1024) + ' KB') : '-'"></b></span>
         </div>
 
         <!-- Status -->
         <div x-show="!connected" class="status-banner warning">
             <span x-show="connecting" x-text="connectingMessage || 'Connecting...'"></span>
-            <span x-show="!connecting && !connected"><svg class="icon" aria-hidden="true"><use href="#i-alert"/></svg> Disconnected — <button @click="reconnect" class="link-button">Reconnect</button></span>
+            <span x-show="!connecting && !connected"><svg class="icon" aria-hidden="true"><use href="#i-alert"/></svg> Disconnected - <button @click="reconnect" class="link-button">Reconnect</button></span>
         </div>
 
         <div x-show="error" class="status-banner error">
@@ -239,7 +239,7 @@
 
             <!-- PFS Handshake Status Banner (1:1 chats only, peer present) -->
             <div x-show="connected && roomType === 'onetoone' && participantCount === 2 && !pfsActive" class="security-status-banner">
-                <svg class="icon" aria-hidden="true"><use href="#i-lock"/></svg> Establishing secure end-to-end encryption… Please wait.
+                <svg class="icon" aria-hidden="true"><use href="#i-lock"/></svg> Establishing secure end-to-end encryption... Please wait.
             </div>
 
             <!-- Legacy non-1:1 room. Group creation is refused by the API
@@ -387,7 +387,7 @@
                         </div>
                     </div>
 
-                    <!-- Emoji SAS (Primary) — rendered via x-for + x-text so the SAS string never touches innerHTML. -->
+                    <!-- Emoji SAS (Primary) - rendered via x-for + x-text so the SAS string never touches innerHTML. -->
                     <div class="sas-code-emoji" aria-label="Short Authentication String">
                         <template x-for="(emoji, index) in sasEmojiArray(sas ? (sas.emoji || '') : '')" :key="'sas-' + index">
                             <span x-text="emoji"></span>
@@ -520,7 +520,7 @@
         </symbol>
     </svg>
 
-    <!-- Cookie notice (informational, dismissible — see static/js/cookie-notice.js) -->
+    <!-- Cookie notice (informational, dismissible - see static/js/cookie-notice.js) -->
     <div id="cookie-notice" class="cookie-notice hidden" role="region" aria-label="Cookie notice">
         <span class="cookie-notice-text">This site uses only strictly necessary cookies (session, CSRF). No tracking, no analytics. <a href="/static/privacy.html">Privacy</a></span>
         <button type="button" class="cookie-notice-ok">OK</button>

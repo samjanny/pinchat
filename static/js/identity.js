@@ -24,7 +24,7 @@
 // We store the ECDSA keypair as an opaque CryptoKey pair in IndexedDB. Per
 // W3C IndexedDB §6 + WebCrypto §13, structured-clone of a CryptoKey
 // preserves the [[extractable]] internal slot. Restoring a non-extractable
-// private key yields another non-extractable CryptoKey — the bytes never
+// private key yields another non-extractable CryptoKey - the bytes never
 // become reachable to JS, even across page loads.
 //
 // The store is scoped to the origin, never synced, and auto-bounded by the
@@ -40,7 +40,7 @@ const IDENTITY_SCHEMA_VERSION = 1;
 /**
  * Open (or create) the identity database. Returns null on any error or
  * when IndexedDB is unavailable (Node, locked-down browsers, private mode
- * with storage blocked, …) — the caller falls back to ephemeral identity.
+ * with storage blocked, ...) - the caller falls back to ephemeral identity.
  *
  * @private
  * @returns {Promise<IDBDatabase|null>}
@@ -70,7 +70,7 @@ function _openIdentityDb() {
 
 /**
  * Load the stored identity keypair if present, valid, and not expired.
- * Returns null on any failure — the caller must regenerate.
+ * Returns null on any failure - the caller must regenerate.
  *
  * @private
  * @returns {Promise<{privateKey: CryptoKey, publicKey: CryptoKey}|null>}
@@ -177,14 +177,14 @@ class IdentityKeyManager {
      * IndexedDB first; only when none is present (first visit, expired
      * TTL, IndexedDB unavailable) does it generate a fresh one and persist
      * it. This keeps the SAS code stable across reconnects, tab refreshes,
-     * and short browser restarts within the TTL window — without that, the
+     * and short browser restarts within the TTL window - without that, the
      * SAS would change on every page load and pressure users into the
      * "Skip verification" path even with a trusted peer.
      *
      * SECURITY: The private key is non-extractable after generation. When
      * later restored from IndexedDB via structured-clone, the
      * [[extractable]] internal slot is preserved (W3C IndexedDB §6 +
-     * WebCrypto §13) — so the bytes never become reachable to JS, neither
+     * WebCrypto §13) - so the bytes never become reachable to JS, neither
      * on creation nor across page loads.
      *
      * @returns {Promise<CryptoKeyPair>}
@@ -199,14 +199,14 @@ class IdentityKeyManager {
             return this.identityKeyPair;
         }
 
-        debugLog('[Identity] No stored identity found — generating fresh ECDSA P-256 keypair...');
+        debugLog('[Identity] No stored identity found - generating fresh ECDSA P-256 keypair...');
 
         // F-02: generate the keypair directly with extractable=false. WebCrypto
         // (W3C §13) sets [[extractable]] per side and for asymmetric ECDSA
         // keypairs the public side is ALWAYS extractable regardless of the
-        // parameter — so exportKey('raw', publicKey) for peer exchange and SAS
-        // continues to work. The prior pattern (extractable=true → export PKCS#8
-        // → re-import non-extractable → fill(0) the buffer) created a window in
+        // parameter - so exportKey('raw', publicKey) for peer exchange and SAS
+        // continues to work. The prior pattern (extractable=true -> export PKCS#8
+        // -> re-import non-extractable -> fill(0) the buffer) created a window in
         // which the raw private key bytes lived in the JS heap as a PKCS#8
         // ArrayBuffer; an XSS or hostile extension running during this window
         // could exfiltrate the long-term identity key. The fill(0) was
@@ -244,7 +244,7 @@ class IdentityKeyManager {
      * Intended for an explicit "forget me on this device" user gesture or
      * for a clean-slate reset after a confirmed compromise. NOT called by
      * destroy(): SAS mismatch / handshake abort should NOT throw away the
-     * user's identity by default — those events typically point at peer
+     * user's identity by default - those events typically point at peer
      * substitution, not at compromise of the user's own private key.
      *
      * @returns {Promise<void>}
@@ -400,7 +400,7 @@ class IdentityKeyManager {
     /**
      * Check if peer identity key changed (used after reconnect).
      *
-     * Compares cached raw bytes — both the previous identity (captured
+     * Compares cached raw bytes - both the previous identity (captured
      * before reconnect) and the current identity must have been imported
      * via importPeerIdentityPublicKey, which populates the *Raw caches.
      *

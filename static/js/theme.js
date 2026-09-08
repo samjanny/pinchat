@@ -25,7 +25,7 @@
         try {
             localStorage.setItem(STORAGE_KEY, value);
         } catch (e) {
-            /* storage unavailable — fall through */
+            /* storage unavailable - fall through */
         }
     }
 

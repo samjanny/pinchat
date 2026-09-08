@@ -12,19 +12,19 @@ class WebSocketManager {
         this.isManuallyDisconnected = false;
 
         // Terminal session flags (v1).
-        // _fatalAuthFailure: explicit protocol/auth mismatch → no auto-reconnect,
+        // _fatalAuthFailure: explicit protocol/auth mismatch -> no auto-reconnect,
         //                    page refresh required (set by requestWsToken gate,
         //                    onopen subprotocol mismatch, SIGNATURE_INVALID).
         // _connectionExhausted: transient transport failure after N retries
-        //                    → user-initiated reconnect gets a fresh budget.
+        //                    -> user-initiated reconnect gets a fresh budget.
         this._fatalAuthFailure = false;
         this._connectionExhausted = false;
 
         // C-01: serial dispatch queue for inbound messages. The DoubleRatchet
         // has its own internal mutex, but app.js#handleWebSocketMessage also
         // mutates non-cryptographic state (participantCount, peerUserId,
-        // ecdhHandshakeStatus, …) and must observe messages in arrival order.
-        // Errors do not poison the queue — see the .catch() in onmessage.
+        // ecdhHandshakeStatus, ...) and must observe messages in arrival order.
+        // Errors do not poison the queue - see the .catch() in onmessage.
         this._inboundQueue = Promise.resolve();
 
         // Token caching for reconnection (avoids PoW on every reconnect)
@@ -182,7 +182,7 @@ class WebSocketManager {
             // v1 gate: verify the server advertises a compatible protocol version
             // and the pinchat.v1 subprotocol. This catches client-v1-vs-server-v0
             // mismatches BEFORE we attempt a WebSocket upgrade (where browser
-            // failure modes are opaque — opaque onerror + 1006 close).
+            // failure modes are opaque - opaque onerror + 1006 close).
             const expectedV = window.PINCHAT_PROTOCOL_VERSION || 1;
             if (
                 data.protocol_version !== expectedV ||
@@ -230,7 +230,7 @@ class WebSocketManager {
         // (v1 gate mismatch, SIGNATURE_INVALID, subprotocol mismatch on onopen),
         // refuse to attempt a new connection. The user must refresh the page.
         if (this._fatalAuthFailure) {
-            console.error('[WS] connect() blocked: session is in fatal auth/protocol failure — page refresh required');
+            console.error('[WS] connect() blocked: session is in fatal auth/protocol failure - page refresh required');
             return;
         }
 
@@ -254,7 +254,7 @@ class WebSocketManager {
 
         let token;
 
-        // PATH 1: Creator optimization — token was pre-issued by /api/rooms.
+        // PATH 1: Creator optimization - token was pre-issued by /api/rooms.
         const creatorToken = sessionStorage.getItem(`ws_token_${this.roomId}`);
         const creatorConnectionId = sessionStorage.getItem(`ws_connection_${this.roomId}`);
         const creatorProtoVersion = sessionStorage.getItem(`ws_protocol_version_${this.roomId}`);
@@ -345,7 +345,7 @@ class WebSocketManager {
                 }
                 console.log('✅ WebSocket connected (pinchat.v1)');
                 this.reconnectAttempts = 0;
-                this._connectionExhausted = false;  // successful connection → restore retry budget
+                this._connectionExhausted = false;  // successful connection -> restore retry budget
 
                 // onConnected is async in app.js (await restartECDHHandshake).
                 // Wrap with Promise.resolve().then() so both async errors AND
@@ -418,7 +418,7 @@ class WebSocketManager {
      *
      * Two kinds of terminal state:
      *  - `_fatalAuthFailure`: explicit protocol/auth mismatch (v1 gate,
-     *    SIGNATURE_INVALID, subprotocol echo mismatch). No retry at all —
+     *    SIGNATURE_INVALID, subprotocol echo mismatch). No retry at all -
      *    the user must refresh the page.
      *  - `_connectionExhausted`: transient transport failure after N retries.
      *    The banner tells the user to check their network; a manual Reconnect
@@ -426,7 +426,7 @@ class WebSocketManager {
      */
     attemptReconnect() {
         if (this._fatalAuthFailure) {
-            console.error('Fatal auth/protocol failure — no auto-reconnect');
+            console.error('Fatal auth/protocol failure - no auto-reconnect');
             return;
         }
         if (this.reconnectAttempts >= this.maxReconnectAttempts) {

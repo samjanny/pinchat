@@ -11,7 +11,7 @@
  *
  * Per RFC 7231 §7.1.2 most browsers preserve the original URL fragment
  * across 303 redirects when the Location header carries no fragment of
- * its own — which means the URL bar on /login (and later /static/login.html)
+ * its own - which means the URL bar on /login (and later /static/login.html)
  * still shows `#key=<base64url>`. That is the E2E bootstrap secret and it
  * MUST NOT linger on a page that is not the chat itself: browser history,
  * accidental screen-shares, malicious extensions reading window.location.hash
@@ -53,7 +53,7 @@
     // /c/<base64url-safe identifier>. Anything else (open-redirect attempt,
     // arbitrary internal page, or no redirect at all) means we do not know
     // where the user should land, so we scrub the fragment but DO NOT
-    // persist it — the user will be asked to re-open the invite link.
+    // persist it - the user will be asked to re-open the invite link.
     var match = redirect.match(/^\/c\/([A-Za-z0-9\-_]+)$/);
     if (match) {
         // The crypto.js extractKeyFromURL helper looks up the stash by

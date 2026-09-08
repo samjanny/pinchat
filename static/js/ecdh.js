@@ -761,7 +761,7 @@ class ECDHKeyExchange {
      *
      * The callback may be async (e.g. app.js passes an async arrow that
      * awaits handleECDHAborted). We wrap in Promise.resolve().then() so both
-     * async rejections and synchronous throws are caught — no unhandled
+     * async rejections and synchronous throws are caught - no unhandled
      * promise rejections on the timeout path.
      *
      * @param {Function} onTimeout - Callback if handshake times out

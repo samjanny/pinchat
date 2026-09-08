@@ -3,7 +3,7 @@
  *
  * Features:
  * - Emoji picker with categorized emoji
- * - Automatic emoticon-to-emoji substitution (e.g., :D → 😄)
+ * - Automatic emoticon-to-emoji substitution (e.g., :D -> 😄)
  * - Code block immunity (text inside ``` or ` is not substituted)
  * - Message rendering with code block styling
  */
