@@ -281,11 +281,11 @@ async function runTests() {
             return match[1];
         };
 
-        const pinsOk = chromeTag === 'v0.7.3'
+        const pinsOk = chromeTag === 'v0.7.4'
             && firefoxTag === chromeTag
             && chromeFloor === signed.data.sequence
             && firefoxFloor === chromeFloor
-            && chromeManifest.version === '1.2.5'
+            && chromeManifest.version === '1.2.6'
             && firefoxManifest.version === chromeManifest.version
             && readPublicKey(chromeBackground) === readPublicKey(firefoxBackground);
         if (!pinsOk) {

@@ -4,6 +4,65 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Dates are the repository-local commit dates; entries are curated for user-visible impact
 rather than being a 1:1 mirror of `git log`.
 
+## [2026-09-08] - v0.7.4
+
+Legal text only. No server, client, protocol or extension behaviour change;
+the protocol version stays 1. The signed manifest moves to sequence 46
+because the operator data and the cookie banner changed. Both extensions move
+`MIN_KNOWN_SEQUENCE` to 46 and `GITHUB_TAG` to v0.7.4 in the same commit that
+carries the sequence-46 manifest. Extension version goes to 1.2.6. No
+JavaScript or CSS asset moved, so the inline SRI attributes and both
+preventive CSP rulesets are unchanged from v0.7.3.
+
+### Fixed - the hosting note no longer claims a commitment to Dutch law
+
+The Privacy Policy said the Controller "relies on the provider's contractual
+commitment that the infrastructure is hosted and operated from its facilities
+in the Netherlands and subject to Dutch law". The provider's own published
+documents point the other way. Their privacy policy states "This Privacy
+Policy is governed by the applicable laws of UAE" with UAE courts; their
+terms identify HOST SAILOR LIMITED, incorporated in the United Arab Emirates;
+neither mentions a data-processing agreement, Article 28 or Standard
+Contractual Clauses; and their transfer clause benchmarks against UAE law
+rather than EU law. The sentence "This website is hosted and operated from
+our facilities located in Netherlands" does appear in their privacy policy,
+but it describes hostsailor.com itself rather than a customer's virtual
+machine, and says nothing about Dutch law.
+
+The RIPE registration shows the same split: the allocation 194.36.188.0/24 is
+netname AE-SAILORHOST-20180920 declaring country NL, held by Host Sailor Ltd,
+an LIR registered in the United Arab Emirates at the same Dubai address as
+its terms. The data sits in the EEA while the entity administering it does
+not, which is what keeps Chapter V open rather than closing it.
+
+The note now states only what can be shown: where the machine is, who the
+provider is, that the provider's own instruments are governed by UAE law,
+that remote access from outside the EEA is possible, and that the arrangement
+is therefore treated as a potential Chapter V transfer. It says that whether
+an Article 28 agreement and an Article 46 mechanism exist is being verified,
+and asserts no adequacy decision, derogation or safeguard until that is
+settled. The opening claim that the accepted terms were "in accordance with
+Article 28 GDPR" is reduced to what is known: standard terms that include
+provisions on data processing.
+
+### Changed - the NI-ICS classification is no longer categorical
+
+The note declared "The Service is a number-independent interpersonal
+communications service". An interpersonal communications service is one
+normally provided for remuneration, and the Privacy Policy states the
+Operator acts in a personal, non-commercial capacity with no advertising,
+analytics or profiling, so the premise is not established. The note now
+states the fact that carries the exemption, that no publicly assigned
+numbering resources are used, makes the NI-ICS characterisation conditional,
+and keeps the Article 11(2) point, which holds regardless of how the Service
+describes itself.
+
+### Fixed - the cookie banner named two of three cookies
+
+The banner on all five pages said "(session, CSRF)" while the server sets
+`pinchat_session`, `csrf_token` and `pc_pow`. The Privacy Policy has
+documented all three since the August rewrite; only the banner was stale.
+
 ## [2026-09-08] - v0.7.3
 
 Legal-text corrections plus browser-extension work. No server or protocol
