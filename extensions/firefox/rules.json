@@ -29,7 +29,7 @@
         {
           "header": "content-security-policy",
           "operation": "set",
-          "value": "script-src 'sha256-vc83MC35lVoXBnYkFcbi+cE5EgJ+drCEfcjEryWT40A=' 'sha256-4jyDkg400LlXkyi0zC+QbIJhh6pEYjneo43JWuFVRZc=' 'sha256-p7E0rA/mvQrZ9DMn8DR/rguB17vQ3i3XBJQ/t7M3WiE=' 'sha256-58hj2liWaS9dR44Q2uCJ5hZP7RxcG2offLv3qbCT8FU=' 'sha256-rvb/bHQ2W2jurmYIKaOUhoCD4mg3w94+UbuljCqwDdI='; default-src 'none'; style-src 'self'; img-src 'self' blob:; font-src 'self'; connect-src 'self' wss://pinchat.io wss://www.pinchat.io; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none';"
+          "value": "script-src 'sha256-IFPp16c490XqfYw01UQmSLORmfv7DKKWOXNpQOdw2X0=' 'sha256-dPmlfH5GU0VsCkR6UpDNPzSRAjhm+xm7SNCDyNSnUqQ=' 'sha256-p7E0rA/mvQrZ9DMn8DR/rguB17vQ3i3XBJQ/t7M3WiE=' 'sha256-58hj2liWaS9dR44Q2uCJ5hZP7RxcG2offLv3qbCT8FU=' 'sha256-JefnNU1ms64X4lDQibD4l8z4rVAi+15sb4hle0uE0yM='; default-src 'none'; style-src 'self'; img-src 'self' blob:; font-src 'self'; connect-src 'self' wss://pinchat.io wss://www.pinchat.io; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none';"
         }
       ]
     },
@@ -50,7 +50,7 @@
         {
           "header": "content-security-policy",
           "operation": "set",
-          "value": "script-src 'sha256-DD4V2qth6q+/FQP66jysQ1s7TA4xfiAo5t6etfb6xog=' 'sha256-vc83MC35lVoXBnYkFcbi+cE5EgJ+drCEfcjEryWT40A=' 'sha256-OZ1in+Y/J5HSZFw2fTUVBNtT5fkGtORNMz8/1yp00Qw=' 'sha256-rvb/bHQ2W2jurmYIKaOUhoCD4mg3w94+UbuljCqwDdI='; default-src 'none'; style-src 'self'; img-src 'self' blob:; font-src 'self'; connect-src 'self' wss://pinchat.io wss://www.pinchat.io; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none';"
+          "value": "script-src 'sha256-nZVXHQyP6NFAX/uvbxioVeAql2otcUFi5bYFJtweelg=' 'sha256-IFPp16c490XqfYw01UQmSLORmfv7DKKWOXNpQOdw2X0=' 'sha256-OZ1in+Y/J5HSZFw2fTUVBNtT5fkGtORNMz8/1yp00Qw=' 'sha256-JefnNU1ms64X4lDQibD4l8z4rVAi+15sb4hle0uE0yM='; default-src 'none'; style-src 'self'; img-src 'self' blob:; font-src 'self'; connect-src 'self' wss://pinchat.io wss://www.pinchat.io; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none';"
         }
       ]
     },
@@ -71,7 +71,7 @@
         {
           "header": "content-security-policy",
           "operation": "set",
-          "value": "script-src 'sha256-nY3zkFVKF7x6KVbWq1mwcHq4Y/g8O10iOmLAFfiDsJ8=' 'sha256-ASU9iIy+m7tW1/44K0w3L64PF+nNCD6kwb6rzLbtRts=' 'sha256-myf4gfSaxf1+Hyh+dZxXfvdSPr/uVnGtDOP6kHyNOj4=' 'sha256-bTiyP1mN6HXBqn2IOgTCv15++m5yBdY1uvkk2nYaIXs=' 'sha256-I6uKHd+us1u+AACTLm7YoW0fUqs2h3W8SbJtoaEMzuU=' 'sha256-ixcpU5MEMEueVzVI9CcM5Z3txpcgSSzL5os4W6fMbyg=' 'sha256-XIH9+Dl23vt0UFA4ta7qVW9y63bq5n1BHgsy1xq7UkA=' 'sha256-DoZesQQdHBacyu2kcueZUIh2iqWNVmtBl6RmFJVUu0w=' 'sha256-58hj2liWaS9dR44Q2uCJ5hZP7RxcG2offLv3qbCT8FU=' 'sha256-rvb/bHQ2W2jurmYIKaOUhoCD4mg3w94+UbuljCqwDdI='; default-src 'none'; style-src 'self'; img-src 'self' blob:; font-src 'self'; connect-src 'self' wss://pinchat.io wss://www.pinchat.io; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none';"
+          "value": "script-src 'sha256-nY3zkFVKF7x6KVbWq1mwcHq4Y/g8O10iOmLAFfiDsJ8=' 'sha256-cKHkBoV1Ml0HoCBQz9XGtXe4hsltvtcuts39MIvku2w=' 'sha256-pGHsPP2igLAVOebsIbbOTrxQgUsGCz8ejzU0yQBjUiE=' 'sha256-0WWGASRwfR87dRsOpbVxQpo5/wnQim/+7Fib3h73yQE=' 'sha256-M8sKqyVMg5ezm73wSQcnusiqf26YPnDo8l+NS9D4QsQ=' 'sha256-gWPUIZMTAGyUKh7K9gqDLwl9I5/OHZ/HYqBJvEM7OxY=' 'sha256-egqIwLEXWc2dlgP6N1sF7CLYLyMe01fSUy9dO/uLPmg=' 'sha256-4p6yp2g03zWglHDEqaZKhxs224jxEoOQGrCeA9zTFU4=' 'sha256-58hj2liWaS9dR44Q2uCJ5hZP7RxcG2offLv3qbCT8FU=' 'sha256-JefnNU1ms64X4lDQibD4l8z4rVAi+15sb4hle0uE0yM='; default-src 'none'; style-src 'self'; img-src 'self' blob:; font-src 'self'; connect-src 'self' wss://pinchat.io wss://www.pinchat.io; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none';"
         }
       ]
     },
@@ -92,7 +92,7 @@
         {
           "header": "content-security-policy",
           "operation": "set",
-          "value": "script-src 'sha256-vc83MC35lVoXBnYkFcbi+cE5EgJ+drCEfcjEryWT40A=' 'sha256-/0mBQtNMmpaDKTrI0YoGMLp0Lhcr9V7hFx3hBD4I/Fs=' 'sha256-rvb/bHQ2W2jurmYIKaOUhoCD4mg3w94+UbuljCqwDdI='; default-src 'none'; style-src 'self'; img-src 'self' blob:; font-src 'self'; connect-src 'self' wss://pinchat.io wss://www.pinchat.io; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none';"
+          "value": "script-src 'sha256-IFPp16c490XqfYw01UQmSLORmfv7DKKWOXNpQOdw2X0=' 'sha256-/0mBQtNMmpaDKTrI0YoGMLp0Lhcr9V7hFx3hBD4I/Fs=' 'sha256-JefnNU1ms64X4lDQibD4l8z4rVAi+15sb4hle0uE0yM='; default-src 'none'; style-src 'self'; img-src 'self' blob:; font-src 'self'; connect-src 'self' wss://pinchat.io wss://www.pinchat.io; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none';"
         }
       ]
     },
@@ -113,7 +113,7 @@
         {
           "header": "content-security-policy",
           "operation": "set",
-          "value": "script-src 'sha256-vc83MC35lVoXBnYkFcbi+cE5EgJ+drCEfcjEryWT40A=' 'sha256-/0mBQtNMmpaDKTrI0YoGMLp0Lhcr9V7hFx3hBD4I/Fs=' 'sha256-rvb/bHQ2W2jurmYIKaOUhoCD4mg3w94+UbuljCqwDdI='; default-src 'none'; style-src 'self'; img-src 'self' blob:; font-src 'self'; connect-src 'self' wss://pinchat.io wss://www.pinchat.io; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none';"
+          "value": "script-src 'sha256-IFPp16c490XqfYw01UQmSLORmfv7DKKWOXNpQOdw2X0=' 'sha256-/0mBQtNMmpaDKTrI0YoGMLp0Lhcr9V7hFx3hBD4I/Fs=' 'sha256-JefnNU1ms64X4lDQibD4l8z4rVAi+15sb4hle0uE0yM='; default-src 'none'; style-src 'self'; img-src 'self' blob:; font-src 'self'; connect-src 'self' wss://pinchat.io wss://www.pinchat.io; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none';"
         }
       ]
     },
