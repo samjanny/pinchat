@@ -4,6 +4,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Dates are the repository-local commit dates; entries are curated for user-visible impact
 rather than being a 1:1 mirror of `git log`.
 
+## [2026-09-08] - v0.8.1
+
+### Changed - group rooms can be created from the homepage
+
+v0.8.0 shipped the group protocol behind `GROUP_CHAT_ENABLED` but left the
+homepage's Group option greyed out with a note that predates the MLS work.
+The option is now live: it binds the real room type, shows a members slider
+(2 to 20, the range the server clamps to) and says plainly what a group room
+is, that anyone with the link can join, that members are told apart by key
+fingerprint rather than a security code, and that the creator's tab must
+stay open. On a server with the flag off, creating a group room reports
+"Group rooms are not enabled on this server" instead of a generic error.
+Static files changed, so the manifest is re-signed at sequence 48 and the
+extensions move to 1.3.1 pinned at this tag.
+
 ## [2026-09-08] - v0.8.0
 
 Group chat lands on the main line, disabled by default. The signed manifest

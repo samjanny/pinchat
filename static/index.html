@@ -7,7 +7,7 @@
     <link rel="stylesheet" href="/static/css/style.css" integrity="sha256-EsvGJwz+p98MSvMTLq6Evv71AuXRtjCZYFOjWpsSa2c=" crossorigin="anonymous" >
     <script src="/static/js/theme.js" integrity="sha256-IFPp16c490XqfYw01UQmSLORmfv7DKKWOXNpQOdw2X0=" crossorigin="anonymous" ></script>
     <script src="/static/js/pow.js" integrity="sha256-dPmlfH5GU0VsCkR6UpDNPzSRAjhm+xm7SNCDyNSnUqQ=" crossorigin="anonymous" ></script>
-    <script src="/static/js/homepage.js" integrity="sha256-az0nhCQipPf9yA4lU2CpdUvFSrEit9hBpCd7W2UYRuk=" crossorigin="anonymous" ></script>
+    <script src="/static/js/homepage.js" integrity="sha256-nkwkptXc0qdrK3Y6jqEyblemK4x50XNoOnAadlrDA0M=" crossorigin="anonymous" ></script>
     <script src="/static/js/alpine-csp.min.js" integrity="sha256-58hj2liWaS9dR44Q2uCJ5hZP7RxcG2offLv3qbCT8FU=" crossorigin="anonymous" defer></script>
 </head>
 <body class="page-home">
@@ -53,23 +53,33 @@
                     <p class="card-sub">Room metadata lives only in the server's RAM and is wiped when the TTL elapses.</p>
 
                     <form @submit.prevent="$store.homepage.createRoom()">
-                        <!-- Hidden: group chats are temporarily disabled -->
-                        <input type="hidden" name="roomType" value="onetoone" x-model="$store.homepage.roomType">
-
-                        <!-- Room type (visual segmented control; group is disabled) -->
+                        <!-- Room type -->
                         <div class="form-group">
                             <label>Room type</label>
                             <div class="radio-group segmented" role="radiogroup" aria-label="Room type">
                                 <label class="radio-label">
-                                    <input type="radio" name="rtype-visual" value="onetoone" checked>
+                                    <input type="radio" name="roomType" value="onetoone" x-model="$store.homepage.roomType">
                                     <span>1 : 1 <em class="tag">recommended</em></span>
                                 </label>
-                                <label class="radio-label disabled">
-                                    <input type="radio" name="rtype-visual" value="group" disabled>
-                                    <span>Group <em class="tag">disabled</em></span>
+                                <label class="radio-label">
+                                    <input type="radio" name="roomType" value="group" x-model="$store.homepage.roomType">
+                                    <span>Group <em class="tag">up to 20</em></span>
                                 </label>
                             </div>
-                            <small>Group chat is temporarily disabled until a tree-based group key agreement is in place.</small>
+                            <small x-show="$store.homepage.roomType === 'onetoone'">Two participants. The security code check gates the first message.</small>
+                            <small x-show="$store.homepage.roomType === 'group'">Anyone with the link can join; members are told apart by key fingerprint, not by a security code. The creator's tab must stay open for the life of the group.</small>
+                        </div>
+
+                        <!-- Members (group rooms only) -->
+                        <div class="form-group" x-show="$store.homepage.roomType === 'group'">
+                            <label for="members">Members</label>
+                            <div class="slider-row">
+                                <input type="range" id="members" class="slider" min="2" max="20" step="1" x-model.number="$store.homepage.maxParticipants">
+                                <div class="slider-val">
+                                    <span x-text="$store.homepage.maxParticipants">10</span><small>people</small>
+                                </div>
+                            </div>
+                            <small>Including you. The server refuses joins beyond this number.</small>
                         </div>
 
                         <!-- TTL slider -->

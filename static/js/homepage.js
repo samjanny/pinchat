@@ -236,6 +236,12 @@ document.addEventListener('alpine:init', () => {
                 throw new Error('Server at maximum capacity. Please try again later.');
             }
 
+            // Group rooms are a server-side feature flag. Off, the server
+            // answers 404 without describing the feature, so say it here.
+            if (response.status === 404 && config.room_type === 'group') {
+                throw new Error('Group rooms are not enabled on this server.');
+            }
+
             // Other errors
             const error = await response.json();
             throw new Error(error.error || 'Error creating the room');
