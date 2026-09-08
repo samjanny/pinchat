@@ -285,7 +285,7 @@ async function runTests() {
             && firefoxTag === chromeTag
             && chromeFloor === signed.data.sequence
             && firefoxFloor === chromeFloor
-            && chromeManifest.version === '1.2.3'
+            && chromeManifest.version === '1.2.4'
             && firefoxManifest.version === chromeManifest.version
             && readPublicKey(chromeBackground) === readPublicKey(firefoxBackground);
         if (!pinsOk) {
@@ -333,6 +333,97 @@ async function runTests() {
         }
 
         console.log('PASSED: packaged DNR rules replace origin trust with per-page signed hashes');
+        passed++;
+    } catch (e) {
+        console.log('FAILED:', e.message);
+        failed++;
+    }
+    console.log('');
+
+    // -------------------------------------------------------------------------
+    // Test 8: Offline resilience and network-quiet behaviour of the verifier
+    // -------------------------------------------------------------------------
+    console.log('--- Test 8: Verifier survives an unreachable manifest host ---');
+    try {
+        const root = path.join(__dirname, '..');
+        const backgrounds = {
+            chrome: fs.readFileSync(path.join(root, 'extensions/chrome/background.js'), 'utf8'),
+            firefox: fs.readFileSync(path.join(root, 'extensions/firefox/background.js'), 'utf8'),
+        };
+
+        for (const [browser, source] of Object.entries(backgrounds)) {
+            // A transport failure must fall back to the last manifest that
+            // cleared both gates. Without this, anyone able to drop the
+            // connection to the manifest host switches the detection layer
+            // off, which is the cheapest possible attack on a verifier.
+            assert(
+                /const MANIFEST_CACHE_KEY = /.test(source),
+                `${browser}: manifest cache key missing`,
+            );
+            assert(
+                /async function loadCachedManifest\(/.test(source),
+                `${browser}: loadCachedManifest missing`,
+            );
+            assert(
+                /async function cacheSignedManifest\(/.test(source),
+                `${browser}: cacheSignedManifest missing`,
+            );
+
+            // The cached copy is re-validated on read, so tampering with
+            // extension storage buys nothing a forged signature would not.
+            const loadBody = source.slice(source.indexOf('async function loadCachedManifest('));
+            assert(
+                loadBody.slice(0, 2000).includes('validateSignedManifest'),
+                `${browser}: cached manifest is not re-validated on read`,
+            );
+
+            // A bad signature or a downgrade must never be rescued by the
+            // cache: those are attack signals, not transport problems. The
+            // rejection branch has to return before any cache lookup.
+            const rejectStart = source.indexOf('if (!result.ok) {');
+            assert(rejectStart > 0, `${browser}: no rejection branch after validation`);
+            const rejectEnd = source.indexOf('return verificationState;', rejectStart);
+            assert(rejectEnd > rejectStart, `${browser}: rejection branch does not return`);
+            const rejectBranch = source.slice(rejectStart, rejectEnd);
+            assert(
+                rejectBranch.includes("verificationState.signatureStatus ="),
+                `${browser}: rejection branch does not record the failure`,
+            );
+            assert(
+                !rejectBranch.includes('loadCachedManifest'),
+                `${browser}: rejected manifest falls back to the cache`,
+            );
+
+            // Background-driven verification must be gated so an idle
+            // browser stops beaconing the manifest host every few minutes.
+            assert(
+                /async function verifyIfRelevant\(/.test(source),
+                `${browser}: verifyIfRelevant missing`,
+            );
+            assert(
+                /onAlarm\.addListener[\s\S]{0,200}?verifyIfRelevant\(/.test(source),
+                `${browser}: alarm still fetches unconditionally`,
+            );
+            assert(
+                !/^verifyIntegrity\(\);$/m.test(source),
+                `${browser}: background start still fetches unconditionally`,
+            );
+
+            // The content script pulls the manifest on load; the 'popup'
+            // profile rejects any sender carrying sender.tab, so GET_STATUS
+            // has to use the shared read-only profile.
+            assert(
+                /message\.type === 'GET_STATUS'\)\s*\{\s*if \(!isSenderTrusted\(sender, 'status'\)\)/.test(source),
+                `${browser}: GET_STATUS does not accept the content script`,
+            );
+            assert(
+                /if \(profile === 'status'\)/.test(source),
+                `${browser}: 'status' sender profile missing`,
+            );
+        }
+
+        console.log('  Cached-manifest fallback, fail-closed rejection, gated background fetch');
+        console.log('PASSED: verifier degrades safely and stays quiet when idle');
         passed++;
     } catch (e) {
         console.log('FAILED:', e.message);

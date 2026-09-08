@@ -166,7 +166,20 @@ function updateUI(state) {
         const sigStatus = state.signatureStatus || 'unknown';
         switch(sigStatus) {
             case 'valid':
-                signatureStatus.innerHTML = '<span style="color: #22c55e;">✓ Valid</span>';
+                if (state.usingCachedManifest) {
+                    // Signature and sequence both checked, but against the
+                    // stored copy: the freshness check did not happen, so do
+                    // not show an unqualified green tick.
+                    const cachedSpan = document.createElement('span');
+                    cachedSpan.style.color = '#f59e0b';
+                    cachedSpan.textContent = '✓ Valid (cached)';
+                    cachedSpan.title = state.manifestCachedAt
+                        ? `Update host unreachable. Using the manifest cached on ${new Date(state.manifestCachedAt).toLocaleString()}.`
+                        : 'Update host unreachable. Using the stored manifest.';
+                    signatureStatus.replaceChildren(cachedSpan);
+                } else {
+                    signatureStatus.innerHTML = '<span style="color: #22c55e;">✓ Valid</span>';
+                }
                 break;
             case 'invalid':
                 signatureStatus.innerHTML = '<span style="color: #ef4444;">✗ Invalid</span>';

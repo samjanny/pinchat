@@ -125,7 +125,7 @@ For permanent Firefox installation, the extension needs to be signed by Mozilla.
 
 | Badge | Meaning |
 |-------|---------|
-| ✓ (green) | Manifest signature verified, SRI attributes checked |
+| green tick | Manifest signature verified, SRI attributes checked |
 | ! (red) | Verification failed - possible compromise |
 | ? (yellow) | Error fetching/verifying manifest |
 | ... (blue) | Verification in progress |
@@ -179,13 +179,41 @@ The manifest includes an incrementing `sequence` number to prevent replay attack
 | New manifest (sequence >= stored) | Accept, update stored |
 | Old manifest (sequence < stored) | **REJECT - Downgrade attack** |
 | Storage cleared | Like first install (acceptable risk) |
+| Manifest host unreachable | Fall back to the cached copy, re-validated |
+| Cached copy fails re-validation | Drop it and report an error |
 
 ### Verification Interval
 
 The extension verifies integrity:
 - On extension install/update
-- Every 5 minutes (configurable in `CONFIG.CHECK_INTERVAL_MINUTES`)
-- When manually triggered via popup
+- On every navigation to pinchat.io
+- On the `CONFIG.CHECK_INTERVAL_MINUTES` alarm (default 5 minutes), but only
+  while a pinchat.io tab is open, or while no usable manifest is cached yet
+- When manually triggered via the popup, which always re-fetches
+
+The alarm is gated on purpose. An unconditional timer means every install
+contacts the manifest host every few minutes for the life of the profile,
+which tells that host and every network observer in between that this
+browser runs the extension and roughly when. An idle extension has nothing
+to verify, so it stays silent. Two consecutive live fetches are also kept at
+least 60 seconds apart (`MIN_LIVE_FETCH_INTERVAL_MS`).
+
+### Offline and Blocked-Network Behaviour
+
+The last manifest that passed both the signature and the sequence gate is
+kept in extension storage and re-validated on every read. When the manifest
+host cannot be reached, that copy is used and the popup shows
+**Valid (cached)** with the date it was stored.
+
+This is a security control, not a convenience. Without it, anyone able to
+drop the connection to the manifest host - a hostile network, a filtering
+proxy, a state-level block, or a plain GitHub outage - switches the whole
+detection layer off simply by making a request fail, and leaves no trace on
+the page. Storage tampering buys nothing: a stored manifest still has to
+clear the same two gates as a freshly fetched one.
+
+A bad signature or a sequence downgrade is never rescued by the cache. Those
+are attack signals rather than transport problems, and they fail closed.
 
 ## Updating Hashes
 
@@ -193,7 +221,8 @@ After deploying changes to pinchat.io:
 
 1. Run the hash generator with your private key
 2. Commit and push the new `hashes.json.signed`
-3. Extensions will automatically pick up changes within 5 minutes
+3. Extensions pick up the change on the next navigation to pinchat.io, or
+   within `CHECK_INTERVAL_MINUTES` if a tab is already open
 
 ## Security Considerations
 
