@@ -46,3 +46,6 @@ ops/
 # Each host configures its own operator.json (or serves it via WEBSITE_DIR).
 # Only operator.example.json (the schema) lives in the repo.
 /static/operator.json
+
+# Build output (extension store packages)
+dist/

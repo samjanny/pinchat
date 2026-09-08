@@ -117,7 +117,45 @@ Or manually convert `chrome/icons/icon.svg` to PNG files:
 2. Click "Load Temporary Add-on..."
 3. Select `firefox/manifest.json`
 
-For permanent Firefox installation, the extension needs to be signed by Mozilla.
+A temporary add-on is removed when Firefox restarts. A permanent install needs
+a package signed by Mozilla; see Packaging below.
+
+## Packaging
+
+Store packages are built from a committed tree, never from the working
+directory:
+
+```bash
+extensions/package.sh            # package HEAD
+extensions/package.sh v0.7.2     # package a specific tag
+```
+
+The script writes `dist/pinchat-verifier-<browser>-<version>.zip` and prints a
+SHA-256 for each, so a published package can be checked against a local
+rebuild.
+
+It uses `git archive`, which has three properties that matter here. The output
+is reproducible from the repository by anyone. Only tracked files are included,
+so Chromium's `_metadata/` directory (written whenever the folder is loaded
+unpacked, and a reserved name in extensions) cannot leak into a release.
+And `manifest.json` lands at the archive root, which is what both stores
+require.
+
+Before building, the script checks that both browsers agree on `GITHUB_TAG`,
+`MIN_KNOWN_SEQUENCE` and the manifest version, that the pinned tag exists, and
+that its signed manifest is at or above the floor. That last check matters:
+store review takes days, and a build whose floor sits above the sequence at
+its own tag rejects every manifest it can fetch.
+
+### Release order
+
+Cut and push the release tag first, then submit to the stores. The extension
+fetches its manifest from the pinned tag, so a build that goes live before the
+tag exists leaves every fresh install in an error state, with no cached
+manifest to fall back on.
+
+Auto-update on both stores is driven by one thing only: a higher `version` in
+`manifest.json`. Bump it in both browsers, in the same commit.
 
 ## Extension Behavior
 
