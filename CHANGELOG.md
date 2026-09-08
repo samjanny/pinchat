@@ -4,6 +4,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Dates are the repository-local commit dates; entries are curated for user-visible impact
 rather than being a 1:1 mirror of `git log`.
 
+## [2026-09-08] - v0.8.3
+
+### Fixed - the invite callout sat beside the button instead of under it
+
+Inside a wrapping flex container the header's width is computed as if
+nothing wrapped, so the v0.8.2 callout landed next to "Copy invite link"
+with its arrow pointing at nothing. It is now a floating popover anchored
+under the buttons, arrow on the button, tooltip-styled, shorter, and
+dismissible with a click; the header row keeps its layout on every width.
+
 ## [2026-09-08] - v0.8.2
 
 ### Changed - the page says why the address bar is not the invite

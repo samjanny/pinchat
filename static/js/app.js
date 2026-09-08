@@ -2690,6 +2690,11 @@ document.addEventListener('alpine:init', () => {
                 && !this.mlsGroupEnded;
         },
 
+        /** The callout can also be dismissed by clicking it. */
+        dismissInviteCallout() {
+            this.inviteShared = true;
+        },
+
         /** Hide the group trust notice for the rest of this page's life. */
         dismissGroupTrustNotice() {
             this.groupTrustNoticeDismissed = true;

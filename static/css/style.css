@@ -635,43 +635,48 @@ footer::before {
 }
 
 .header-actions {
+    position: relative;
     display: flex;
-    flex-wrap: wrap;
     gap: 0.5rem;
 }
 
-/* Callout under the invite buttons: a speech bubble whose arrow points up
-   at "Copy invite link". Shown only while alone in the room and before the
-   invite has been copied or shared (see showInviteCallout in app.js). */
+/* Floating callout anchored under the invite buttons, arrow pointing up at
+   them. Shown only while alone in the room and before the invite has been
+   copied or shared (see showInviteCallout in app.js); a click dismisses it.
+   Absolutely positioned so the header row keeps its layout. */
 .invite-callout {
-    position: relative;
-    flex-basis: 100%;
-    max-width: 22rem;
-    margin-top: 0.6rem;
-    padding: 0.6rem 0.8rem;
-    background: var(--primary);
-    color: #fff;
+    position: absolute;
+    top: calc(100% + 12px);
+    right: 0;
+    z-index: 20;
+    width: max-content;
+    max-width: min(19rem, 82vw);
+    padding: 0.55rem 0.75rem;
+    background: var(--text);
+    color: var(--bg);
     border-radius: var(--radius-md);
-    font-size: 0.8rem;
-    line-height: 1.35;
+    font-size: 0.78rem;
+    line-height: 1.4;
+    text-align: left;
     box-shadow: var(--shadow-md);
+    cursor: pointer;
     animation: invite-nudge 1.6s ease-in-out infinite;
 }
 
 .invite-callout strong {
     display: block;
-    font-size: 0.85rem;
-    margin-bottom: 0.15rem;
+    font-size: 0.8rem;
+    margin-bottom: 0.1rem;
 }
 
 .invite-callout::before {
     content: "";
     position: absolute;
-    top: -8px;
-    left: 1.25rem;
-    border-left: 8px solid transparent;
-    border-right: 8px solid transparent;
-    border-bottom: 8px solid var(--primary);
+    top: -7px;
+    right: 1.5rem;
+    border-left: 7px solid transparent;
+    border-right: 7px solid transparent;
+    border-bottom: 7px solid var(--text);
 }
 
 @keyframes invite-nudge {
@@ -681,6 +686,11 @@ footer::before {
 
 @media (prefers-reduced-motion: reduce) {
     .invite-callout { animation: none; }
+}
+
+@media (max-width: 600px) {
+    .invite-callout { left: 0; right: auto; }
+    .invite-callout::before { left: 1.5rem; right: auto; }
 }
 
 /* Status banners */

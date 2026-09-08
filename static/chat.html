@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>PinChat - Secure Chat</title>
-    <link rel="stylesheet" href="/static/css/style.css" integrity="sha256-CqFpHD5PwZxEU+XHjnatW75oK10IRxNPOg+AT4P66To=" crossorigin="anonymous" >
+    <link rel="stylesheet" href="/static/css/style.css" integrity="sha256-u3u1lml9s9VH0M5s6RRt4TIpXy3vZ4Mzjo58riSwSVE=" crossorigin="anonymous" >
     <script src="/static/js/theme.js" integrity="sha256-IFPp16c490XqfYw01UQmSLORmfv7DKKWOXNpQOdw2X0=" crossorigin="anonymous" ></script>
     <script src="/static/js/pow.js" integrity="sha256-dPmlfH5GU0VsCkR6UpDNPzSRAjhm+xm7SNCDyNSnUqQ=" crossorigin="anonymous" ></script>
     <script src="/static/js/nicknames.js" integrity="sha256-FFlmH12HLY/cK10Uu5ALIabktzw+KiCJdF2p60qlSuc=" crossorigin="anonymous" ></script>
@@ -153,8 +153,8 @@
                 </button>
                 <!-- Points at the button while the user is alone and has not
                      invited anyone yet: the moment people copy the URL bar. -->
-                <div x-show="showInviteCallout()" class="invite-callout" role="status">
-                    <strong>Invite people from here.</strong> The address bar hides the encryption key on purpose, so copying it gives a link that does not open the room.
+                <div x-show="showInviteCallout()" @click="dismissInviteCallout()" class="invite-callout" role="status" title="Dismiss">
+                    <strong>Share the room from here.</strong> The address bar does not contain the key, so a copied URL will not open the room.
                 </div>
             </div>
         </header>
@@ -530,7 +530,7 @@
     <!-- end MLS -->
     <script src="/static/js/websocket.js" integrity="sha256-eGxesUz6eyUCNUX1gvPfdcqbeE6Eui0+zYKvzCdbtVw=" crossorigin="anonymous" ></script>
     <script src="/static/js/emoji.js" integrity="sha256-egqIwLEXWc2dlgP6N1sF7CLYLyMe01fSUy9dO/uLPmg=" crossorigin="anonymous" ></script>
-    <script src="/static/js/app.js" integrity="sha256-fL4/0m/iI6VZuEts82+2wU9HZbjgo8zLq8XWN56nr8I=" crossorigin="anonymous" ></script>
+    <script src="/static/js/app.js" integrity="sha256-lbKRbaSpV4SaURBIQB4qlOSrdeR+mPbnqY64SA0VVnM=" crossorigin="anonymous" ></script>
     <script src="/static/js/alpine-csp.min.js" integrity="sha256-58hj2liWaS9dR44Q2uCJ5hZP7RxcG2offLv3qbCT8FU=" crossorigin="anonymous" defer></script>
 
     <!-- Lucide icon sprite (ISC license, https://lucide.dev) -->
