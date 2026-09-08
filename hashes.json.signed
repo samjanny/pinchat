@@ -1,13 +1,13 @@
 {
   "data": {
     "version": "1.2.0",
-    "sequence": 48,
-    "generated": "2026-09-08T12:18:44.894Z",
+    "sequence": 49,
+    "generated": "2026-09-08T12:37:43.803Z",
     "site": "https://pinchat.io",
     "files": [
       {
         "path": "/static/css/style.css",
-        "hash": "12cbc6270cfea7df0c4af3132eae84befef502e5d1b630996053a35a9b126b67"
+        "hash": "0aa1691c3e4fc19c4453e5c78e76ad5bbe682b5d0847134f3a0f804f83fae93a"
       },
       {
         "path": "/static/js/alpine-csp.min.js",
@@ -15,7 +15,7 @@
       },
       {
         "path": "/static/js/app.js",
-        "hash": "5faa2cc4126883aaa0df84634429b17bd6d0883e2dcf3e7bb57a8d3ee44d14a7"
+        "hash": "7cbe3fd26fe223a559b84b6cf36fb6c14f4765b8e0a3cccbabc5d6379ea7afc2"
       },
       {
         "path": "/static/js/cookie-notice.js",
@@ -187,23 +187,23 @@
       },
       {
         "path": "/static/index.html",
-        "hash": "b423465c1be42a90af393476f1a8db860e69a2bb2b822676934d5efdf777bc80"
+        "hash": "67fc5c6ff747c2573ed05af9f9ddf0a1ec2eb42e0c4ae2cb0901c9641cdbd922"
       },
       {
         "path": "/static/login.html",
-        "hash": "37b18b69d2226947bb5c7c88a2a74f45f72b67da3575c7f6d1af7f268a9141ab"
+        "hash": "8978c3b3deac5d686ec9505958c675e10eb120965ea9f0f8a77965e8a3709acb"
       },
       {
         "path": "/static/chat.html",
-        "hash": "edc70beaa959c447527b2886661500e70c255dbf154987b38312df29af1a8471"
+        "hash": "cd864e721b6c20a3def1350a412cb322d29fe0d3c2a04b534952ff25999bb174"
       },
       {
         "path": "/static/terms.html",
-        "hash": "e1537858c8168bf57704e28266809d8024424f154d1b34243af084049564a926"
+        "hash": "fead3e9b3eaf745573ef6986360b600ce2236d3edb2ada89eb9c6409ee225b99"
       },
       {
         "path": "/static/privacy.html",
-        "hash": "e8329a2f8fc2b18ac0e443ca23bcf1a6cdb9d9e33cc0b15d6da580618517a6a3"
+        "hash": "8ffa3582307c5e8fac53dfe93b8e73ffe7ddeee2da91b4aa6560882a89808153"
       },
       {
         "path": "/static/operator.json",
@@ -211,5 +211,5 @@
       }
     ]
   },
-  "signature": "MEQCIFvIXR+jc0GL6zh1029r9M/FOAV0VreQDtSHyyEf4/lbAiBxbxua4cVlgL1FzuENxfNARBvUHAgh6bcljfk0RYC1RA=="
+  "signature": "MEQCIG4eYPuyhs6/E8Pk4M6K7Jfha4xHXokGrddWYaKrUh61AiB2Nv6jiiTsnRhY7zCXFBfFW4r3tct+z8bbTU8oClS+DQ=="
 }

@@ -636,7 +636,51 @@ footer::before {
 
 .header-actions {
     display: flex;
+    flex-wrap: wrap;
     gap: 0.5rem;
+}
+
+/* Callout under the invite buttons: a speech bubble whose arrow points up
+   at "Copy invite link". Shown only while alone in the room and before the
+   invite has been copied or shared (see showInviteCallout in app.js). */
+.invite-callout {
+    position: relative;
+    flex-basis: 100%;
+    max-width: 22rem;
+    margin-top: 0.6rem;
+    padding: 0.6rem 0.8rem;
+    background: var(--primary);
+    color: #fff;
+    border-radius: var(--radius-md);
+    font-size: 0.8rem;
+    line-height: 1.35;
+    box-shadow: var(--shadow-md);
+    animation: invite-nudge 1.6s ease-in-out infinite;
+}
+
+.invite-callout strong {
+    display: block;
+    font-size: 0.85rem;
+    margin-bottom: 0.15rem;
+}
+
+.invite-callout::before {
+    content: "";
+    position: absolute;
+    top: -8px;
+    left: 1.25rem;
+    border-left: 8px solid transparent;
+    border-right: 8px solid transparent;
+    border-bottom: 8px solid var(--primary);
+}
+
+@keyframes invite-nudge {
+    0%, 100% { transform: translateY(0); }
+    50% { transform: translateY(3px); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .invite-callout { animation: none; }
 }
 
 /* Status banners */

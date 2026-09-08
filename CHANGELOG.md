@@ -4,6 +4,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Dates are the repository-local commit dates; entries are curated for user-visible impact
 rather than being a 1:1 mirror of `git log`.
 
+## [2026-09-08] - v0.8.2
+
+### Changed - the page says why the address bar is not the invite
+
+The encryption key lives in the URL fragment and is moved out of the address
+bar on page load (screen sharing, history and extensions all see that bar),
+so a URL copied from there opens nothing, and nothing on the page said so.
+The button now reads "Copy invite link" and explains that in its tooltip,
+the welcome text and the waiting banner say to use it and why, and a visitor
+who lands on a keyless link is told what happened and what to ask for. On
+browsers with the Web Share API (mostly mobile, where the browser's own
+share sheet would send the bare URL) a "Share" button hands the complete link
+to the share sheet instead. While the user is alone in a fresh room, a
+callout under the header points at the button and says to invite people from
+there; it disappears once the invite has been copied or shared, or when
+someone joins.
+
 ## [2026-09-08] - v0.8.1
 
 ### Changed - group rooms can be created from the homepage

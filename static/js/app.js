@@ -80,6 +80,12 @@ document.addEventListener('alpine:init', () => {
 
         // UI
         copied: false,
+        // navigator.share exists mostly on mobile, where the browser's own
+        // share sheet would send the address-bar URL, which has no key.
+        canShare: false,
+        // Set once the invite has been copied or shared from this page; the
+        // header callout that points at the button goes away for good.
+        inviteShared: false,
 
         // Image sharing
         pendingImage: null,      // {previewUrl, name, size, mimeType, arrayBuffer}
@@ -171,6 +177,8 @@ document.addEventListener('alpine:init', () => {
                 return;
             }
             this.initialized = true;
+            this.canShare = typeof navigator !== 'undefined'
+                && typeof navigator.share === 'function';
 
             debugLog('Initializing chat room:', this.roomId);
 
@@ -219,7 +227,9 @@ document.addEventListener('alpine:init', () => {
             // Load the encryption key from the URL (bootstrap key)
             const key = await window.cryptoManager.extractKeyFromURL();
             if (!key) {
-                this.error = '⚠️ Encryption key not found in the URL. Make sure you have the full link.';
+                this.error = '⚠️ This link has no encryption key. It was probably copied from '
+                    + 'the address bar, which hides the key on purpose. Ask whoever invited '
+                    + 'you to press "Copy invite link" in the room and send you that link.';
                 this.connecting = false;
                 return;
             }
@@ -997,7 +1007,8 @@ document.addEventListener('alpine:init', () => {
                 : null;
             if (role === 'joiner' && (!expectedGroupId || !expectedCreatorKeyHash)) {
                 this.error = '⚠️ Group invite is missing its authenticated creator pins. '
-                    + 'Ask the creator to copy and resend the complete link.';
+                    + 'Ask the creator to press "Copy invite link" in the room and resend '
+                    + 'that link; a URL taken from the address bar does not work.';
                 return;
             }
             if (role === 'creator' && expectedGroupId && expectedCreatorKeyHash) {
@@ -1715,7 +1726,11 @@ document.addEventListener('alpine:init', () => {
         /**
          * Copies the room link to the clipboard
          */
-        async copyLink() {
+        /**
+         * Rebuild the shareable invite link. Returns null (and sets
+         * this.error) when a group invite is not ready yet.
+         */
+        buildInviteLink() {
             // C-06: the bootstrap secret was moved from window.location.hash
             // to sessionStorage on page load. window.location.href therefore
             // no longer carries the #key=... fragment that recipients need.
@@ -1730,7 +1745,7 @@ document.addEventListener('alpine:init', () => {
                 });
                 if (!fragment && this.roomType === 'group') {
                     this.error = '⚠️ Secure group invite is not ready yet. Please wait.';
-                    return;
+                    return null;
                 }
                 if (fragment) {
                     link = window.location.origin + window.location.pathname
@@ -1745,10 +1760,17 @@ document.addEventListener('alpine:init', () => {
                     }
                 } catch (_) { /* sessionStorage unavailable: fall back to bare URL */ }
             }
+            return link;
+        },
+
+        async copyLink() {
+            const link = this.buildInviteLink();
+            if (!link) return;
 
             try {
                 await navigator.clipboard.writeText(link);
                 this.copied = true;
+                this.inviteShared = true;
 
                 setTimeout(() => {
                     this.copied = false;
@@ -1757,6 +1779,26 @@ document.addEventListener('alpine:init', () => {
             } catch (error) {
                 console.error('Failed to copy link:', error);
                 alert('Copy this link:\n\n' + link);
+            }
+        },
+
+        /**
+         * Hand the full invite link to the OS share sheet. Mobile browsers
+         * offer "share this page" themselves, but that sends the address-bar
+         * URL, which carries no key; this button sends a link that works.
+         */
+        async shareLink() {
+            const link = this.buildInviteLink();
+            if (!link) return;
+            try {
+                await navigator.share({ title: 'PinChat room', url: link });
+                this.inviteShared = true;
+            } catch (error) {
+                // AbortError: the user closed the share sheet. Anything else
+                // falls back to the clipboard so the action still succeeds.
+                if (!error || error.name !== 'AbortError') {
+                    await this.copyLink();
+                }
             }
         },
 
@@ -2634,6 +2676,18 @@ document.addEventListener('alpine:init', () => {
             if (this.sasReverifyRequired) return 'Re-verify identity to send';
             if (this.isSasDecisionPending()) return 'Verify identity before sending';
             return 'Send message';
+        },
+
+        /**
+         * The callout pointing at "Copy invite link": shown while the user is
+         * alone in a connected room and has not copied or shared the invite
+         * yet, which is exactly when someone would otherwise copy the URL bar.
+         */
+        showInviteCallout() {
+            return this.connected
+                && this.participantCount < 2
+                && !this.inviteShared
+                && !this.mlsGroupEnded;
         },
 
         /** Hide the group trust notice for the rest of this page's life. */
