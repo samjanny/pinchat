@@ -4,13 +4,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Dates are the repository-local commit dates; entries are curated for user-visible impact
 rather than being a 1:1 mirror of `git log`.
 
-## [Unreleased]
+## [2026-09-08] - v0.8.0
 
-Group chat lands on the main line, disabled by default. NOT DEPLOYABLE AS IS:
-the tree carries 45 files under static/js against a signed manifest covering
-24, so it needs a re-sign, new extension pins and a new tag before any deploy.
-The signature is the only manual step; `extensions/finish-release.sh` takes
-it from there (pins, extension version, release-pin test, every CI job).
+Group chat lands on the main line, disabled by default. The signed manifest
+moves to sequence 47 and now covers all 51 served files (the MLS bundle
+included); the extensions ship as 1.3.0 pinned at this tag, with the
+sequence floor raised to 47.
 
 ### Added - MLS group chat behind GROUP_CHAT_ENABLED
 
