@@ -195,7 +195,17 @@ production. If it is missing the legal pages still render, with placeholders.
 
 ```bash
 ./generate-certs.sh
-docker-compose up --build
+docker compose up --build
+```
+
+When upgrading a running deployment, build first and dry-run the new image
+against the real `.env` before switching, since the server refuses to start
+on a setting it cannot honour (see the upgrade notes in `CHANGELOG.md`):
+
+```bash
+docker compose build
+timeout 8 docker compose run --rm --no-deps -T pinchat   # must print "Starting HTTP server"
+docker compose up -d
 ```
 
 ### Tests

@@ -11,7 +11,23 @@ moves to sequence 47 and now covers all 51 served files (the MLS bundle
 included); the extensions ship as 1.3.0 pinned at this tag, with the
 sequence floor raised to 47.
 
-### Added - MLS group chat behind GROUP_CHAT_ENABLED
+### Upgrade notes
+
+Three settings can stop the new server from starting, on purpose, and each
+message names the fix. `MAX_IMAGE_SIZE` has a hard maximum of 2MB (a 2MB
+image grows to about 2.8MB once encrypted and framed, under the relay's 4MB
+per-room ceiling; larger values used to be accepted at startup and rejected
+on the wire). `FORCE_HTTP=true` outside development needs a non-empty
+`TRUSTED_PROXIES`. And `docker-compose.yml` now pins the compose network, so
+the first `docker compose up` on an existing deployment must be preceded by
+`docker compose down`. Build first, then dry-run the new image against the
+real `.env` before switching:
+
+```bash
+docker compose build
+timeout 8 docker compose run --rm --no-deps -T pinchat   # must print "Starting HTTP server"
+docker compose down && docker compose up -d
+```
 
 Rooms of up to 20 members use an MLS (RFC 9420, ciphersuite 0x0002) group
 implemented from scratch and validated against the IETF test vectors. The
