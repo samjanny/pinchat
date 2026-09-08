@@ -4,11 +4,64 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Dates are the repository-local commit dates; entries are curated for user-visible impact
 rather than being a 1:1 mirror of `git log`.
 
-## [Unreleased]
+## [2026-09-08] - v0.7.3
 
-Browser-extension only. No server, client or protocol change; the signed
-manifest stays at sequence 44 and both extensions keep `GITHUB_TAG` v0.7.2.
-Extension version goes to 1.2.4.
+Legal-text corrections plus browser-extension work. No server or protocol
+change; the protocol version stays 1 and a v0.7.2 client interoperates with
+this build. The signed manifest moves to sequence 45 because the Terms, the
+operator data and the ASCII punctuation sweep touched seventeen static files.
+Both extensions move `MIN_KNOWN_SEQUENCE` to 45 and `GITHUB_TAG` to v0.7.3 in
+the same commit that carries the sequence-45 manifest, so a build cut from
+this tag fetches a manifest it accepts. Extension version goes to 1.2.5.
+
+### Fixed - abuse reports no longer ask for the room's encryption key
+
+Section 5 of the Terms asked a reporter to send the "room URL". A room link
+is `https://pinchat.io/c/<id>#key=<bootstrap key>`, and the fragment is the
+key that decrypts the room. Browsers never send it to the Service, which is
+the entire reason for putting it there, and then the Terms invited a user to
+paste it into an email. Email is not encrypted, so a good-faith abuse report
+would have disclosed the room key to the Operator, to the reporter's mail
+provider and to every relay in between, in cleartext and at rest. The clause
+now asks for the room identifier, or the link with everything from the `#`
+onwards removed, and states why.
+
+### Fixed - the retention claim in the Terms understated the design
+
+Section 6 said "Rooms self-destruct when their configured time-to-live
+elapses; messages cannot be recovered afterwards", which implies messages
+exist somewhere until the room expires. They do not: ciphertext is held in
+memory only long enough to relay it and is never written to disk, as the
+Privacy Policy already stated. The Terms now say that, and confine the
+time-to-live claim to room metadata, which is what actually expires.
+
+### Changed - the DSA note no longer contradicts the Privacy Policy
+
+`OPERATOR_DSA_NOTE` claimed exemption from Art. 15(2) transparency reporting
+"as it qualifies as a micro or small enterprise", while the Privacy Policy
+states the Operator is a natural person acting in a personal, non-commercial
+capacity. A non-commercial natural person is not an enterprise, and the DSA
+reaches information society services, meaning services normally provided for
+remuneration, which a free personal project may well not be. The note no
+longer asserts either the classification or the exemption: it states the
+condition, says the question is undetermined, describes what would follow if
+the DSA did apply, and notes that the contact points and the published terms
+exist regardless.
+
+The warranty disclaimer drops "merchantability" and "fitness for a particular
+purpose", US formulas in a document governed by Italian law that already
+cites Articles 1218 and 1229 of the Civil Code, in favour of a disclaimer of
+availability, security, reliability, accuracy, non-infringement and
+suitability.
+
+### Changed - typographic punctuation replaced with ASCII across the tree
+
+446 em dashes, en dashes, ellipsis glyphs and arrow glyphs became `-`, `...`
+and `->`. Everything outside `static/` landed in the previous release cycle;
+the remaining 148 are in this one, because they force a re-sign and doing
+them separately would have cost a second signing cycle. Some are visible in
+the interface: the `...` in "Connecting...", "Waiting for peer..." and the
+composer placeholders, and the `-` placeholder in the room info rows.
 
 ### Added - the verifier survives an unreachable manifest host
 
