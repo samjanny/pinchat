@@ -4,6 +4,79 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Dates are the repository-local commit dates; entries are curated for user-visible impact
 rather than being a 1:1 mirror of `git log`.
 
+## [Unreleased]
+
+Browser-extension only. No server, client or protocol change; the signed
+manifest stays at sequence 44 and both extensions keep `GITHUB_TAG` v0.7.2.
+Extension version goes to 1.2.4.
+
+### Added - the verifier survives an unreachable manifest host
+
+The last manifest that cleared both the signature and the sequence gate is
+now cached in extension storage and re-validated on every read. When
+`raw.githubusercontent.com` cannot be reached the cached copy is used and the
+popup shows **Valid (cached)** with the date it was stored, instead of the
+extension dropping to an error state with no manifest at all.
+
+This closes the cheapest attack available against the verifier: anyone able
+to drop that one connection - a hostile network, a filtering proxy, a
+state-level block, or a GitHub outage - could previously switch the whole
+detection layer off by making a request fail, silently and with no trace on
+the page. The packaged declarativeNetRequest CSP was never affected and kept
+blocking unpinned scripts throughout; what the cache restores is the SRI and
+file-hash detection layer. A bad signature or a sequence downgrade is still
+never rescued by the cache: both fail closed.
+
+### Changed - the extension no longer beacons when idle
+
+The verification alarm used to fetch the manifest every
+`CHECK_INTERVAL_MINUTES` regardless of whether a pinchat.io tab existed, and
+each MV3 service-worker restart added another unconditional request. Every
+install therefore reported itself to the manifest host, and to any observer
+on the path, for the life of the profile. The alarm and the background-start
+path are now gated on having something to verify, a navigation to pinchat.io
+triggers a refresh so the manifest is fresh exactly when it matters, and two
+live fetches are kept at least 60 seconds apart. The popup's "Verify Now"
+and install/update still fetch unconditionally.
+
+### Fixed - the content script can read verification status again
+
+`GET_STATUS` was checked against the `popup` sender profile, which rejects
+any sender carrying `sender.tab`. A content script always carries one, so the
+pull path in `content.js` was dead and the page depended entirely on winning
+a race with the background push. A third read-only `status` profile now
+accepts both the popup and a content script running on pinchat.io.
+
+### Added - reproducible store packaging
+
+`extensions/package.sh` builds the Chrome and Firefox packages with
+`git archive` from a committed tree and prints a SHA-256 for each. Only tracked
+files are archived, so Chromium's locally generated `_metadata/` directory
+cannot leak into a release, and `manifest.json` lands at the archive root as
+both stores require. Before building it checks that the two browsers agree on
+`GITHUB_TAG`, `MIN_KNOWN_SEQUENCE` and version, that the pinned tag exists, and
+that its signed manifest is at or above the floor. Output goes to `dist/`,
+which is gitignored.
+
+### Changed - README trimmed to an entry point
+
+The top-level README had grown to roughly 750 lines, most of it restating the
+threat model, primitives, ratchet design and limitations already specified at
+greater length in `SECURITY.md` and `PROTOCOL.md`. It is now about 340 lines
+and keeps what belongs in a README: what the project is, the honest
+capability matrix, quick start, the configuration reference, and pointers.
+Nothing was dropped outright; the deep material now has a single home. The
+extension README gains a packaging and release-order section.
+
+### Changed - Chrome manifest floor corrected
+
+`minimum_chrome_version` was 86, below the Chrome 88 floor for MV3
+`background.service_worker`, and `"type": "module"` raises the real floor to
+Chrome 92 while buying nothing, since `background.js` has no `import` or
+`export`. The module type is dropped and the floor moves to 88. Firefox's
+`strict_min_version` 113.0 was already correct: `declarativeNetRequest` and
+response-header `modifyHeaders` both land in Firefox 113.
+
 ## [2026-08-27] - v0.7.2
 
 Comment-only change to a signed asset. No behaviour change anywhere;
