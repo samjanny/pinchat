@@ -171,8 +171,19 @@ document.addEventListener('alpine:init', () => {
             // Best-effort cleanup of decrypted image blob URLs when the tab
             // is closed. Browser GC frees them eventually, but explicit revoke
             // shortens the window in which the references stay enumerable.
-            window.addEventListener('beforeunload', () => {
+            window.addEventListener('beforeunload', (event) => {
                 this.cleanupImageBlobs();
+                // The creator's MLS group state lives only in this page. A
+                // reload silently ends the group's ability to admit or remove
+                // anyone (see static/js/mls/README.md, known gaps), so make
+                // the browser ask first once there is a group to lose.
+                if (this.roomType === 'group'
+                    && this.mlsSession
+                    && this.mlsSession.role === 'creator'
+                    && this.groupPeers.length > 0) {
+                    event.preventDefault();
+                    event.returnValue = '';
+                }
             });
 
             // Initialize emoji picker categories
@@ -476,7 +487,7 @@ document.addEventListener('alpine:init', () => {
                     while (this.mlsSession
                         && this.mlsPendingDepartures.length > 0) {
                         const senderId = this.mlsPendingDepartures[0];
-                        await this.mlsSession.removeMemberBySenderId(senderId);
+                        await this.mlsSession.requestRemovalAfterLivenessCheck(senderId);
                         this.mlsPendingDepartures.shift();
                     }
                     if (this.mlsSession) {
@@ -565,7 +576,7 @@ document.addEventListener('alpine:init', () => {
                     this.participantCount = message.participant_count;
                     if (message.user_id !== this.userId) {
                         this.addSystemMessage(this.roomType === 'group'
-                            ? '👋 A relay participant disconnected; MLS membership changes only after an authenticated Remove'
+                            ? '👋 The relay reports a participant disconnected; checking whether they are still reachable before changing group membership'
                             : '👋 A participant left the chat');
                     }
 
@@ -575,13 +586,15 @@ document.addEventListener('alpine:init', () => {
                         this.peerNickname = null;
                     }
                     if (this.roomType === 'group' && message.user_id) {
-                        // Creator-only: emit an MLS Remove commit so the
-                        // departing peer's epoch keys are invalidated.
-                        // Await durable tombstone/removal staging so the
-                        // ordered relay cursor cannot ACK and forget this
+                        // Creator-only. `userleft` comes from the relay and
+                        // is not authenticated, so it must not drive a Remove
+                        // on its own (issue #1). The session challenges the
+                        // member over MLS first and removes only if it stays
+                        // silent for the grace window. Await the staging so
+                        // the ordered relay cursor cannot ACK and forget this
                         // lifecycle event first.
                         if (this.mlsSession) {
-                            await this.mlsSession.removeMemberBySenderId(
+                            await this.mlsSession.requestRemovalAfterLivenessCheck(
                                 message.user_id,
                             );
                         } else if (!this.mlsPendingDepartures.includes(
@@ -1088,6 +1101,9 @@ document.addEventListener('alpine:init', () => {
                     this.mlsReady = this.mlsTransportSynced;
                     if (!this.mlsReady) break;
                     this.addSystemMessage('✅ Secure group established');
+                    this.addSystemMessage(
+                        'ℹ️ Keep this tab open: the group lives in this page. If you reload or close it, no one can join or be removed until a new room is created',
+                    );
                     this._startMlsUpdateTimer();
                     break;
                 case 'update-committed':
@@ -1156,6 +1172,24 @@ document.addEventListener('alpine:init', () => {
                         && event.removedLeafIndex !== undefined) {
                         this.addSystemMessage('🔁 A participant was removed; group re-keyed');
                     }
+                    break;
+                case 'liveness-check-started':
+                    this.addSystemMessage(
+                        `🔎 Verifying a reported departure over the encrypted channel (${Math.round(event.graceMs / 1000)}s)`,
+                    );
+                    break;
+                case 'liveness-confirmed':
+                    // The relay said this member left; the member just proved
+                    // otherwise with an authenticated message. Membership is
+                    // unchanged and the user should know the relay was wrong.
+                    this.addSystemMessage(
+                        '🔐 Security notice: the relay reported a departure for a member who is still reachable; no one was removed',
+                    );
+                    break;
+                case 'liveness-timeout':
+                    this.addSystemMessage(
+                        '⏱️ A reported departure went unanswered; removing the member and re-keying',
+                    );
                     break;
                 case 'remove-committed':
                     this.addSystemMessage('🔁 Group re-keyed (departing member removed)');

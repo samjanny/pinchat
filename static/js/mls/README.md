@@ -187,11 +187,28 @@ AuthenticatedContent before applying the referenced leaf update.
 ## Known gaps (post-MVP)
 
 - **Creator is a single point of failure.** Only the creator commits
-  (Add/Remove), its group state lives in memory only, and its role is
-  derived from the creator-token optimization, which does not survive
-  a page reload. If the creator leaves or reloads, remaining members
-  can keep chatting in the current epoch but nobody can join or be
-  removed any more; the group must be re-created from a fresh room.
+  (Add/Remove) and its group state lives in memory only. The creator
+  role itself survives a same-tab reload through sessionStorage, but the
+  group does not: `_start()` would mint a fresh group with a new group_id
+  that existing members and the pinned invite link both reject. If the
+  creator leaves or reloads, remaining members can keep chatting in the
+  current epoch but nobody can join or be removed any more; the group must
+  be re-created from a fresh room. The chat page now installs a
+  `beforeunload` guard for a creator with members, so an accidental reload
+  is prompted rather than silent, and tells the creator to keep the tab
+  open when the group is established. Surviving a reload for real would
+  mean persisting epoch secrets and the creator's signature key, which is
+  a deliberate product decision, not a fix.
+- **Relay-reported departures are challenged, not trusted.** `userleft`
+  comes from the relay and is unauthenticated. The creator no longer
+  commits a Remove on it directly: it sends the reported member a liveness
+  ping as an MLS application message, and removes only if no authenticated
+  reply (or any other authenticated message from that leaf) arrives within
+  the grace window (20 s by default). A relay can still suppress the reply
+  for the whole window, which is indistinguishable from a real departure
+  and is the irreducible residual with an untrusted relay; what it can no
+  longer do is land a permanent eviction with one forged frame, and the
+  creator is told when a "departed" member answers.
 - **No out-of-band verification ceremony.** Group identities are fresh
   per-session signature keys whose credential is the key itself. Their key
   fingerprints prevent the relay from substituting a visual nickname, but

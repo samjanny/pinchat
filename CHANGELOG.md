@@ -4,6 +4,70 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Dates are the repository-local commit dates; entries are curated for user-visible impact
 rather than being a 1:1 mirror of `git log`.
 
+## [Unreleased]
+
+Group chat lands on the main line, disabled by default. NOT DEPLOYABLE AS IS:
+the tree carries 45 files under static/js against a signed manifest covering
+24, so it needs a re-sign, new extension pins and a new tag before any deploy.
+
+### Added - MLS group chat behind GROUP_CHAT_ENABLED
+
+Rooms of up to 20 members use an MLS (RFC 9420, ciphersuite 0x0002) group
+implemented from scratch and validated against the IETF test vectors. The
+room creator at leaf 0 is the only committer; every Commit and Welcome is
+signature-verified before any state changes; per-epoch secret trees give
+forward secrecy and periodic re-keying gives post-compromise security. The
+flag defaults to false, so nothing changes for an existing deployment until
+an operator turns it on. The server refuses group rooms with 404 while it is
+off, so a disabled feature is not described to callers.
+
+The group branch had been cut before v0.5.0. Merging main into it recovered
+everything since, and in particular the SAS quarantine gate, which the branch
+did not have: 1:1 ciphertext was being decrypted and shown before the user had
+made a SAS decision. In the other direction the branch brings main a
+ReplayCache with O(1) amortized expiry and eviction, replacing the per-message
+sort of the full anti-replay set that the September audit had flagged, plus
+CSRF verification on /api/rooms.
+
+### Changed - a relay-reported departure is challenged before anyone is removed
+
+`userleft` comes from the relay and is unauthenticated, yet the creator used
+to commit an MLS Remove on it directly, so a malicious relay could evict any
+live member permanently with one forged frame (issue #1). The creator now
+sends the reported member a liveness ping as an MLS application message and
+removes only if no authenticated reply, or any other authenticated message
+from that leaf, arrives within a 20-second grace window. Only the creator may
+ask and only the addressed leaf answers; the ping is never shown as a chat
+message. A relay can still suppress the reply for the whole window, which is
+indistinguishable from a real departure and is the residual with an untrusted
+relay, but it can no longer land a permanent eviction in one move, and the
+creator is told when a "departed" member answers. Deferred removals and every
+existing Remove code path are unchanged; the challenge sits in front of them.
+
+### Changed - the creator is warned before losing the group
+
+The creator's group state lives only in its open tab; a reload mints a new
+group that existing members and the pinned invite reject, after which nobody
+can join or be removed. The page now installs a `beforeunload` prompt for a
+creator with members and says so when the group is established. Surviving a
+reload for real would mean persisting epoch secrets and the creator's
+signature key, which is a product decision this release does not make.
+
+### Changed - one image allowlist
+
+The group branch's picker accepted image/avif from a local set while main's
+crypto layer enforces an audited PNG/JPEG/GIF/WebP allowlist on both encrypt
+and decrypt. app.js now consults that single list everywhere, so AVIF is no
+longer offered; adding it back is a deliberate change to the audited list.
+
+### Documentation
+
+README describes group chat and its two structural limits instead of stating
+it is disabled. The Privacy Policy discloses the MLS control traffic the relay
+sees in group rooms: public keys, signatures, membership size and changes,
+never content. The MLS module README records the reload guard and the
+liveness challenge under known gaps.
+
 ## [2026-09-08] - v0.7.5
 
 Browser-extension only. No server, client or protocol change, and no re-sign:

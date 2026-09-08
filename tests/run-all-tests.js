@@ -213,6 +213,11 @@ const TEST_SUITES = {
         name: 'MLS creator-only Commit policy',
         file: 'test-mls-creator-policy.js',
         description: 'Authenticated leaf-0 admin enforcement and creator preservation'
+    },
+    'mls-liveness': {
+        name: 'MLS liveness challenge before relay-driven Remove',
+        file: 'test-mls-liveness.js',
+        description: 'A relay-reported departure is challenged over MLS; Remove only on silence (issue #1)'
     }
 };
 

@@ -196,6 +196,9 @@ async function main() {
         shouldHandleOwnEnvelope: () => false,
         onRelayEnvelope: async (envelope) => { routedEnvelope = envelope; },
         removeMemberBySenderId: async (senderId) => { removedRoute = senderId; },
+        // app.js routes relay departures through the liveness challenge now;
+        // the assertion below is about routing, so record it the same way.
+        requestRemovalAfterLivenessCheck: async (senderId) => { removedRoute = senderId; },
     };
     const rosterBeforeRelayEvents = JSON.stringify(chatStore.groupPeers);
     await chatStore.handleWebSocketMessage({

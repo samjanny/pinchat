@@ -61,6 +61,17 @@
     // ciphertext-protected payload.
     const PAYLOAD_TEXT = 0x01;
     const PAYLOAD_IMAGE = 0x02;
+    // Liveness challenge (issue #1). A relay-controlled `userleft` is a hint,
+    // not an authorisation: before the creator commits a Remove for a member
+    // the relay reports as gone, it asks that member to prove it is still
+    // there over MLS, which the relay can suppress but cannot forge.
+    //   PING: [0x03][u32be target leaf][16-byte nonce]   creator -> group
+    //   PONG: [0x04][16-byte nonce]                       target  -> group
+    const PAYLOAD_LIVENESS_PING = 0x03;
+    const PAYLOAD_LIVENESS_PONG = 0x04;
+    const LIVENESS_NONCE_BYTES = 16;
+    const DEFAULT_LIVENESS_GRACE_MS = 20 * 1000;
+    const MAX_LIVENESS_PING_ATTEMPTS = 2;
     const CREATOR_LEAF_INDEX = 0;
     const BOOTSTRAP_PIN_BYTES = 32;
     const BOOTSTRAP_PROOF_BYTES = 32;
@@ -244,6 +255,27 @@
         return out;
     }
 
+    function encodeLivenessPing(targetLeafIndex, nonce) {
+        const out = new Uint8Array(1 + 4 + LIVENESS_NONCE_BYTES);
+        out[0] = PAYLOAD_LIVENESS_PING;
+        new DataView(out.buffer).setUint32(1, targetLeafIndex, false);
+        out.set(nonce, 5);
+        return out;
+    }
+
+    function encodeLivenessPong(nonce) {
+        const out = new Uint8Array(1 + LIVENESS_NONCE_BYTES);
+        out[0] = PAYLOAD_LIVENESS_PONG;
+        out.set(nonce, 1);
+        return out;
+    }
+
+    function randomNonce() {
+        const out = new Uint8Array(LIVENESS_NONCE_BYTES);
+        globalThis.crypto.getRandomValues(out);
+        return out;
+    }
+
     function encodeImagePayload(imageBytes, mimeType) {
         const mimeUtf8 = new TextEncoder().encode(String(mimeType || 'application/octet-stream'));
         if (mimeUtf8.length > 255) {
@@ -337,6 +369,7 @@
         constructor({
             role, send, cancelPendingControl, onEvent, pskSecret,
             expectedGroupId, expectedCreatorKeyHash, relaySenderId,
+            livenessGraceMs,
         }) {
             if (role !== 'creator' && role !== 'joiner') {
                 throw new Error(`mls-session: invalid role "${role}"`);
@@ -475,6 +508,12 @@
             // the departed route. If its Add is later accepted, suppress the
             // Welcome and commit an immediate Remove.
             this._departedSenderIds = new Set();
+            // senderId -> { leafIndex, nonce, timer, attempts, pingSent }.
+            // A relay-reported departure parks here until the member answers
+            // (challenge cancelled) or the grace window elapses (Remove).
+            this._livenessChallenges = new Map();
+            this._livenessGraceMs = Number.isFinite(livenessGraceMs) && livenessGraceMs > 0
+                ? livenessGraceMs : DEFAULT_LIVENESS_GRACE_MS;
             this._drainingDeferredEnvelopes = false;
         }
 
@@ -741,6 +780,7 @@
             if (this._pendingCommit?.retryTimer) {
                 clearTimeout(this._pendingCommit.retryTimer);
             }
+            this._clearLivenessChallenges();
             if (candidateGroup && candidateGroup !== liveGroup) {
                 candidateGroup.destroySecrets();
             }
@@ -796,6 +836,7 @@
             if (pendingCommit?.retryTimer) {
                 clearTimeout(pendingCommit.retryTimer);
             }
+            this._clearLivenessChallenges();
             if (candidateGroup && candidateGroup !== liveGroup) {
                 candidateGroup.destroySecrets();
             }
@@ -1119,6 +1160,7 @@
                     foldedUpdates: pending.foldedUpdates,
                 });
             } else if (pending.kind === 'remove') {
+                this._cancelLivenessChallenge(pending.senderId);
                 if (this._leafBySenderId.get(pending.senderId)
                     === pending.removedLeafIndex) {
                     this._leafBySenderId.delete(pending.senderId);
@@ -1996,11 +2038,25 @@
                 attributionWarning = true;
             }
 
+            // Any authenticated message from a leaf is proof it is alive, so a
+            // pending challenge for it is answered by ordinary traffic too.
+            this._noteLeafAlive(senderLeafIndex);
+
             if (pt.length === 0) {
                 this.onEvent({ kind: 'error', reason: 'empty application payload' });
                 return;
             }
             const tag = pt[0];
+            if (tag === PAYLOAD_LIVENESS_PING) {
+                await this._answerLivenessPing(pt, senderLeafIndex);
+                return;
+            }
+            if (tag === PAYLOAD_LIVENESS_PONG) {
+                // Liveness was already credited above from the authenticated
+                // sender leaf; the nonce only says which challenge it answers,
+                // and a stale or foreign nonce is simply ignored.
+                return;
+            }
             if (tag === PAYLOAD_TEXT) {
                 this.onEvent({
                     kind: 'message',
@@ -2375,6 +2431,142 @@
             return this._serializeOperation(
                 () => this._removeMemberBySenderId(senderId),
             );
+        }
+
+        /**
+         * Transport-driven removal (issue #1). The relay says `senderId` has
+         * left. Instead of committing a Remove on that word alone, challenge
+         * the member over MLS and remove only if it stays silent for the
+         * grace window. A relay that forged the departure must now suppress
+         * the member's authenticated reply for the whole window, and the
+         * creator is told when a "departed" member answers.
+         *
+         * Falls straight through to removeMemberBySenderId when there is no
+         * live leaf to challenge (deferred KeyPackage, pending Add, tombstone
+         * bookkeeping), which is the existing, unchanged behaviour there.
+         */
+        async requestRemovalAfterLivenessCheck(senderId) {
+            return this._serializeOperation(
+                () => this._requestRemovalAfterLivenessCheck(senderId),
+            );
+        }
+
+        async _requestRemovalAfterLivenessCheck(senderId) {
+            if (this.role !== 'creator') return;
+            if (typeof senderId !== 'string' || senderId.length === 0) return;
+            if (this._state === 'removed') return;
+            if (!this._leafBySenderId.has(senderId)) {
+                return this._removeMemberBySenderId(senderId);
+            }
+            if (this._livenessChallenges.has(senderId)) return;
+            const leafIndex = this._leafBySenderId.get(senderId);
+            const challenge = {
+                leafIndex,
+                nonce: randomNonce(),
+                timer: null,
+                attempts: 0,
+                pingSent: false,
+            };
+            this._livenessChallenges.set(senderId, challenge);
+            await this._sendLivenessPing(senderId, challenge);
+            this._armLivenessTimer(senderId, challenge);
+            this.onEvent({
+                kind: 'liveness-check-started',
+                senderId,
+                leafIndex,
+                graceMs: this._livenessGraceMs,
+            });
+        }
+
+        async _sendLivenessPing(senderId, challenge) {
+            challenge.attempts += 1;
+            if (this._state !== 'joined' || this._localCommitBusy || this._pendingCommit) {
+                return;
+            }
+            try {
+                await this._sendApplicationPayload(
+                    encodeLivenessPing(challenge.leafIndex, challenge.nonce),
+                );
+                challenge.pingSent = true;
+            } catch (err) {
+                console.warn('[MLS] liveness ping not sent:', err.message);
+            }
+        }
+
+        _armLivenessTimer(senderId, challenge) {
+            if (challenge.timer) clearTimeout(challenge.timer);
+            challenge.timer = setTimeout(() => {
+                challenge.timer = null;
+                void this._serializeOperation(
+                    () => this._expireLivenessChallenge(senderId),
+                );
+            }, this._livenessGraceMs);
+        }
+
+        async _expireLivenessChallenge(senderId) {
+            const challenge = this._livenessChallenges.get(senderId);
+            if (!challenge) return;
+            if (this._state === 'removed' || this._state === 'desynced') {
+                this._livenessChallenges.delete(senderId);
+                return;
+            }
+            // Never remove on a challenge the member could not have seen: if
+            // the ping was blocked by a pending Commit, try once more first.
+            if (!challenge.pingSent && challenge.attempts < MAX_LIVENESS_PING_ATTEMPTS) {
+                await this._sendLivenessPing(senderId, challenge);
+                this._armLivenessTimer(senderId, challenge);
+                return;
+            }
+            this._livenessChallenges.delete(senderId);
+            this.onEvent({
+                kind: 'liveness-timeout',
+                senderId,
+                leafIndex: challenge.leafIndex,
+            });
+            await this._removeMemberBySenderId(senderId);
+        }
+
+        async _answerLivenessPing(pt, senderLeafIndex) {
+            // Only the creator may ask, and only the addressed leaf answers.
+            if (senderLeafIndex !== CREATOR_LEAF_INDEX) return;
+            if (pt.length !== 1 + 4 + LIVENESS_NONCE_BYTES) return;
+            if (!this.group || this.group.myLeafIndex === CREATOR_LEAF_INDEX) return;
+            const target = new DataView(pt.buffer, pt.byteOffset, pt.byteLength)
+                .getUint32(1, false);
+            if (target !== this.group.myLeafIndex) return;
+            if (this._state !== 'joined' || this._localCommitBusy || this._pendingCommit) {
+                return;
+            }
+            try {
+                await this._sendApplicationPayload(
+                    encodeLivenessPong(pt.subarray(5, 5 + LIVENESS_NONCE_BYTES)),
+                );
+            } catch (err) {
+                console.warn('[MLS] liveness pong not sent:', err.message);
+            }
+        }
+
+        _noteLeafAlive(leafIndex) {
+            for (const [senderId, challenge] of this._livenessChallenges) {
+                if (challenge.leafIndex !== leafIndex) continue;
+                this._cancelLivenessChallenge(senderId);
+                this.onEvent({ kind: 'liveness-confirmed', senderId, leafIndex });
+            }
+        }
+
+        _cancelLivenessChallenge(senderId) {
+            const challenge = this._livenessChallenges.get(senderId);
+            if (!challenge) return false;
+            if (challenge.timer) clearTimeout(challenge.timer);
+            this._livenessChallenges.delete(senderId);
+            return true;
+        }
+
+        _clearLivenessChallenges() {
+            for (const challenge of this._livenessChallenges.values()) {
+                if (challenge.timer) clearTimeout(challenge.timer);
+            }
+            this._livenessChallenges.clear();
         }
 
         /**
