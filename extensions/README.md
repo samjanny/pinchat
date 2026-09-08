@@ -92,7 +92,10 @@ extensions/finish-release.sh v0.8.0 1.3.0   # <tag> <extension version>
 ```
 
 The release tag must contain the exact signed manifest before the extensions
-are published. `generate-hashes.js` also regenerates `chrome/rules.json` and
+are published. addons.mozilla.org also refuses any upload whose Firefox
+manifest lacks `browser_specific_settings.gecko.data_collection_permissions`
+(mandatory for new submissions since November 2025); ours declares
+`{"required": ["none"]}`, which is the truthful answer and must stay so. `generate-hashes.js` also regenerates `chrome/rules.json` and
 `firefox/rules.json` from that exact signed manifest; commit those files with
 the release.
 

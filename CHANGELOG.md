@@ -4,6 +4,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Dates are the repository-local commit dates; entries are curated for user-visible impact
 rather than being a 1:1 mirror of `git log`.
 
+## [Unreleased]
+
+### Changed - extension 1.3.5 declares that it collects no data
+
+addons.mozilla.org rejected the 1.3.4 upload: since November 2025 a Firefox
+manifest must carry `data_collection_permissions`. It now declares
+`required: ["none"]`, which is what the extension does. Both extensions move
+to 1.3.5 with the same manifest pin (v0.8.4, sequence 51); no site file
+changed, so nothing was re-signed.
+
 ## [2026-09-08] - v0.8.4
 
 ### Added - the homepage presents the integrity verifier
