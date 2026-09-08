@@ -219,6 +219,14 @@ mod tests {
 
     #[test]
     fn test_hash_ip_different_ips() {
+        // hash_ip reads PRIVACY_MODE, and env vars are process-global while
+        // cargo runs tests in parallel threads. Without this guard
+        // test_development_mode can flip the variable underneath us and
+        // hash_ip returns the cleartext IP, failing the assertion below.
+        let _env_guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        unsafe {
+            std::env::remove_var("PRIVACY_MODE");
+        }
         let secret = [0u8; 32];
 
         let hash1 = hash_ip("192.168.1.100", &secret);
@@ -232,6 +240,14 @@ mod tests {
 
     #[test]
     fn test_hash_ip_different_secrets() {
+        // hash_ip reads PRIVACY_MODE, and env vars are process-global while
+        // cargo runs tests in parallel threads. Without this guard
+        // test_development_mode can flip the variable underneath us and
+        // hash_ip returns the cleartext IP, failing the assertion below.
+        let _env_guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        unsafe {
+            std::env::remove_var("PRIVACY_MODE");
+        }
         let secret1 = [0u8; 32];
         let secret2 = [1u8; 32];
         let ip = "192.168.1.100";
