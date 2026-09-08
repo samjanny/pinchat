@@ -218,6 +218,11 @@ const TEST_SUITES = {
         name: 'MLS liveness challenge before relay-driven Remove',
         file: 'test-mls-liveness.js',
         description: 'A relay-reported departure is challenged over MLS; Remove only on silence (issue #1)'
+    },
+    'group-creator-reload': {
+        name: 'Group creator reload is refused, not silently re-minted',
+        file: 'test-group-creator-reload.js',
+        description: 'A creator start with pins already attached ends the group instead of splitting the room'
     }
 };
 

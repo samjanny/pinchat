@@ -196,9 +196,14 @@ AuthenticatedContent before applying the referenced leaf update.
   be re-created from a fresh room. The chat page now installs a
   `beforeunload` guard for a creator with members, so an accidental reload
   is prompted rather than silent, and tells the creator to keep the tab
-  open when the group is established. Surviving a reload for real would
-  mean persisting epoch secrets and the creator's signature key, which is
-  a deliberate product decision, not a fix.
+  open when the group is established. If a reload happens anyway, the
+  creator start finds the group pins already attached to its fragment (a
+  fresh creator has none) and refuses to mint a second group behind the
+  same link: the composer locks, the page says the group has ended and
+  offers a new room, instead of splitting members between two groups that
+  cannot read each other. Surviving a reload for real would mean
+  persisting epoch secrets and the creator's signature key, which is a
+  deliberate product decision, not a fix.
 - **Relay-reported departures are challenged, not trusted.** `userleft`
   comes from the relay and is unauthenticated. The creator no longer
   commits a Remove on it directly: it sends the reported member a liveness
@@ -218,7 +223,10 @@ AuthenticatedContent before applying the referenced leaf update.
   while an expired/missing resume credential is rejected fail-closed for
   MLS. Peer admission rests on the URL-fragment PSK (the link is the
   capability), authenticated LeafNodes, and the creator's membership
-  decisions; users do not currently compare fingerprints out of band.
+  decisions; users do not currently compare fingerprints out of band. The
+  chat page says so: once the group is established it shows an
+  "Identities not verified" notice pointing at the fingerprints, so the
+  padlock badges never imply a check that did not happen.
 - **Filtered direct path on the wire (§7.6).** `commitAddMember` emits
   the *full* direct path with empty `encrypted_path_secret` lists where
   the copath sibling resolution is empty, instead of dropping those

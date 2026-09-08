@@ -219,10 +219,16 @@ async fn main() {
         std::process::exit(1);
     }
 
-    // In reverse-proxy HTTP mode, secure cookies must be forced in production.
-    if config.force_http && !config.force_secure_cookies && privacy_mode != "development" {
-        eprintln!("❌ FATAL: FORCE_HTTP=true requires FORCE_SECURE_COOKIES=true in production.");
-        eprintln!("   This prevents session cookies from being sent over insecure transport.");
+    // Reverse-proxy mode has preconditions that are easy to miss and costly
+    // when missed (see Config::reverse_proxy_misconfiguration). Refuse to
+    // start rather than run degraded; development mode stays permissive.
+    let proxy_problem = if privacy_mode == "development" {
+        None
+    } else {
+        config.reverse_proxy_misconfiguration()
+    };
+    if let Some(problem) = proxy_problem {
+        eprintln!("FATAL: {}", problem);
         std::process::exit(1);
     }
 

@@ -251,6 +251,32 @@
                 <button @click="reopenSasVerification()" class="btn btn-verify-now">Verify now</button>
             </div>
 
+            <!-- Group trust notice: groups have no SAS ceremony. Admission is
+                 the link plus authenticated leaf keys, so say so instead of
+                 letting the padlock badges imply more than they verify. -->
+            <div x-show="roomType === 'group' && mlsReady && !groupTrustNoticeDismissed" class="unverified-warning-banner">
+                <div class="unverified-warning-content">
+                    <span class="unverified-warning-icon"><svg class="icon" aria-hidden="true"><use href="#i-unlock"/></svg></span>
+                    <div class="unverified-warning-text">
+                        <strong>Identities not verified</strong>
+                        <p>Anyone with this link can join. Members are authenticated by their key fingerprint (hover a name), not by a security code: compare fingerprints over another channel if it matters.</p>
+                    </div>
+                </div>
+                <button @click="dismissGroupTrustNotice()" class="btn btn-verify-now">Got it</button>
+            </div>
+
+            <!-- Group ended: the creator tab lost its in-page group state -->
+            <div x-show="mlsGroupEnded" class="mitm-warning-banner">
+                <div class="mitm-warning-content">
+                    <span class="mitm-warning-icon"><svg class="icon" aria-hidden="true"><use href="#i-alert"/></svg></span>
+                    <div class="mitm-warning-text">
+                        <strong>Group ended</strong>
+                        <p>This tab created the group and was reloaded; the group keys lived only in the page. Create a new room and share its link.</p>
+                    </div>
+                </div>
+                <a href="/static/index.html" class="btn btn-danger btn-new-chat">New Room</a>
+            </div>
+
             <!-- Waiting-for-peer banner (alone in the room) -->
             <div x-show="connected && participantCount < 2" class="security-status-banner">
                 <svg class="icon" aria-hidden="true"><use href="#i-clock"/></svg> Waiting for another participant to join the room. Share the link to invite someone.

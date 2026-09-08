@@ -78,14 +78,23 @@ git push
 
 The extensions fetch the manifest from the immutable release tag configured by
 `GITHUB_TAG` in both background scripts. For the current security release this is:
-`https://raw.githubusercontent.com/samjanny/pinchat/v0.6.1/hashes.json.signed`.
+`https://raw.githubusercontent.com/samjanny/pinchat/v0.7.5/hashes.json.signed`.
 
-On every extension release, update both background scripts to the new tag,
-raise `MIN_KNOWN_SEQUENCE` to the signed manifest sequence, and bump both
-extension manifest versions. The release tag must contain the exact signed
-manifest before the extensions are published. `generate-hashes.js` also
-regenerates `chrome/rules.json` and `firefox/rules.json` from that exact signed
-manifest; commit those files with the release.
+On every extension release, both background scripts move to the new tag,
+`MIN_KNOWN_SEQUENCE` rises to the signed manifest sequence, both extension
+manifest versions bump, and the release-pin test (`tests/test-security.js`,
+Test 7) follows. `finish-release.sh` does all of that from the freshly signed
+manifest and then runs every CI job, so the only manual step is the signature:
+
+```bash
+node extensions/generate-hashes.js --private-key private.pem --output hashes.json.signed
+extensions/finish-release.sh v0.8.0 1.3.0   # <tag> <extension version>
+```
+
+The release tag must contain the exact signed manifest before the extensions
+are published. `generate-hashes.js` also regenerates `chrome/rules.json` and
+`firefox/rules.json` from that exact signed manifest; commit those files with
+the release.
 
 ### 5. Generate Icon PNGs
 

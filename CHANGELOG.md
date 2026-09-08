@@ -9,6 +9,8 @@ rather than being a 1:1 mirror of `git log`.
 Group chat lands on the main line, disabled by default. NOT DEPLOYABLE AS IS:
 the tree carries 45 files under static/js against a signed manifest covering
 24, so it needs a re-sign, new extension pins and a new tag before any deploy.
+The signature is the only manual step; `extensions/finish-release.sh` takes
+it from there (pins, extension version, release-pin test, every CI job).
 
 ### Added - MLS group chat behind GROUP_CHAT_ENABLED
 
@@ -67,6 +69,42 @@ it is disabled. The Privacy Policy discloses the MLS control traffic the relay
 sees in group rooms: public keys, signatures, membership size and changes,
 never content. The MLS module README records the reload guard and the
 liveness challenge under known gaps.
+
+### Changed - the server refuses a proxy setup that cannot see clients
+
+Outside `PRIVACY_MODE=development`, `FORCE_HTTP=true` now requires a non-empty
+`TRUSTED_PROXIES` as well as `FORCE_SECURE_COOKIES=true`, and the process
+exits at startup naming the missing one. With the proxy untrusted every
+visitor was seen as the proxy's own address and shared one rate-limit bucket,
+so a single client could lock everyone out of room creation; that state used
+to be silent. `docker-compose.yml` pins the compose network so the gateway the
+proxy connects from is always `172.18.0.1`, the value `.env.example` now
+documents for the bundled setup.
+
+### Changed - a reloaded group creator ends the group instead of splitting it
+
+The creator's group state lives only in its page. A creator start that already
+sees group pins on its invite fragment (a fresh creator has none) is a reload,
+and it no longer mints a second group behind the same link, which left the
+shared link rejecting new joiners while the members could not read the
+creator. The composer locks, the page says the group has ended and offers a
+new room.
+
+### Added - group rooms say that identities are not verified
+
+Groups have no security-code ceremony: admission is the link plus
+authenticated leaf keys, and members are told apart by key fingerprint. The
+chat page now says so in a dismissible notice once the group is established,
+so the padlock badges never imply a check that did not happen.
+
+### Added - one command from signature to green CI
+
+`extensions/finish-release.sh <tag> <extension-version>` sets `GITHUB_TAG` and
+`MIN_KNOWN_SEQUENCE` in both extensions, the manifest versions, the release-pin
+test and the README from the freshly signed manifest, then runs verify-sri,
+the Node suite, the typographic scan, fmt, clippy, the Rust tests and cargo
+audit, and prints the commit, merge, tag and package commands. The signature
+with the offline key is the only step left by hand.
 
 ## [2026-09-08] - v0.7.5
 

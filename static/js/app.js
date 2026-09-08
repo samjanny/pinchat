@@ -97,6 +97,14 @@ document.addEventListener('alpine:init', () => {
         // WebSocket Manager
         wsManager: null,
 
+        // Set when a creator tab is found to have lost its group state (page
+        // reload or its own invite link re-opened). The composer locks and
+        // the page says to create a new room instead of silently minting a
+        // second group behind the same link.
+        mlsGroupEnded: false,
+        // The group trust notice (no SAS ceremony for groups) is shown once
+        // per page; dismissing it is a per-tab, in-memory choice.
+        groupTrustNoticeDismissed: false,
         // MLS session (only used when roomType === 'group'; null otherwise).
         // The MLSSession wrapper holds the stateful Group, KeyPackage
         // bundle and dispatches incoming `mls` envelopes.
@@ -964,7 +972,7 @@ document.addEventListener('alpine:init', () => {
          * Idempotent - safe to call from 'connected' and 'userjoined'.
          */
         async _ensureMlsSession() {
-            if (this.mlsSession) return;
+            if (this.mlsSession || this.mlsGroupEnded) return;
 
             const role = this.mlsRole || 'joiner';
 
@@ -990,6 +998,26 @@ document.addEventListener('alpine:init', () => {
             if (role === 'joiner' && (!expectedGroupId || !expectedCreatorKeyHash)) {
                 this.error = '⚠️ Group invite is missing its authenticated creator pins. '
                     + 'Ask the creator to copy and resend the complete link.';
+                return;
+            }
+            if (role === 'creator' && expectedGroupId && expectedCreatorKeyHash) {
+                // A creator arrives from the homepage with a bare key fragment;
+                // the group pins are attached to it only after this tab has
+                // minted the group. Pins already present on a creator start
+                // therefore mean the page was reloaded (or its own invite link
+                // re-opened) and the group state that lived in it is gone.
+                // Minting a fresh group here would split the room in two: the
+                // link already shared rejects new joiners and the existing
+                // members can no longer read the creator. Stop instead and say
+                // so; the creator role in sessionStorage is intentionally not
+                // enough to resume a group (static/js/mls/README.md).
+                this.mlsGroupEnded = true;
+                this.mlsReady = false;
+                this._stopMlsUpdateTimer();
+                this.error = '⚠️ This tab created the group and was reloaded. '
+                    + 'The group keys lived only in the page, so this group has ended: '
+                    + 'members still connected can read each other, but nobody can join '
+                    + 'or be removed. Create a new room and share its link.';
                 return;
             }
 
@@ -2573,6 +2601,7 @@ document.addEventListener('alpine:init', () => {
          */
         isComposerLocked() {
             if (this.sasMismatchFatal) return true;
+            if (this.mlsGroupEnded) return true;
             if (!this.connected) return true;
             if (this.participantCount < 2) return true;
             if (this.roomType === 'onetoone' && !this.pfsActive) return true;
@@ -2587,6 +2616,7 @@ document.addEventListener('alpine:init', () => {
         /** Placeholder copy that mirrors the current lock reason. */
         composerPlaceholder() {
             if (this.sasMismatchFatal) return 'Session destroyed - open a new chat.';
+            if (this.mlsGroupEnded) return 'Group ended - create a new room.';
             if (!this.connected) return 'Connecting...';
             if (this.participantCount < 2) return 'Waiting for someone to join this room...';
             if (this.roomType === 'onetoone' && !this.pfsActive) return 'Establishing secure connection...';
@@ -2597,12 +2627,18 @@ document.addEventListener('alpine:init', () => {
 
         /** Short tooltip shown on the send button in blocked states. */
         composerLockedLabel() {
+            if (this.mlsGroupEnded) return 'Group ended';
             if (!this.connected) return 'Not connected';
             if (this.participantCount < 2) return 'Waiting for peer to join';
             if (this.roomType === 'onetoone' && !this.pfsActive) return 'Waiting for secure connection...';
             if (this.sasReverifyRequired) return 'Re-verify identity to send';
             if (this.isSasDecisionPending()) return 'Verify identity before sending';
             return 'Send message';
+        },
+
+        /** Hide the group trust notice for the rest of this page's life. */
+        dismissGroupTrustNotice() {
+            this.groupTrustNoticeDismissed = true;
         },
 
         /**

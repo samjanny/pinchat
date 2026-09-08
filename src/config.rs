@@ -595,8 +595,135 @@ impl Config {
         }
     }
 
+    /// Preconditions that only make sense together with `FORCE_HTTP=true`,
+    /// i.e. when a reverse proxy terminates TLS in front of this process.
+    ///
+    /// Returns `Some(message)` describing the first violated precondition,
+    /// or `None` when the reverse-proxy configuration is coherent. `main`
+    /// treats `Some` as fatal outside development mode.
+    ///
+    /// Why `TRUSTED_PROXIES` is mandatory here: behind a proxy every request
+    /// reaches this process from the proxy's own address. With no trusted
+    /// proxy configured, `X-Forwarded-For` is ignored by design and every
+    /// visitor collapses into a single rate-limit bucket and a single PoW
+    /// challenge-cache key. One client can then exhaust the shared room-token
+    /// budget for everyone. This was found live in production on 2026-09-08.
+    pub fn reverse_proxy_misconfiguration(&self) -> Option<&'static str> {
+        if !self.force_http {
+            return None;
+        }
+        if !self.force_secure_cookies {
+            return Some(
+                "FORCE_HTTP=true requires FORCE_SECURE_COOKIES=true in production. \
+                 This prevents session cookies from being sent over insecure transport.",
+            );
+        }
+        if self.trusted_proxies.is_empty() {
+            return Some(
+                "FORCE_HTTP=true requires TRUSTED_PROXIES to name the reverse proxy. \
+                 Without it X-Forwarded-For is ignored and every visitor shares one \
+                 rate-limit bucket, so a single client can lock everyone out of room \
+                 creation. Set it to the address the proxy connects from, as seen by \
+                 this process (for docker-compose behind nginx on the host this is the \
+                 compose network gateway, e.g. TRUSTED_PROXIES=172.18.0.1, not 127.0.0.1).",
+            );
+        }
+        None
+    }
+
     /// Returns true if authentication is enabled (password hashes are configured)
     pub fn is_auth_enabled(&self) -> bool {
         !self.password_hashes.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A coherent non-proxy baseline; tests flip only the fields they are about.
+    fn base() -> Config {
+        Config {
+            host: [127, 0, 0, 1],
+            port: 3000,
+            ws_conn_burst_size: 100,
+            ws_conn_period_secs: 60,
+            room_token_burst_size: 100,
+            room_token_period_secs: 600,
+            msg_rate_limit: 30,
+            msg_rate_window_secs: 1,
+            room_msg_rate_limit: 120,
+            room_byte_rate_limit: 8 * 1024 * 1024,
+            commit_rate_limit: 12,
+            commit_rate_window_secs: 60,
+            proposal_rate_limit: 8,
+            proposal_rate_window_secs: 60,
+            frame_rate_limit: 120,
+            protocol_error_limit: 10,
+            pow_min_difficulty: 12,
+            pow_max_difficulty: 18,
+            challenge_ttl_secs: 300,
+            jwt_token_ttl_secs: 30,
+            jwt_issuer: crate::jwt::DEFAULT_JWT_ISSUER.to_string(),
+            max_ws_connection_age_secs: 1800,
+            ws_reconnect_grace_secs: 20,
+            ecdh_burst_limit: 8,
+            ecdh_burst_window_secs: 60,
+            room_cleanup_interval_secs: 60,
+            challenge_cleanup_interval_secs: 60,
+            password_hashes: vec![],
+            session_ttl_secs: 86400,
+            login_burst_size: 5,
+            login_period_secs: 900,
+            trusted_proxies: vec![],
+            replay_cache_max_per_room: 1000,
+            force_secure_cookies: false,
+            max_image_size: 300 * 1024,
+            force_http: false,
+            website_dir: None,
+            allow_anonymous: true,
+            cors_allowed_origins: vec!["https://localhost:3000".to_string()],
+            group_chat_enabled: false,
+        }
+    }
+
+    #[test]
+    fn direct_tls_mode_has_no_proxy_preconditions() {
+        // Without FORCE_HTTP there is no proxy, so an empty TRUSTED_PROXIES
+        // and non-forced cookies are both fine.
+        assert_eq!(base().reverse_proxy_misconfiguration(), None);
+    }
+
+    #[test]
+    fn proxy_mode_requires_secure_cookies_first() {
+        let mut c = base();
+        c.force_http = true;
+        let msg = c.reverse_proxy_misconfiguration().expect("must be flagged");
+        assert!(msg.contains("FORCE_SECURE_COOKIES"), "got: {msg}");
+    }
+
+    #[test]
+    fn proxy_mode_requires_a_trusted_proxy() {
+        // The production misconfiguration of 2026-09-08: proxy mode, cookies
+        // forced, but nobody trusted for X-Forwarded-For, so every visitor
+        // shared one rate-limit bucket.
+        let mut c = base();
+        c.force_http = true;
+        c.force_secure_cookies = true;
+        let msg = c.reverse_proxy_misconfiguration().expect("must be flagged");
+        assert!(msg.contains("TRUSTED_PROXIES"), "got: {msg}");
+        assert!(
+            msg.contains("172.18.0.1"),
+            "must name the docker-compose value: {msg}"
+        );
+    }
+
+    #[test]
+    fn coherent_proxy_mode_passes() {
+        let mut c = base();
+        c.force_http = true;
+        c.force_secure_cookies = true;
+        c.trusted_proxies = vec!["172.18.0.1".to_string()];
+        assert_eq!(c.reverse_proxy_misconfiguration(), None);
     }
 }
