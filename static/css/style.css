@@ -2646,6 +2646,66 @@ input[type="password"]:focus {
     display: grid;
     gap: 14px;
 }
+
+/* Browser extension callout on the homepage: text on the left, the two
+   store buttons on the right; stacks on narrow screens. Deliberately not
+   an .info-box: the de-box pass hides every non-warning info-box. */
+.extension-card {
+    margin-top: 56px;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 18px 32px;
+    align-items: center;
+    padding: 24px 26px;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--primary);
+    border-radius: var(--radius-md);
+}
+.extension-card h3 {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 15px;
+    font-weight: 600;
+    margin: 0 0 8px;
+}
+.extension-card h3 .icon { color: var(--primary); }
+.extension-card p {
+    font-size: 13.5px;
+    line-height: 1.55;
+    color: var(--text-medium);
+    margin: 0;
+}
+.extension-card p + p { margin-top: 8px; }
+.extension-actions {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    min-width: 12rem;
+}
+.extension-actions .btn {
+    text-align: center;
+    text-decoration: none;
+}
+.extension-card .btn-secondary {
+    background: var(--bg-card);
+    color: var(--text);
+    border: 1px solid var(--border-medium);
+}
+.extension-card .btn-secondary:hover {
+    border-color: var(--primary);
+    color: var(--primary);
+}
+.extension-source {
+    font-size: 12.5px;
+    color: var(--text-light);
+    text-align: center;
+}
+@media (max-width: 640px) {
+    .extension-card { grid-template-columns: 1fr; }
+    .extension-actions { min-width: 0; }
+}
 .info-box.warning {
     border-radius: var(--radius-md);
     border: 1px solid color-mix(in srgb, var(--warning) 40%, var(--border));

@@ -4,6 +4,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Dates are the repository-local commit dates; entries are curated for user-visible impact
 rather than being a 1:1 mirror of `git log`.
 
+## [2026-09-08] - v0.8.4
+
+### Added - the homepage presents the integrity verifier
+
+A section between the features and the notes explains why a browser-based
+E2EE chat needs an independent check on the code it is served, and offers
+the PinChat Integrity Verifier for Chrome and Firefox. The store buttons go
+through `/ext/chrome` and `/ext/firefox`, redirects kept in the reverse
+proxy rather than in the signed pages, so a store URL can change without a
+release; until the listings are live they lead to the GitHub release page,
+where the packages and their digests are. The top bar gains an
+"Extension" link.
+
 ## [2026-09-08] - v0.8.3
 
 ### Fixed - the invite callout sat beside the button instead of under it

@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>PinChat - E2E Encrypted Chat</title>
-    <link rel="stylesheet" href="/static/css/style.css" integrity="sha256-u3u1lml9s9VH0M5s6RRt4TIpXy3vZ4Mzjo58riSwSVE=" crossorigin="anonymous" >
+    <link rel="stylesheet" href="/static/css/style.css" integrity="sha256-2ADK6elOkq11xXDHV4/ZwVHncsASsNvV9sdiQ74o1hM=" crossorigin="anonymous" >
     <script src="/static/js/theme.js" integrity="sha256-IFPp16c490XqfYw01UQmSLORmfv7DKKWOXNpQOdw2X0=" crossorigin="anonymous" ></script>
     <script src="/static/js/pow.js" integrity="sha256-dPmlfH5GU0VsCkR6UpDNPzSRAjhm+xm7SNCDyNSnUqQ=" crossorigin="anonymous" ></script>
     <script src="/static/js/homepage.js" integrity="sha256-nkwkptXc0qdrK3Y6jqEyblemK4x50XNoOnAadlrDA0M=" crossorigin="anonymous" ></script>
@@ -20,6 +20,7 @@
             </div>
             <div class="spacer"></div>
             <a class="topbar-link" href="#features">Features</a>
+            <a class="topbar-link" href="#extension">Extension</a>
             <a class="topbar-link" href="#important">Security</a>
             <a class="topbar-link muted" href="https://github.com/samjanny/pinchat" target="_blank" rel="noopener noreferrer">GitHub&nbsp;↗</a>
         </nav>
@@ -150,6 +151,20 @@
                     <div class="feature-icon"><svg class="icon" aria-hidden="true"><use href="#i-code"/></svg></div>
                     <div class="feature-title">Open Source</div>
                     <div class="feature-desc">Code is publicly auditable on <a href="https://github.com/samjanny/pinchat" target="_blank" rel="noopener noreferrer">GitHub</a>. Reproducible Docker builds.</div>
+                </div>
+            </section>
+
+            <!-- ==== BROWSER EXTENSION ==== -->
+            <section id="extension" class="extension-card">
+                <div class="extension-text">
+                    <h3><svg class="icon" aria-hidden="true"><use href="#i-shield"/></svg>Verify what your browser runs</h3>
+                    <p>The server that relays your encrypted messages is the same server that delivers the code doing the encrypting. If it were compromised, it could serve modified code and you would have no ordinary way to notice.</p>
+                    <p>The <strong>PinChat Integrity Verifier</strong> is the independent check: it lets pinchat.io run only the scripts published in a release manifest signed with an offline key, and warns you if anything served differs from that release. Free, open source, no data collected, active only on pinchat.io.</p>
+                </div>
+                <div class="extension-actions">
+                    <a class="btn btn-primary" href="/ext/chrome" target="_blank" rel="noopener noreferrer">Add to Chrome</a>
+                    <a class="btn btn-secondary" href="/ext/firefox" target="_blank" rel="noopener noreferrer">Add to Firefox</a>
+                    <a class="extension-source" href="https://github.com/samjanny/pinchat/tree/main/extensions" target="_blank" rel="noopener noreferrer">Source and packages on GitHub</a>
                 </div>
             </section>
 

@@ -78,7 +78,7 @@ git push
 
 The extensions fetch the manifest from the immutable release tag configured by
 `GITHUB_TAG` in both background scripts. For the current security release this is:
-`https://raw.githubusercontent.com/samjanny/pinchat/v0.8.3/hashes.json.signed`.
+`https://raw.githubusercontent.com/samjanny/pinchat/v0.8.4/hashes.json.signed`.
 
 On every extension release, both background scripts move to the new tag,
 `MIN_KNOWN_SEQUENCE` rises to the signed manifest sequence, both extension
