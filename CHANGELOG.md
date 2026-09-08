@@ -4,6 +4,55 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Dates are the repository-local commit dates; entries are curated for user-visible impact
 rather than being a 1:1 mirror of `git log`.
 
+## [2026-09-08] - v0.7.5
+
+Browser-extension only. No server, client or protocol change, and no re-sign:
+nothing under `static/` moved, so the signed manifest stays at sequence 46 and
+the extension floor stays 46. `rules.json` ships inside the extension, so the
+extension version goes to 1.2.7 and `GITHUB_TAG` to v0.7.5.
+
+### Fixed - three scripts on the chat page were blocked by the extension's own CSP
+
+The preventive CSP pins a per-page set of script hashes and deliberately omits
+`'self'`, so anything not pinned is blocked. The list of scripts each page
+loads was maintained by hand in `generate-csp-rules.js` and had drifted:
+`chat.html` loads thirteen scripts, the list named ten. `theme.js`, `pow.js`
+and `nicknames.js` were all in the signed manifest, so a hash existed for
+each, but none was pinned.
+
+The consequence was not cosmetic. `generateNickname()` is defined only in
+`nicknames.js`, and `app.js` calls it when the `connected` frame arrives, on
+every connection. The extension whose purpose is to protect the chat page was
+breaking it. The blast radius is bounded only because the extension is not
+published to either store yet, so it affects whoever loads it unpacked; it
+would have shipped with the first store release.
+
+`generate-csp-rules.js` now reads each page and takes the script list from the
+page itself, so the two cannot drift again and adding a `<script>` tag pins
+its hash automatically.
+
+### Changed - the generator proves the page before trusting it
+
+Deriving a policy from a document is only safe while the document is itself
+covered by the signed manifest; an unsigned edit that added a `<script>` would
+otherwise widen the very policy meant to constrain it. `verify-sri.js` checks
+every static file against the manifest, but relying on that would make the
+generator's safety depend on another script having run first. `pageScripts()`
+therefore verifies each page's own hash against the manifest before reading
+it, and refuses off-origin or non-`/static/` script sources.
+
+### Added - a coverage gate in CI
+
+Comparing the rulesets against `buildRules()` only proved they were not stale.
+It said nothing about whether the policy covered the page, which is the whole
+property the rules exist to provide, and that is why this shipped green.
+`verify-sri.js` now reads the ruleset that actually ships and asserts that
+every script tag on every page has its hash in that page's `script-src`.
+Against the previous `rules.json` it reports all three missing files for both
+browsers and exits non-zero. The same assertion is added to Test 7 in
+`tests/test-security.js`, so the main CI job catches it too and not only the
+SRI workflow.
+
 ## [2026-09-08] - v0.7.4
 
 Legal text only. No server, client, protocol or extension behaviour change;
