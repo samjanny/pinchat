@@ -218,7 +218,7 @@ pub async fn create_room(
     // Atomic check+insert (prevents concurrent requests from exceeding capacity)
     match state.try_create_room(room) {
         Ok(created_room_id) => {
-            tracing::info!("Created room id={}…", short_room_id(&created_room_id));
+            tracing::info!("Created room id={}...", short_room_id(&created_room_id));
 
             // Generate WebSocket token for room creator to avoid second PoW
             // This improves UX by eliminating the second challenge
@@ -301,7 +301,7 @@ pub async fn room_page(
         ),
         None => {
             tracing::warn!(
-                "Room page access failed - Room {}… not found",
+                "Room page access failed - Room {}... not found",
                 short_room_id(&room_id)
             );
             return Err((StatusCode::NOT_FOUND, "Room not found").into_response());
@@ -330,7 +330,7 @@ pub async fn room_page(
     // still removed eagerly rather than waiting for the cleanup tick.
     if room_is_expired {
         tracing::warn!(
-            "Room page access failed - Room {}… has expired (ttl_minutes: {})",
+            "Room page access failed - Room {}... has expired (ttl_minutes: {})",
             short_room_id(&room_id),
             ttl_minutes
         );
@@ -345,7 +345,7 @@ pub async fn room_page(
     // enumeration infeasible, but unified responses remove a metadata side-channel.
     if room_is_full {
         tracing::warn!(
-            "Room page access failed - Room {}… is full",
+            "Room page access failed - Room {}... is full",
             short_room_id(&room_id)
         );
         return Err((StatusCode::NOT_FOUND, "Room not found").into_response());

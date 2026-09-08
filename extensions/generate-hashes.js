@@ -56,7 +56,7 @@ const HTML_FILES = [
 ];
 
 // Deployment-specific data files: hashed (hex) for integrity but not
-// SRI-injected. Not tracked in the public repo — each operator keeps
+// SRI-injected. Not tracked in the public repo - each operator keeps
 // a local copy at static/operator.json matching what the server serves
 // at /static/operator.json, then re-signs the manifest on change.
 const DATA_FILES = [

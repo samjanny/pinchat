@@ -125,7 +125,7 @@ pub fn verify_token(
     // enforcement; a future minor that widened the default would silently
     // weaken verification. Algorithm::HS256 is the only acceptable algorithm
     // because sign_token uses Header::default() (HS256). Also require `exp`,
-    // `aud`, `iss` — without these gates a token missing the claim would
+    // `aud`, `iss` - without these gates a token missing the claim would
     // skip the corresponding validation in jsonwebtoken.
     let mut validation = Validation::new(Algorithm::HS256);
     validation.set_required_spec_claims(&["exp", "aud", "iss"]);
@@ -228,13 +228,13 @@ mod tests {
     //
     // verify_token MUST reject:
     //   (a) a token whose `aud` is anything other than WS_TOKEN_AUDIENCE,
-    //       even with a matching secret and issuer — prevents a token minted
+    //       even with a matching secret and issuer - prevents a token minted
     //       for some other surface (admin endpoint, future internal service)
     //       from being replayed at the WS upgrade.
     //   (b) a token whose `iss` does not match the deployment's configured
-    //       issuer — prevents cross-instance reuse when two PinChat instances
+    //       issuer - prevents cross-instance reuse when two PinChat instances
     //       happen to share an HMAC key during rotation.
-    //   (c) a token missing either claim — relies on set_required_spec_claims.
+    //   (c) a token missing either claim - relies on set_required_spec_claims.
 
     #[test]
     fn test_token_rejects_wrong_audience() {
@@ -308,7 +308,7 @@ mod tests {
     //   (a) a token signed with any algorithm other than HS256, even if the
     //       MAC key is correct. Otherwise an attacker who learned the secret
     //       could downgrade the algorithm and we'd have to trust the
-    //       jsonwebtoken default-validation surface — which is documentation,
+    //       jsonwebtoken default-validation surface - which is documentation,
     //       not type-system enforcement.
     //   (b) a token missing the `exp` claim. The default Validation accepts
     //       missing-exp silently, which means an attacker who can mint

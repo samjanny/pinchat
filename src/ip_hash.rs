@@ -139,10 +139,10 @@ fn ip_in_cidr(ip: &IpAddr, cidr: &str) -> Option<bool> {
 ///
 /// IPv6 addresses are truncated to their /64 prefix: the lower 64 bits are
 /// zeroed before re-serialisation. This collapses every host suffix derived
-/// from the same /64 — SLAAC privacy-extensions rotations (RFC 4941), VPS
+/// from the same /64 - SLAAC privacy-extensions rotations (RFC 4941), VPS
 /// providers that assign a /64 per tenant (Hetzner, Linode, OVH), and any
 /// other pattern where one logical "user" cycles through 2^64 addresses
-/// from the same prefix — into a single rate-limit bucket.
+/// from the same prefix - into a single rate-limit bucket.
 ///
 /// Inputs that fail to parse as `IpAddr` are returned unchanged. The HMAC
 /// downstream still produces a stable hash, just without the canonical
@@ -152,7 +152,7 @@ fn canonicalize_for_rate_limit(ip: &str) -> String {
         Ok(IpAddr::V4(_)) => ip.to_string(),
         Ok(IpAddr::V6(v6)) => {
             let s = v6.segments();
-            // Zero out segments 4..8 → /64 prefix
+            // Zero out segments 4..8 -> /64 prefix
             std::net::Ipv6Addr::new(s[0], s[1], s[2], s[3], 0, 0, 0, 0).to_string()
         }
         Err(_) => ip.to_string(),
@@ -174,7 +174,7 @@ fn canonicalize_for_rate_limit(ip: &str) -> String {
 /// `canonicalize_for_rate_limit`). Without this, an attacker with a /64
 /// allocation (typical residential or VPS assignment) could rotate
 /// through 2^64 host suffixes and each address would be a separate
-/// rate-limit / challenge-cache bucket — defeating per-host limits.
+/// rate-limit / challenge-cache bucket - defeating per-host limits.
 ///
 /// # Development Mode
 /// When PRIVACY_MODE environment variable is set to "development",
@@ -352,7 +352,7 @@ mod tests {
 
     #[test]
     fn test_canonicalize_ipv4_unchanged() {
-        // IPv4 addresses pass through verbatim — no /64 collapse applies.
+        // IPv4 addresses pass through verbatim - no /64 collapse applies.
         assert_eq!(
             canonicalize_for_rate_limit("192.168.1.100"),
             "192.168.1.100"
@@ -432,7 +432,7 @@ mod tests {
     fn test_hash_ip_ipv4_canonicalization_stable() {
         // IPv4 hash must not change after introducing canonicalization.
         // Without a way to roll back the secret, we just assert that the
-        // canonical form of an IPv4 string equals the input — which means
+        // canonical form of an IPv4 string equals the input - which means
         // the HMAC input is unchanged from the pre-F-13 implementation.
         let _env_guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
         unsafe {

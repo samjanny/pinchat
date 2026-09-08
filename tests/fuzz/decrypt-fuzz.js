@@ -8,7 +8,7 @@
  * pair, then drives `bob.decryptMessage(...)` on a warmed-up DR pair.
  *
  * The warm-up runs ONCE at module load: three legitimate in-order
- * Alice→Bob messages, just enough to push Bob past the "first-message"
+ * Alice->Bob messages, just enough to push Bob past the "first-message"
  * branch in `_decryptMessageImpl`. We snapshot Bob's state at that
  * point and restore from the snapshot before every iteration, so each
  * iteration starts from the same well-defined state and the fuzzer
@@ -19,7 +19,7 @@
  *   1. NO uncaught exception / unhandled rejection. Any error must
  *      surface synchronously to the campaign runner through `throw`. Async
  *      rejections that escape would mark the JS process unhealthy
- *      and the fuzzer would not see them — `process.on('unhandledRejection')`
+ *      and the fuzzer would not see them - `process.on('unhandledRejection')`
  *      below promotes them into thrown findings.
  *
  *   2. STATE INTEGRITY on a thrown decrypt. After
@@ -27,7 +27,7 @@
  *      (Nr, Ns, PN, ratchetCount, root key bytes, both chain key bytes,
  *      DHrRaw, DHsSignature, skippedKeys size, hasRatchetedSinceReceive)
  *      MUST be byte-identical to the post-warm-up snapshot. This is the
- *      universal version of F-10 — every decrypt failure must leave the
+ *      universal version of F-10 - every decrypt failure must leave the
  *      ratchet untouched. A drift here is a real bug.
  *
  *   3. NO unexpected success. Random bytes cannot, by AEAD assumption,
@@ -173,7 +173,7 @@ function buildInputs(fdp) {
     const vRoll = fdp.consumeIntegralInRange(0, 9);
     const v = vRoll < 8 ? 1 : fdp.consumeIntegralInRange(0, 255);
 
-    // dh: P-256 raw uncompressed export is 65 bytes → 87 base64url chars.
+    // dh: P-256 raw uncompressed export is 65 bytes -> 87 base64url chars.
     // The fuzzer should mostly produce strings of plausible length to
     // exercise the verify path; occasionally weird lengths to exercise
     // parse/reject branches.
@@ -181,7 +181,7 @@ function buildInputs(fdp) {
     const dhBytes = fdp.consumeBytes(dhLen);
     const dh = toB64u(dhBytes);
 
-    // sig: ECDSA P-256 raw is 64 bytes → 86 base64url chars.
+    // sig: ECDSA P-256 raw is 64 bytes -> 86 base64url chars.
     const sigLen = fdp.consumeIntegralInRange(0, 200);
     const sigBytes = fdp.consumeBytes(sigLen);
     const sig = toB64u(sigBytes);

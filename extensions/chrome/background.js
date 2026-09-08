@@ -48,11 +48,11 @@ const GITHUB_REPO = 'samjanny/pinchat';
 // PR merge, stolen PAT) could otherwise push a freshly-signed-with-stolen-key
 // manifest to `main` and have every installed extension fetch it on the next
 // refresh. Pinning to a tag moves the trust anchor onto a string that cannot
-// be silently rewritten — a tag rebase shows up in `git log --tags --graph`
+// be silently rewritten - a tag rebase shows up in `git log --tags --graph`
 // and the manifest is immutable at the GitHub raw URL once the tag is pushed.
 // Lifecycle: this constant MUST be bumped to the new tag on every extension
 // release. A server-side release that does NOT ship a new extension keeps
-// using the previous pinned manifest — that is the intended behaviour and
+// using the previous pinned manifest - that is the intended behaviour and
 // reinforces the trust anchor.
 const GITHUB_TAG = 'v0.7.2';
 
@@ -663,7 +663,7 @@ async function notifyContentScripts() {
  *  - 'content': sender is a content script running on a pinchat.io tab
  *    (sender.tab.url points to OFFICIAL_DOMAIN). Used for FILE_HASH_*.
  *
- * Without externally_connectable, web pages cannot reach onMessage at all —
+ * Without externally_connectable, web pages cannot reach onMessage at all -
  * but we still validate sender to harden against future regressions and to
  * reject content scripts that somehow run on the wrong origin.
  */

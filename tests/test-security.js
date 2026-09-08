@@ -61,7 +61,7 @@ async function runTests() {
             console.log('PASSED: non-extractable creator key cannot be exported');
             passed++;
         } else {
-            console.log('FAILED: key was exported — extractable=false not enforced');
+            console.log('FAILED: key was exported - extractable=false not enforced');
             failed++;
         }
     } catch (e) {
@@ -93,7 +93,7 @@ async function runTests() {
             console.log('PASSED: non-extractable joiner key cannot be exported');
             passed++;
         } else {
-            console.log('FAILED: key was exported — extractable=false not enforced');
+            console.log('FAILED: key was exported - extractable=false not enforced');
             failed++;
         }
     } catch (e) {
@@ -177,13 +177,13 @@ async function runTests() {
     console.log('');
 
     // -------------------------------------------------------------------------
-    // Test 5: F-02 regression — IdentityKeyManager production path
+    // Test 5: F-02 regression - IdentityKeyManager production path
     // -------------------------------------------------------------------------
     // Test 3 above verifies the GENERIC pattern (generateKey(false, ...) yields
     // a non-extractable private key). Test 5 exercises the REAL production
     // class `IdentityKeyManager.generateIdentityKeypair()`. Before v0.2.5 the
-    // class used a three-step round-trip (extractable=true → exportKey('pkcs8')
-    // → importKey(false) → fill(0)) that briefly placed the raw private key
+    // class used a three-step round-trip (extractable=true -> exportKey('pkcs8')
+    // -> importKey(false) -> fill(0)) that briefly placed the raw private key
     // bytes in the JS heap. F-02 collapsed it to a single non-extractable
     // generateKey. This test exists to catch any future regression that
     // re-introduces an extractable intermediate.
@@ -243,7 +243,7 @@ async function runTests() {
         }
 
         if (privateExportFailed && publicExportSucceeded && signVerifyOk && failedImportWasAtomic) {
-            console.log('PASSED: F-02 — non-extractable identity + transactional peer import');
+            console.log('PASSED: F-02 - non-extractable identity + transactional peer import');
             passed++;
         } else {
             console.log(`FAILED: privateExportFailed=${privateExportFailed}, publicExportSucceeded=${publicExportSucceeded}, signVerifyOk=${signVerifyOk}, failedImportWasAtomic=${failedImportWasAtomic}`);

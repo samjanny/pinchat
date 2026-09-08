@@ -89,7 +89,7 @@ async function main() {
         console.log(`stat::number_of_executed_units: ${result.iterations}`);
         console.log(`stat::average_exec_per_sec: ${result.perSecond}`);
         console.log('');
-        console.log(`Fuzz campaign completed cleanly after ${seconds}s — no findings.`);
+        console.log(`Fuzz campaign completed cleanly after ${seconds}s - no findings.`);
     } catch (err) {
         console.error('');
         console.error('FUZZ FINDING (or fatal error):');

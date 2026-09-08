@@ -124,7 +124,7 @@ async function testConcurrentEncryptMonotonicCounters() {
     // Fire all encrypts in a single microtask burst. With the mutex in place
     // each call observes the chain state ratcheted by the previous one;
     // without the mutex multiple calls would read CK_0 and produce
-    // HMAC(CK_0, "MessageKey-1"), HMAC(CK_0, "MessageKey-2"), … which the
+    // HMAC(CK_0, "MessageKey-1"), HMAC(CK_0, "MessageKey-2"), ... which the
     // peer cannot derive.
     const encrypted = await Promise.all(
         Array.from({ length: N }, (_, i) =>
@@ -173,9 +173,9 @@ async function testDelayedCrossDhRound() {
     await bob.decryptMessage(round1[0].payload, round1[0].header, ROOM, ALICE_ID);
     await bob.decryptMessage(round1[1].payload, round1[1].header, ROOM, ALICE_ID);
 
-    // Bob replies → triggers Bob's send-side DH ratchet (rc -> 1 on his side).
+    // Bob replies -> triggers Bob's send-side DH ratchet (rc -> 1 on his side).
     const b0 = await bob.encryptMessage('bob reply', ROOM, BOB_ID);
-    // Alice receives → her receive-side DH ratchet (rc -> 1 on her side).
+    // Alice receives -> her receive-side DH ratchet (rc -> 1 on her side).
     const decB0 = await alice.decryptMessage(b0.payload, b0.header, ROOM, BOB_ID);
     assert.strictEqual(decB0.text, 'bob reply');
 
@@ -186,7 +186,7 @@ async function testDelayedCrossDhRound() {
     assert.strictEqual(round2_a0.header.rc, 1, 'ratchetCount must be 1 after one DH ratchet');
 
     // Bob receives round 2 message. This triggers:
-    //   - skipMessageKeys(5)  → stores OLD_DH:2, OLD_DH:3, OLD_DH:4 in skippedKeys
+    //   - skipMessageKeys(5)  -> stores OLD_DH:2, OLD_DH:3, OLD_DH:4 in skippedKeys
     //   - performDHRatchetOnReceive(newAliceDh)
     //   - decrypt round2_a0 in the fresh receiving chain
     const decRound2 = await bob.decryptMessage(round2_a0.payload, round2_a0.header, ROOM, ALICE_ID);
@@ -253,7 +253,7 @@ async function testDhPrivateNonExtractable() {
     // Imported peer DH public keys must also be non-extractable: if they
     // were exportable, an XSS could recover the raw bytes and check them
     // against precomputed group elements for traffic analysis. The raw
-    // bytes ARE retained in DHrRaw — that is fine: it is a side-channel
+    // bytes ARE retained in DHrRaw - that is fine: it is a side-channel
     // we already chose to expose, see comments in skipMessageKeys.
     await assert.rejects(
         webcrypto.subtle.exportKey('raw', alice.DHr),
@@ -299,14 +299,14 @@ async function testEncryptRollbackOnAeadFailure() {
         Ns: alice.Ns,
         ratchetCount: alice.ratchetCount,
         sendingChainCounter: alice.sendingChain.messageNumber,
-        // chainKeyMaterial is a Uint8Array — copy bytes for byte-comparison
+        // chainKeyMaterial is a Uint8Array - copy bytes for byte-comparison
         sendingChainKey: new Uint8Array(alice.sendingChain.chainKeyMaterial),
         DHsSignature: alice.DHsSignature,
     };
 
     // Monkey-patch crypto.subtle.encrypt to throw on the next call only.
     // The DoubleRatchet implementation reads `crypto.subtle.encrypt` directly,
-    // and Node 19+ aliases globalThis.crypto to webcrypto — so patching the
+    // and Node 19+ aliases globalThis.crypto to webcrypto - so patching the
     // bound encrypt on the global subtle reaches the production code.
     const realEncrypt = webcrypto.subtle.encrypt.bind(webcrypto.subtle);
     let nextEncryptThrows = true;

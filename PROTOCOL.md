@@ -155,10 +155,10 @@ Client                                    Server
 ```
 
 **Server rejection paths** (pre-upgrade, before `on_upgrade`):
-- No `Sec-WebSocket-Protocol` header → **401 Unauthorized**
-- No `pinchat.v1` base offered → **426 Upgrade Required**
-- No `pinchat.v1.jwt.<token>` companion → **401 Unauthorized**
-- Invalid / expired JWT → **401**; wrong room_id → **403**; replayed jti → **403**
+- No `Sec-WebSocket-Protocol` header -> **401 Unauthorized**
+- No `pinchat.v1` base offered -> **426 Upgrade Required**
+- No `pinchat.v1.jwt.<token>` companion -> **401 Unauthorized**
+- Invalid / expired JWT -> **401**; wrong room_id -> **403**; replayed jti -> **403**
 
 ### Room Creation Response (v1)
 

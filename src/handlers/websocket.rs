@@ -98,7 +98,7 @@ pub async fn ws_handler(
     // bounce of a legitimate token through an Origin/room-mismatch path
     // would burn its jti and lock the real client out of its own session.
 
-    // Origin check — defense-in-depth (RFC 6455 §4.1).
+    // Origin check - defense-in-depth (RFC 6455 §4.1).
     // The primary guard is the SameSite=Strict session cookie preventing
     // cross-origin token acquisition; this check makes the guarantee
     // explicit and holds even if that assumption ever changes.
@@ -231,7 +231,7 @@ pub async fn ws_handler(
     let connection_id = claims.connection_id;
     let ws_size = max_ws_size(state.config.max_image_size);
 
-    // Echo only the base subprotocol back (do NOT echo the jwt.* companion —
+    // Echo only the base subprotocol back (do NOT echo the jwt.* companion -
     // the RFC requires the response subprotocol to be one the client offered,
     // but we pick the non-secret one so the 101 response carries no token).
     ws.protocols(["pinchat.v1"])
@@ -243,7 +243,7 @@ pub async fn ws_handler(
 /// Increments the per-connection protocol-error counter. Returns true once the
 /// counter reaches `config.protocol_error_limit`, signalling the recv loop to
 /// close the connection. Counts parse failures, unknown msg_type, and ECDH
-/// oversize — categories a well-behaved client never produces.
+/// oversize - categories a well-behaved client never produces.
 fn bump_protocol_error(state: &AppState, connection_id: Uuid) -> bool {
     let limit = state.config.protocol_error_limit;
     let mut entry = state
@@ -442,7 +442,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: Uuid, connec
             // and is not counted against the rate limit. All other frame
             // types (Text, Binary, Ping, Pong) pass through the lifecycle
             // gates and the global rate limiter, but only Text is
-            // application-relevant — Binary/Ping/Pong are accounted for
+            // application-relevant - Binary/Ping/Pong are accounted for
             // and dropped.
             let text = match msg {
                 WsMessage::Close(_) => break,
@@ -535,7 +535,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: Uuid, connec
                             // here; an authenticated peer could flood handshake
                             // frames and force the receiver client into repeated
                             // signature verification + key import + Double
-                            // Ratchet reinit. Real handshakes need 1–2 frames
+                            // Ratchet reinit. Real handshakes need 1-2 frames
                             // per session, so a small burst over a long window
                             // is more than enough for legitimate reconnects.
                             {
@@ -660,7 +660,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, room_id: Uuid, connec
                                 // The cryptographic signature verification happens client-side
                                 // (server is blind relay), but we enforce shape + DoS caps here.
                                 const MAX_SIG_LEN: usize = 100; // ECDSA P-256 base64url ≤ 88 chars
-                                const MAX_DH_LEN: usize = 100; // P-256 uncompressed raw 65 B → ~88 chars base64url
+                                const MAX_DH_LEN: usize = 100; // P-256 uncompressed raw 65 B -> ~88 chars base64url
                                 let hdr = match incoming.header {
                                     Some(h)
                                         if h.v == crate::models::PINCHAT_PROTOCOL_VERSION
@@ -881,7 +881,7 @@ mod tests {
     //! We cannot use `ServiceExt::oneshot` because axum's `WebSocketUpgrade`
     //! extractor requires a `hyper::upgrade::OnUpgrade` request extension
     //! that is only installed by a real server during an actual upgrade
-    //! (absence → axum returns 426 before our handler runs). Instead we
+    //! (absence -> axum returns 426 before our handler runs). Instead we
     //! spin up a bound listener and issue raw upgrade requests via reqwest.
     use super::*;
     use crate::config::Config;
@@ -1012,7 +1012,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_missing_origin_in_production() {
-        // PRIVACY_MODE not set → production policy applies: missing Origin → 403.
+        // PRIVACY_MODE not set -> production policy applies: missing Origin -> 403.
         // Defense-in-depth against non-browser clients (curl/script) that could
         // otherwise bypass the cors_allowed_origins allowlist with a stolen
         // session cookie.
@@ -1113,7 +1113,7 @@ mod tests {
     async fn rejects_old_protocol_version() {
         let (addr, _state, room_id) = spawn_test_server().await;
         let path = format!("/ws/{}", room_id);
-        // Only a non-v1 subprotocol offered → 426.
+        // Only a non-v1 subprotocol offered -> 426.
         let status = raw_upgrade(addr, &path, Some("pinchat.v0")).await;
         assert_eq!(status, 426);
     }
@@ -1122,7 +1122,7 @@ mod tests {
     async fn rejects_missing_jwt_subprotocol() {
         let (addr, _state, room_id) = spawn_test_server().await;
         let path = format!("/ws/{}", room_id);
-        // Base pinchat.v1 present, but no companion jwt token → 401.
+        // Base pinchat.v1 present, but no companion jwt token -> 401.
         let status = raw_upgrade(addr, &path, Some("pinchat.v1")).await;
         assert_eq!(status, 401);
     }
@@ -1159,7 +1159,7 @@ mod tests {
 
     #[tokio::test]
     async fn accepts_valid_subprotocol_and_jwt() {
-        // Full success path: bound listener + valid single-use JWT → 101 + echoed subprotocol.
+        // Full success path: bound listener + valid single-use JWT -> 101 + echoed subprotocol.
         let (addr, state, room_id) = spawn_test_server().await;
         let claims = WsTokenClaims::new(room_id, 30, &state.config.jwt_issuer);
         let token = sign_token(&claims, &state.jwt_secret).unwrap();

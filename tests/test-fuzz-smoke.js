@@ -5,7 +5,7 @@
  *
  * Runs the decrypt-path fuzz target for a short, fixed budget (default
  * 5 seconds). Purpose:
- *   - Catches harness rot — if the fuzz target stops loading because
+ *   - Catches harness rot - if the fuzz target stops loading because
  *     the production module shape changed, this suite fails first.
  *   - Quick coverage of the random-input decrypt path on every CI run.
  *
@@ -25,7 +25,7 @@ console.log(`Fuzz smoke (${SMOKE_SECONDS}s decrypt-path campaign):`);
 
 runCampaign(SMOKE_SECONDS)
     .then((result) => {
-        console.log(`  [OK] ${result.iterations} iterations (${result.perSecond} exec/s) — no findings`);
+        console.log(`  [OK] ${result.iterations} iterations (${result.perSecond} exec/s) - no findings`);
         console.log(`  Replay seed: ${result.seed}`);
         console.log('  Longer campaigns: node tests/run-fuzz.js <seconds>');
     })

@@ -18,7 +18,7 @@ let fileHashVerificationDone = false;  // Track if we've verified file hashes
 let manifestSRIMap = {};  // Map of path -> expected SRI for O(1) lookups
 let reVerifyTimeout = null;  // Debounce timer for re-verification
 
-// Overlay persistence — a compromised page could try to remove or hide our
+// Overlay persistence - a compromised page could try to remove or hide our
 // warning host element. We retain the args used to render the overlay so a
 // watchdog (and the main MutationObserver) can re-mount/restore on tamper.
 let overlayPersistentState = {
@@ -193,7 +193,7 @@ function validateResourceAgainstManifest(element) {
             // manifestSRIMap is empty and every legitimate resource would be
             // wrongly flagged "not in manifest". Defer to performDOMSecurityCheck,
             // which already waits for the manifest and re-scans the full DOM
-            // once it arrives — so any genuinely unknown resource is still
+            // once it arrives - so any genuinely unknown resource is still
             // caught, just slightly later.
             if (!manifestData || !manifestData.files) {
                 return null;
@@ -594,7 +594,7 @@ function verifySRIInDOM(manifest) {
     // Check for <base> elements. The site does not legitimately use one, so any
     // <base> at all is suspicious. A <base href="https://attacker.com/"> rewrites
     // the resolution of every relative URL in the page (form actions, link hrefs,
-    // images, fetch()) — an injection point for phishing/exfiltration.
+    // images, fetch()) - an injection point for phishing/exfiltration.
     const bases = document.querySelectorAll('base[href]');
     bases.forEach(base => {
         const issue = validateBaseElement(base);
@@ -632,7 +632,7 @@ function validateBaseElement(element) {
         };
     }
 
-    // Even same-origin <base> is unexpected on this site — flag it.
+    // Even same-origin <base> is unexpected on this site - flag it.
     return {
         path: href,
         error: 'Unexpected <base> element',
@@ -753,9 +753,9 @@ function setupDOMObserver() {
 
     // Safe-fail deadline: validateResourceAgainstManifest defers verdicts
     // when manifestData is still null (race with the async manifest delivery
-    // from the background script). If the manifest never lands — network
+    // from the background script). If the manifest never lands - network
     // blocked, hashes.json.signed deleted, background script crashed/disabled,
-    // service worker not yet woken — we MUST surface that as an overlay
+    // service worker not yet woken - we MUST surface that as an overlay
     // rather than silently treat the page as trusted.
     //
     // 10s is generous enough to absorb cold-start service worker spin-up
@@ -764,10 +764,10 @@ function setupDOMObserver() {
     // notice before they trust the page.
     setTimeout(() => {
         if (!manifestData || !manifestData.files) {
-            console.error('[PinChat Verify] Manifest not delivered within 10s — treating page as unverified');
+            console.error('[PinChat Verify] Manifest not delivered within 10s - treating page as unverified');
             showWarningOverlay([{
                 path: 'Manifest',
-                error: 'Manifest unavailable — cannot verify page integrity. The background script may be blocked, the network may be filtering hashes.json.signed, or the service worker is not running.',
+                error: 'Manifest unavailable - cannot verify page integrity. The background script may be blocked, the network may be filtering hashes.json.signed, or the service worker is not running.',
                 type: 'manifest-unavailable'
             }], true);
         }
@@ -1011,18 +1011,18 @@ function restoreOverlayIfTampered() {
     if (!overlayPersistentState.active) return;
 
     if (!overlayElement || !document.contains(overlayElement)) {
-        console.warn('[PinChat Verify] Overlay missing — re-mounting');
+        console.warn('[PinChat Verify] Overlay missing - re-mounting');
         overlayElement = null;
         showWarningOverlay(overlayPersistentState.mismatches, overlayPersistentState.isUnauthorized);
         return;
     }
 
     if (overlayElement.hasAttribute('style')) {
-        console.warn('[PinChat Verify] Overlay style attribute tampered — clearing');
+        console.warn('[PinChat Verify] Overlay style attribute tampered - clearing');
         overlayElement.removeAttribute('style');
     }
     if (overlayElement.hidden) {
-        console.warn('[PinChat Verify] Overlay `hidden` attribute set — clearing');
+        console.warn('[PinChat Verify] Overlay `hidden` attribute set - clearing');
         overlayElement.hidden = false;
     }
     if (overlayElement.getAttribute('class')) {
@@ -1103,7 +1103,7 @@ chrome.runtime.sendMessage({ type: 'GET_STATUS' }, (response) => {
 // can execute. Initial DOM check is deferred to DOMContentLoaded (it depends on
 // the manifest arriving from background and on a fully-parsed DOM), but the
 // observer must be live as soon as possible so injections during parse are
-// caught — even if the script tag has already started fetching, we'll flag it
+// caught - even if the script tag has already started fetching, we'll flag it
 // and trigger the warning overlay before the user trusts the page.
 setupDOMObserver();
 

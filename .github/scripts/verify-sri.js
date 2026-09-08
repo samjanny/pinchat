@@ -115,7 +115,7 @@ for (const htmlFile of HTML_FILES) {
     }
   }
   const status = fileBad === 0 ? 'OK' : 'FAIL';
-  console.log(`${htmlFile}: ${fileChecked} tags, ${fileBad} bad — ${status}`);
+  console.log(`${htmlFile}: ${fileChecked} tags, ${fileBad} bad - ${status}`);
 }
 
 console.log(`\nTotal: ${totalChecked} SRI tags checked, ${totalBad} mismatches`);

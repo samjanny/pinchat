@@ -5,35 +5,35 @@
  *
  * The hand-rolled scenarios in test-ratchet-correctness.js pin specific
  * regressions (C-01, C-02, C-05, F-10). This file complements them with
- * randomized delivery patterns, plaintexts, and reorderings — searching
+ * randomized delivery patterns, plaintexts, and reorderings - searching
  * for ratchet state-machine bugs that a fixed scenario would miss.
  *
  * Properties checked (audit-3 M-03 assurance):
  *
- *   P1 — Round-trip identity under in-order delivery.
+ *   P1 - Round-trip identity under in-order delivery.
  *        For any sequence of plaintexts encrypted by Alice and delivered
  *        in order to Bob, every plaintext is recovered byte-exact.
  *
- *   P2 — Round-trip identity under bounded reorder (≤ MAX_SKIP within a chain).
+ *   P2 - Round-trip identity under bounded reorder (≤ MAX_SKIP within a chain).
  *        Bob can decrypt messages out of order if they fall within the
  *        100-message skip window, and the late ones are flagged
  *        _outOfOrder.
  *
- *   P3 — Replay rejection.
+ *   P3 - Replay rejection.
  *        A successfully decrypted message, redelivered with the same
  *        payload + header, MUST be rejected (AEAD failure or
  *        counter-rewind rejection).
  *
- *   P4 — Concurrent encrypt monotonicity.
+ *   P4 - Concurrent encrypt monotonicity.
  *        N parallel `encryptMessage` calls produce N strictly sequential
  *        header.n values 0..N-1, every result decrypts at the peer.
  *
- *   P5 — Bidirectional ping-pong under arbitrary turn-taking.
+ *   P5 - Bidirectional ping-pong under arbitrary turn-taking.
  *        Random interleaving of Alice-sends / Bob-sends / Alice-delivers
  *        / Bob-delivers preserves round-trip identity, including across
  *        DH ratchet rotations.
  *
- *   P6 — Corrupt payload preserves state.
+ *   P6 - Corrupt payload preserves state.
  *        Flipping a single bit in a payload byte must cause decrypt to
  *        throw AND leave Nr / ratchetCount / chain key material / skipped
  *        keys count byte-identical to pre-call. This is F-10 generalised
@@ -149,7 +149,7 @@ async function testInOrderRoundtrip() {
         ),
         { numRuns: 20 },
     );
-    pass('P1 — round-trip identity under in-order delivery (20 cases)');
+    pass('P1 - round-trip identity under in-order delivery (20 cases)');
 }
 
 // ── P2: round-trip under bounded reorder ────────────────────────────────
@@ -191,7 +191,7 @@ async function testReorderedRoundtrip() {
         ),
         { numRuns: 20 },
     );
-    pass('P2 — round-trip under bounded reorder, with _outOfOrder flag correctness (20 cases)');
+    pass('P2 - round-trip under bounded reorder, with _outOfOrder flag correctness (20 cases)');
 }
 
 // ── P3: replay rejection ────────────────────────────────────────────────
@@ -215,7 +215,7 @@ async function testReplayRejection() {
                     assert.strictEqual(dec.text, messages[i]);
                 }
                 // Now replay one. Counter rewind + AEAD on consumed key both
-                // produce a thrown error — either is acceptable.
+                // produce a thrown error - either is acceptable.
                 const replayIdx = replayIdxRaw % encrypted.length;
                 let threw = false;
                 try {
@@ -232,7 +232,7 @@ async function testReplayRejection() {
         ),
         { numRuns: 20 },
     );
-    pass('P3 — replay of an already-decrypted message is rejected (20 cases)');
+    pass('P3 - replay of an already-decrypted message is rejected (20 cases)');
 }
 
 // ── P4: concurrent encrypt monotonicity + decryptability ────────────────
@@ -266,7 +266,7 @@ async function testConcurrentEncryptThenDecrypt() {
         ),
         { numRuns: 15 },
     );
-    pass('P4 — concurrent encrypts produce monotone counters and all decrypt (15 cases)');
+    pass('P4 - concurrent encrypts produce monotone counters and all decrypt (15 cases)');
 }
 
 // ── P5: bidirectional ping-pong under arbitrary turn-taking ─────────────
@@ -292,8 +292,8 @@ async function testBidirectionalPingPong() {
             fc.array(STEP, { minLength: 4, maxLength: 40 }),
             async (steps) => {
                 const { alice, bob } = await setupPair();
-                const aliceToBob = [];  // pending Alice→Bob
-                const bobToAlice = [];  // pending Bob→Alice
+                const aliceToBob = [];  // pending Alice->Bob
+                const bobToAlice = [];  // pending Bob->Alice
                 for (const s of steps) {
                     if (s.tag === 'AS') {
                         const enc = await alice.encryptMessage(s.msg, ROOM, ALICE_ID);
@@ -305,19 +305,19 @@ async function testBidirectionalPingPong() {
                         if (aliceToBob.length === 0) continue;
                         const m = aliceToBob.shift();
                         const dec = await bob.decryptMessage(m.payload, m.header, ROOM, ALICE_ID);
-                        assert.strictEqual(dec.text, m.msg, 'A→B delivery roundtrip failed');
+                        assert.strictEqual(dec.text, m.msg, 'A->B delivery roundtrip failed');
                     } else if (s.tag === 'DBA') {
                         if (bobToAlice.length === 0) continue;
                         const m = bobToAlice.shift();
                         const dec = await alice.decryptMessage(m.payload, m.header, ROOM, BOB_ID);
-                        assert.strictEqual(dec.text, m.msg, 'B→A delivery roundtrip failed');
+                        assert.strictEqual(dec.text, m.msg, 'B->A delivery roundtrip failed');
                     }
                 }
             },
         ),
         { numRuns: 20 },
     );
-    pass('P5 — bidirectional ping-pong preserves round-trip under arbitrary turn-taking (20 cases)');
+    pass('P5 - bidirectional ping-pong preserves round-trip under arbitrary turn-taking (20 cases)');
 }
 
 // ── P6: corrupt payload preserves state ─────────────────────────────────
@@ -342,7 +342,7 @@ async function testCorruptPayloadPreservesState() {
                 }
                 const enc = await alice.encryptMessage(msg, ROOM, ALICE_ID);
 
-                // Base64url → bytes → flip one bit → base64url.
+                // Base64url -> bytes -> flip one bit -> base64url.
                 function b64uToBytes(s) {
                     const std = s.replace(/-/g, '+').replace(/_/g, '/');
                     const padded = std + '='.repeat((4 - std.length % 4) % 4);
@@ -353,7 +353,7 @@ async function testCorruptPayloadPreservesState() {
                         .replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
                 }
                 const bytes = b64uToBytes(enc.payload);
-                if (bytes.length === 0) return;  // pathological — skip
+                if (bytes.length === 0) return;  // pathological - skip
                 const pos = posSeed % bytes.length;
                 const corrupted = Buffer.from(bytes);
                 corrupted[pos] ^= (1 << bitPos);
@@ -369,7 +369,7 @@ async function testCorruptPayloadPreservesState() {
                 }
 
                 // If the flip happens to produce an authentication-tag
-                // collision (statistically: ~2^-128 — never), decrypt could
+                // collision (statistically: ~2^-128 - never), decrypt could
                 // succeed with garbage plaintext. Treat that as a pass for
                 // the state-integrity property; the corruption is
                 // indistinguishable from a legitimate payload by AEAD.
@@ -384,13 +384,13 @@ async function testCorruptPayloadPreservesState() {
         ),
         { numRuns: 30 },
     );
-    pass('P6 — corrupt payload throws AND leaves receiver state byte-identical (30 cases)');
+    pass('P6 - corrupt payload throws AND leaves receiver state byte-identical (30 cases)');
 }
 
 // ── runner ──────────────────────────────────────────────────────────────
 
 (async () => {
-    console.log('Property-based tests (fast-check) — Double Ratchet under random delivery:');
+    console.log('Property-based tests (fast-check) - Double Ratchet under random delivery:');
     try {
         await testInOrderRoundtrip();
         await testReorderedRoundtrip();

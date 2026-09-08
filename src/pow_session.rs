@@ -7,7 +7,7 @@
 //! This module issues an opaque, short-lived cookie (`pc_pow`) that is mixed
 //! into the cache key so each browser gets its own challenge even when the
 //! source IP is shared. The cookie is a random UUID v4, HttpOnly/Secure/
-//! SameSite=Strict, and scoped to the PoW flow only — it is not used for
+//! SameSite=Strict, and scoped to the PoW flow only - it is not used for
 //! tracking and expires alongside the challenge.
 //!
 //! Fallback: clients that block cookies simply receive a new UUID and a new

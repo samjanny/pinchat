@@ -67,7 +67,7 @@ pub struct Config {
     // signature verification + key import + Double Ratchet re-init on the
     // peer client; without a dedicated cap, an authenticated peer could
     // exhaust the receiver's CPU under cover of the (much looser)
-    // frame_rate_limit. Real handshakes need 1–2 frames per session and a
+    // frame_rate_limit. Real handshakes need 1-2 frames per session and a
     // few more across reconnects, so a small burst over a long window is
     // ample.
     pub ecdh_burst_limit: usize,
@@ -314,7 +314,7 @@ impl Config {
             //   1000 entries × 1000 rooms × 136 B ≈ 136 MB worst case.
             //
             // The previous default was 10000, which extrapolated to ~1.4 GB
-            // worst case on a VPS — disproportionate given the cache is an
+            // worst case on a VPS - disproportionate given the cache is an
             // advisory anti-replay layer (the authoritative defence is the
             // Double Ratchet monotone counter, checked client-side). 1000
             // entries still tolerate ~17 minutes at the msg_rate_limit of
