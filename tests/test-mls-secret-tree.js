@@ -29,7 +29,7 @@ function assert(cond, name, detail) {
         passed += 1;
     } else {
         failed += 1;
-        console.log(`  FAIL ${name}${detail ? `  — ${detail}` : ''}`);
+        console.log(`  FAIL ${name}${detail ? `  - ${detail}` : ''}`);
     }
 }
 
@@ -44,7 +44,7 @@ function hex(u8) {
 
 async function main() {
     const cs2 = VECTORS.filter((x) => x.cipher_suite === 2);
-    console.log(`# secret-tree — cipher_suite=2 (${cs2.length} trees)`);
+    console.log(`# secret-tree - cipher_suite=2 (${cs2.length} trees)`);
 
     for (let ei = 0; ei < cs2.length; ei += 1) {
         const v = cs2[ei];

@@ -1,15 +1,15 @@
 /**
- * PinChat MLS — ratchet-tree container (RFC 9420 §7).
+ * PinChat MLS - ratchet-tree container (RFC 9420 §7).
  *
  * Wraps the `vector<optional<Node>>` produced by nodes.js with the
  * operations that depend on the *tree shape*:
  *
- *   - resolution(node)       — §7.7, the ordered set of non-blank
+ *   - resolution(node)       - §7.7, the ordered set of non-blank
  *                              descendants used by TreeKEM encryption.
- *   - filteredDirectPath     — §7.6, direct path skipping blanked
+ *   - filteredDirectPath     - §7.6, direct path skipping blanked
  *                              intermediate parents (not yet wired;
  *                              placeholder for TreeKEM).
- *   - leafFor / encryptionKey / parentEncryptionKey — shortcut
+ *   - leafFor / encryptionKey / parentEncryptionKey - shortcut
  *                              accessors that centralise the blank
  *                              handling every higher layer wants.
  *
@@ -79,7 +79,7 @@
     }
 
     /**
-     * "Filtered direct path" — direct path with blanked ancestors removed.
+     * "Filtered direct path" - direct path with blanked ancestors removed.
      * RFC 9420 §7.6 uses the filtered path to decide which copath
      * resolution to encrypt to when committing. For now we expose the
      * full direct path unchanged; TreeKEM will filter at encryption time.

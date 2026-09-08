@@ -6,22 +6,24 @@
  *     the signed manifest and verified by the PinChat extension via SRI.
  *     Tampering with either is caught by the extension.
  *   - The operator-specific values (name, contact email, PEC, hosting, etc.)
- *     live in /static/operator.json, which is intentionally NOT in the signed
- *     manifest: it is deployment-specific data, different per operator.
+ *     live in /static/operator.json. The file is deployment-specific and
+ *     untracked in git, but the deployed copy IS listed in the signed
+ *     manifest (verify-sri.js checks it when present), so changing it on
+ *     the server requires a re-sign like any other static asset.
  *   - All substitution is done with textContent / href, never innerHTML.
  *     Even if an attacker compromised the server and tampered with
- *     operator.json, they could only change displayed text — not inject
+ *     operator.json, they could only change displayed text, not inject
  *     script, HTML, or navigate to hostile origins. Mailto links are
  *     sanity-checked to be syntactically plausible email addresses before
  *     being assigned.
  *
  * Template conventions:
  *   <span data-legal="OPERATOR_NAME">fallback</span>
- *     → text replaced with operator.OPERATOR_NAME
+ *     -> text replaced with operator.OPERATOR_NAME
  *   <a data-legal-mailto="OPERATOR_EMAIL_SUPPORT" href="#">...</a>
- *     → href replaced with "mailto:" + operator.OPERATOR_EMAIL_SUPPORT
+ *     -> href replaced with "mailto:" + operator.OPERATOR_EMAIL_SUPPORT
  *   <p data-legal-optional="OPERATOR_FOO">...</p>
- *     → element is removed entirely when operator.OPERATOR_FOO is missing
+ *     -> element is removed entirely when operator.OPERATOR_FOO is missing
  *       or an empty string, so the page does not render orphan paragraphs.
  *
  * If operator.json cannot be fetched or does not contain a requested key,

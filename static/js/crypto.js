@@ -7,7 +7,7 @@
  * Clients before this release are "v0 implicit" and will be rejected.
  */
 const PINCHAT_PROTOCOL_VERSION = 1;
-// Browser path: expose to window. Node test harness has no window — the
+// Browser path: expose to window. Node test harness has no window - the
 // Node export block at the bottom of this file mirrors the value onto
 // globalThis there. The `typeof` guard keeps both runtimes happy.
 if (typeof window !== 'undefined') {
@@ -110,6 +110,43 @@ const AAD_FIELD_TYPES = {
     RATCHET_COUNT: 0x07,  // 8 bytes (BigUint64) - binds ratchet count to ciphertext
     PREVIOUS_CHAIN_LENGTH: 0x08 // 8 bytes (BigUint64) - binds pn to ciphertext
 };
+
+/**
+ * Image MIME types this client will encrypt or render.
+ *
+ * Audit F-1 / L-1: the sender-side check was `file.type.startsWith('image/')`,
+ * which admits image/svg+xml, and the RECEIVER had no check at all --
+ * decryptImage returned the peer-controlled mimeType straight out of the
+ * decrypted envelope, and app.js fed it to `new Blob(..., {type})` plus
+ * URL.createObjectURL. What the AEAD guarantees is only that the PEER wrote
+ * that string, not that it is safe to build an object URL from.
+ *
+ * Two consequences. A modified client could declare text/html and produce a
+ * same-origin blob: document; our CSP is inherited by blob: documents so
+ * inline script stays blocked, but "open image in new tab" lands the viewer on
+ * attacker-authored markup under the real origin. SVG is the subtler one: it
+ * renders inside <img>, so a peer could paint arbitrary vector content that
+ * imitates application chrome directly inside a message bubble.
+ *
+ * The list mirrors the file picker's accept attribute in chat.html and is
+ * enforced on BOTH ends: on send so the user gets an immediate, specific
+ * error, and on receive because that is the side the local user cannot vouch
+ * for.
+ */
+const ALLOWED_IMAGE_MIME_TYPES = Object.freeze([
+    'image/png',
+    'image/jpeg',
+    'image/gif',
+    'image/webp',
+]);
+
+/**
+ * @param {unknown} mimeType
+ * @returns {boolean} true when the type is in ALLOWED_IMAGE_MIME_TYPES
+ */
+function isAllowedImageMimeType(mimeType) {
+    return typeof mimeType === 'string' && ALLOWED_IMAGE_MIME_TYPES.includes(mimeType);
+}
 
 /**
  * Encodes AAD fields using TLV (Type-Length-Value) format
@@ -292,8 +329,20 @@ class ChainRatchet {
             throw new Error('Chain ratchet not initialized');
         }
 
-        // Calculate how many ratchet steps ahead this counter is
+        // Calculate how many ratchet steps ahead this counter is.
+        //
+        // Audit F-2: a negative or non-integer result used to skip the loop
+        // below silently and then derive a key from the CURRENT chain position
+        // while labelling it with the requested counter -- the wrong key, with
+        // no error raised. The Double Ratchet keeps Nr and
+        // receivingChain.messageNumber aligned on every receive path, so this
+        // is unreachable today. Assert the invariant rather than assume it, so
+        // a future refactor fails loudly here instead of producing a session
+        // whose messages simply stop decrypting.
         const stepsAhead = counter - currentCounter;
+        if (!Number.isInteger(stepsAhead) || stepsAhead < 0) {
+            throw new Error('CHAIN_COUNTER_REGRESSION');
+        }
 
         // Simulate ratcheting forward (without modifying actual chain state)
         let simulatedChainKey = new Uint8Array(this.chainKeyMaterial);
@@ -390,7 +439,7 @@ class ChainRatchet {
 
 /**
  * Derive a 32-byte MLS PSK from the raw URL-fragment bytes via HKDF-SHA256.
- *   salt = empty (RFC 5869 default — IKM is already 256 bits of entropy)
+ *   salt = empty (RFC 5869 default - IKM is already 256 bits of entropy)
  *   info = "PinChat MLS PSK v1" (domain-separation label per RFC 5869 §3.2)
  *
  * Per RFC 5869 the `info` field is the canonical domain-separator across
@@ -448,8 +497,8 @@ class CryptoManager {
      * to sessionStorage and scrubs the URL bar (C-06).
      *
      * Sources, in priority order:
-     *   1. window.location.hash — initial page load via the invite link.
-     *   2. sessionStorage[`pinchat_hash:${pathname}`] — post-login restore
+     *   1. window.location.hash - initial page load via the invite link.
+     *   2. sessionStorage[`pinchat_hash:${pathname}`] - post-login restore
      *      (login-stash.js / websocket.js / homepage.js) AND in-tab re-reads
      *      after C-06 has already scrubbed the URL on a previous call.
      *
@@ -471,7 +520,7 @@ class CryptoManager {
 
         // Priority 2: sessionStorage stash (login-stash.js, in-tab re-read,
         // or websocket.js's 401-bounce path). We intentionally do NOT
-        // remove the stash here — the post-import block below rewrites it
+        // remove the stash here - the post-import block below rewrites it
         // anyway, and leaving it in place during the import phase means a
         // crash before the rewrite still keeps the secret recoverable.
         if (!fragment) {
@@ -834,7 +883,7 @@ class CryptoManager {
      * Full reset of ratchet state and re-extraction of the bootstrap key.
      *
      * Tears down the live Double Ratchet instance (the only ratchet at
-     * runtime — the legacy single-chain path was removed in the C-13
+     * runtime - the legacy single-chain path was removed in the C-13
      * hygiene pass) and re-reads the bootstrap key from the URL fragment
      * or sessionStorage. Throws BOOTSTRAP_KEY_LOST when neither source
      * has it any more so the caller can surface "re-open the room link"
@@ -843,7 +892,7 @@ class CryptoManager {
      * @throws {Error} 'BOOTSTRAP_KEY_LOST' if the URL fragment / sessionStorage stash is missing.
      */
     async resetToBootstrapKey() {
-        debugLog('[CRYPTO] Full reset → re-extract bootstrap key');
+        debugLog('[CRYPTO] Full reset -> re-extract bootstrap key');
 
         if (this.doubleRatchet) {
             this.doubleRatchet.destroy();
@@ -875,6 +924,12 @@ class CryptoManager {
     async encryptImage(imageData, mimeType, roomId, senderId) {
         if (!this.doubleRatchetActive) {
             throw new Error('Double Ratchet not initialized - cannot encrypt');
+        }
+
+        // Audit F-1: refuse to put a type on the wire that the receiving side
+        // will reject anyway. Keeps both ends on one allowlist.
+        if (!isAllowedImageMimeType(mimeType)) {
+            throw new Error('UNSUPPORTED_IMAGE_TYPE');
         }
 
         debugLog('[CRYPTO] Encrypting image with Double Ratchet...');
@@ -941,6 +996,14 @@ class CryptoManager {
             throw new Error('Expected image message but got: ' + imageEnvelope.type);
         }
 
+        // Audit F-1: screen the peer-controlled mimeType BEFORE the caller can
+        // build a Blob and an object URL from it. This is the gate that
+        // matters -- the sender-side check protects the sender's own UX, this
+        // one protects us from a peer running a modified client.
+        if (!isAllowedImageMimeType(imageEnvelope.mimeType)) {
+            throw new Error('UNSUPPORTED_IMAGE_TYPE');
+        }
+
         // Convert base64 back to ArrayBuffer
         const imageData = this.base64ToArrayBuffer(imageEnvelope.data);
 
@@ -992,6 +1055,8 @@ if (typeof module !== 'undefined' && module.exports) {
     globalThis.AAD_FIELD_TYPES = AAD_FIELD_TYPES;
     globalThis.encodeAADWithLengthPrefix = encodeAADWithLengthPrefix;
     globalThis.ChainRatchet = ChainRatchet;
+    globalThis.ALLOWED_IMAGE_MIME_TYPES = ALLOWED_IMAGE_MIME_TYPES;
+    globalThis.isAllowedImageMimeType = isAllowedImageMimeType;
     module.exports = {
         CryptoManager,
         ChainRatchet,
@@ -1003,6 +1068,8 @@ if (typeof module !== 'undefined' && module.exports) {
         parseMlsBootstrapPins,
         MLS_GROUP_ID_FRAGMENT_PARAM,
         MLS_CREATOR_KEY_FRAGMENT_PARAM,
+        ALLOWED_IMAGE_MIME_TYPES,
+        isAllowedImageMimeType,
     };
 } else {
     window.cryptoManager = new CryptoManager();

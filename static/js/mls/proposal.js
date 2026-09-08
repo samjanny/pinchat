@@ -1,5 +1,5 @@
 /**
- * PinChat MLS — Proposal + Commit structs (RFC 9420 §12).
+ * PinChat MLS - Proposal + Commit structs (RFC 9420 §12).
  *
  * Proposal layer
  * --------------
@@ -39,7 +39,7 @@
  * Add/Update/Remove are fully implemented and tested. PSK is parsed by
  * delegating to welcome.js's PreSharedKeyID serde. ReInit /
  * ExternalInit / GroupContextExtensions are parsed as opaque "rest of
- * body" blobs with their own serialized bytes captured — enough to
+ * body" blobs with their own serialized bytes captured - enough to
  * roundtrip unknown proposals without decoding them.
  */
 (function (root, factory) {

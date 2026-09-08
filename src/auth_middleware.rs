@@ -159,7 +159,7 @@ mod tests {
     //!
     //! The middleware needs the full AppState + axum router machinery to
     //! exercise the auth gate, so we spin up a bound listener and issue raw
-    //! HTTP requests — same pattern used by src/handlers/websocket.rs#tests.
+    //! HTTP requests - same pattern used by src/handlers/websocket.rs#tests.
     use super::*;
     use crate::config::Config;
     use crate::state::AppState;
@@ -168,7 +168,7 @@ mod tests {
 
     fn auth_test_config() -> Config {
         // Pre-baked Argon2id hash for password "test-only" so is_auth_enabled
-        // returns true. Real value irrelevant — we never authenticate here.
+        // returns true. Real value irrelevant - we never authenticate here.
         let hash = "$argon2id$v=19$m=47104,t=1,p=1$YWJjZGVmZ2hpamtsbW5vcA$\
              aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789abcdef0123456789abcdef01"
             .to_string();
@@ -218,7 +218,7 @@ mod tests {
 
     async fn spawn_protected() -> SocketAddr {
         let state = AppState::new(1000, auth_test_config());
-        // Dummy protected handler — we only care about the redirect headers.
+        // Dummy protected handler - we only care about the redirect headers.
         let app: Router = Router::new()
             .route("/c/:room_id", get(|| async { "ok" }))
             .layer(middleware::from_fn_with_state(state.clone(), require_auth))

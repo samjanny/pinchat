@@ -1,4 +1,4 @@
-# PinChat — Log Policy & Accountability Record
+# PinChat - Log Policy & Accountability Record
 
 **Document type:** Internal accountability record (Art. 5(2) GDPR)
 **Controller:** {{OPERATOR_NAME}}
@@ -87,7 +87,7 @@ possess.
 No general obligation exists under the applicable law of the
 Controller's jurisdiction for a non-telecom, non-ISP service
 operator to routinely retain web access logs. This does not mean
-that log retention would be unlawful — an operator with a
+that log retention would be unlawful - an operator with a
 legitimate, proportionate purpose could retain minimal logs.
 Rather, for this specific Service, no such purpose has been
 identified that would outweigh the data minimisation principle.

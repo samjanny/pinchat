@@ -15,9 +15,9 @@
  *      GroupSecrets, extracting joiner_secret.
  *   5. Derive welcome_secret = ExpandWithLabel(
  *          KDF.Extract(joiner_secret, zero(Nh)),
- *          "welcome", "", Nh) — no PSKs in these vectors.
+ *          "welcome", "", Nh) - no PSKs in these vectors.
  *   6. Derive welcome_key / welcome_nonce from welcome_secret.
- *   7. AES-128-GCM decrypt encrypted_group_info → GroupInfo bytes.
+ *   7. AES-128-GCM decrypt encrypted_group_info -> GroupInfo bytes.
  *   8. Parse GroupInfo; verify SignWithLabel("GroupInfoTBS", tbs,
  *      signature) against the vector's signer_pub.
  *   9. Round-trip every intermediate struct to confirm our serdes are
@@ -48,7 +48,7 @@ function assert(cond, name, detail) {
         console.log(`  OK   ${name}`);
         passed += 1;
     } else {
-        console.log(`  FAIL ${name}${detail ? `  — ${detail}` : ''}`);
+        console.log(`  FAIL ${name}${detail ? `  - ${detail}` : ''}`);
         failed += 1;
     }
 }
@@ -69,7 +69,7 @@ function bytesEqual(a, b) {
 }
 
 async function main() {
-    console.log('# Welcome end-to-end — welcome.json cs=2');
+    console.log('# Welcome end-to-end - welcome.json cs=2');
 
     const v = VECTORS.find((x) => x.cipher_suite === 2);
     const initPrivBytes = hexDecode(v.init_priv);
@@ -77,7 +77,7 @@ async function main() {
     const welcomeWrapped = hexDecode(v.welcome);
     const signerPubBytes = hexDecode(v.signer_pub);
 
-    // Step 1–2: unwrap MLSMessage, parse Welcome, round-trip.
+    // Step 1-2: unwrap MLSMessage, parse Welcome, round-trip.
     const welFrame = MLSMessage.parseMLSMessage(welcomeWrapped);
     assert(welFrame.wireFormat === MLSMessage.WireFormat.MLS_WELCOME, 'wire_format == mls_welcome');
     const welcome = Welcome.parseWelcome(welFrame.body);
@@ -96,7 +96,7 @@ async function main() {
     const myEntry = welcome.secrets.find((e) => bytesEqual(e.newMember, ref));
     assert(!!myEntry, 'EncryptedGroupSecrets entry for our KeyPackage ref is present');
 
-    // Step 4: import init_priv, DecryptWithLabel → GroupSecrets.
+    // Step 4: import init_priv, DecryptWithLabel -> GroupSecrets.
     const initPriv = await HPKE.importPrivateKey(initPrivBytes, kp.initKey);
     const gs = await Welcome.decryptGroupSecrets(
         myEntry.encryptedGroupSecrets, initPriv, kp.initKey, welcome.encryptedGroupInfo
@@ -112,7 +112,7 @@ async function main() {
         'GroupSecrets round-trip (joiner_secret intact)'
     );
 
-    // Step 5–6: derive welcome_secret → welcome_key/nonce.
+    // Step 5-6: derive welcome_secret -> welcome_key/nonce.
     const psk = new Uint8Array(32); // no PSKs
     const welcomeSecret = await Welcome.deriveWelcomeSecret(gs.joinerSecret, psk);
     const { key: welcomeKey, nonce: welcomeNonce } = await Welcome.welcomeKeyNonce(welcomeSecret);

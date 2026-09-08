@@ -1,5 +1,5 @@
 /**
- * PinChat MLS — secret tree + per-leaf AEAD ratchet (RFC 9420 §9).
+ * PinChat MLS - secret tree + per-leaf AEAD ratchet (RFC 9420 §9).
  *
  * Shape mirrors the ratchet tree. The root of the secret tree is the
  * `encryption_secret` derived from the key schedule. Internal nodes split

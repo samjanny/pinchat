@@ -1,5 +1,5 @@
 /**
- * PinChat MLS — public P-256 point helpers.
+ * PinChat MLS - public P-256 point helpers.
  *
  * TreeKEM's deterministic DHKEM DeriveKeyPair starts from a secret scalar,
  * but JavaScript must never multiply that scalar with hand-written BigInt

@@ -1,5 +1,5 @@
 /**
- * PinChat MLS — key schedule (RFC 9420 §8).
+ * PinChat MLS - key schedule (RFC 9420 §8).
  *
  * Inputs per epoch:
  *   - init_secret_[n-1] : the previous epoch's init_secret. For a freshly
@@ -11,7 +11,7 @@
  *   - psk_secret        : aggregated PSK secret (all-zero bytes of length
  *                         Nh when no PSKs are used).
  *   - group_context     : serialized GroupContext_[n] (we accept it as a
- *                         byte string — serialization is handled by the
+ *                         byte string - serialization is handled by the
  *                         caller since GroupContext lives outside the key
  *                         schedule).
  *
@@ -38,7 +38,7 @@
  *       DeriveSecret(epoch_secret, <label>)
  *
  * The concrete `<label>` strings used by DeriveSecret (as chosen by the
- * reference test vectors — see tests/vectors/mls/key-schedule.json) are:
+ * reference test vectors - see tests/vectors/mls/key-schedule.json) are:
  *   "sender data" (NB: space), "encryption", "exporter", "external",
  *   "confirm", "membership", "resumption", "authentication", "init".
  */
@@ -180,7 +180,7 @@
      *       length)
      *
      * We leave the `Hash(context)` to the caller since we don't export
-     * SHA-256 as a separate helper — HPKE.hkdfExtract with a zero-key
+     * SHA-256 as a separate helper - HPKE.hkdfExtract with a zero-key
      * achieves the same effect, or the caller can use SubtleCrypto.digest.
      */
     async function mlsExporter(exporterSecret, label, contextHash, length) {

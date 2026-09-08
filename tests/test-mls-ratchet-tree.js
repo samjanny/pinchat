@@ -21,7 +21,7 @@ function assert(cond, name, detail) {
         passed += 1;
     } else {
         failed += 1;
-        console.log(`  FAIL ${name}${detail ? `  — ${detail}` : ''}`);
+        console.log(`  FAIL ${name}${detail ? `  - ${detail}` : ''}`);
     }
 }
 
@@ -32,7 +32,7 @@ function hexDecode(h) {
 
 function main() {
     const cs2 = VECTORS.filter((v) => v.cipher_suite === 2);
-    console.log(`# ratchet-tree resolutions — cipher_suite=2 (${cs2.length} trees)`);
+    console.log(`# ratchet-tree resolutions - cipher_suite=2 (${cs2.length} trees)`);
 
     for (let i = 0; i < cs2.length; i += 1) {
         const v = cs2[i];

@@ -1,5 +1,5 @@
 /**
- * PinChat MLS — transcript hashes (RFC 9420 §5.3 + §8.2).
+ * PinChat MLS - transcript hashes (RFC 9420 §5.3 + §8.2).
  *
  * Every committed state transition is bound into a two-hash transcript
  * chain so that joiners can verify a consistent group history:
@@ -19,10 +19,10 @@
  *
  * Where:
  *   - ConfirmedTranscriptHashInput is serialize(wire_format ||
- *     FramedContent || signature) — i.e. the AuthenticatedContent minus
+ *     FramedContent || signature) - i.e. the AuthenticatedContent minus
  *     the trailing `opaque<V>` confirmation_tag.
  *   - The MAC is HMAC-SHA256 with the current epoch's confirmation_key.
- *   - In the interim hash, confirmation_tag is wrapped as `opaque<V>` —
+ *   - In the interim hash, confirmation_tag is wrapped as `opaque<V>` -
  *     a single-byte varint length prefix (0x20) followed by the 32
  *     HMAC-SHA256 output bytes.
  *
@@ -33,7 +33,7 @@
  * structure.
  *
  * Verified byte-for-byte against the IETF transcript-hashes.json vectors
- * — see tests/test-mls-transcript-hashes.js.
+ * - see tests/test-mls-transcript-hashes.js.
  */
 (function (root, factory) {
     if (typeof module !== 'undefined' && module.exports) {
@@ -74,7 +74,7 @@
      *
      * `confirmedTranscriptHashInputBytes` must be the already-serialized
      * ConfirmedTranscriptHashInput (wire_format || FramedContent ||
-     * opaque<V>(signature)). The caller — typically the framing module —
+     * opaque<V>(signature)). The caller - typically the framing module -
      * produces these bytes.
      */
     async function confirmedTranscriptHash(interimTranscriptHashPrev, confirmedTranscriptHashInputBytes) {

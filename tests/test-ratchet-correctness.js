@@ -124,7 +124,7 @@ async function testConcurrentEncryptMonotonicCounters() {
     // Fire all encrypts in a single microtask burst. With the mutex in place
     // each call observes the chain state ratcheted by the previous one;
     // without the mutex multiple calls would read CK_0 and produce
-    // HMAC(CK_0, "MessageKey-1"), HMAC(CK_0, "MessageKey-2"), … which the
+    // HMAC(CK_0, "MessageKey-1"), HMAC(CK_0, "MessageKey-2"), ... which the
     // peer cannot derive.
     const encrypted = await Promise.all(
         Array.from({ length: N }, (_, i) =>
@@ -173,9 +173,9 @@ async function testDelayedCrossDhRound() {
     await bob.decryptMessage(round1[0].payload, round1[0].header, ROOM, ALICE_ID);
     await bob.decryptMessage(round1[1].payload, round1[1].header, ROOM, ALICE_ID);
 
-    // Bob replies → triggers Bob's send-side DH ratchet (rc -> 1 on his side).
+    // Bob replies -> triggers Bob's send-side DH ratchet (rc -> 1 on his side).
     const b0 = await bob.encryptMessage('bob reply', ROOM, BOB_ID);
-    // Alice receives → her receive-side DH ratchet (rc -> 1 on her side).
+    // Alice receives -> her receive-side DH ratchet (rc -> 1 on her side).
     const decB0 = await alice.decryptMessage(b0.payload, b0.header, ROOM, BOB_ID);
     assert.strictEqual(decB0.text, 'bob reply');
 
@@ -186,7 +186,7 @@ async function testDelayedCrossDhRound() {
     assert.strictEqual(round2_a0.header.rc, 1, 'ratchetCount must be 1 after one DH ratchet');
 
     // Bob receives round 2 message. This triggers:
-    //   - skipMessageKeys(5)  → stores OLD_DH:2, OLD_DH:3, OLD_DH:4 in skippedKeys
+    //   - skipMessageKeys(5)  -> stores OLD_DH:2, OLD_DH:3, OLD_DH:4 in skippedKeys
     //   - performDHRatchetOnReceive(newAliceDh)
     //   - decrypt round2_a0 in the fresh receiving chain
     const decRound2 = await bob.decryptMessage(round2_a0.payload, round2_a0.header, ROOM, ALICE_ID);
@@ -253,7 +253,7 @@ async function testDhPrivateNonExtractable() {
     // Imported peer DH public keys must also be non-extractable: if they
     // were exportable, an XSS could recover the raw bytes and check them
     // against precomputed group elements for traffic analysis. The raw
-    // bytes ARE retained in DHrRaw — that is fine: it is a side-channel
+    // bytes ARE retained in DHrRaw - that is fine: it is a side-channel
     // we already chose to expose, see comments in skipMessageKeys.
     await assert.rejects(
         webcrypto.subtle.exportKey('raw', alice.DHr),
@@ -299,14 +299,14 @@ async function testEncryptRollbackOnAeadFailure() {
         Ns: alice.Ns,
         ratchetCount: alice.ratchetCount,
         sendingChainCounter: alice.sendingChain.messageNumber,
-        // chainKeyMaterial is a Uint8Array — copy bytes for byte-comparison
+        // chainKeyMaterial is a Uint8Array - copy bytes for byte-comparison
         sendingChainKey: new Uint8Array(alice.sendingChain.chainKeyMaterial),
         DHsSignature: alice.DHsSignature,
     };
 
     // Monkey-patch crypto.subtle.encrypt to throw on the next call only.
     // The DoubleRatchet implementation reads `crypto.subtle.encrypt` directly,
-    // and Node 19+ aliases globalThis.crypto to webcrypto — so patching the
+    // and Node 19+ aliases globalThis.crypto to webcrypto - so patching the
     // bound encrypt on the global subtle reaches the production code.
     const realEncrypt = webcrypto.subtle.encrypt.bind(webcrypto.subtle);
     let nextEncryptThrows = true;
@@ -406,10 +406,69 @@ async function testStateCompromiseDoesNotRecoverPastMessages() {
     pass('state compromise does not recover past chain messages (PFS)');
 }
 
+// ── Test 8: F-2 hostile header integer coercion ─────────────────────────
+
+async function testHostileHeaderIntegerCoercion() {
+    // Audit F-2. `pn`, `n` and `rc` reach two primitives that coerce silently
+    // AND agree with each other:
+    //
+    //   _buildCanonicalBytes -> DataView.setUint32 -> ToUint32("0") === 0
+    //   encodeAADWithLengthPrefix -> BigInt("0")                    === 0n
+    //
+    // So a relay rewriting n from 0 to "0" produces a header whose genuine
+    // ECDSA signature still verifies and whose AAD still matches. Pre-fix the
+    // message decrypted and then poisoned the receiver: `this.Nr =
+    // messageNumber + 1` evaluated to the string "01", relational comparisons
+    // kept working so nothing threw, but skipped-key ids are built by
+    // interpolation and "...:01" never matches the "...:1" a numeric counter
+    // produces. Every later out-of-order message was dropped in silence.
+    const { alice, bob } = await setupPair();
+    const enc = await alice.encryptMessage('hello', ROOM, ALICE_ID);
+
+    // The exact coercion pair that satisfies both integrity checks.
+    await assert.rejects(
+        () => bob.decryptMessage(enc.payload, { ...enc.header, n: String(enc.header.n) }, ROOM, ALICE_ID),
+        /PROTOCOL_MISMATCH/,
+        'a numeric-string counter must be rejected before decryption'
+    );
+
+    // The rest of the coercion surface, plus the out-of-range case where the
+    // u32 signature field wraps while the 8-byte AAD field does not.
+    for (const mutation of [
+        { pn: '0' },
+        { rc: '0' },
+        { n: 4294967296 },
+        { n: -1 },
+        { n: 0.5 },
+        { n: null },
+        { rc: false },
+        { pn: true },
+    ]) {
+        await assert.rejects(
+            () => bob.decryptMessage(enc.payload, { ...enc.header, ...mutation }, ROOM, ALICE_ID),
+            /PROTOCOL_MISMATCH/,
+            `header mutation ${JSON.stringify(mutation)} must be rejected`
+        );
+    }
+
+    // The guard runs before the signature check and before any state mutation,
+    // so none of the above may latch fatalAuthFailure or otherwise disturb the
+    // ratchet: the genuine header must still decrypt.
+    const dec = await bob.decryptMessage(enc.payload, enc.header, ROOM, ALICE_ID);
+    assert.strictEqual(dec.text, 'hello');
+
+    // The assertion that would have caught the original bug directly: a single
+    // accepted "0" left Nr as the string "01" for the rest of the session.
+    assert.strictEqual(typeof bob.Nr, 'number', 'Nr must remain numeric');
+    assert.strictEqual(bob.Nr, 1);
+
+    pass('hostile header integer coercion rejected, ratchet left usable');
+}
+
 // ── Runner ───────────────────────────────────────────────────────────────
 
 (async () => {
-    console.log('Ratchet correctness tests (regressions for C-01, C-02, C-05, F-10):');
+    console.log('Ratchet correctness tests (regressions for C-01, C-02, C-05, F-10, F-2):');
     try {
         await testSequentialBaseline();
         await testConcurrentEncryptMonotonicCounters();
@@ -418,6 +477,7 @@ async function testStateCompromiseDoesNotRecoverPastMessages() {
         await testDhPrivateNonExtractable();
         await testEncryptRollbackOnAeadFailure();
         await testStateCompromiseDoesNotRecoverPastMessages();
+        await testHostileHeaderIntegerCoercion();
         console.log('');
         console.log('All ratchet-correctness tests PASSED.');
         process.exit(0);

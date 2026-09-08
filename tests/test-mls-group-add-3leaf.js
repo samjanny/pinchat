@@ -1,15 +1,15 @@
 #!/usr/bin/env node
 
 /**
- * MLS Group — 3-leaf flow exercising commitAddMember + processCommit.
+ * MLS Group - 3-leaf flow exercising commitAddMember + processCommit.
  *
  * Sequence:
  *   1. Alice creates a group.
- *   2. Bob (joiner #1) builds a KeyPackage → Alice commits Add → Bob
+ *   2. Bob (joiner #1) builds a KeyPackage -> Alice commits Add -> Bob
  *      Welcomes in. Both at epoch 1, 2-leaf tree.
- *   3. Carol (joiner #2) builds a KeyPackage → Alice commits Add →
+ *   3. Carol (joiner #2) builds a KeyPackage -> Alice commits Add ->
  *      broadcasts Commit + Welcome. Bob processes the Commit (NOT the
- *      Welcome — it's not for him), Carol processes the Welcome. Alice,
+ *      Welcome - it's not for him), Carol processes the Welcome. Alice,
  *      Bob, and Carol must all converge to identical epoch-2 secrets,
  *      a 3-leaf tree, and the ability to exchange application messages
  *      pairwise.
@@ -37,7 +37,7 @@ function assert(cond, name, detail) {
         console.log(`  OK   ${name}`);
         passed += 1;
     } else {
-        console.log(`  FAIL ${name}${detail ? `  — ${detail}` : ''}`);
+        console.log(`  FAIL ${name}${detail ? `  - ${detail}` : ''}`);
         failed += 1;
     }
 }
@@ -93,9 +93,9 @@ async function buildKeyPackage() {
 function hex(u8) { return Buffer.from(u8).toString('hex'); }
 
 async function main() {
-    console.log('# Group — 3-leaf Add/Commit/Welcome');
+    console.log('# Group - 3-leaf Add/Commit/Welcome');
 
-    // ----- Epoch 0 → 1: Alice + Bob -----
+    // ----- Epoch 0 -> 1: Alice + Bob -----
     const aliceId = await freshIdentity();
     const alice = await Group.Group.create({ identity: aliceId });
     const bob = await buildKeyPackage();
@@ -117,7 +117,7 @@ async function main() {
     assert(alice.nLeaves === 2 && bobGroup.nLeaves === 2,
         'Both see 2-leaf tree at epoch 1');
 
-    // ----- Epoch 1 → 2: add Carol -----
+    // ----- Epoch 1 -> 2: add Carol -----
     const carol = await buildKeyPackage();
     const r2 = await alice.commitAddMember({ keyPackageBytes: carol.keyPackageBytes });
     assert(alice.epoch === 2n, 'Alice advanced to epoch 2');
@@ -157,25 +157,25 @@ async function main() {
     // Pairwise application messages at epoch 2.
     const wireAB = await alice.encryptApplicationMessage('hello bob');
     assert(new TextDecoder().decode((await bobGroup.decryptApplicationMessage(wireAB)).plaintext) === 'hello bob',
-        'Alice → Bob app msg at epoch 2');
+        'Alice -> Bob app msg at epoch 2');
 
     const wireAC = await alice.encryptApplicationMessage('hello carol');
     assert(new TextDecoder().decode((await carolGroup.decryptApplicationMessage(wireAC)).plaintext) === 'hello carol',
-        'Alice → Carol app msg at epoch 2');
+        'Alice -> Carol app msg at epoch 2');
 
     const wireBC = await bobGroup.encryptApplicationMessage('hi carol from bob');
     assert(new TextDecoder().decode((await carolGroup.decryptApplicationMessage(wireBC)).plaintext) === 'hi carol from bob',
-        'Bob → Carol app msg at epoch 2');
+        'Bob -> Carol app msg at epoch 2');
 
     const wireCA = await carolGroup.encryptApplicationMessage('hi alice from carol');
     assert(new TextDecoder().decode((await alice.decryptApplicationMessage(wireCA)).plaintext) === 'hi alice from carol',
-        'Carol → Alice app msg at epoch 2');
+        'Carol -> Alice app msg at epoch 2');
 
     const wireCB = await carolGroup.encryptApplicationMessage('hi bob from carol');
     assert(new TextDecoder().decode((await bobGroup.decryptApplicationMessage(wireCB)).plaintext) === 'hi bob from carol',
-        'Carol → Bob app msg at epoch 2');
+        'Carol -> Bob app msg at epoch 2');
 
-    // ----- Epoch 2 → 3: add Dave -----
+    // ----- Epoch 2 -> 3: add Dave -----
     const dave = await buildKeyPackage();
     const r3 = await alice.commitAddMember({ keyPackageBytes: dave.keyPackageBytes });
     assert(alice.epoch === 3n, 'Alice advanced to epoch 3');
@@ -215,14 +215,14 @@ async function main() {
 
     // Round-trip every pair Alice ↔ {Bob, Carol, Dave}.
     for (const [from, to, name] of [
-        [alice, bobGroup, 'Alice→Bob'],
-        [alice, carolGroup, 'Alice→Carol'],
-        [alice, daveGroup, 'Alice→Dave'],
-        [bobGroup, daveGroup, 'Bob→Dave'],
-        [carolGroup, daveGroup, 'Carol→Dave'],
-        [daveGroup, alice, 'Dave→Alice'],
-        [daveGroup, bobGroup, 'Dave→Bob'],
-        [daveGroup, carolGroup, 'Dave→Carol'],
+        [alice, bobGroup, 'Alice->Bob'],
+        [alice, carolGroup, 'Alice->Carol'],
+        [alice, daveGroup, 'Alice->Dave'],
+        [bobGroup, daveGroup, 'Bob->Dave'],
+        [carolGroup, daveGroup, 'Carol->Dave'],
+        [daveGroup, alice, 'Dave->Alice'],
+        [daveGroup, bobGroup, 'Dave->Bob'],
+        [daveGroup, carolGroup, 'Dave->Carol'],
     ]) {
         const w = await from.encryptApplicationMessage(`hi from ${name}`);
         const pt = await to.decryptApplicationMessage(w);
@@ -231,9 +231,9 @@ async function main() {
     }
 
     // ---- Tampered KeyPackage rejection -----------------------------------
-    // A relay that flips a single byte of any signed field — leafNode
+    // A relay that flips a single byte of any signed field - leafNode
     // encryption_key, leafNode signature_key, or the outer KeyPackage
-    // signature itself — must be rejected by commitAddMember. Without
+    // signature itself - must be rejected by commitAddMember. Without
     // these checks an attacker could splice attacker-controlled leaves
     // into the tree.
     console.log('# KeyPackage tamper rejection');
@@ -248,7 +248,7 @@ async function main() {
         const tamperedEncKey = kpVictim.keyPackageBytes.slice();
         // Find the encryption_key bytes (first 65-byte uncompressed point
         // after the LeafNode prefix). Easier: just flip a byte well inside
-        // the structure. We pick a byte that's part of the signed body —
+        // the structure. We pick a byte that's part of the signed body -
         // bytes 100..200 are LeafNode territory in our typical encoding.
         tamperedEncKey[120] ^= 0x01;
         const aliceA = await Group.Group.create({ identity: await freshIdentity() });
@@ -303,7 +303,7 @@ async function main() {
         // We don't have an easy hook to forge this, so instead test the
         // direct guard via the public API: Group.processCommit on a
         // hand-constructed bogus PublicMessage. We assert the path
-        // exists by reading the source — if a future refactor removes
+        // exists by reading the source - if a future refactor removes
         // the check, this test stays in place to flag it.
         const groupSource = require('fs').readFileSync(
             require('path').join(__dirname, '..', 'static', 'js', 'mls', 'group.js'),
@@ -405,7 +405,7 @@ async function main() {
         });
         assert(bobOk.epoch === 1n, 'matching PSK joins (sanity)');
 
-        // Wrong PSK → Welcome AEAD tag fails.
+        // Wrong PSK -> Welcome AEAD tag fails.
         let threwPsk = false;
         try {
             await Group.Group.joinFromWelcomeWithTree({
@@ -423,7 +423,7 @@ async function main() {
         } catch (_) { threwPsk = true; }
         assert(threwPsk, 'wrong PSK rejected by Welcome decryption');
 
-        // Default (no PSK passed) → also fails when creator used a non-zero PSK.
+        // Default (no PSK passed) -> also fails when creator used a non-zero PSK.
         let threwNoPsk = false;
         try {
             await Group.Group.joinFromWelcomeWithTree({
@@ -436,7 +436,7 @@ async function main() {
                 expectedSignerLeafIndex: 0,
                 expectedCommitEpoch: aliceX.epoch - 1n,
                 ...await bootstrapPins(aliceX),
-                // pskSecret omitted → defaults to zeros, which mismatches `psk`
+                // pskSecret omitted -> defaults to zeros, which mismatches `psk`
             });
         } catch (_) { threwNoPsk = true; }
         assert(threwNoPsk, 'absent PSK rejected when creator bound a non-zero PSK');
@@ -537,7 +537,7 @@ async function main() {
         // ---- Replay state cleared on epoch transition --------------------
         // After a new commit advances the epoch, a fresh (gen=0) message
         // from a sender whose previous gen=0 was already consumed must be
-        // accepted again — the per-epoch consumed set has been dropped.
+        // accepted again - the per-epoch consumed set has been dropped.
         const eve = await buildKeyPackage();
         const rEve = await alice.commitAddMember({ keyPackageBytes: eve.keyPackageBytes });
         await bobGroup.processCommit(rEve.commitMessage);

@@ -1,5 +1,5 @@
 /**
- * PinChat MLS — tree hash (RFC 9420 §7.8).
+ * PinChat MLS - tree hash (RFC 9420 §7.8).
  *
  * For a ratchet tree of N leaves, tree_hash(x) is defined recursively:
  *

@@ -1,5 +1,5 @@
 /**
- * PinChat MLS — PublicMessage (RFC 9420 §6.2).
+ * PinChat MLS - PublicMessage (RFC 9420 §6.2).
  *
  *   struct {
  *       FramedContent content;
@@ -97,7 +97,7 @@
 
     // --- Wire serialisation ----------------------------------------------
     //
-    // PublicMessage has no length prefix on the payload body — each
+    // PublicMessage has no length prefix on the payload body - each
     // section (content, auth, optional membership_tag) is written
     // contiguously. Since FramedContent uses a variable-length inline
     // proposal/commit body, we need the caller to supply a parsePayload

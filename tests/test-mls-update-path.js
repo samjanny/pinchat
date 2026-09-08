@@ -24,7 +24,7 @@ function assert(cond, name, detail) {
         passed += 1;
     } else {
         failed += 1;
-        console.log(`  FAIL ${name}${detail ? `  — ${detail}` : ''}`);
+        console.log(`  FAIL ${name}${detail ? `  - ${detail}` : ''}`);
     }
 }
 
@@ -39,7 +39,7 @@ function hex(u8) {
 
 function main() {
     const cs2 = VECTORS.filter((v) => v.cipher_suite === 2);
-    console.log(`# update-path round-trip — cipher_suite=2 (${cs2.length} entries)`);
+    console.log(`# update-path round-trip - cipher_suite=2 (${cs2.length} entries)`);
 
     let totalPaths = 0;
     for (let i = 0; i < cs2.length; i += 1) {
@@ -54,7 +54,7 @@ function main() {
                 parsed = Nodes.parseUpdatePath(orig);
             } catch (err) {
                 failed += 1;
-                console.log(`  FAIL entry ${i} path ${j}: parse threw — ${err.message}`);
+                console.log(`  FAIL entry ${i} path ${j}: parse threw - ${err.message}`);
                 continue;
             }
 

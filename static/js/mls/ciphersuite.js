@@ -1,11 +1,11 @@
 /**
- * PinChat MLS — ciphersuite profile.
+ * PinChat MLS - ciphersuite profile.
  *
  * We commit to a single MLS ciphersuite end-to-end so the protocol stays
  * auditable and implementable with WebCrypto alone, with no vendored
  * cryptographic libraries.
  *
- *   Ciphersuite 0x0002 — MLS_128_DHKEMP256_AES128GCM_SHA256_P256
+ *   Ciphersuite 0x0002 - MLS_128_DHKEMP256_AES128GCM_SHA256_P256
  *     KEM        : DHKEM(P-256, HKDF-SHA256)     kem_id  = 0x0010
  *     KDF        : HKDF-SHA256                   kdf_id  = 0x0001
  *     AEAD       : AES-128-GCM                   aead_id = 0x0001

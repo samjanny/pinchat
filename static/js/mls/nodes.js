@@ -1,22 +1,22 @@
 /**
- * PinChat MLS — ratchet-tree node structs (RFC 9420 §7.2 + §7.6).
+ * PinChat MLS - ratchet-tree node structs (RFC 9420 §7.2 + §7.6).
  *
  * A ratchet tree is a vector<optional<Node>> where a Node is either a
  * LeafNode or a ParentNode. This module owns the encode/decode of every
  * node-adjacent struct:
  *
- *   Credential      — §5.3          (basic only; x509 deferred)
- *   Capabilities    — §7.2.1
- *   Extension / Extensions<V> — §7.2
- *   Lifetime        — §7.2
- *   LeafNodeSource  — §7.2 (u8)
- *   LeafNode        — §7.2 (select on leaf_node_source)
- *   ParentNode      — §7.3
- *   NodeType        — §7.6 (u8)
- *   Node            — §7.6 (select on node_type)
- *   optional<Node>  — §7.6
+ *   Credential      - §5.3          (basic only; x509 deferred)
+ *   Capabilities    - §7.2.1
+ *   Extension / Extensions<V> - §7.2
+ *   Lifetime        - §7.2
+ *   LeafNodeSource  - §7.2 (u8)
+ *   LeafNode        - §7.2 (select on leaf_node_source)
+ *   ParentNode      - §7.3
+ *   NodeType        - §7.6 (u8)
+ *   Node            - §7.6 (select on node_type)
+ *   optional<Node>  - §7.6
  *
- * Every function here operates on raw bytes via the codec — no
+ * Every function here operates on raw bytes via the codec - no
  * cryptographic side effects. Higher layers (tree-hash, ratchet-tree,
  * TreeKEM) layer on top.
  *
@@ -30,7 +30,7 @@
  *
  * Credential types
  * ----------------
- *   basic (0x0001) is implemented. x509 (0x0002) is not — PinChat does
+ *   basic (0x0001) is implemented. x509 (0x0002) is not - PinChat does
  *   not ship an X.509 trust store and the extra complexity is not
  *   justified for our ephemeral rooms.
  */
@@ -95,7 +95,7 @@
     // --- Capabilities ------------------------------------------------------
     //
     // Five parallel vectors of u16 values advertising what the leaf
-    // supports. Order matters — it is part of the signed content.
+    // supports. Order matters - it is part of the signed content.
 
     function writeU16Vector(encoder, items) {
         encoder.writeVector(items, (e, v) => e.writeU16(v));

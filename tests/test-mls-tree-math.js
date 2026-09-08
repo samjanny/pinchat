@@ -19,7 +19,7 @@ function assert(cond, name, detail) {
         console.log(`  OK   ${name}`);
         passed += 1;
     } else {
-        console.log(`  FAIL ${name}${detail ? `  — ${detail}` : ''}`);
+        console.log(`  FAIL ${name}${detail ? `  - ${detail}` : ''}`);
         failed += 1;
     }
 }
@@ -97,11 +97,11 @@ eq(TreeMath.commonAncestor(0, 6, 4), 3, 'commonAncestor(L0,L3)');
 // node and descend to left(5) = 4.
 // ---------------------------------------------------------------------------
 console.log('# truncated 3-leaf tree (width 5)');
-eq(TreeMath.right(3, 3), 4, 'right(3,3) — truncated to leaf');
-eq(TreeMath.parent(4, 3), 3, 'parent(4,3) — skips missing parent at 5');
+eq(TreeMath.right(3, 3), 4, 'right(3,3) - truncated to leaf');
+eq(TreeMath.parent(4, 3), 3, 'parent(4,3) - skips missing parent at 5');
 eq(TreeMath.sibling(4, 3), 1, 'sibling(4,3)');
 eq(TreeMath.directPathWithRoot(0, 3), [1, 3], 'directPathWithRoot(L0,3)');
-eq(TreeMath.directPathWithRoot(4, 3), [3], 'directPathWithRoot(L2,3) — only root on path');
+eq(TreeMath.directPathWithRoot(4, 3), [3], 'directPathWithRoot(L2,3) - only root on path');
 eq(TreeMath.copath(4, 3), [1], 'copath(L2,3)');
 
 // ---------------------------------------------------------------------------
@@ -152,7 +152,7 @@ assert(invariantsOk, 'sibling/parent/directPath invariants on n=1..16');
 console.log('# leafDescendants');
 eq(TreeMath.leafDescendants(3, 4), [0, 1, 2, 3], 'leafDescendants(root, n=4)');
 eq(TreeMath.leafDescendants(1, 4), [0, 1], 'leafDescendants(node 1, n=4)');
-eq(TreeMath.leafDescendants(3, 3), [0, 1, 2], 'leafDescendants(root, n=3) — truncated');
+eq(TreeMath.leafDescendants(3, 3), [0, 1, 2], 'leafDescendants(root, n=3) - truncated');
 
 // ---------------------------------------------------------------------------
 // IETF reference vectors (mlswg/mls-implementations test-vectors/tree-math.json)

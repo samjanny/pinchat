@@ -459,7 +459,7 @@ mod tests {
             );
         }
 
-        // Clamp: below 2 → 2, above 20 → 20.
+        // Clamp: below 2 -> 2, above 20 -> 20.
         let low = Room::new(RoomConfig {
             room_type: RoomType::Group,
             ttl_minutes: 30,

@@ -1,5 +1,5 @@
 /**
- * PinChat MLS — KeyPackage (RFC 9420 §10).
+ * PinChat MLS - KeyPackage (RFC 9420 §10).
  *
  *   struct {
  *       ProtocolVersion version;          // u16
@@ -28,7 +28,7 @@
  * ---------
  * A KeyPackage reference (used inside Welcome.secrets[i].new_member)
  * is the hash of the full serialized KeyPackage under the RFC 9420 §5.2
- * RefHash label "MLS 1.0 KeyPackage Reference" (no auto-prefix — RefHash
+ * RefHash label "MLS 1.0 KeyPackage Reference" (no auto-prefix - RefHash
  * writes the label verbatim).
  */
 (function (root, factory) {
@@ -97,7 +97,7 @@
 
     /**
      * RFC 9420 §5.2 KeyPackage reference. The label "MLS 1.0 KeyPackage
-     * Reference" is written *verbatim* — RefHash does not auto-prefix.
+     * Reference" is written *verbatim* - RefHash does not auto-prefix.
      */
     async function keyPackageRef(kpBytes) {
         return Labeled.refHash('MLS 1.0 KeyPackage Reference', kpBytes);

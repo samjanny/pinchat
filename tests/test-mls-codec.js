@@ -22,7 +22,7 @@ function assert(cond, name, detail) {
         console.log(`  OK   ${name}`);
         passed += 1;
     } else {
-        console.log(`  FAIL ${name}${detail ? `  — ${detail}` : ''}`);
+        console.log(`  FAIL ${name}${detail ? `  - ${detail}` : ''}`);
         failed += 1;
     }
 }
@@ -82,7 +82,7 @@ console.log('# fixed-width integers');
 })();
 
 // ---------------------------------------------------------------------------
-// MLS varint — RFC 9420 §2.1.2 reference vectors and canonicality
+// MLS varint - RFC 9420 §2.1.2 reference vectors and canonicality
 // ---------------------------------------------------------------------------
 console.log('# canonical MLS varint reference vectors');
 (function () {
@@ -190,7 +190,7 @@ console.log('# vector T<V>');
 })();
 
 // ---------------------------------------------------------------------------
-// Extension-list uniqueness — RFC 9420 §13.4
+// Extension-list uniqueness - RFC 9420 §13.4
 // ---------------------------------------------------------------------------
 console.log('# extension-list uniqueness');
 (function () {

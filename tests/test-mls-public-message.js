@@ -38,7 +38,7 @@ function assert(cond, name, detail) {
         console.log(`  OK   ${name}`);
         passed += 1;
     } else {
-        console.log(`  FAIL ${name}${detail ? `  — ${detail}` : ''}`);
+        console.log(`  FAIL ${name}${detail ? `  - ${detail}` : ''}`);
         failed += 1;
     }
 }
@@ -63,7 +63,7 @@ function parsePayloadCallback(decoder, contentType) {
 }
 
 async function verifyOne(v, label, wrappedHex) {
-    console.log(`# PublicMessage — ${label}`);
+    console.log(`# PublicMessage - ${label}`);
     const wrapped = hexDecode(wrappedHex);
 
     const frame = MLSMessage.parseMLSMessage(wrapped);

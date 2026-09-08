@@ -7,24 +7,24 @@
  * AEAD + sender_data encryption + signature + padding model.
  *
  * The IETF vector's group has nLeaves = 2 (discovered by rejection
- * sampling during implementation — the vector does not advertise it
+ * sampling during implementation - the vector does not advertise it
  * directly, it falls out of SenderData's leaf_index once decrypted).
  *
  * For each of `proposal_priv`, `commit_priv`, `application_priv`:
  *   1. Unwrap MLSMessage(mls_private_message).
  *   2. Parse PrivateMessage + round-trip byte-for-byte.
  *   3. Decrypt sender_data with senderDataKeyNonce(sender_data_secret,
- *      ciphertext) → (leaf_index, generation, reuse_guard).
+ *      ciphertext) -> (leaf_index, generation, reuse_guard).
  *   4. Derive ratchet key/nonce from the per-leaf secret tree; mask the
  *      first 4 nonce bytes with reuse_guard.
  *   5. AEAD-decrypt the ciphertext.
- *   6. Parse PrivateMessageContent → inner payload + auth + padding.
+ *   6. Parse PrivateMessageContent -> inner payload + auth + padding.
  *   7. Assert the decrypted inner payload matches the vector's raw
  *      `proposal` / `commit` / `application` bytes.
  *   8. Verify SignWithLabel("FramedContentTBS") using signature_pub
  *      against the reconstructed FramedContent (sender is inferred
  *      as member(leaf_index) once SenderData is known).
- *   9. Re-encrypt with encryptPrivateMessage and decrypt — confirms
+ *   9. Re-encrypt with encryptPrivateMessage and decrypt - confirms
  *      our encryption path is symmetric.
  */
 
@@ -48,7 +48,7 @@ function assert(cond, name, detail) {
         console.log(`  OK   ${name}`);
         passed += 1;
     } else {
-        console.log(`  FAIL ${name}${detail ? `  — ${detail}` : ''}`);
+        console.log(`  FAIL ${name}${detail ? `  - ${detail}` : ''}`);
         failed += 1;
     }
 }
@@ -63,7 +63,7 @@ function hex(u8) {
 }
 
 async function verifyOne(v, label, wrappedHex, rawPayloadHex, contentType) {
-    console.log(`# PrivateMessage — ${label}`);
+    console.log(`# PrivateMessage - ${label}`);
     const wrapped = hexDecode(wrappedHex);
 
     const frame = MLSMessage.parseMLSMessage(wrapped);
@@ -146,7 +146,7 @@ async function verifyOne(v, label, wrappedHex, rawPayloadHex, contentType) {
     });
     assert(
         hex(redec.content.payloadBytes) === hex(out.content.payloadBytes),
-        `${label}: re-encrypt → decrypt round-trip`
+        `${label}: re-encrypt -> decrypt round-trip`
     );
 }
 

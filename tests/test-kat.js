@@ -9,16 +9,16 @@
  * step against an INDEPENDENT reference implementation (Node's built-in
  * `crypto.hkdfSync` and `crypto.createHmac`). The reference path uses the
  * same primitives but a completely separate code path. If the production
- * helpers drift — wrong info label, wrong byte order, wrong number of
- * iterations, swapped salt/IKM — the assertion fails immediately.
+ * helpers drift - wrong info label, wrong byte order, wrong number of
+ * iterations, swapped salt/IKM - the assertion fails immediately.
  *
  * KAT scope (deliberately narrow):
- *   1. HKDF helper            — `DoubleRatchet.hkdf` byte-exact vs hkdfSync
- *   2. Initial chain labels   — initiator vs responder receive/send chains
- *   3. Chain ratchet step     — CK_n+1 = HMAC-SHA256(CK_n, "ChainRatchet")
- *   4. Canonical DH header    — tag || u16_be(len) || dh || u32_be(rc)
- *   5. Handshake v2 transcript— fixed canonical bytes + pinned SHA-256 digest
- *   6. SAS v4                 — fixed P-256 public inputs + pinned 96-bit output
+ *   1. HKDF helper            - `DoubleRatchet.hkdf` byte-exact vs hkdfSync
+ *   2. Initial chain labels   - initiator vs responder receive/send chains
+ *   3. Chain ratchet step     - CK_n+1 = HMAC-SHA256(CK_n, "ChainRatchet")
+ *   4. Canonical DH header    - tag || u16_be(len) || dh || u32_be(rc)
+ *   5. Handshake v2 transcript - fixed canonical bytes, pinned digest
+ *   6. SAS v4                 - fixed P-256 public inputs + pinned 96-bit output
  *
  * OUT OF SCOPE on purpose:
  *   - Anything that needs a randomly-generated ECDH/ECDSA private keypair.
@@ -84,14 +84,14 @@ async function testHkdfHelper() {
     // The Double Ratchet HKDF helper is reachable as an instance method.
     // It takes (ikm, salt, info_string, length_bytes) and returns Uint8Array.
     //
-    // We don't need a full DoubleRatchet bootstrap for this — instantiate
+    // We don't need a full DoubleRatchet bootstrap for this - instantiate
     // with a null identity manager and never enter sign/encrypt paths.
     const dr = new DoubleRatchet(null);
 
     // Three (ikm, salt, info, len) tuples that exercise the schedule:
-    //   tuple A — root-key derivation in initialize()
-    //   tuple B — chain-key derivation in initialize() (initiator->responder)
-    //   tuple C — root-key advancement during a DH ratchet
+    //   tuple A - root-key derivation in initialize()
+    //   tuple B - chain-key derivation in initialize() (initiator->responder)
+    //   tuple C - root-key advancement during a DH ratchet
     const tuples = [
         {
             ikm: range(32),                          // 0x00..0x1f
@@ -200,14 +200,14 @@ async function testChainRatchetStep() {
     assert.strictEqual(
         hex(c.chainKeyMaterial),
         hex(refCK1),
-        'CK_1 mismatch — chain ratchet must be HMAC-SHA256(CK_0, "ChainRatchet")'
+        'CK_1 mismatch - chain ratchet must be HMAC-SHA256(CK_0, "ChainRatchet")'
     );
 
     for (let i = 0; i < 4; i++) await c.ratchet();
     assert.strictEqual(
         hex(c.chainKeyMaterial),
         hex(refCK5),
-        'CK_5 mismatch — chain ratchet must compose to 5 HMAC steps'
+        'CK_5 mismatch - chain ratchet must compose to 5 HMAC steps'
     );
 
     pass('chain ratchet CK_1 and CK_5 match HMAC-SHA256(prev, "ChainRatchet") reference');
@@ -453,7 +453,7 @@ async function testCanonicalHandshakeTranscript() {
 // ── runner ──────────────────────────────────────────────────────────────
 
 (async () => {
-    console.log('Known Answer Tests (KAT) — KDF schedule + canonical encoding:');
+    console.log('Known Answer Tests (KAT) - KDF schedule + canonical encoding:');
     try {
         await testHkdfHelper();
         await testInitialChainLabels();

@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 /**
- * MLS session orchestration — creator/Joiner Welcome flow.
+ * MLS session orchestration - creator/Joiner Welcome flow.
  *
  * This deliberately exercises MLSSession rather than calling Group join
  * helpers directly. It covers the Commit buffering and committer binding
@@ -58,7 +58,7 @@ function assert(condition, name, detail = '') {
         console.log(`  OK   ${name}`);
         passed += 1;
     } else {
-        console.log(`  FAIL ${name}${detail ? ` — ${detail}` : ''}`);
+        console.log(`  FAIL ${name}${detail ? ` - ${detail}` : ''}`);
         failed += 1;
     }
 }
@@ -425,7 +425,7 @@ async function createExchange({
 }
 
 async function main() {
-    console.log('# MLS session — Welcome join orchestration');
+    console.log('# MLS session - Welcome join orchestration');
 
     const proofPsk = new Uint8Array(32).fill(0x91);
     const proofCreatorOut = [];

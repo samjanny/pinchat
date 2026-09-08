@@ -1,5 +1,5 @@
 /**
- * PinChat MLS — FramedContent / AuthenticatedContent framing (RFC 9420 §6).
+ * PinChat MLS - FramedContent / AuthenticatedContent framing (RFC 9420 §6).
  *
  * The framing layer wraps every group operation (application message,
  * proposal, commit) with a common envelope that carries:
@@ -8,7 +8,7 @@
  *   - a signature over the content + group context
  *   - for commits, a confirmation_tag over the transcript hash
  *
- * This file owns the outer wrappers only — the proposal / commit bodies
+ * This file owns the outer wrappers only - the proposal / commit bodies
  * are handled as opaque `payload` byte blobs here and parsed by the
  * proposal module in a follow-up commit. Keeping proposal/commit
  * decoding out of framing.js lets the framing layer ship byte-for-byte
@@ -56,7 +56,7 @@
  * Note on FramedContent.payload
  * -----------------------------
  * For content_type == application, `payload` is `opaque application_data<V>`
- * on the wire — i.e. a length-prefixed opaque blob. For content_type
+ * on the wire - i.e. a length-prefixed opaque blob. For content_type
  * == proposal / commit, the RFC embeds the Proposal / Commit struct
  * *inline* (no length prefix). We paper over that by exposing
  * `writeFramedContent(encoder, fc, { inlinePayload: true })` for the
@@ -124,7 +124,7 @@
      *   - for content_type=application: the raw application_data bytes
      *     (we prefix them with an opaque<V> length as per the RFC)
      *   - for content_type=proposal/commit: the inline struct bytes
-     *     (no extra length prefix — the proposal/commit has its own
+     *     (no extra length prefix - the proposal/commit has its own
      *     internal varint-length fields)
      */
     function writeFramedContent(encoder, fc) {
@@ -145,14 +145,14 @@
 
     /**
      * Read a FramedContent. For proposal/commit content types we read the
-     * remaining bytes of the slice as the inline payload — the caller
+     * remaining bytes of the slice as the inline payload - the caller
      * must bound the decoder before calling (e.g. by reading
      * AuthenticatedContent in a single shot and slicing off auth bytes
      * at the end), or the decoder will consume trailing auth bytes.
      *
      * Because we don't know the on-wire length of a Proposal/Commit
      * without parsing it, we expose a two-step parser:
-     *   readFramedContentShallow(decoder) — reads through content_type
+     *   readFramedContentShallow(decoder) - reads through content_type
      *   then returns { groupId, epoch, sender, authenticatedData,
      *                  contentType, payloadStart }
      * and the caller finishes by slicing payload bytes from
@@ -251,7 +251,7 @@
 
         // For proposal/commit, the payload is inlined and variable-length.
         // We locate the payload end by scanning the fixed tail structure of
-        // FramedContentAuthData: an opaque<V> signature, and — for commit —
+        // FramedContentAuthData: an opaque<V> signature, and - for commit -
         // an opaque<V> confirmation_tag.
         //
         // Strategy: peel the tail off the end by treating the bytes BACK-
@@ -270,7 +270,7 @@
         // callback to advance past the inline body.
         throw new Error(
             'framing: use parseAuthenticatedContentWith(bytes, parsePayload) ' +
-            'for non-application content types — Proposal/Commit parsing ' +
+            'for non-application content types - Proposal/Commit parsing ' +
             'lives in proposal.js'
         );
     }

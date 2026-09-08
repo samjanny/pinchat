@@ -4,7 +4,430 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Dates are the repository-local commit dates; entries are curated for user-visible impact
 rather than being a 1:1 mirror of `git log`.
 
-## [Unreleased] - target v0.6.0, handshake v2
+## [2026-09-08] - v0.7.5
+
+Browser-extension only. No server, client or protocol change, and no re-sign:
+nothing under `static/` moved, so the signed manifest stays at sequence 46 and
+the extension floor stays 46. `rules.json` ships inside the extension, so the
+extension version goes to 1.2.7 and `GITHUB_TAG` to v0.7.5.
+
+### Fixed - three scripts on the chat page were blocked by the extension's own CSP
+
+The preventive CSP pins a per-page set of script hashes and deliberately omits
+`'self'`, so anything not pinned is blocked. The list of scripts each page
+loads was maintained by hand in `generate-csp-rules.js` and had drifted:
+`chat.html` loads thirteen scripts, the list named ten. `theme.js`, `pow.js`
+and `nicknames.js` were all in the signed manifest, so a hash existed for
+each, but none was pinned.
+
+The consequence was not cosmetic. `generateNickname()` is defined only in
+`nicknames.js`, and `app.js` calls it when the `connected` frame arrives, on
+every connection. The extension whose purpose is to protect the chat page was
+breaking it. The blast radius is bounded only because the extension is not
+published to either store yet, so it affects whoever loads it unpacked; it
+would have shipped with the first store release.
+
+`generate-csp-rules.js` now reads each page and takes the script list from the
+page itself, so the two cannot drift again and adding a `<script>` tag pins
+its hash automatically.
+
+### Changed - the generator proves the page before trusting it
+
+Deriving a policy from a document is only safe while the document is itself
+covered by the signed manifest; an unsigned edit that added a `<script>` would
+otherwise widen the very policy meant to constrain it. `verify-sri.js` checks
+every static file against the manifest, but relying on that would make the
+generator's safety depend on another script having run first. `pageScripts()`
+therefore verifies each page's own hash against the manifest before reading
+it, and refuses off-origin or non-`/static/` script sources.
+
+### Added - a coverage gate in CI
+
+Comparing the rulesets against `buildRules()` only proved they were not stale.
+It said nothing about whether the policy covered the page, which is the whole
+property the rules exist to provide, and that is why this shipped green.
+`verify-sri.js` now reads the ruleset that actually ships and asserts that
+every script tag on every page has its hash in that page's `script-src`.
+Against the previous `rules.json` it reports all three missing files for both
+browsers and exits non-zero. The same assertion is added to Test 7 in
+`tests/test-security.js`, so the main CI job catches it too and not only the
+SRI workflow.
+
+## [2026-09-08] - v0.7.4
+
+Legal text only. No server, client, protocol or extension behaviour change;
+the protocol version stays 1. The signed manifest moves to sequence 46
+because the operator data and the cookie banner changed. Both extensions move
+`MIN_KNOWN_SEQUENCE` to 46 and `GITHUB_TAG` to v0.7.4 in the same commit that
+carries the sequence-46 manifest. Extension version goes to 1.2.6. No
+JavaScript or CSS asset moved, so the inline SRI attributes and both
+preventive CSP rulesets are unchanged from v0.7.3.
+
+### Fixed - the hosting note no longer claims a commitment to Dutch law
+
+The Privacy Policy said the Controller "relies on the provider's contractual
+commitment that the infrastructure is hosted and operated from its facilities
+in the Netherlands and subject to Dutch law". The provider's own published
+documents point the other way. Their privacy policy states "This Privacy
+Policy is governed by the applicable laws of UAE" with UAE courts; their
+terms identify HOST SAILOR LIMITED, incorporated in the United Arab Emirates;
+neither mentions a data-processing agreement, Article 28 or Standard
+Contractual Clauses; and their transfer clause benchmarks against UAE law
+rather than EU law. The sentence "This website is hosted and operated from
+our facilities located in Netherlands" does appear in their privacy policy,
+but it describes hostsailor.com itself rather than a customer's virtual
+machine, and says nothing about Dutch law.
+
+The RIPE registration shows the same split: the allocation 194.36.188.0/24 is
+netname AE-SAILORHOST-20180920 declaring country NL, held by Host Sailor Ltd,
+an LIR registered in the United Arab Emirates at the same Dubai address as
+its terms. The data sits in the EEA while the entity administering it does
+not, which is what keeps Chapter V open rather than closing it.
+
+The note now states only what can be shown: where the machine is, who the
+provider is, that the provider's own instruments are governed by UAE law,
+that remote access from outside the EEA is possible, and that the arrangement
+is therefore treated as a potential Chapter V transfer. It says that whether
+an Article 28 agreement and an Article 46 mechanism exist is being verified,
+and asserts no adequacy decision, derogation or safeguard until that is
+settled. The opening claim that the accepted terms were "in accordance with
+Article 28 GDPR" is reduced to what is known: standard terms that include
+provisions on data processing.
+
+### Changed - the NI-ICS classification is no longer categorical
+
+The note declared "The Service is a number-independent interpersonal
+communications service". An interpersonal communications service is one
+normally provided for remuneration, and the Privacy Policy states the
+Operator acts in a personal, non-commercial capacity with no advertising,
+analytics or profiling, so the premise is not established. The note now
+states the fact that carries the exemption, that no publicly assigned
+numbering resources are used, makes the NI-ICS characterisation conditional,
+and keeps the Article 11(2) point, which holds regardless of how the Service
+describes itself.
+
+### Fixed - the cookie banner named two of three cookies
+
+The banner on all five pages said "(session, CSRF)" while the server sets
+`pinchat_session`, `csrf_token` and `pc_pow`. The Privacy Policy has
+documented all three since the August rewrite; only the banner was stale.
+
+## [2026-09-08] - v0.7.3
+
+Legal-text corrections plus browser-extension work. No server or protocol
+change; the protocol version stays 1 and a v0.7.2 client interoperates with
+this build. The signed manifest moves to sequence 45 because the Terms, the
+operator data and the ASCII punctuation sweep touched seventeen static files.
+Both extensions move `MIN_KNOWN_SEQUENCE` to 45 and `GITHUB_TAG` to v0.7.3 in
+the same commit that carries the sequence-45 manifest, so a build cut from
+this tag fetches a manifest it accepts. Extension version goes to 1.2.5.
+
+### Fixed - abuse reports no longer ask for the room's encryption key
+
+Section 5 of the Terms asked a reporter to send the "room URL". A room link
+is `https://pinchat.io/c/<id>#key=<bootstrap key>`, and the fragment is the
+key that decrypts the room. Browsers never send it to the Service, which is
+the entire reason for putting it there, and then the Terms invited a user to
+paste it into an email. Email is not encrypted, so a good-faith abuse report
+would have disclosed the room key to the Operator, to the reporter's mail
+provider and to every relay in between, in cleartext and at rest. The clause
+now asks for the room identifier, or the link with everything from the `#`
+onwards removed, and states why.
+
+### Fixed - the retention claim in the Terms understated the design
+
+Section 6 said "Rooms self-destruct when their configured time-to-live
+elapses; messages cannot be recovered afterwards", which implies messages
+exist somewhere until the room expires. They do not: ciphertext is held in
+memory only long enough to relay it and is never written to disk, as the
+Privacy Policy already stated. The Terms now say that, and confine the
+time-to-live claim to room metadata, which is what actually expires.
+
+### Changed - the DSA note no longer contradicts the Privacy Policy
+
+`OPERATOR_DSA_NOTE` claimed exemption from Art. 15(2) transparency reporting
+"as it qualifies as a micro or small enterprise", while the Privacy Policy
+states the Operator is a natural person acting in a personal, non-commercial
+capacity. A non-commercial natural person is not an enterprise, and the DSA
+reaches information society services, meaning services normally provided for
+remuneration, which a free personal project may well not be. The note no
+longer asserts either the classification or the exemption: it states the
+condition, says the question is undetermined, describes what would follow if
+the DSA did apply, and notes that the contact points and the published terms
+exist regardless.
+
+The warranty disclaimer drops "merchantability" and "fitness for a particular
+purpose", US formulas in a document governed by Italian law that already
+cites Articles 1218 and 1229 of the Civil Code, in favour of a disclaimer of
+availability, security, reliability, accuracy, non-infringement and
+suitability.
+
+### Changed - typographic punctuation replaced with ASCII across the tree
+
+446 em dashes, en dashes, ellipsis glyphs and arrow glyphs became `-`, `...`
+and `->`. Everything outside `static/` landed in the previous release cycle;
+the remaining 148 are in this one, because they force a re-sign and doing
+them separately would have cost a second signing cycle. Some are visible in
+the interface: the `...` in "Connecting...", "Waiting for peer..." and the
+composer placeholders, and the `-` placeholder in the room info rows.
+
+### Added - the verifier survives an unreachable manifest host
+
+The last manifest that cleared both the signature and the sequence gate is
+now cached in extension storage and re-validated on every read. When
+`raw.githubusercontent.com` cannot be reached the cached copy is used and the
+popup shows **Valid (cached)** with the date it was stored, instead of the
+extension dropping to an error state with no manifest at all.
+
+This closes the cheapest attack available against the verifier: anyone able
+to drop that one connection - a hostile network, a filtering proxy, a
+state-level block, or a GitHub outage - could previously switch the whole
+detection layer off by making a request fail, silently and with no trace on
+the page. The packaged declarativeNetRequest CSP was never affected and kept
+blocking unpinned scripts throughout; what the cache restores is the SRI and
+file-hash detection layer. A bad signature or a sequence downgrade is still
+never rescued by the cache: both fail closed.
+
+### Changed - the extension no longer beacons when idle
+
+The verification alarm used to fetch the manifest every
+`CHECK_INTERVAL_MINUTES` regardless of whether a pinchat.io tab existed, and
+each MV3 service-worker restart added another unconditional request. Every
+install therefore reported itself to the manifest host, and to any observer
+on the path, for the life of the profile. The alarm and the background-start
+path are now gated on having something to verify, a navigation to pinchat.io
+triggers a refresh so the manifest is fresh exactly when it matters, and two
+live fetches are kept at least 60 seconds apart. The popup's "Verify Now"
+and install/update still fetch unconditionally.
+
+### Fixed - the content script can read verification status again
+
+`GET_STATUS` was checked against the `popup` sender profile, which rejects
+any sender carrying `sender.tab`. A content script always carries one, so the
+pull path in `content.js` was dead and the page depended entirely on winning
+a race with the background push. A third read-only `status` profile now
+accepts both the popup and a content script running on pinchat.io.
+
+### Added - reproducible store packaging
+
+`extensions/package.sh` builds the Chrome and Firefox packages with
+`git archive` from a committed tree and prints a SHA-256 for each. Only tracked
+files are archived, so Chromium's locally generated `_metadata/` directory
+cannot leak into a release, and `manifest.json` lands at the archive root as
+both stores require. Before building it checks that the two browsers agree on
+`GITHUB_TAG`, `MIN_KNOWN_SEQUENCE` and version, that the pinned tag exists, and
+that its signed manifest is at or above the floor. Output goes to `dist/`,
+which is gitignored.
+
+### Changed - README trimmed to an entry point
+
+The top-level README had grown to roughly 750 lines, most of it restating the
+threat model, primitives, ratchet design and limitations already specified at
+greater length in `SECURITY.md` and `PROTOCOL.md`. It is now about 340 lines
+and keeps what belongs in a README: what the project is, the honest
+capability matrix, quick start, the configuration reference, and pointers.
+Nothing was dropped outright; the deep material now has a single home. The
+extension README gains a packaging and release-order section.
+
+### Changed - Chrome manifest floor corrected
+
+`minimum_chrome_version` was 86, below the Chrome 88 floor for MV3
+`background.service_worker`, and `"type": "module"` raises the real floor to
+Chrome 92 while buying nothing, since `background.js` has no `import` or
+`export`. The module type is dropped and the floor moves to 88. Firefox's
+`strict_min_version` 113.0 was already correct: `declarativeNetRequest` and
+response-header `modifyHeaders` both land in Firefox 113.
+
+## [2026-08-27] - v0.7.2
+
+Comment-only change to a signed asset. No behaviour change anywhere;
+protocol version stays 1.
+
+### Changed - legal.js header no longer misdescribes the manifest
+
+The header comment in `static/js/legal.js` said `operator.json` was
+intentionally outside the signed manifest. It has been listed there since
+the manifest covered `/static/**`, and `verify-sri.js` checks the deployed
+copy when present, so the comment now says that changing the file on the
+server requires a re-sign like any other static asset. Because the script
+is itself a signed asset, its hash moved: manifest sequence 44, inline SRI
+in `terms.html` and `privacy.html` refreshed, extension CSP rules
+regenerated, `MIN_KNOWN_SEQUENCE` 44 and `GITHUB_TAG` v0.7.2 in both
+extensions, extension version 1.2.3.
+
+## [2026-08-27] - v0.7.1
+
+Legal-text release. No code change on the server or in the chat client;
+the protocol version stays 1 and a v0.7.0 client interoperates with this
+build. The signed manifest moves to sequence 43 because two static pages
+and the deployment-specific `operator.json` changed.
+
+### Changed - Terms of Service and Privacy Policy rewritten
+
+Both pages were rewritten against the code rather than from memory, and
+several statements the previous text made were corrected. Room lifetime
+is 5 minutes to 24 hours, not 15 minutes; a room that everyone has left
+is kept until its time-to-live elapses rather than being deleted on the
+last disconnect; the rate limiter keeps a keyed hash of the client IP for
+up to 15 minutes after the last request; the `pc_pow` cookie, the
+ciphertext replay hashes, the browser-side theme and cookie-notice flags
+and the WebSocket token stash are now disclosed. The beta access
+password, its distribution and the correspondence it involves have their
+own entries, with a legal basis and a retention period each. The hosting
+provider is described as a company incorporated in the United Arab
+Emirates operating from a data centre in the Netherlands, and the
+arrangement is treated as a potential Chapter V transfer instead of
+"no transfer applies". New sections cover how the encryption works in
+brief, the optional integrity extension, the right to object, contesting
+an enforcement decision, the source licence and the governing court.
+The purposes table lists a separate legal-obligation row for legal
+requests. The `operator.json` keys read by the templates changed
+accordingly (`OPERATOR_HOSTING_NOTE`, `OPERATOR_LOG_RETENTION`,
+`OPERATOR_LEGAL_CLASSIFICATION_NOTE`, `OPERATOR_JUDICIAL_COOPERATION_NOTE`,
+`LAST_UPDATED`); `operator.example.json` follows and its comment no longer
+claims the deployed file is outside the signed manifest.
+
+### Changed - extension repointed at v0.7.1
+
+`MIN_KNOWN_SEQUENCE` moves to 43 and `GITHUB_TAG` to v0.7.1 in both
+extensions, in the same commit that carries the sequence-43 manifest, so
+a build made from this tag fetches a manifest it accepts. Extension
+version goes to 1.2.2 so installed copies pick up the new pins.
+
+## [2026-08-25] - v0.7.0
+
+Security release closing an external review of the 1:1 path. Eleven
+findings, no wire-format change: the protocol version stays 1 and a v0.6.x
+client interoperates with this build. Two server responses do change shape,
+neither of them reachable from the shipped UI.
+
+### Fixed - JWT replay window on the WebSocket upgrade
+
+`verify_token` never set `Validation::leeway`, and jsonwebtoken defaults it
+to 60 seconds, so a 30-second ws-token stayed signature-valid for a full
+minute past `exp`. The single-use `jti` record was retained for a fixed TTL
+measured from the moment of consumption, and the cleanup task runs on a 60s
+tick, so the record could be evicted while the signature still verified. A
+stolen token replayed inside that window could not add a third socket while
+both peers were connected, because `add_participant` rejects the duplicate
+connection id, but after a disconnect it took over the slot with the
+original UUID and nickname. Leeway is now pinned to 0, and the `jti`
+retention is derived from the token's own `exp` claim plus a margin covering
+the cleanup interval, so the replay record is guaranteed to outlive every
+instant at which the signature verifies.
+
+### Fixed - room-state rejections no longer burn a valid token
+
+The room existence, expiry and capacity checks ran in `handle_socket`,
+after `consume_token`. A client that lost the race for the second slot, or
+arrived at a room that had just expired, had its token consumed by a
+rejection it did not cause and had to re-run Proof-of-Work to retry. The
+read is hoisted ahead of the burn; `add_participant` remains authoritative
+for capacity, so the residual race costs a token at most once per genuine
+tie.
+
+### Fixed - open redirect and handler panic in the login redirect
+
+The redirect filter was `starts_with('/') && !starts_with("//")`, which
+accepts `/\evil.example`. Per the WHATWG URL specification a relative
+reference beginning `/\` enters the same "special authority ignore slashes"
+state as `//`, so Chrome, Firefox and Safari resolve it to the
+scheme-relative form and navigate off-origin. The same predicate now also
+screens control characters, which closes a second defect in the same path:
+both call sites converted the target with `.parse().unwrap()`, so a form
+field carrying `%0d%0a` decoded to a bare CRLF, passed the filter, and
+panicked the handler task.
+
+### Fixed - peer-controlled values reaching sensitive sinks
+
+Three inputs written by the remote peer were used without validation.
+
+`decryptImage` returned the `mimeType` straight out of the decrypted
+envelope, and it reached `new Blob(..., {type})` and `createObjectURL`. The
+AEAD proves only that the peer wrote that string. A modified client could
+declare `text/html` and produce a same-origin `blob:` document, or
+`image/svg+xml`, which renders inside `<img>` and lets a peer paint content
+imitating application chrome inside a message bubble. One allowlist is now
+enforced on encrypt, on decrypt, and at the file picker.
+
+The Double Ratchet destructured `pn`, `n` and `rc` from the header without
+type checks. `setUint32` coerces through ToUint32 and `BigInt` accepts
+numeric strings, and the two agree, so `n: "0"` verified against the peer's
+genuine signature, matched the AAD, and decrypted. `this.Nr = messageNumber
++ 1` then evaluated to the string `"01"`, and since skipped-key ids are
+built by interpolation, every later out-of-order message was dropped in
+silence for the rest of the session. Only a hostile relay could deliver such
+a header, since the server types the fields as `u32`, but the threat model
+treats the relay as untrusted.
+
+Code-block restoration in the message renderer used a string replacement,
+and `String.prototype.replace` interprets `$&`, `` $` ``, `$'` and `$$`
+inside one. HTML escaping does not touch `$`, so a message like `` `X$'` ``
+spliced in the part of the subject following the match, duplicating and
+reordering the rendered output. Not an XSS, since everything injected was
+already escaped, but it let a sender control how their message rendered.
+
+### Changed - SAS verification survives a peer departure
+
+Membership frames are relay-controlled and unauthenticated, and `userleft`
+destroyed the identity manager along with the SAS verdict. A hostile relay
+could forge one `userleft` to erase an out-of-band verification and let the
+next handshake come up as a first-time, skippable prompt. Departure now
+behaves like reconnect: the identity is retained and the peer's key is
+diffed on return. The result is stricter, not looser, since a different peer
+arriving after a verification now forces re-verification with skipping
+refused. A detected MITM still hard resets.
+
+### Changed - group rooms refused, expired rooms answer 404
+
+`create_room` accepted `room_type: group`. The variant deserialized and
+`Room::new` preserved it while capping participants at two, but the client
+only runs the handshake for `onetoone` and both encrypt and decrypt throw
+without an initialised ratchet, so the room could not carry a message. It is
+now refused with 400 ahead of the Proof-of-Work gate. The creation UI
+already disabled the option, so nothing user-facing changes.
+
+An expired room answered 410 while a missing or full one answered 404, which
+told a caller holding a room id whether the room had ever existed. All three
+states now share one response. No client code branched on 410.
+
+### Fixed - protocol documentation drift
+
+`PROTOCOL.md` still described the v1 DH-header signature, which shipped as
+v2 back in v0.5.0. The canonical sequence, the per-message signing
+behaviour, the `PREVIOUS_CHAIN_LENGTH` AAD field and the backlog were all
+corrected. Two backlog items had partly shipped while still being listed as
+deferred; F-03 is now marked partially shipped, with the part that was never
+implemented spelled out.
+
+### Changed - extension pins move to v0.7.0
+
+The manifest re-signs to sequence 42, so both extensions move
+`MIN_KNOWN_SEQUENCE` to 42 and `GITHUB_TAG` to `v0.7.0`, and the extension
+version goes to 1.2.1. The floor is checked against the manifest fetched
+from the pinned tag, so the two constants must move together: a build
+carrying floor N pointing at a tag whose manifest is below N rejects every
+manifest it can reach. The `v0.7.0` tag must be pushed before users update
+or install the extension.
+
+## [2026-08-06] - v0.6.1
+
+### Changed - SAS gate hardening and dependency-free fuzzing
+
+Further work on the 1:1 verification gate in `static/js/app.js`, with
+`tests/test-chat-sas-gate.js` added as its regression suite. The fuzzing
+harness drops its external dependency in favour of a self-contained
+provider (`tests/fuzz/fuzzed-data-provider.js`), removing the bulk of
+`package-lock.json`.
+
+### Fixed - SRI gate rejected clean checkouts
+
+`verify-sri.js` treated `/static/operator.json` like any other signed file.
+That entry is deployment-specific and absent from a clean checkout, so CI
+failed on a fresh clone. It is now verified when present and skipped when
+not. README security disclosures were clarified in the same release.
+
+## [2026-07-14] - v0.6.0
 
 Breaking E2E handshake change. Wire-incompatible with v1; both endpoints must
 run v2 (a v1 peer is refused fail-closed). The WebSocket subprotocol
@@ -60,6 +483,36 @@ version 1.1.0. The security suite checks these values stay aligned. The SRI CI
 gate now also verifies the manifest's ECDSA signature and all 24 signed file
 hashes, preventing an internally consistent HTML/SRI update from passing with a
 stale release manifest.
+
+## [2026-07-10] - v0.5.0
+
+Backport of the 1:1 Double Ratchet hardening from the experimental group
+branch onto the stable line, without the experimental group feature. Not
+wire- or key-compatible with 0.4.x peers: both sides must run this build.
+
+### Changed - DH header signature v1 to v2
+
+The ECDSA signature over the ratchet header now binds the full semantic
+header (`pn || n || rc`) instead of `rc` alone, so a relay cannot swap `pn`
+or `n` while keeping a valid signature. The canonical tag bumped to
+`"pinchat-drheader-v2"`. `PREVIOUS_CHAIN_LENGTH` (0x08) was added to the
+message AAD in the same change.
+
+### Fixed - chain keys derived from the retained root key
+
+Initial and post-ratchet chain keys are now independent HKDF output rather
+than a second expansion of the retained root key, so a state compromise can
+no longer reconstruct prior messages in the current chain.
+
+### Changed - SAS re-verify gate
+
+While a changed peer identity awaits user confirmation, authenticated but
+unverified plaintext is no longer rendered, for messages and images alike.
+
+### Fixed - per-connection limiter state leaked on room teardown
+
+`remove_room` now also drops the per-connection rate-limiter state, fixing a
+leak across room churn when socket cleanup raced room removal.
 
 ## [2026-07-06] - v0.4.1
 
@@ -182,11 +635,11 @@ the room fields into locals and drops the guard before `remove_room` runs.
   byte-exact against an independent Node reference, Alice/Bob symmetry,
   transcript sensitivity, 16 emoji.
 
-## [2026-05-13] — v0.3.1
+## [2026-05-13] - v0.3.1
 
 Hotfix release for a v0.3.0 regression that broke the 1:1 ECDH
 handshake asymmetrically. Wire protocol unchanged (still v1).
-`static/js/ecdh.js` changed → `hashes.json.signed` regenerates and
+`static/js/ecdh.js` changed -> `hashes.json.signed` regenerates and
 re-signs on commit; the extension manifest URL pin bumps from
 `v0.3.0` to `v0.3.1`. Tag must be pushed to GitHub BEFORE users
 update or install the extension.
@@ -195,7 +648,7 @@ update or install the extension.
 
 - **1:1 handshake: initiator was aborting on Double Ratchet init.**
   The peer's ephemeral ECDH public key was imported via
-  `crypto.subtle.importKey('raw', …, extractable=false, …)` in
+  `crypto.subtle.importKey('raw', ..., extractable=false, ...)` in
   `ECDHKeyExchange.decryptPublicKey`. The v0.3.0 Double Ratchet
   initializer (`double-ratchet.js#initialize`) then calls
   `crypto.subtle.exportKey('raw', theirPublicKey)` to populate
@@ -203,7 +656,7 @@ update or install the extension.
   ratchet-change detection). The export threw
   `DOMException: A parameter or an operation is not supported by
   the underlying object` and only the **initiator** branch hit
-  that path — the responder leaves `DHr=null` to defer ratchet
+  that path - the responder leaves `DHr=null` to defer ratchet
   setup until the first received message. Result: one side
   rendered the SAS modal, the other aborted the handshake. The
   fix imports the peer public key with `extractable=true`. Public
@@ -216,28 +669,28 @@ update or install the extension.
 
 v0.3.0 and v0.3.1 are wire-compatible. Mixed-version pairs work
 in both directions: a v0.3.0 responder pairs with a v0.3.1
-initiator (and vice versa) without seeing the abort — the bug
+initiator (and vice versa) without seeing the abort - the bug
 was strictly client-local on the initiator side and depended on
 which client tried to call `exportKey` on a non-extractable
 imported key.
 
-## [2026-05-12] — v0.3.0
+## [2026-05-12] - v0.3.0
 
 SAS overhaul release. Wire protocol unchanged (still v1). The SAS code
 is computed locally on both sides from material already on the wire
-(identity public keys, room id) — so this is a coordinated client
+(identity public keys, room id) - so this is a coordinated client
 change, not a wire-format break. Mixed-version chats during rollout
 will see different emoji codes on each side until both endpoints
 update; pre-v0.3.0 clients still produce the old SAS.
 
-`static/js/ecdh.js` and `static/chat.html` changed → `hashes.json.signed`
+`static/js/ecdh.js` and `static/chat.html` changed -> `hashes.json.signed`
 regenerates and re-signs on commit (post-commit hook). The extension
 manifest URL pin bumps from `v0.2.6` to `v0.3.0` accordingly. Tag must
-be pushed to GitHub BEFORE users update or install the extension —
+be pushed to GitHub BEFORE users update or install the extension -
 the v0.3.0 extension will fail-loud (full-screen overlay) until the
 `/v0.3.0/hashes.json.signed` URL resolves.
 
-### Security — SAS v2 (audit-3 M-02, planned bundle items F-01 + F-04)
+### Security - SAS v2 (audit-3 M-02, planned bundle items F-01 + F-04)
 
 The SAS derivation is rewritten end-to-end. The third-pass audit
 (M-02) correctly observed that PBKDF2 was the wrong tool: PBKDF2
@@ -258,28 +711,28 @@ bits  = 72                                  // 9 bytes, 12 emoji × 6 bits
 
 Changes vs pre-v0.3.0:
 
-- **PBKDF2-SHA256 → HKDF-SHA256.** Semantically correct (keyed PRF
+- **PBKDF2-SHA256 -> HKDF-SHA256.** Semantically correct (keyed PRF
   for high-entropy material vs password stretcher for human secrets).
   Performance side-effect: SAS derivation drops from ~30-100 ms to
-  ~µs. We do not advertise the timing as security — it isn't.
+  ~µs. We do not advertise the timing as security - it isn't.
 - **Salt no longer contains per-handshake material.** Pre-v0.3.0
   used `roomId || sorted_nonces || sorted_timestamps`. The nonces
   and timestamps were fresh per handshake, so the SAS changed every
-  reconnect — even when both peers retained the same identity
+  reconnect - even when both peers retained the same identity
   keypair via the IndexedDB persistence introduced in v0.2.0
   (intended fix for C-04). v2 makes the SAS a function of
   `(IK_A, IK_B, room_id)` only, so it is stable for the identity
   TTL. Users who verified the code once do not face a different
   code on the next handshake. This eliminates the "skip fatigue"
   failure mode where users were trained to bypass MITM detection.
-- **48 bits → 72 bits.** With HKDF the per-derivation cost is ~µs,
+- **48 bits -> 72 bits.** With HKDF the per-derivation cost is ~µs,
   so iteration count buys nothing against grinding. Output width is
   the only friction. 72 bits / 12 emoji puts a birthday-style SAS
   collision at hours-to-days on commodity GPU hardware (constrained
-  by the ECDSA-keypair search rate, not the SHA throughput) — up
+  by the ECDSA-keypair search rate, not the SHA throughput) - up
   from ~10 minutes at 48 bits.
-- **8 emoji → 12 emoji.** Rendered in the existing 4-column CSS grid
-  as 3 rows of 4. No CSS change needed — the grid template already
+- **8 emoji -> 12 emoji.** Rendered in the existing 4-column CSS grid
+  as 3 rows of 4. No CSS change needed - the grid template already
   adapts. Mobile breakpoint at 400px uses 3 columns (4 rows).
 - **`sasObject` shape changed.** Was
   `{ emoji, hex, bits: 48, iterations: 100000 }`; is now
@@ -309,7 +762,7 @@ Changes vs pre-v0.3.0:
 - `SECURITY.md` `SAS Generation` section split into "v2 (current)"
   and "v1 (pre-v0.3.0, retained for historical context)". The v2
   section spells out the construction, the four security properties,
-  and the rationale for HKDF over PBKDF2 — directly addressing
+  and the rationale for HKDF over PBKDF2 - directly addressing
   audit-3 M-02.
 - `PROTOCOL.md` gains a "Backlog: wire-format items deferred to a
   future protocol bump" section. The original v0.3.0 plan bundled
@@ -330,17 +783,17 @@ who see a mismatch during the transition is: update both clients.
 After the upgrade, the SAS will stabilize and "verify once" becomes
 honest.
 
-This is a one-time UX cost during the v0.2.x → v0.3.0 rollout and
+This is a one-time UX cost during the v0.2.x -> v0.3.0 rollout and
 is the price of fixing the recurring SAS-instability problem that
 the audit (M-02) identified as the real driver of "users skip
-verification" — itself a more serious security risk than the
+verification" - itself a more serious security risk than the
 transition blip.
 
-## [2026-05-12] — v0.2.7
+## [2026-05-12] - v0.2.7
 
 Third-pass audit follow-up. Wire protocol unchanged (still v1). No
 `static/js/*` files changed, so the extension manifest does not need
-regeneration and the in-tree `hashes.json.signed` stays valid — the
+regeneration and the in-tree `hashes.json.signed` stays valid - the
 extension `GITHUB_TAG` pin remains `v0.2.6` (per the lifecycle rule
 documented in the extension code: server-side releases that do not
 ship a new extension keep using the previous pinned manifest).
@@ -349,16 +802,16 @@ ship a new extension keep using the previous pinned manifest).
 
 - **CSRF token compare uses `subtle::ConstantTimeEq` (finding L-01).**
   The hand-rolled XOR-accumulator with an early length-mismatch return
-  in `src/auth.rs` worked correctly — the HMAC tag length is fixed at
+  in `src/auth.rs` worked correctly - the HMAC tag length is fixed at
   64 hex chars for SHA-256 and the attacker-controlled token length is
-  not a secret, so the practical impact was nil — but rolling our own
+  not a secret, so the practical impact was nil - but rolling our own
   primitive is a posture we shouldn't maintain. The verifier now uses
   the audited `subtle` crate (already present transitively in the
   dependency tree; promoted to a direct dependency). The Choice-based
   API short-circuits on length mismatch and otherwise runs in time
   independent of slice contents.
 
-### Testing — Known Answer Tests (audit-3 M-03 assurance)
+### Testing - Known Answer Tests (audit-3 M-03 assurance)
 
 A new `tests/test-kat.js` suite pins the byte-exact output of every
 KDF / HMAC step in the ratchet key schedule against an INDEPENDENT
@@ -368,17 +821,17 @@ different code than the production helpers (WebCrypto via
 `crypto.subtle.importKey` + `deriveBits`), so byte-exact equality
 across all four KATs is a meaningful cross-implementation check.
 
-- **KAT 1** — HKDF helper byte-exact for three tuples covering the
+- **KAT 1** - HKDF helper byte-exact for three tuples covering the
   root-key bootstrap, initial sending-chain derivation (initiator
   role), and DH-ratchet chain-key advancement under a non-zero salt.
-- **KAT 2** — initiator/responder chain labels (`InitiatorToResponder`
+- **KAT 2** - initiator/responder chain labels (`InitiatorToResponder`
   and `ResponderToInitiator`) produce distinct keys for identical IKM
   and salt, AND initiator.sendingChain matches responder.receivingChain
   (the labels-must-line-up symmetry that desynchronises Alice/Bob if
   ever broken).
-- **KAT 3** — chain ratchet step `CK_{n+1} = HMAC-SHA256(CK_n,
+- **KAT 3** - chain ratchet step `CK_{n+1} = HMAC-SHA256(CK_n,
   "ChainRatchet")` pinned at `CK_1` and `CK_5` from a fixed `CK_0`.
-- **KAT 4** — canonical DH-header bytes (`"pinchat-drheader-v1" ||
+- **KAT 4** - canonical DH-header bytes (`"pinchat-drheader-v1" ||
   u16_be(len(dh)) || dh || u32_be(rc)`) byte-exact against a hand-built
   reference, plus an explicit tag-string assertion so a typo in the
   domain-separation prefix fails loudly.
@@ -390,7 +843,7 @@ the ECDH/ECDSA-driven paths to functional round-trip tests in
 ECDH/ECDSA private key would defeat the non-extractable property that
 v0.2.0 / v0.2.5 deliberately enforced.
 
-### Documentation — claim refinement (audit-3 H-01, H-02)
+### Documentation - claim refinement (audit-3 H-01, H-02)
 
 The third-pass audit pushed back on language like "the server cannot
 read your messages" as too absolute given that the actual guarantee
@@ -405,8 +858,8 @@ spells out what is and isn't true under three real configurations:
    peer identity confirmed out of band, but the server can still
    serve modified JS on the next reload and there is no automatic
    detection.
-3. **SAS skipped.** Client-side AEAD is still active — the traffic is
-   encrypted — but peer identity is not confirmed, so the server
+3. **SAS skipped.** Client-side AEAD is still active - the traffic is
+   encrypted - but peer identity is not confirmed, so the server
    operator can mount an active MITM at handshake time and become an
    authenticated peer to each side.
 
@@ -418,13 +871,13 @@ gate, not magic.
 Deferred to v0.3.0 (already planned): widen SAS to 72 bits / 12 emoji
 laid out in 4-column rows, **and** switch the SAS derivation from
 PBKDF2-SHA256 100K to HKDF / HMAC. Audit-3 M-02 correctly observed
-that PBKDF2 is the wrong tool for SAS — it stretches low-entropy
+that PBKDF2 is the wrong tool for SAS - it stretches low-entropy
 passwords, but the SAS inputs are uniformly-high-entropy identity
 public keys plus room/transcript context. HKDF is the natural
 keyed-PRF construction for deriving display bytes from public
 material; the 100K iterations were never doing useful work.
 
-## [2026-05-12] — v0.2.6
+## [2026-05-12] - v0.2.6
 
 Second-pass audit follow-up. Three independent fixes that do not touch
 the wire format. `hashes.json.signed` must be regenerated and re-signed
@@ -452,7 +905,7 @@ be pushed to GitHub *before* users update or install the extension.
   `https://raw.githubusercontent.com/samjanny/pinchat/main/...`. The
   `main` branch is mutable: a GitHub-write compromise (account takeover,
   malicious PR merge, stolen PAT) could overwrite the manifest the
-  extensions trust, even without compromising the signing key — though
+  extensions trust, even without compromising the signing key - though
   the resulting manifest would still need a valid signature to be
   accepted, so the threat is the conjunction of GitHub-write AND
   signing-key compromise. Pinning to `v0.2.6` moves the trust anchor
@@ -462,13 +915,13 @@ be pushed to GitHub *before* users update or install the extension.
   not ship a new extension keep using the previous pinned manifest.
   Same constant value and inline comment on both Chrome and Firefox.
 
-### Testing — regression coverage for v0.2.5 fixes (finding F-16)
+### Testing - regression coverage for v0.2.5 fixes (finding F-16)
 
 Three new tests close the gap flagged by the second-pass audit. The
 pre-v0.2.5 builds had tests for the *generic patterns* but not for
 the specific production code paths the fixes hardened.
 
-- **F-02 regression — `IdentityKeyManager` production path**
+- **F-02 regression - `IdentityKeyManager` production path**
   (`tests/test-security.js` test 5). The pre-v0.2.5 generic test (test 3)
   only verified that `subtle.generateKey({ECDSA, P-256}, false, ...)`
   yields a non-extractable private key. Test 5 instantiates the actual
@@ -479,7 +932,7 @@ the specific production code paths the fixes hardened.
   `IdentityKeyManager.verify`. Catches any future regression that
   reintroduces an extractable intermediate.
 
-- **F-07 regression — JWT algorithm pin + required `exp`** (three
+- **F-07 regression - JWT algorithm pin + required `exp`** (three
   Rust tests in `src/jwt.rs`):
   - `test_token_rejects_hs384_signature` and
     `test_token_rejects_hs512_signature` forge tokens signed with the
@@ -491,7 +944,7 @@ the specific production code paths the fixes hardened.
     `WsTokenClaims` always has `exp: u64`), and asserts rejection by
     the `set_required_spec_claims(["exp"])` gate.
 
-- **F-10 regression — encrypt-path rollback on AEAD failure**
+- **F-10 regression - encrypt-path rollback on AEAD failure**
   (`tests/test-ratchet-correctness.js`). Warms up a Double Ratchet
   pair, snapshots `Ns` / `ratchetCount` / `sendingChain.messageNumber`
   / `sendingChain.chainKeyMaterial` (byte-copy) / `DHsSignature`,
@@ -503,12 +956,12 @@ the specific production code paths the fixes hardened.
   one would have produced (chain was not consumed), and that the peer
   decrypts the recovered message.
 
-## [2026-05-12] — v0.2.5
+## [2026-05-12] - v0.2.5
 
 Cryptographic-audit follow-up patch release. Wire protocol unchanged
 (still v1). Existing v1 clients remain interoperable with the patched
 server, and vice-versa. `hashes.json.signed` must be regenerated and
-re-signed out-of-band with the maintainer's signing key before deploy —
+re-signed out-of-band with the maintainer's signing key before deploy -
 `static/js/identity.js`, `static/js/double-ratchet.js` and the
 JWT-bearing path in the server binary have changed.
 
@@ -523,7 +976,7 @@ JWT-bearing path in the server binary have changed.
   reachable ArrayBuffer; an XSS or hostile extension running during
   identity creation (every 24 h on TTL refresh) could exfiltrate the
   long-term identity key and from there forge ECDSA signatures on DH
-  ratchet rotations — bypassing the MITM defense introduced in v0.2.0.
+  ratchet rotations - bypassing the MITM defense introduced in v0.2.0.
   The new code calls `generateKey(..., false, ['sign', 'verify'])`
   directly: per WebCrypto §13, the public side of an asymmetric ECDSA
   keypair is always extractable regardless of the parameter, so
@@ -532,7 +985,7 @@ JWT-bearing path in the server binary have changed.
 
 - **JWT verification pins HS256 explicitly (finding F-07).**
   `verify_token` used `Validation::default()`, which in
-  `jsonwebtoken 10.x` happens to accept only HS256 — but as
+  `jsonwebtoken 10.x` happens to accept only HS256 - but as
   documentation, not type-system enforcement. A future minor that
   widened the default would silently weaken verification. The path
   is now `Validation::new(Algorithm::HS256)` with
@@ -554,13 +1007,13 @@ JWT-bearing path in the server binary have changed.
 ### Documentation
 
 - **`SECURITY.md` doc-drift reconciled (findings F-05, F-11).**
-  - Replay cache default corrected: 10 000 → 1 000 entries
+  - Replay cache default corrected: 10 000 -> 1 000 entries
     (`src/config.rs`).
-  - Login-stash safety-net TTL corrected: 30 s → 5 min
+  - Login-stash safety-net TTL corrected: 30 s -> 5 min
     (`static/js/login-stash.js`).
   - PBKDF2-100K cost claim recalibrated: the previous "≈10 s on
     consumer hardware" is off by ~100×. Updated to reflect actual
-    measurements (~30–100 ms on a modern desktop browser with
+    measurements (~30-100 ms on a modern desktop browser with
     hardware SHA-256; ~25 000 PBKDF2-100K/s on an RTX 4090-class
     GPU). The 48-bit SAS output is the binding constraint, not the
     iteration count; protocol v2 will widen the SAS to 72 bits.
@@ -595,7 +1048,7 @@ JWT-bearing path in the server binary have changed.
 All six require a wire-format change; hard cut from v1, no
 negotiation. See PROTOCOL.md at the next bump.
 
-## [2026-05-12] — v0.2.4
+## [2026-05-12] - v0.2.4
 
 Single-fix patch release. Wire protocol unchanged; `hashes.json.signed`
 re-signed (only `static/js/app.js` and the chat HTML SRI line moved).
@@ -605,28 +1058,28 @@ re-signed (only `static/js/app.js` and the chat HTML SRI line moved).
 - **`Copy link` produced a fragment-less invite URL.** v0.2.3 moved the
   bootstrap secret out of `window.location.hash` into `sessionStorage`
   on first import (C-06), so `window.location.href` no longer carries
-  `#key=…` for the rest of the session. The header `Copy link` button
-  just read `location.href` and handed peers a URL with no key — they
+  `#key=...` for the rest of the session. The header `Copy link` button
+  just read `location.href` and handed peers a URL with no key - they
   loaded the chat page, `extractKeyFromURL` found neither a fragment
   nor a stash for *their* tab, and the handshake never started.
   `copyLink()` now falls back to `sessionStorage['pinchat_hash:'+pathname]`
   when the live hash is empty, reconstructing `origin + pathname +
-  search + #key=…` before writing to the clipboard. The URL bar itself
-  stays scrubbed — that is intentional anti-leak behaviour from v0.2.3
+  search + #key=...` before writing to the clipboard. The URL bar itself
+  stays scrubbed - that is intentional anti-leak behaviour from v0.2.3
   and the button is the supported share channel.
 
-## [2026-05-11] — v0.2.3
+## [2026-05-11] - v0.2.3
 
 Security and UX patch release driven by a full audit pass on the 1:1
 chat path. Wire protocol unchanged (still v1); existing v1 clients
 remain interoperable with the patched server, and vice-versa. The
 `hashes.json.signed` manifest needs to be regenerated and re-signed
-out-of-band with the maintainer's signing key before deploy — the
+out-of-band with the maintainer's signing key before deploy - the
 shipped JS bytes have changed across this release.
 
 ### Security (high)
 
-- **Double Ratchet — concurrent send race fixed.** `encryptMessage()`
+- **Double Ratchet - concurrent send race fixed.** `encryptMessage()`
   and `decryptMessage()` mutate `Ns`/`Nr`/chain state/`DHs`/`DHr`/
   `rootKey` across multiple `await` points. Two overlapping calls
   (rapid double-tap on Send, paste-then-Enter, send-while-image-upload)
@@ -642,7 +1095,7 @@ shipped JS bytes have changed across this release.
   inbound dispatch in `websocket.js` also runs through a serial queue
   so application-level handlers in `app.js` observe messages in arrival
   order.
-- **Double Ratchet — cross-DH late delivery fixed.** A delayed message
+- **Double Ratchet - cross-DH late delivery fixed.** A delayed message
   whose key was already sitting in `this.skippedKeys` (because the
   receiver had ratcheted past it during a peer DH rotation) used to hit
   the `isNewKey` branch first, since `header.dh` no longer matched
@@ -659,14 +1112,14 @@ shipped JS bytes have changed across this release.
   of the parameter, so `exportKey('raw', publicKey)` for header
   construction still works; the `true` was only weakening the *private*
   side under XSS / extension compromise. Same change applied to peer
-  DH public keys (`this.DHr`) — `skipMessageKeys` now reads raw bytes
+  DH public keys (`this.DHr`) - `skipMessageKeys` now reads raw bytes
   from the existing `this.DHrRaw` cache instead of `exportKey`-ing the
   imported handle.
 - **Bootstrap fragment preserved across the `/login` redirect.** The
   `require_auth` middleware used to issue a bare `Redirect::to("/login")`
   when an unauthenticated user clicked `/c/<uuid>#key=<base64>`. After
   the round-trip, the fragment was lost and the user landed on `/` with
-  no way back to the room — usability bug *and*, depending on browser,
+  no way back to the room - usability bug *and*, depending on browser,
   the bootstrap secret had transited through `/login`'s URL bar
   visible to anything reading `window.location.hash` on the login page.
   The middleware now redirects to `/login?redirect=<path-and-query>`
@@ -710,13 +1163,13 @@ shipped JS bytes have changed across this release.
 
 ### Defensive hardening
 
-- **Server-side `REPLAY_CACHE_MAX_PER_ROOM` default 10000 → 1000.**
+- **Server-side `REPLAY_CACHE_MAX_PER_ROOM` default 10000 -> 1000.**
   The previous default extrapolated to roughly 1.4 GB worst case
   across 1000 rooms on a small VPS, disproportionate given the cache
   is advisory (the authoritative anti-replay is the client-side
   Double Ratchet counter). The new default still buffers about
   17 minutes of traffic at `MSG_RATE_LIMIT = 30 msg/s`. The
-  ~"640 KB" comment in the previous version was wrong — the entry
+  ~"640 KB" comment in the previous version was wrong - the entry
   cost is closer to 136 B (hex SHA-256 String + DateTime + HashSet
   overhead), not 64 B.
 - **WebSocket frame rate limiter now counts all non-Close frames.**
@@ -744,7 +1197,7 @@ shipped JS bytes have changed across this release.
   stale "Must be extractable for SAS generation" comment in
   `ecdh.js` predated the move of the SAS derivation to identity keys.
 - **`arraysEqual` comment de-overpromised.** The helper only ever
-  compares public DH key bytes for ratchet-direction detection — no
+  compares public DH key bytes for ratchet-direction detection - no
   secret is being compared and JS engines do not give true wall-clock
   constant-time guarantees. The comment now says so plainly.
 
@@ -757,7 +1210,7 @@ shipped JS bytes have changed across this release.
   and the login-stash flow.
 - `PROTOCOL.md`: AAD-TLV `BigUint64` field endianness specified as
   little-endian (current implementation behaviour, asymmetric with
-  the explicit big-endian DH-header signature — a candidate for the
+  the explicit big-endian DH-header signature - a candidate for the
   next protocol bump); Bootstrap Key prose updated to match; stale
   TODO on `skipMessageKeys` replaced by the actual implementation
   behaviour.
@@ -794,28 +1247,28 @@ shipped JS bytes have changed across this release.
   `<head>` with its own SRI integrity attribute.
 - `hashes.json.signed` (extension manifest) **must be regenerated
   and re-signed** with the maintainer's offline signing key before
-  the production deploy — the shipped JS bytes have changed across
+  the production deploy - the shipped JS bytes have changed across
   this release. See `extensions/README.md` and the signing helpers
   under `extensions/` for the procedure.
 
-## [2026-05-07] — v0.2.2
+## [2026-05-07] - v0.2.2
 
 Security patch release. Wire protocol unchanged (still v1); no client-side
 changes, no deploy-ordering constraints vs. v0.2.1.
 
 ### Security (high)
 
-- **`rustls-webpki` 0.103.8 → 0.103.13.** Pulled in transitively via
-  `axum-server` → `tokio-rustls` → `rustls`; closes four advisories that
+- **`rustls-webpki` 0.103.8 -> 0.103.13.** Pulled in transitively via
+  `axum-server` -> `tokio-rustls` -> `rustls`; closes four advisories that
   reach the TLS-terminating server path:
-  - **RUSTSEC-2026-0049** — CRLs were not considered authoritative by their
+  - **RUSTSEC-2026-0049** - CRLs were not considered authoritative by their
     Distribution Point because of faulty matching logic.
-  - **RUSTSEC-2026-0098** — name constraints for URI names were incorrectly
+  - **RUSTSEC-2026-0098** - name constraints for URI names were incorrectly
     accepted, so a constrained CA could issue certificates outside its
     permitted scope.
-  - **RUSTSEC-2026-0099** — name constraints were accepted for certificates
+  - **RUSTSEC-2026-0099** - name constraints were accepted for certificates
     asserting a wildcard name, with the same scope-bypass effect.
-  - **RUSTSEC-2026-0104** — reachable panic when parsing a malformed
+  - **RUSTSEC-2026-0104** - reachable panic when parsing a malformed
     Certificate Revocation List (DoS surface on TLS handshake paths that
     consume CRLs).
 
@@ -833,26 +1286,26 @@ changes, no deploy-ordering constraints vs. v0.2.1.
 `cargo audit` still emits two warnings that do not fail the run and are
 not exploitable in this codebase:
 
-- **RUSTSEC-2026-0097** — `rand 0.8.5` unsoundness when used with a
+- **RUSTSEC-2026-0097** - `rand 0.8.5` unsoundness when used with a
   custom logger via `rand::rng()`. We do not register such a logger.
-- **RUSTSEC-2025-0134** — `rustls-pemfile 2.2.0` is unmaintained,
+- **RUSTSEC-2025-0134** - `rustls-pemfile 2.2.0` is unmaintained,
   pinned transitively by `axum-server`. Tracked upstream.
 
-## [2026-04-24] — v0.2.1
+## [2026-04-24] - v0.2.1
 
 Security patch release. Wire protocol unchanged (still v1); no deploy-ordering
 constraints vs. v0.2.0 clients.
 
 ### Security (high)
 
-- **Double Ratchet — same-chain out-of-order recovery fixed.** When the receiver
+- **Double Ratchet - same-chain out-of-order recovery fixed.** When the receiver
   saw a message whose counter was ahead of `Nr` (e.g. message `n=2` before `n=0`
   and `n=1` on the same DH chain), the previous `decryptMessage` ratcheted the
   receiving chain forward N times *without* storing the skipped message keys, so
   the delayed predecessors could never be decrypted. Worse, if a message with
   `n < Nr` arrived (delayed from the sliding-window path), the post-decrypt
   block rewound `Nr`, desynchronising the chain and causing every subsequent
-  in-order message to fail AEAD verification — a network-adjacent **session
+  in-order message to fail AEAD verification - a network-adjacent **session
   DoS**: any server or path that delivered `2, 0, 1` instead of `0, 1, 2`
   silently killed the session. `decryptMessage` now (a) rejects
   `messageNumber < Nr` when there is no stored skipped key, (b) calls
@@ -877,7 +1330,7 @@ constraints vs. v0.2.0 clients.
 ### Tests
 
 - `tests/test-double-ratchet.js` **Test 11b** was previously documented as a
-  "known limitation" — messages `0, 1` were expected to fail to decrypt after
+  "known limitation" - messages `0, 1` were expected to fail to decrypt after
   receiving `2` first. With the ratchet correctness fix, the test is renamed
   to *Skipped-Key Recovery* and now asserts that the delayed `0, 1` decrypt
   from stored skipped keys, and a replay of the already-consumed `0` is
@@ -890,12 +1343,12 @@ constraints vs. v0.2.0 clients.
 - `static/chat.html`: SRI `integrity` attributes for `crypto.js` and
   `double-ratchet.js` refreshed to match the patched bodies. The signed
   manifest (`hashes.json.signed`) must be regenerated out-of-band before
-  production deploy — it requires the maintainer's signing key and is not
+  production deploy - it requires the maintainer's signing key and is not
   included in this commit.
 - `README.md` Changelog section extracted to this dedicated file; README
   now links to it.
 
-## [2026-04-22] — v0.2.0 (protocol v1)
+## [2026-04-22] - v0.2.0 (protocol v1)
 
 **First explicitly numbered wire-protocol version.** Pre-release clients and
 servers are considered "v0 implicit" and are rejected after this release.
@@ -909,8 +1362,8 @@ the full reject-code matrix.
   DH rotations were actually unsigned. They are now ECDSA-signed over
   `"pinchat-drheader-v1" || len(dh):u16_be || dh || rc:u32_be`, binding the
   signature to the current ratchet round. A live MITM that swaps the DH
-  header mid-session triggers `SIGNATURE_INVALID` → WebSocket close 1008 →
-  hard identity teardown → no auto-reconnect.
+  header mid-session triggers `SIGNATURE_INVALID` -> WebSocket close 1008 ->
+  hard identity teardown -> no auto-reconnect.
 - **JWT out of the URL.** Previously the WebSocket token travelled in
   `?token=<jwt>`, so it could land in proxy access logs, referrer headers,
   and middlebox caches. Now the client offers
@@ -939,7 +1392,7 @@ the full reject-code matrix.
 - `PROTOCOL_OR_AUTH_FAILURE` vs `CONNECTION_EXHAUSTED` separation so the
   client banner distinguishes "refresh the page" from "check your network".
 - Async error boundary wrappers around `onMessage`, `onConnected`, and the
-  `ECDHKeyExchange.startTimeout` callback — unhandled promise rejections
+  `ECDHKeyExchange.startTimeout` callback - unhandled promise rejections
   from the new teardown paths can no longer escape silently.
 - Integration tests for the WebSocket upgrade handshake (bound listener +
   raw TCP): reject paths for missing subprotocol, v0 subprotocol, missing
@@ -967,8 +1420,8 @@ the full reject-code matrix.
 - **E2E encryption key leak via login redirect URL.** When a `/api/ws-token/*` or
   `/api/rooms` request returned 401, the client previously concatenated
   `window.location.hash` into the `?redirect=` query parameter. Because the
-  fragment carries the symmetric room key (`#key=…`), this caused the key to be
-  sent to the server — and therefore to any reverse-proxy / CDN / browser-history
+  fragment carries the symmetric room key (`#key=...`), this caused the key to be
+  sent to the server - and therefore to any reverse-proxy / CDN / browser-history
   / `Referer` sink. The redirect now strips the fragment, stashes it in
   `sessionStorage` (tab-scoped) before navigating, and `extractKeyFromURL()`
   restores it via `history.replaceState` on the first read after login.

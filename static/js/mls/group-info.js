@@ -1,5 +1,5 @@
 /**
- * PinChat MLS — GroupInfo (RFC 9420 §12.4.3.1).
+ * PinChat MLS - GroupInfo (RFC 9420 §12.4.3.1).
  *
  *   struct {
  *       GroupContext group_context;

@@ -20,6 +20,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const readline = require('readline');
+const { writeRulesFromManifest } = require('./generate-csp-rules');
 
 // Files to hash - order matters: JS/CSS first, then HTML (which depends on JS/CSS hashes)
 const JS_CSS_FILES = [
@@ -46,7 +47,7 @@ const JS_CSS_FILES = [
   '/static/js/debug.js',
 
   // MLS / TreeKEM bundle (RFC 9420, ciphersuite 0x0002)
-  // Listed in load order for readability — hashing itself is order-insensitive.
+  // Listed in load order for readability - hashing itself is order-insensitive.
   '/static/js/mls/codec.js',
   '/static/js/mls/tree-math.js',
   '/static/js/mls/p256.js',
@@ -85,7 +86,7 @@ const HTML_FILES = [
 ];
 
 // Deployment-specific data files: hashed (hex) for integrity but not
-// SRI-injected. Not tracked in the public repo — each operator keeps
+// SRI-injected. Not tracked in the public repo - each operator keeps
 // a local copy at static/operator.json matching what the server serves
 // at /static/operator.json, then re-signs the manifest on change.
 const DATA_FILES = [
@@ -627,6 +628,11 @@ async function main() {
     fs.writeFileSync(options.output, JSON.stringify(output, null, 2));
     console.log(`\nOutput written to: ${options.output}`);
 
+    // Keep the extension's pre-execution CSP allowlist coupled to the exact
+    // signed release hashes. This runs only after signing succeeded, so a key
+    // or signing failure cannot leave the packaged rules ahead of the manifest.
+    writeRulesFromManifest(path.resolve(options.output));
+
     // Summary
     console.log(`
 Summary:
@@ -635,6 +641,7 @@ Summary:
   - HTML files updated with SRI: ${htmlUpdates.length}
   - Total files in manifest: ${files.length}
   - Sequence number: ${sequence}
+  - Preventive extension CSP rules: updated
 
 IMPORTANT:
   1. Commit the updated HTML files to git

@@ -1,15 +1,15 @@
 /**
- * PinChat MLS — "labeled operations" (RFC 9420 §5).
+ * PinChat MLS - "labeled operations" (RFC 9420 §5).
  *
  * This module provides the top-level labeled wrappers the MLS spec
  * layers over the raw cryptographic primitives:
  *
  *   §5.2 RefHash(label, value) = Hash(serialize(RefHashInput))
  *
- *   §5.1.1 SignWithLabel / VerifyWithLabel — wraps ECDSA P-256 over
+ *   §5.1.1 SignWithLabel / VerifyWithLabel - wraps ECDSA P-256 over
  *          serialize(SignContent{label="MLS 1.0 "+Label, content}).
  *
- *   §5.1.2 EncryptWithLabel / DecryptWithLabel — wraps HPKE-SealBase /
+ *   §5.1.2 EncryptWithLabel / DecryptWithLabel - wraps HPKE-SealBase /
  *          OpenBase with info = serialize(EncryptContext{label, context})
  *          and empty AAD.
  *
@@ -62,7 +62,7 @@
      *   RefHash(label, value) = Hash(serialize(RefHashInput{label, value}))
      *
      * Unlike the KDF / Sign / Encrypt labels, RefHash does *not* prefix
-     * the label with "MLS 1.0 " — verified empirically against the IETF
+     * the label with "MLS 1.0 " - verified empirically against the IETF
      * crypto-basics.json vectors.
      *
      * `label` is a JS string (written verbatim as the opaque label bytes).
@@ -149,7 +149,7 @@
      *
      * `privateKey` is the recipient's ECDH P-256 CryptoKey (deriveBits
      * capable). `publicKeyBytes` is the recipient's public key as bytes
-     * — required by HPKE's key-schedule context.
+     * - required by HPKE's key-schedule context.
      */
     async function decryptWithLabel(privateKey, publicKeyBytes, label, context, kemOutput, ciphertext) {
         const info = encryptContextBytes(label, context);

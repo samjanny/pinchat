@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 /**
- * MLS Group — Remove flow.
+ * MLS Group - Remove flow.
  *
  * Sequence:
  *   1. Alice creates a group.
@@ -37,7 +37,7 @@ function assert(cond, name, detail) {
         console.log(`  OK   ${name}`);
         passed += 1;
     } else {
-        console.log(`  FAIL ${name}${detail ? `  — ${detail}` : ''}`);
+        console.log(`  FAIL ${name}${detail ? `  - ${detail}` : ''}`);
         failed += 1;
     }
 }
@@ -140,12 +140,12 @@ function groupSecretRefs(group) {
 }
 
 async function main() {
-    console.log('# Group — Remove flow');
+    console.log('# Group - Remove flow');
 
     const aliceId = await freshIdentity();
     const alice = await Group.Group.create({ identity: aliceId });
 
-    // Add Bob → epoch 1.
+    // Add Bob -> epoch 1.
     const bob = await buildKeyPackage();
     const r1 = await alice.commitAddMember({ keyPackageBytes: bob.keyPackageBytes });
     const tree1 = Nodes.ratchetTreeBytes(alice.ratchetTree);
@@ -161,7 +161,7 @@ async function main() {
         ...await bootstrapPins(alice),
     });
 
-    // Add Carol → epoch 2.
+    // Add Carol -> epoch 2.
     const carol = await buildKeyPackage();
     const r2 = await alice.commitAddMember({ keyPackageBytes: carol.keyPackageBytes });
     await bobGroup.processCommit(r2.commitMessage);
@@ -252,7 +252,7 @@ async function main() {
     // Application message at epoch 3: Carol decrypts Alice.
     const wireA3 = await alice.encryptApplicationMessage('only us now');
     assert(new TextDecoder().decode((await carolGroup.decryptApplicationMessage(wireA3)).plaintext) === 'only us now',
-        'Alice → Carol app msg at epoch 3');
+        'Alice -> Carol app msg at epoch 3');
 
     // Bob (still at epoch 2) cannot decrypt epoch 3 traffic.
     let bobThrew = false;
@@ -326,11 +326,11 @@ async function main() {
 
     const wireA4 = await alice.encryptApplicationMessage('post-remove epoch');
     assert(new TextDecoder().decode((await daveGroup.decryptApplicationMessage(wireA4)).plaintext) === 'post-remove epoch',
-        'Alice → Dave app msg at epoch 4');
+        'Alice -> Dave app msg at epoch 4');
     assert(new TextDecoder().decode((await carolGroup.decryptApplicationMessage(
         await daveGroup.encryptApplicationMessage('hi from dave'),
     )).plaintext) === 'hi from dave',
-        'Dave → Carol app msg at epoch 4');
+        'Dave -> Carol app msg at epoch 4');
 
     const cappedCandidate = alice.forkForPendingCommit();
     const existingLeaf = RatchetTree.leafFor(

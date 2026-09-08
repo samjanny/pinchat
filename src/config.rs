@@ -85,7 +85,7 @@ pub struct Config {
     // signature verification + key import + Double Ratchet re-init on the
     // peer client; without a dedicated cap, an authenticated peer could
     // exhaust the receiver's CPU under cover of the (much looser)
-    // frame_rate_limit. Real handshakes need 1–2 frames per session and a
+    // frame_rate_limit. Real handshakes need 1-2 frames per session and a
     // few more across reconnects, so a small burst over a long window is
     // ample.
     pub ecdh_burst_limit: usize,
@@ -369,12 +369,22 @@ impl Config {
                 })
                 .unwrap_or_default(),
 
-            // Anti-replay cache max entries per room (default: 1000). The
-            // implementation uses a hash lookup plus FIFO insertion queue,
-            // so expiry/eviction is O(1) amortized rather than sorting
-            // attacker-controlled entries on the message path. The hard
-            // validation cap below prevents operators from accidentally
+            // Anti-replay cache max entries per room (default: 1000).
+            //
+            // The cache is a hash lookup plus a FIFO insertion queue, so
+            // expiry and capacity eviction are O(1) amortized: no
+            // attacker-controlled sort or full-set scan runs on the message
+            // path. The validation cap below stops an operator from
             // multiplying this advisory cache into unbounded room memory.
+            //
+            // 1000 is chosen for the memory budget, not the algorithm: at
+            // roughly 136 bytes per entry across 1000 rooms that is about
+            // 136 MB worst case. The previous default of 10000 extrapolated
+            // to ~1.4 GB on a VPS, disproportionate for a layer that is
+            // advisory anyway, since the authoritative anti-replay defence is
+            // the client-side Double Ratchet counter. 1000 entries still
+            // tolerate ~17 minutes at the 30 msg/s rate limit before eviction
+            // starts mattering for a busy room.
             replay_cache_max_per_room: env::var("REPLAY_CACHE_MAX_PER_ROOM")
                 .ok()
                 .and_then(|v| v.parse().ok())

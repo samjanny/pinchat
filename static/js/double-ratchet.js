@@ -68,7 +68,7 @@ class DoubleRatchet {
 
         // Highest (ratchetCount, messageNumber) tuple successfully decrypted.
         // Used to flag late/reordered arrivals to the UI without weakening the
-        // cryptographic acceptance rules — out-of-order messages are still
+        // cryptographic acceptance rules - out-of-order messages are still
         // valid, but the application can mark them visually.
         this.maxRatchetSeen = -1;
         this.maxCounterSeen = -1;
@@ -89,15 +89,15 @@ class DoubleRatchet {
 
         // C-01b (audit C-1): synchronous fatal-auth gate. Set to true the
         // moment SIGNATURE_INVALID is detected in _decryptMessageImpl. Once
-        // set, every subsequent encryptMessage / decryptMessage call —
+        // set, every subsequent encryptMessage / decryptMessage call -
         // including those already queued on the mutex chain when detection
-        // fired — short-circuits at the entry gate and refuses to touch
+        // fired - short-circuits at the entry gate and refuses to touch
         // ratchet state. This eliminates the race window between
         // SIGNATURE_INVALID detection and the asynchronous WS close: even
         // if the WS layer drains buffered frames before the close handshake
         // completes, no further decryption can advance state under attacker
         // control. The flag is intentionally not resettable from inside
-        // this class — the only valid recovery is a full session refresh.
+        // this class - the only valid recovery is a full session refresh.
         this.fatalAuthFailure = false;
     }
 
@@ -278,7 +278,7 @@ class DoubleRatchet {
 
     async _encryptMessageImpl(plaintext, roomId, senderId, msgType = 'message') {
         if (this.fatalAuthFailure) {
-            // Session is irreversibly compromised — refuse to emit ciphertext
+            // Session is irreversibly compromised - refuse to emit ciphertext
             // that could be observed by an attacker who already swapped DH
             // keys. UI will surface SIGNATURE_INVALID via the receive path.
             throw new Error('SIGNATURE_INVALID');
@@ -390,7 +390,7 @@ class DoubleRatchet {
             // public key via the cached identity signature, and (b) perform the DH
             // ratchet when needed.
             if (!this.DHsSignature) {
-                throw new Error('DHsSignature missing — signCurrentDHs must run after every DHs generation');
+                throw new Error('DHsSignature missing - signCurrentDHs must run after every DHs generation');
             }
             return {
                 payload: payload,
@@ -459,6 +459,37 @@ class DoubleRatchet {
         if (!header.sig || typeof header.sig !== 'string') {
             throw new Error('MISSING_SIGNATURE');
         }
+        if (typeof header.dh !== 'string' || header.dh.length === 0) {
+            throw new Error('PROTOCOL_MISMATCH');
+        }
+
+        // Audit F-2: pn / n / rc must be genuine uint32 values before anything
+        // downstream reads them. Two primitives coerce silently AND in
+        // agreement, so a non-number can satisfy both integrity checks at once:
+        //
+        //   _buildCanonicalBytes -> DataView.setUint32 -> ToUint32
+        //   encodeAADWithLengthPrefix -> BigInt(value)  -> accepts "0", false
+        //
+        // n: "0" therefore verifies against the peer's genuine ECDSA signature
+        // (ToUint32("0") === 0) and matches the AAD (BigInt("0") === 0n), the
+        // AEAD tag passes, and the message decrypts. The damage lands after
+        // that, at `this.Nr = messageNumber + 1`, which becomes the string
+        // concatenation "0" + 1 === "01". Relational comparisons keep working
+        // numerically so nothing throws, but skipped-key ids are built by
+        // interpolation (`${dh}:${this.Nr}`) and "...:01" never matches the
+        // "...:1" a numeric counter produces. Out-of-order messages are then
+        // dropped in silence, permanently, for the rest of the session.
+        //
+        // Only a hostile relay can deliver such a header: the Rust server
+        // types these three fields as u32 (models/message.rs) and
+        // re-serializes, so an honest deployment cannot forward a string. The
+        // threat model treats the relay as untrusted, and this guard turns a
+        // silent permanent desync into a clean fail-closed.
+        const isUint32 = (value) =>
+            Number.isInteger(value) && value >= 0 && value <= 0xFFFFFFFF;
+        if (!isUint32(header.pn) || !isUint32(header.n) || !isUint32(header.rc)) {
+            throw new Error('PROTOCOL_MISMATCH');
+        }
 
         // Extract header fields
         const { dh: dhPublicKeyBase64, pn: prevChainLength, n: messageNumber, rc: ratchetCount } = header;
@@ -474,12 +505,12 @@ class DoubleRatchet {
         // a MITM could swap the DH public key in the header and hijack the chain
         // direction.
         //
-        // Audit H-2: this is intentionally outside the snapshot/rollback block —
+        // Audit H-2: this is intentionally outside the snapshot/rollback block -
         // the verify path is pure (no this.* mutation), so a rollback would be a
         // no-op. The throw path sets `this.fatalAuthFailure = true` SYNCHRONOUSLY
         // before re-throwing (audit C-1), so any decryptMessage() / encryptMessage()
         // calls already queued on the mutex chain at detection time will
-        // short-circuit at their entry gate when their turn comes — closing the
+        // short-circuit at their entry gate when their turn comes - closing the
         // race between detection and the async WS close handshake.
         try {
             const sigBytes = this.base64urlToArrayBuffer(header.sig);
@@ -494,17 +525,17 @@ class DoubleRatchet {
         }
 
         // C-02: Skipped-key short-circuit.
-        // If we have already derived this (dh, n) message key — either via a
+        // If we have already derived this (dh, n) message key - either via a
         // forward-jump pre-derive (skipMessageKeys with messageNumber > Nr) or
-        // via a pre-ratchet skip on receive (prevChainLength > Nr) — use it
+        // via a pre-ratchet skip on receive (prevChainLength > Nr) - use it
         // directly WITHOUT touching chain state.
         //
         // Without this, a late message from a previous DH chain would hit the
         // `isNewKey` branch below (because header.dh != this.DHrRaw after the
         // chain has rotated), trigger a SPURIOUS performDHRatchetOnReceive on
         // an OLD key, and the subsequent AEAD would fail. State would roll
-        // back, but the legitimate message — whose key is sitting in
-        // this.skippedKeys — would be lost.
+        // back, but the legitimate message - whose key is sitting in
+        // this.skippedKeys - would be lost.
         const skippedKeyId = `${dhPublicKeyBase64}:${messageNumber}`;
         if (this.skippedKeys.has(skippedKeyId)) {
             debugLog(`[DoubleRatchet] Skipped-key hit for #${messageNumber} (dh=${dhPublicKeyBase64.substring(0, 12)}...)`);
@@ -535,7 +566,7 @@ class DoubleRatchet {
 
                 const envelope = JSON.parse(new TextDecoder().decode(plaintextBytes));
                 // Late deliveries are by definition out-of-order. We do NOT
-                // update maxRatchetSeen / maxCounterSeen — those track the
+                // update maxRatchetSeen / maxCounterSeen - those track the
                 // forward edge of the conversation, not late arrivals.
                 envelope._outOfOrder = true;
                 debugLog(`[DoubleRatchet] Skipped-key decrypt success #${messageNumber}`);
@@ -620,7 +651,7 @@ class DoubleRatchet {
             // state should be advanced afterwards.
             //   - skipped-key path: already past this counter, do NOT touch chain state
             //   - forward-jump path: messageNumber > Nr, store intermediate keys first
-            //   - replay/too-old path: messageNumber < Nr with no stored key → reject
+            //   - replay/too-old path: messageNumber < Nr with no stored key -> reject
             //   - in-order path: messageNumber === Nr (after skip), derive and advance once
             const skippedKeyId = `${dhPublicKeyBase64}:${messageNumber}`;
             const isSkippedKey = this.skippedKeys.has(skippedKeyId);
@@ -668,7 +699,7 @@ class DoubleRatchet {
                     {type: AAD_FIELD_TYPES.PREVIOUS_CHAIN_LENGTH, value: prevChainLength}
                 ]);
 
-                // Decrypt with AES-GCM — this is the AEAD authentication point.
+                // Decrypt with AES-GCM - this is the AEAD authentication point.
                 // Only on success does the outer try block reach the commit phase.
                 plaintextBytes = await crypto.subtle.decrypt(
                     {
@@ -995,7 +1026,7 @@ class DoubleRatchet {
      *
      * NOTE: The XOR-accumulator pattern below is structurally constant-time
      * at the algorithmic level (every byte is compared, no early return).
-     * It is NOT a true wall-clock constant-time primitive — JS engines
+     * It is NOT a true wall-clock constant-time primitive - JS engines
      * (V8/SpiderMonkey) make no guarantees about branch prediction or
      * cache effects on `|=`. That is acceptable here because this helper
      * only compares PUBLIC DH key bytes (this.DHrRaw vs incoming header.dh)

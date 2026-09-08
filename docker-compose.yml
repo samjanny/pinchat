@@ -16,7 +16,7 @@ services:
     security_opt:
       - no-new-privileges:true
     
-    # Linux capabilities — dropped entirely.
+    # Linux capabilities - dropped entirely.
     # The Dockerfile creates the non-root `pinchat` user (uid 1000) and chowns
     # /app at BUILD time. The runtime process never calls chown/setuid/setgid,
     # and port 3000 is >1024 so CAP_NET_BIND_SERVICE is not needed either.

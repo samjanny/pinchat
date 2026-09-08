@@ -39,6 +39,11 @@ const TEST_SUITES = {
         file: 'test-websocket-resume.js',
         description: 'In-memory resume bearer propagation and fail-closed identity recovery'
     },
+    sasgate: {
+        name: 'Chat SAS Gate',
+        file: 'test-chat-sas-gate.js',
+        description: '1:1 application data is quarantined until an explicit SAS decision'
+    },
     correctness: {
         name: 'Ratchet Correctness',
         file: 'test-ratchet-correctness.js',
@@ -67,7 +72,7 @@ const TEST_SUITES = {
     fuzz: {
         name: 'Fuzz Smoke',
         file: 'test-fuzz-smoke.js',
-        description: 'jazzer-js coverage-guided decrypt-path fuzz, short smoke run (longer: node tests/run-fuzz.js N)'
+        description: 'dependency-free decrypt-path mutation fuzz, short smoke run (longer: node tests/run-fuzz.js N)'
     },
     'mls-tree-math': {
         name: 'MLS tree math',
@@ -147,7 +152,7 @@ const TEST_SUITES = {
     'mls-welcome': {
         name: 'MLS Welcome / GroupInfo end-to-end',
         file: 'test-mls-welcome.js',
-        description: 'Full joiner flow: unwrap → HPKE-decrypt → AES-decrypt → verify GroupInfo'
+        description: 'Full joiner flow: unwrap -> HPKE-decrypt -> AES-decrypt -> verify GroupInfo'
     },
     'mls-secret-tree': {
         name: 'MLS secret tree + per-leaf AEAD ratchet',
@@ -235,10 +240,10 @@ function runTest(suiteName) {
 
         proc.on('close', (code) => {
             // Exit code 77 = SKIPPED (autotools convention). The two
-            // suites that depend on optional npm dev-deps (fast-check,
-            // @jazzer.js/core) emit 77 when their require() throws on a
+            // suites that depend on optional npm dev-deps (fast-check)
+            // emit 77 when their require() throws on a
             // fresh clone without `npm ci`. The runner treats SKIP as
-            // non-failing — `npm ci` is required for full coverage but
+            // non-failing - `npm ci` is required for full coverage but
             // the core suites stay usable offline.
             let status;
             if (code === 0) status = 'passed';
@@ -320,7 +325,7 @@ async function main() {
         console.log('SOME TEST SUITES FAILED');
         process.exit(1);
     } else if (skipped > 0) {
-        console.log(`ALL TEST SUITES PASSED (${skipped} SKIPPED — install dev-deps with \`npm ci\` for full coverage)`);
+        console.log(`ALL TEST SUITES PASSED (${skipped} SKIPPED - install dev-deps with \`npm ci\` for full coverage)`);
         process.exit(0);
     } else {
         console.log('ALL TEST SUITES PASSED');

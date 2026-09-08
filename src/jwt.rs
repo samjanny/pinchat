@@ -238,11 +238,21 @@ pub fn verify_token(
     // enforcement; a future minor that widened the default would silently
     // weaken verification. Algorithm::HS256 is the only acceptable algorithm
     // because sign_token uses Header::default() (HS256). Also require `exp`,
-    // `aud`, `iss` — without these gates a token missing the claim would
+    // `aud`, `iss` - without these gates a token missing the claim would
     // skip the corresponding validation in jsonwebtoken.
     let mut validation = Validation::new(Algorithm::HS256);
     validation.leeway = 0;
     validation.set_required_spec_claims(&["exp", "aud", "iss"]);
+
+    // Audit H-1: pin the clock-skew allowance to zero. `Validation::new`
+    // defaults to `leeway: 60`, which keeps a signature verifiable for a full
+    // minute past `exp`. The single-use `jti` record is retained relative to
+    // the token's own expiry, so that extra minute was a window in which the
+    // signature still checked out while the replay guard had already been
+    // garbage-collected by the consumed-token cleanup task. Tokens live 30s
+    // by design and are minted and redeemed by the same client within a
+    // single page interaction; no honest caller needs a minute of skew on top.
+    validation.leeway = 0;
 
     // Audit C-2: pin both audience and issuer. set_audience accepts the
     // expected `aud` value(s); set_issuer accepts expected `iss` value(s).
@@ -399,13 +409,13 @@ mod tests {
     //
     // verify_token MUST reject:
     //   (a) a token whose `aud` is anything other than WS_TOKEN_AUDIENCE,
-    //       even with a matching secret and issuer — prevents a token minted
+    //       even with a matching secret and issuer - prevents a token minted
     //       for some other surface (admin endpoint, future internal service)
     //       from being replayed at the WS upgrade.
     //   (b) a token whose `iss` does not match the deployment's configured
-    //       issuer — prevents cross-instance reuse when two PinChat instances
+    //       issuer - prevents cross-instance reuse when two PinChat instances
     //       happen to share an HMAC key during rotation.
-    //   (c) a token missing either claim — relies on set_required_spec_claims.
+    //   (c) a token missing either claim - relies on set_required_spec_claims.
 
     #[test]
     fn test_token_rejects_wrong_audience() {
@@ -479,7 +489,7 @@ mod tests {
     //   (a) a token signed with any algorithm other than HS256, even if the
     //       MAC key is correct. Otherwise an attacker who learned the secret
     //       could downgrade the algorithm and we'd have to trust the
-    //       jsonwebtoken default-validation surface — which is documentation,
+    //       jsonwebtoken default-validation surface - which is documentation,
     //       not type-system enforcement.
     //   (b) a token missing the `exp` claim. The default Validation accepts
     //       missing-exp silently, which means an attacker who can mint
@@ -537,6 +547,41 @@ mod tests {
             result.is_err(),
             "Token missing `exp` must be rejected (set_required_spec_claims gate)"
         );
+    }
+
+    // Audit H-1 regression: `Validation::new` ships `leeway: 60`, so without
+    // an explicit pin a token stays verifiable for a minute past `exp`. The
+    // jti replay record is not held that long, which opened a real replay
+    // window. verify_token MUST reject a token that is already expired, even
+    // by less than the default leeway.
+    #[test]
+    fn test_token_rejects_expired_within_default_leeway() {
+        let secret = [23u8; 32];
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        for seconds_past_exp in [1u64, 30, 59] {
+            let claims = WsTokenClaims {
+                room_id: Uuid::new_v4(),
+                connection_id: Uuid::new_v4(),
+                exp: now - seconds_past_exp,
+                jti: Uuid::new_v4(),
+                aud: WS_TOKEN_AUDIENCE.to_string(),
+                iss: TEST_ISS.to_string(),
+                resume: false,
+                mls_control_cursor: None,
+                creator_bootstrap_generation: None,
+            };
+            let token = sign_token(&claims, &secret).expect("sign");
+
+            assert!(
+                verify_token(&token, &secret, TEST_ISS).is_err(),
+                "token expired {}s ago must be rejected; leeway is not pinned to 0",
+                seconds_past_exp
+            );
+        }
     }
 
     #[test]

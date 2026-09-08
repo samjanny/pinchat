@@ -67,7 +67,7 @@ pub fn verify_csrf_token(token: &str, secret: &[u8; 32]) -> bool {
     // hand-rolled XOR-accumulator below. The HMAC tag length is fixed (64
     // hex chars for SHA-256), and the attacker-provided length is not a
     // secret, so the practical impact of the original early-length-return
-    // pattern was nil — but rolling our own is the position we don't want
+    // pattern was nil - but rolling our own is the position we don't want
     // to maintain. `subtle::ConstantTimeEq` for `[u8]` short-circuits on
     // length and otherwise runs in time independent of slice contents.
     provided_signature

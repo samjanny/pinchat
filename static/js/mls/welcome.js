@@ -1,5 +1,5 @@
 /**
- * PinChat MLS — Welcome (RFC 9420 §12.4).
+ * PinChat MLS - Welcome (RFC 9420 §12.4).
  *
  * A Welcome is the message a committer sends to each new group member
  * alongside the broadcast Commit. It carries:
@@ -42,7 +42,7 @@
  *
  * PreSharedKeyID
  * --------------
- * Full PSK serialization is deferred — PinChat does not use PSKs, so the
+ * Full PSK serialization is deferred - PinChat does not use PSKs, so the
  * psks<V> field is always empty in our Welcome messages. Incoming PSK
  * vectors are parsed as an opaque blob (decoder reads psks<V> as a
  * vector of opaque<V> so unknown types don't abort parsing).

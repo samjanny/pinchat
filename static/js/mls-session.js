@@ -1,5 +1,5 @@
 /**
- * PinChat MLS session — high-level façade the app.js controller talks
+ * PinChat MLS session - high-level façade the app.js controller talks
  * to when `room_type === 'group'`. Mirrors the shape of the existing
  * DoubleRatchet wrapper so the UI layer can branch on one field and
  * otherwise keep the same send / receive / on-message API surface.
@@ -31,20 +31,20 @@
  * Add Commit with its Welcome). This is the same shape the Rust server's
  * Message::Mls expects. `onEvent` fires
  * with `{ kind, ... }` for UI updates. `kind` values:
- *   'keypackage-published'   — our KeyPackage has been emitted
- *   'welcome-sent'            — Alice sent a Welcome to the new member
- *   'joined'                  — Bob completed join
- *   'removed'                 — authenticated Remove made this session terminal
- *   'roster'                  — live leaves identified by signature-key hash
- *   'message'                 — payload + authenticated sender key identity
- *   'error'                   — unrecoverable error with { reason }
+ *   'keypackage-published'   - our KeyPackage has been emitted
+ *   'welcome-sent'            - Alice sent a Welcome to the new member
+ *   'joined'                  - Bob completed join
+ *   'removed'                 - authenticated Remove made this session terminal
+ *   'roster'                  - live leaves identified by signature-key hash
+ *   'message'                 - payload + authenticated sender key identity
+ *   'error'                   - unrecoverable error with { reason }
  */
 (function (root) {
     'use strict';
 
     const MLS = root.MLS;
     if (!MLS) {
-        throw new Error('mls-session: window.MLS is not loaded — ensure the mls/*.js modules are included before this file');
+        throw new Error('mls-session: window.MLS is not loaded - ensure the mls/*.js modules are included before this file');
     }
 
     function base64UrlEncode(bytes) {
@@ -57,7 +57,7 @@
     // Application-payload tag bytes. Every MLS application_data we send
     // begins with one of these so the receiver can route between text and
     // images (and, later, additional payload kinds) without sniffing.
-    // The tag is OUTSIDE the MLS framing — it's the first byte of the
+    // The tag is OUTSIDE the MLS framing - it's the first byte of the
     // ciphertext-protected payload.
     const PAYLOAD_TEXT = 0x01;
     const PAYLOAD_IMAGE = 0x02;
@@ -394,7 +394,7 @@
             // permanent Welcome rejection therefore triggers a compensating
             // Remove for the admitted-but-unreachable leaf.
             this._acceptedWelcomeByCommit = new Map();
-            // Per-sender_id → leafIndex map maintained by the creator.
+            // Per-sender_id -> leafIndex map maintained by the creator.
             // We commit at most one KeyPackage per WebSocket sender_id;
             // a second KeyPackage from the same sender (or a sender
             // already represented in the tree) is rejected. Without this
@@ -407,7 +407,7 @@
             // former member. The set is never evicted; reaching the hard cap
             // fails future Adds closed.
             this._consumedKeyPackageRefs = new Set();
-            // Reverse leafIndex → sender_id binding used ONLY for transport
+            // Reverse leafIndex -> sender_id binding used ONLY for transport
             // routing diagnostics. The MLS signature authenticates the leaf
             // and its signature_key; sender_id is relay metadata and MUST
             // never supply a displayed name or security identity. The
@@ -1497,7 +1497,7 @@
 
             // Creator: accept KeyPackages from new joiners while we have
             // a valid group to commit into. The state machine moves
-            // 'awaiting-keypackage' → 'joined' on the first commit and
+            // 'awaiting-keypackage' -> 'joined' on the first commit and
             // stays 'joined' afterwards; both states accept new KPs.
             if (wireFormat === MLS.MLSMessage.WireFormat.MLS_KEY_PACKAGE
                 && this.role === 'creator'
@@ -1521,7 +1521,7 @@
                 }
                 if (this._leafBySenderId.has(senderId)) {
                     this.onEvent({ kind: 'error',
-                        reason: `sender ${senderId} already has a leaf — duplicate KeyPackage rejected` });
+                        reason: `sender ${senderId} already has a leaf - duplicate KeyPackage rejected` });
                     return;
                 }
                 let keyPackageRef;
@@ -1623,7 +1623,7 @@
             }
 
             // Anything else (commit while still awaiting-welcome, etc.)
-            // is silently dropped — Welcome is the catch-up path.
+            // is silently dropped - Welcome is the catch-up path.
         }
 
         /**
@@ -1832,7 +1832,7 @@
         async _handleIncomingKeyPackage(
             kpBytes, senderId, admittedKeyPackageRef = null,
         ) {
-            // The envelope payload is the raw KeyPackage body — wire_format
+            // The envelope payload is the raw KeyPackage body - wire_format
             // rides as a separate envelope field, so the bytes are NOT wrapped
             // in MLSMessage framing. Pass them straight to commitAddMember
             // which calls KeyPackage.parseKeyPackage internally.

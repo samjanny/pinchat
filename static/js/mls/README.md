@@ -1,4 +1,4 @@
-# MLS / TreeKEM — custom implementation
+# MLS / TreeKEM - custom implementation
 
 Branch: `experimental-groups-custom`
 
@@ -11,7 +11,7 @@ AES-GCM), which is already used by the 1:1 crypto path.
 
 We commit to a single MLS ciphersuite:
 
-    0x0002 — MLS_128_DHKEMP256_AES128GCM_SHA256_P256
+    0x0002 - MLS_128_DHKEMP256_AES128GCM_SHA256_P256
 
 Rationale: every primitive is already in the PinChat TCB, natively exposed
 through WebCrypto, and the ciphersuite is a first-class citizen of RFC 9420.
@@ -37,7 +37,7 @@ are intentionally not interoperable.
 
 | Module                                   | Status | Tests                                                                                  |
 | ---------------------------------------- | :----: | -------------------------------------------------------------------------------------- |
-| [`ciphersuite.js`](ciphersuite.js)       |   ✅   | —                                                                                      |
+| [`ciphersuite.js`](ciphersuite.js)       |   ✅   | -                                                                                      |
 | [`tree-math.js`](tree-math.js)           |   ✅   | [`test-mls-tree-math.js`](../../../tests/test-mls-tree-math.js)                        |
 | [`codec.js`](codec.js)                   |   ✅   | [`test-mls-codec.js`](../../../tests/test-mls-codec.js)                                |
 | [`hpke.js`](hpke.js)                     |   ✅   | [`test-mls-hpke.js`](../../../tests/test-mls-hpke.js)                                  |
@@ -221,7 +221,7 @@ AuthenticatedContent before applying the referenced leaf update.
 - **Joiner-side transcript-hash re-derivation (RFC §5.3).** A new
   joiner cannot independently re-derive
   `confirmed_transcript_hash[n]` because they don't have
-  `interim_transcript_hash[n-1]` — that depends on the prior epoch's
+  `interim_transcript_hash[n-1]` - that depends on the prior epoch's
   state, which they never observed. The joiner therefore TRUSTS the
   CTH carried in the GroupInfo, gated only by the M-1 binding
   (`GroupInfo.signer === Commit.sender`). A creator that equivocates
@@ -236,7 +236,7 @@ AuthenticatedContent before applying the referenced leaf update.
   requires sub-microsecond timing over a noisy network.
 - **Replay state across page reload.** `consumedByLeaf` lives in
   memory only. On reload, the user re-establishes the MLS session
-  with a fresh KeyPackage → fresh Welcome → fresh epoch state, so
+  with a fresh KeyPackage -> fresh Welcome -> fresh epoch state, so
   the previous epoch's `(leaf, generation)` tuples become irrelevant
   (the encryption_secret has changed). Replay across reload is moot
   in our architecture because we don't survive reloads, we re-join.

@@ -13,6 +13,7 @@
 
 const { webcrypto } = require('crypto');
 const { subtle } = webcrypto;
+const assert = require('assert');
 const fs = require('fs');
 const path = require('path');
 
@@ -64,7 +65,7 @@ async function runTests() {
             console.log('PASSED: non-extractable creator key cannot be exported');
             passed++;
         } else {
-            console.log('FAILED: key was exported — extractable=false not enforced');
+            console.log('FAILED: key was exported - extractable=false not enforced');
             failed++;
         }
     } catch (e) {
@@ -96,7 +97,7 @@ async function runTests() {
             console.log('PASSED: non-extractable joiner key cannot be exported');
             passed++;
         } else {
-            console.log('FAILED: key was exported — extractable=false not enforced');
+            console.log('FAILED: key was exported - extractable=false not enforced');
             failed++;
         }
     } catch (e) {
@@ -180,13 +181,13 @@ async function runTests() {
     console.log('');
 
     // -------------------------------------------------------------------------
-    // Test 5: F-02 regression — IdentityKeyManager production path
+    // Test 5: F-02 regression - IdentityKeyManager production path
     // -------------------------------------------------------------------------
     // Test 3 above verifies the GENERIC pattern (generateKey(false, ...) yields
     // a non-extractable private key). Test 5 exercises the REAL production
     // class `IdentityKeyManager.generateIdentityKeypair()`. Before v0.2.5 the
-    // class used a three-step round-trip (extractable=true → exportKey('pkcs8')
-    // → importKey(false) → fill(0)) that briefly placed the raw private key
+    // class used a three-step round-trip (extractable=true -> exportKey('pkcs8')
+    // -> importKey(false) -> fill(0)) that briefly placed the raw private key
     // bytes in the JS heap. F-02 collapsed it to a single non-extractable
     // generateKey. This test exists to catch any future regression that
     // re-introduces an extractable intermediate.
@@ -246,7 +247,7 @@ async function runTests() {
         }
 
         if (privateExportFailed && publicExportSucceeded && signVerifyOk && failedImportWasAtomic) {
-            console.log('PASSED: F-02 — non-extractable identity + transactional peer import');
+            console.log('PASSED: F-02 - non-extractable identity + transactional peer import');
             passed++;
         } else {
             console.log(`FAILED: privateExportFailed=${privateExportFailed}, publicExportSucceeded=${publicExportSucceeded}, signVerifyOk=${signVerifyOk}, failedImportWasAtomic=${failedImportWasAtomic}`);
@@ -359,13 +360,13 @@ async function runTests() {
             return match[1];
         };
 
-        const pinsOk = chromeTag === 'v0.6.0'
+        const pinsOk = chromeTag === 'v0.7.5'
             && firefoxTag === chromeTag
             && Number.isSafeInteger(chromeFloor)
             && chromeFloor > 0
             && chromeFloor <= signed.data.sequence
             && firefoxFloor === chromeFloor
-            && chromeManifest.version === '1.1.0'
+            && chromeManifest.version === '1.2.7'
             && firefoxManifest.version === chromeManifest.version
             && readPublicKey(chromeBackground) === readPublicKey(firefoxBackground);
         if (!pinsOk) {
@@ -377,6 +378,158 @@ async function runTests() {
         }
         console.log(`  Release ${chromeTag}, sequence floor ${chromeFloor}, extension ${chromeManifest.version}`);
         console.log('PASSED: Chrome and Firefox release pins are aligned');
+        passed++;
+    } catch (e) {
+        console.log('FAILED:', e.message);
+        failed++;
+    }
+    console.log('');
+
+    // -------------------------------------------------------------------------
+    // Test 7: Extension CSP is preventive, pinned, and deterministic
+    // -------------------------------------------------------------------------
+    console.log('--- Test 8: Extension enforces signed script hashes before execution ---');
+    try {
+        const root = path.join(__dirname, '..');
+        const signed = JSON.parse(fs.readFileSync(path.join(root, 'hashes.json.signed'), 'utf8'));
+        const chromeManifest = JSON.parse(fs.readFileSync(path.join(root, 'extensions/chrome/manifest.json'), 'utf8'));
+        const firefoxManifest = JSON.parse(fs.readFileSync(path.join(root, 'extensions/firefox/manifest.json'), 'utf8'));
+        const chromeRules = JSON.parse(fs.readFileSync(path.join(root, 'extensions/chrome/rules.json'), 'utf8'));
+        const firefoxRules = JSON.parse(fs.readFileSync(path.join(root, 'extensions/firefox/rules.json'), 'utf8'));
+        const { buildRules } = require('../extensions/generate-csp-rules');
+        const expectedRules = buildRules(signed);
+
+        for (const manifest of [chromeManifest, firefoxManifest]) {
+            assert(manifest.permissions.includes('declarativeNetRequestWithHostAccess'));
+            assert.strictEqual(manifest.declarative_net_request.rule_resources[0].enabled, true);
+            assert.strictEqual(manifest.declarative_net_request.rule_resources[0].path, 'rules.json');
+        }
+        assert.deepStrictEqual(chromeRules, expectedRules);
+        assert.deepStrictEqual(firefoxRules, expectedRules);
+        assert(chromeRules[0].action.responseHeaders[0].value.includes("script-src 'none'"));
+        for (const rule of chromeRules.slice(1)) {
+            const csp = rule.action.responseHeaders[0].value;
+            assert(!/script-src[^;]*'self'/.test(csp), 'script-src must not trust the origin');
+            assert(csp.includes("'sha256-"), 'page rule must pin at least one signed script');
+        }
+
+
+        // Coverage, not just freshness. The rules used to be derived from a
+        // hand-maintained script list that had drifted: chat.html loaded
+        // theme.js, pow.js and nicknames.js, none were pinned, and with no
+        // 'self' in script-src all three were blocked for extension users.
+        const sriOf = (hex) => `sha256-${Buffer.from(hex, 'hex').toString('base64')}`;
+        const signedHashes = new Map(signed.data.files.map((f) => [f.path, f.hash]));
+        for (const rule of chromeRules) {
+            const page = rule.condition.regexFilter
+                .replace('^https://(www\\.)?pinchat\\.io', '')
+                .replace('(?:\\?.*)?$', '')
+                .replace(/\\/g, '');
+            if (!page.endsWith('.html')) continue;
+            const html = fs.readFileSync(path.join(root, page.replace(/^\//, '')), 'utf8');
+            const policy = rule.action.responseHeaders[0].value.split(';')[0];
+            for (const m of html.matchAll(/<script\b[^>]*\ssrc="([^"]+)"/g)) {
+                const hex = signedHashes.get(m[1]);
+                assert(hex, `${page} loads ${m[1]}, absent from the signed manifest`);
+                assert(
+                    policy.includes(`'${sriOf(hex)}'`),
+                    `${page} loads ${m[1]} but its hash is not pinned in script-src`,
+                );
+            }
+        }
+
+        console.log('PASSED: packaged DNR rules replace origin trust with per-page signed hashes');
+        passed++;
+    } catch (e) {
+        console.log('FAILED:', e.message);
+        failed++;
+    }
+    console.log('');
+
+    // -------------------------------------------------------------------------
+    // Test 9: Offline resilience and network-quiet behaviour of the verifier
+    // -------------------------------------------------------------------------
+    console.log('--- Test 9: Verifier survives an unreachable manifest host ---');
+    try {
+        const root = path.join(__dirname, '..');
+        const backgrounds = {
+            chrome: fs.readFileSync(path.join(root, 'extensions/chrome/background.js'), 'utf8'),
+            firefox: fs.readFileSync(path.join(root, 'extensions/firefox/background.js'), 'utf8'),
+        };
+
+        for (const [browser, source] of Object.entries(backgrounds)) {
+            // A transport failure must fall back to the last manifest that
+            // cleared both gates. Without this, anyone able to drop the
+            // connection to the manifest host switches the detection layer
+            // off, which is the cheapest possible attack on a verifier.
+            assert(
+                /const MANIFEST_CACHE_KEY = /.test(source),
+                `${browser}: manifest cache key missing`,
+            );
+            assert(
+                /async function loadCachedManifest\(/.test(source),
+                `${browser}: loadCachedManifest missing`,
+            );
+            assert(
+                /async function cacheSignedManifest\(/.test(source),
+                `${browser}: cacheSignedManifest missing`,
+            );
+
+            // The cached copy is re-validated on read, so tampering with
+            // extension storage buys nothing a forged signature would not.
+            const loadBody = source.slice(source.indexOf('async function loadCachedManifest('));
+            assert(
+                loadBody.slice(0, 2000).includes('validateSignedManifest'),
+                `${browser}: cached manifest is not re-validated on read`,
+            );
+
+            // A bad signature or a downgrade must never be rescued by the
+            // cache: those are attack signals, not transport problems. The
+            // rejection branch has to return before any cache lookup.
+            const rejectStart = source.indexOf('if (!result.ok) {');
+            assert(rejectStart > 0, `${browser}: no rejection branch after validation`);
+            const rejectEnd = source.indexOf('return verificationState;', rejectStart);
+            assert(rejectEnd > rejectStart, `${browser}: rejection branch does not return`);
+            const rejectBranch = source.slice(rejectStart, rejectEnd);
+            assert(
+                rejectBranch.includes("verificationState.signatureStatus ="),
+                `${browser}: rejection branch does not record the failure`,
+            );
+            assert(
+                !rejectBranch.includes('loadCachedManifest'),
+                `${browser}: rejected manifest falls back to the cache`,
+            );
+
+            // Background-driven verification must be gated so an idle
+            // browser stops beaconing the manifest host every few minutes.
+            assert(
+                /async function verifyIfRelevant\(/.test(source),
+                `${browser}: verifyIfRelevant missing`,
+            );
+            assert(
+                /onAlarm\.addListener[\s\S]{0,200}?verifyIfRelevant\(/.test(source),
+                `${browser}: alarm still fetches unconditionally`,
+            );
+            assert(
+                !/^verifyIntegrity\(\);$/m.test(source),
+                `${browser}: background start still fetches unconditionally`,
+            );
+
+            // The content script pulls the manifest on load; the 'popup'
+            // profile rejects any sender carrying sender.tab, so GET_STATUS
+            // has to use the shared read-only profile.
+            assert(
+                /message\.type === 'GET_STATUS'\)\s*\{\s*if \(!isSenderTrusted\(sender, 'status'\)\)/.test(source),
+                `${browser}: GET_STATUS does not accept the content script`,
+            );
+            assert(
+                /if \(profile === 'status'\)/.test(source),
+                `${browser}: 'status' sender profile missing`,
+            );
+        }
+
+        console.log('  Cached-manifest fallback, fail-closed rejection, gated background fetch');
+        console.log('PASSED: verifier degrades safely and stays quiet when idle');
         passed++;
     } catch (e) {
         console.log('FAILED:', e.message);

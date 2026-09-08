@@ -1,5 +1,5 @@
 /**
- * PinChat MLS — wire-format codec (RFC 9420 §2 + §B).
+ * PinChat MLS - wire-format codec (RFC 9420 §2 + §B).
  *
  * MLS adopts the TLS 1.3 presentation language (RFC 8446) with a twist:
  * variable-length vectors carry an MLS variable-length integer prefix based
@@ -13,7 +13,7 @@
  *   00                          | 1           | 0 .. 2^6  - 1
  *   01                          | 2           | 2^6  .. 2^14 - 1
  *   10                          | 4           | 2^14 .. 2^30 - 1
- *   11                          | invalid     | —
+ *   11                          | invalid     | -
  *
  * All encode functions produce a Uint8Array; all decode functions accept a
  * `Decoder` cursor and advance it on success, throwing on truncation.

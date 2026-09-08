@@ -1,5 +1,5 @@
 /**
- * PinChat MLS — parent hashes (RFC 9420 §7.9).
+ * PinChat MLS - parent hashes (RFC 9420 §7.9).
  *
  * Parent-hash chaining binds every parent node on a committer's direct
  * path, and the committer's own LeafNode, to the actual shape of the

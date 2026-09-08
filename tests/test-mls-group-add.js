@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 /**
- * MLS Group — Add + Commit + Welcome flow (2-leaf MVP).
+ * MLS Group - Add + Commit + Welcome flow (2-leaf MVP).
  *
  * End-to-end: Alice creates a group, generates a Welcome+Commit that
  * adds Bob, and Bob joins from the Welcome. After that both members
@@ -12,9 +12,9 @@
  *   2. Bob  : generates identity + an HPKE init keypair + a signed
  *             KeyPackage (basic credential).
  *   3. Alice: commitAddMember({ keyPackageBytes: bobKeyPackageBytes })
- *             → { commitMessage, welcomeMessage }
+ *             -> { commitMessage, welcomeMessage }
  *             Alice's state advances to epoch 1 with a 2-leaf tree.
- *   4. Bob  : Group.joinFromWelcomeWithTree — parses the Welcome,
+ *   4. Bob  : Group.joinFromWelcomeWithTree - parses the Welcome,
  *             decrypts GroupSecrets under his init_priv, decrypts
  *             the GroupInfo AEAD, verifies the GroupInfo signature
  *             against Alice's leaf signature key, then derives the
@@ -40,7 +40,7 @@ function assert(cond, name, detail) {
         console.log(`  OK   ${name}`);
         passed += 1;
     } else {
-        console.log(`  FAIL ${name}${detail ? `  — ${detail}` : ''}`);
+        console.log(`  FAIL ${name}${detail ? `  - ${detail}` : ''}`);
         failed += 1;
     }
 }
@@ -128,7 +128,7 @@ async function buildBobKeyPackage() {
 }
 
 async function main() {
-    console.log('# Group — Add/Commit/Welcome (2-leaf MVP)');
+    console.log('# Group - Add/Commit/Welcome (2-leaf MVP)');
 
     // 1. Alice creates the group.
     const aliceId = await freshIdentity();
@@ -138,7 +138,7 @@ async function main() {
     // 2. Bob builds a KeyPackage.
     const bob = await buildBobKeyPackage();
 
-    // 3. Alice commits Add(Bob) → generates commit + welcome.
+    // 3. Alice commits Add(Bob) -> generates commit + welcome.
     const { commitMessage, welcomeMessage } = await alice.commitAddMember({
         keyPackageBytes: bob.keyPackageBytes,
     });
@@ -192,12 +192,12 @@ async function main() {
     const wire1 = await alice.encryptApplicationMessage('ciao bob, eccoci');
     const pt1 = await bobGroup.decryptApplicationMessage(wire1);
     assert(new TextDecoder().decode(pt1.plaintext) === 'ciao bob, eccoci',
-        'Alice → Bob application message at epoch 1 decrypts');
+        'Alice -> Bob application message at epoch 1 decrypts');
 
     const wire2 = await bobGroup.encryptApplicationMessage('ciao alice!');
     const pt2 = await alice.decryptApplicationMessage(wire2);
     assert(new TextDecoder().decode(pt2.plaintext) === 'ciao alice!',
-        'Bob → Alice application message at epoch 1 decrypts');
+        'Bob -> Alice application message at epoch 1 decrypts');
 
     // 6. Path-only Update commit: PCS rotation without membership change.
     const authenticatorBefore = Buffer.from(

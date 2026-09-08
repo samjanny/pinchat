@@ -32,7 +32,7 @@ function assert(cond, name, detail) {
         console.log(`  OK   ${name}`);
         passed += 1;
     } else {
-        console.log(`  FAIL ${name}${detail ? `  — ${detail}` : ''}`);
+        console.log(`  FAIL ${name}${detail ? `  - ${detail}` : ''}`);
         failed += 1;
     }
 }
@@ -127,7 +127,7 @@ async function main() {
 
         const { enc: encBytes, ct } = await HPKE.seal(recipient.publicKeyBytes, info, aad, plaintext);
         const recovered = await HPKE.open(encBytes, recipient.privateKey, recipient.publicKeyBytes, info, aad, ct);
-        eqBytes(recovered, plaintext, 'Seal → Open recovers plaintext');
+        eqBytes(recovered, plaintext, 'Seal -> Open recovers plaintext');
 
         // Tamper the AAD: must reject.
         let rejectedBadAad = false;
@@ -178,7 +178,7 @@ async function main() {
         const c1 = await sender.seal(new Uint8Array(0), m1);
         const c2 = await sender.seal(new Uint8Array(0), m2);
 
-        // Sender seq must advance — otherwise c0 == c1 (they don't, below).
+        // Sender seq must advance - otherwise c0 == c1 (they don't, below).
         assert(hex(c0) !== hex(c1), 'distinct ciphertexts across seq 0 and 1');
 
         eqBytes(await receiver.open(new Uint8Array(0), c0), m0, 'receiver decrypts msg 0');
@@ -212,7 +212,7 @@ async function main() {
         eqBytes(r1, s1, 'exporter secret symmetric');
 
         const s2 = await sender.export(new TextEncoder().encode('other-label'), 32);
-        assert(hex(s2) !== hex(s1), 'different exporter context → different secret');
+        assert(hex(s2) !== hex(s1), 'different exporter context -> different secret');
 
         sender.destroy();
         receiver.destroy();

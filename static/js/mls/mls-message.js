@@ -1,5 +1,5 @@
 /**
- * PinChat MLS — MLSMessage framing (RFC 9420 §15.1).
+ * PinChat MLS - MLSMessage framing (RFC 9420 §15.1).
  *
  *   enum {
  *       reserved(0),
@@ -23,7 +23,7 @@
  *       };
  *   } MLSMessage;
  *
- * This module only implements the *outer* framing — a
+ * This module only implements the *outer* framing - a
  * `{version, wireFormat, body: Uint8Array}` triple. Each wire-format
  * owner (key-package.js, welcome.js, etc.) parses and re-serializes the
  * body bytes separately. The caller chooses the inner decoder based on

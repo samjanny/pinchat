@@ -30,7 +30,7 @@ function assert(cond, name, detail) {
         console.log(`  OK   ${name}`);
         passed += 1;
     } else {
-        console.log(`  FAIL ${name}${detail ? `  — ${detail}` : ''}`);
+        console.log(`  FAIL ${name}${detail ? `  - ${detail}` : ''}`);
         failed += 1;
     }
 }
@@ -51,7 +51,7 @@ async function main() {
         process.exit(1);
     }
 
-    console.log(`# transcript-hashes — cipher_suite=2`);
+    console.log(`# transcript-hashes - cipher_suite=2`);
 
     const ac = hexDecode(v.authenticated_content);
     const confKey = hexDecode(v.confirmation_key);

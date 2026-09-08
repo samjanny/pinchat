@@ -27,7 +27,6 @@ const HTML_FILES = [
 ];
 
 const SRI_RE = /(?:src|href)="(\/static\/[^"]+)"\s+integrity="sha256-([^"]+)"/g;
-
 const DEPLOYMENT_SPECIFIC_FILES = new Set(['/static/operator.json']);
 
 function sha256Normalized(filePath) {
@@ -38,6 +37,46 @@ function sha256Normalized(filePath) {
 function sha256NormalizedHex(filePath) {
   const text = fs.readFileSync(filePath, 'utf8').replace(/\r\n/g, '\n');
   return crypto.createHash('sha256').update(Buffer.from(text, 'utf8')).digest('hex');
+}
+
+function verifyExtensionPackage(browser) {
+  const baseDir = path.join('extensions', browser);
+  const manifest = JSON.parse(fs.readFileSync(path.join(baseDir, 'manifest.json'), 'utf8'));
+  const resources = new Set();
+  const add = (value) => {
+    if (typeof value === 'string' && value.length > 0) resources.add(value);
+  };
+
+  add(manifest.background?.service_worker);
+  for (const script of manifest.background?.scripts || []) add(script);
+  for (const contentScript of manifest.content_scripts || []) {
+    for (const script of contentScript.js || []) add(script);
+    for (const stylesheet of contentScript.css || []) add(stylesheet);
+  }
+  add(manifest.action?.default_popup);
+  for (const icon of Object.values(manifest.action?.default_icon || {})) add(icon);
+  for (const icon of Object.values(manifest.icons || {})) add(icon);
+  for (const ruleSet of manifest.declarative_net_request?.rule_resources || []) add(ruleSet.path);
+  for (const group of manifest.web_accessible_resources || []) {
+    for (const resource of group.resources || []) add(resource);
+  }
+
+  let bad = 0;
+  for (const resource of resources) {
+    const segments = resource.split(/[\\/]/);
+    if (path.isAbsolute(resource) || segments.includes('..')) {
+      console.error(`EXTENSION PACKAGE: unsafe ${browser} resource path ${resource}`);
+      bad++;
+      continue;
+    }
+    if (!fs.existsSync(path.join(baseDir, resource))) {
+      console.error(`EXTENSION PACKAGE: missing ${browser}/${resource}`);
+      bad++;
+    }
+  }
+
+  console.log(`Extension package: ${browser} ${resources.size} declared resources, ${bad} bad`);
+  return bad;
 }
 
 let totalChecked = 0;
@@ -76,7 +115,7 @@ for (const htmlFile of HTML_FILES) {
     }
   }
   const status = fileBad === 0 ? 'OK' : 'FAIL';
-  console.log(`${htmlFile}: ${fileChecked} tags, ${fileBad} bad — ${status}`);
+  console.log(`${htmlFile}: ${fileChecked} tags, ${fileBad} bad - ${status}`);
 }
 
 console.log(`\nTotal: ${totalChecked} SRI tags checked, ${totalBad} mismatches`);
@@ -100,8 +139,8 @@ try {
   }
 
   let manifestChecked = 0;
-  let manifestSkipped = 0;
   let manifestBad = 0;
+  let manifestSkipped = 0;
   for (const entry of signed.data.files) {
     const filePath = '.' + entry.path;
     if (!fs.existsSync(filePath)) {
@@ -131,9 +170,87 @@ try {
     + `${manifestChecked} files checked, ${manifestSkipped} deployment-specific skipped, `
     + `${manifestBad} bad`,
   );
+
+  // The preventive CSP is another release artifact derived from the same
+  // signed hashes. Reject stale or hand-edited browser rulesets.
+  const { buildRules } = require('../../extensions/generate-csp-rules');
+  const expectedRules = buildRules(signed);
+
+  // Coverage gate. Comparing a ruleset against buildRules() only proves it is
+  // not stale; it says nothing about whether the policy covers the page. It
+  // did not, for a long time: chat.html loads theme.js, pow.js and
+  // nicknames.js, the hand-maintained list omitted all three, and because
+  // script-src carries no 'self' they were blocked outright for every
+  // extension user while this gate stayed green.
+  //
+  // This must read the ruleset that actually ships, not the one buildRules()
+  // just derived: the derived one is correct by construction and would make
+  // the check vacuous.
+  const sriFromHex = (hex) => `sha256-${Buffer.from(hex, 'hex').toString('base64')}`;
+  const signedByPath = new Map(signed.data.files.map((f) => [f.path, f.hash]));
+
+  function checkRuleCoverage(browser, rules) {
+    let bad = 0;
+    for (const rule of rules) {
+      const filter = rule.condition.regexFilter;
+      const pagePath = filter
+        .replace('^https://(www\\.)?pinchat\\.io', '')
+        .replace('(?:\\?.*)?$', '')
+        .replace(/\\/g, '');
+      if (!pagePath.endsWith('.html')) continue; // catch-all rule, nothing to cover
+      const pageFile = '.' + pagePath;
+      if (!fs.existsSync(pageFile)) {
+        console.error(`CSP COVERAGE: ${browser} has a rule for ${pagePath}, which does not exist`);
+        bad++;
+        continue;
+      }
+      const policy = rule.action.responseHeaders[0].value.split(';')[0];
+      const html = fs.readFileSync(pageFile, 'utf8');
+      const loaded = [...html.matchAll(/<script\b[^>]*\ssrc="([^"]+)"/g)].map((m) => m[1]);
+      for (const src of loaded) {
+        const hex = signedByPath.get(src);
+        if (!hex) {
+          console.error(`CSP COVERAGE: ${browser}: ${pagePath} loads ${src}, absent from the signed manifest`);
+          bad++;
+          continue;
+        }
+        if (!policy.includes(`'${sriFromHex(hex)}'`)) {
+          console.error(`CSP COVERAGE: ${browser}: ${pagePath} loads ${src}, whose hash is not in its script-src`);
+          bad++;
+        }
+      }
+    }
+    return bad;
+  }
+
+  for (const browser of ['chrome', 'firefox']) {
+    const rulesPath = `extensions/${browser}/rules.json`;
+    const actualRules = JSON.parse(fs.readFileSync(rulesPath, 'utf8'));
+    if (JSON.stringify(actualRules) !== JSON.stringify(expectedRules)) {
+      console.error(`PREVENTIVE CSP: ${rulesPath} does not match signed manifest`);
+      totalBad++;
+    } else {
+      console.log(`Preventive CSP: ${browser} rules match signed manifest`);
+    }
+    const coverageBad = checkRuleCoverage(browser, actualRules);
+    if (coverageBad === 0) {
+      console.log(`Preventive CSP: ${browser} rules cover every script tag on every page`);
+    } else {
+      totalBad += coverageBad;
+    }
+  }
 } catch (error) {
   console.error(`SIGNED MANIFEST: ${error.message}`);
   totalBad++;
+}
+
+for (const browser of ['chrome', 'firefox']) {
+  try {
+    totalBad += verifyExtensionPackage(browser);
+  } catch (error) {
+    console.error(`EXTENSION PACKAGE: ${browser}: ${error.message}`);
+    totalBad++;
+  }
 }
 
 process.exit(totalBad === 0 ? 0 : 1);

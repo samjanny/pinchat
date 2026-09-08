@@ -1,14 +1,14 @@
 /**
- * Coverage-guided fuzz target for the Double Ratchet decrypt path.
+ * Mutation-fuzz target for the Double Ratchet decrypt path.
  *
  * Fuzz strategy
  * -------------
- * Each iteration draws bytes from libFuzzer (via @jazzer.js/core's
- * FuzzedDataProvider) and shapes them into a plausible `(header, payload)`
+ * Each iteration draws bytes from the local dependency-free data provider
+ * and shapes them into a plausible `(header, payload)`
  * pair, then drives `bob.decryptMessage(...)` on a warmed-up DR pair.
  *
  * The warm-up runs ONCE at module load: three legitimate in-order
- * Alice→Bob messages, just enough to push Bob past the "first-message"
+ * Alice->Bob messages, just enough to push Bob past the "first-message"
  * branch in `_decryptMessageImpl`. We snapshot Bob's state at that
  * point and restore from the snapshot before every iteration, so each
  * iteration starts from the same well-defined state and the fuzzer
@@ -17,9 +17,9 @@
  * Invariants asserted per iteration
  * ---------------------------------
  *   1. NO uncaught exception / unhandled rejection. Any error must
- *      surface synchronously to libFuzzer through `throw`. Async
+ *      surface synchronously to the campaign runner through `throw`. Async
  *      rejections that escape would mark the JS process unhealthy
- *      and the fuzzer would not see them — `process.on('unhandledRejection')`
+ *      and the fuzzer would not see them - `process.on('unhandledRejection')`
  *      below promotes them into thrown findings.
  *
  *   2. STATE INTEGRITY on a thrown decrypt. After
@@ -27,7 +27,7 @@
  *      (Nr, Ns, PN, ratchetCount, root key bytes, both chain key bytes,
  *      DHrRaw, DHsSignature, skippedKeys size, hasRatchetedSinceReceive)
  *      MUST be byte-identical to the post-warm-up snapshot. This is the
- *      universal version of F-10 — every decrypt failure must leave the
+ *      universal version of F-10 - every decrypt failure must leave the
  *      ratchet untouched. A drift here is a real bug.
  *
  *   3. NO unexpected success. Random bytes cannot, by AEAD assumption,
@@ -46,7 +46,7 @@
 
 'use strict';
 
-const { FuzzedDataProvider } = require('@jazzer.js/core');
+const { FuzzedDataProvider } = require('./fuzzed-data-provider');
 const { webcrypto } = require('crypto');
 
 global.debugLog = () => {};
@@ -173,7 +173,7 @@ function buildInputs(fdp) {
     const vRoll = fdp.consumeIntegralInRange(0, 9);
     const v = vRoll < 8 ? 1 : fdp.consumeIntegralInRange(0, 255);
 
-    // dh: P-256 raw uncompressed export is 65 bytes → 87 base64url chars.
+    // dh: P-256 raw uncompressed export is 65 bytes -> 87 base64url chars.
     // The fuzzer should mostly produce strings of plausible length to
     // exercise the verify path; occasionally weird lengths to exercise
     // parse/reject branches.
@@ -181,7 +181,7 @@ function buildInputs(fdp) {
     const dhBytes = fdp.consumeBytes(dhLen);
     const dh = toB64u(dhBytes);
 
-    // sig: ECDSA P-256 raw is 64 bytes → 86 base64url chars.
+    // sig: ECDSA P-256 raw is 64 bytes -> 86 base64url chars.
     const sigLen = fdp.consumeIntegralInRange(0, 200);
     const sigBytes = fdp.consumeBytes(sigLen);
     const sig = toB64u(sigBytes);
@@ -206,7 +206,7 @@ function buildInputs(fdp) {
 // Promises into local catches. But if the production code accidentally
 // fires-and-forgets a Promise (e.g. a setTimeout micro-task), the
 // rejection would escape to process-level. Wire those into the iteration
-// so jazzer-js sees them as findings.
+// so the campaign runner sees them as findings.
 let pendingUnhandled = null;
 process.on('unhandledRejection', (reason) => {
     pendingUnhandled = reason;

@@ -1,5 +1,5 @@
 /**
- * PinChat MLS — GroupContext (RFC 9420 §8.1).
+ * PinChat MLS - GroupContext (RFC 9420 §8.1).
  *
  *   struct {
  *       ProtocolVersion version = mls10;    // u16, 0x0001
@@ -17,7 +17,7 @@
  * signatures.
  *
  * We commit to `version = 0x0001` (mls10) and `cipher_suite = 0x0002`.
- * Other values will fail decode — defensive by design.
+ * Other values will fail decode - defensive by design.
  */
 (function (root, factory) {
     if (typeof module !== 'undefined' && module.exports) {

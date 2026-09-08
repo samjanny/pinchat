@@ -1,12 +1,20 @@
 # Node (dev-time test deps only; client is build-less)
 node_modules/
 
-# jazzer-js fuzz corpus & crash artifacts — local-only
+# jazzer-js fuzz corpus & crash artifacts - local-only
 tests/fuzz/corpus/
 tests/fuzz/crash-*
 tests/fuzz/leak-*
 tests/fuzz/oom-*
 tests/fuzz/timeout-*
+
+# Chromium writes this when the extension is loaded unpacked: it compiles the
+# declarativeNetRequest rules from rules.json into an indexed ruleset under
+# _metadata/. It is a local browser artifact, regenerated on every load, and
+# is not part of a release package. Matched for both browsers because the
+# directory appears wherever a Chromium build loads the folder, not only in
+# extensions/chrome.
+extensions/*/_metadata/
 
 # Rust
 target/
@@ -28,17 +36,16 @@ certs/
 Thumbs.db
 .env
 
-# Icons
-/extensions/chrome/icons/
-/extensions/firefox/icons/
-
 # Imported source tree from legacy private repo
 prichat-main/
 
-# Internal operational runbooks — do not publish by default
+# Internal operational runbooks - do not publish by default
 ops/
 
-# Operator-specific legal data — deployment-specific, never commit.
+# Operator-specific legal data - deployment-specific, never commit.
 # Each host configures its own operator.json (or serves it via WEBSITE_DIR).
 # Only operator.example.json (the schema) lives in the repo.
 /static/operator.json
+
+# Build output (extension store packages)
+dist/

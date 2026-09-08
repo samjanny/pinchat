@@ -5,9 +5,9 @@
  * IETF crypto-basics.json reference vectors for cipher_suite = 2.
  *
  * Covers:
- *   - DeriveSecret        → against crypto-basics.derive_secret
- *   - ExpandWithLabel     → against crypto-basics.expand_with_label
- *   - RefHash             → against crypto-basics.ref_hash
+ *   - DeriveSecret        -> against crypto-basics.derive_secret
+ *   - ExpandWithLabel     -> against crypto-basics.expand_with_label
+ *   - RefHash             -> against crypto-basics.ref_hash
  *
  * The SignWithLabel and EncryptWithLabel fields of crypto-basics.json
  * are verified in the modules that own their primitives (signature,
@@ -29,7 +29,7 @@ function assert(cond, name, detail) {
         console.log(`  OK   ${name}`);
         passed += 1;
     } else {
-        console.log(`  FAIL ${name}${detail ? `  — ${detail}` : ''}`);
+        console.log(`  FAIL ${name}${detail ? `  - ${detail}` : ''}`);
         failed += 1;
     }
 }
@@ -101,7 +101,7 @@ async function main() {
         process.exit(1);
     }
 
-    console.log(`# crypto-basics — cipher_suite=2`);
+    console.log(`# crypto-basics - cipher_suite=2`);
 
     // --- DeriveSecret ---
     {
@@ -152,7 +152,7 @@ async function main() {
         assert(verified === true,
             `VerifyWithLabel("${label}") accepts IETF vector signature`);
 
-        // Tamper the content — verification must fail.
+        // Tamper the content - verification must fail.
         const tampered = new Uint8Array(content);
         tampered[0] ^= 0x01;
         const verifiedBad = await Labeled.verifyWithLabel(pub, label, tampered, vectorSig);

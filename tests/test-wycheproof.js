@@ -8,7 +8,7 @@
  *     Drives `IdentityKeyManager.verify` against 260 Wycheproof cases
  *     covering: valid signatures, malleability/high-s, arithmetic edge
  *     cases, integer overflow attempts, malformed encodings, point at
- *     infinity, special-case public keys, …
+ *     infinity, special-case public keys, ...
  *   - HKDF-SHA256 against 86 Wycheproof cases covering: RFC 5869 KAT,
  *     empty salt, empty info, maximal output size, size-too-large
  *     (must reject), output collision sanity.
@@ -23,9 +23,9 @@
  *   signature format would show up here as a single-vector failure.
  *
  * Result semantics per Wycheproof:
- *   - "valid"      → MUST verify. Failure is a wrapper bug.
- *   - "invalid"    → MUST NOT verify. Acceptance is a wrapper bug.
- *   - "acceptable" → implementation-defined. Either result is OK; we
+ *   - "valid"      -> MUST verify. Failure is a wrapper bug.
+ *   - "invalid"    -> MUST NOT verify. Acceptance is a wrapper bug.
+ *   - "acceptable" -> implementation-defined. Either result is OK; we
  *                    record the actual outcome for visibility.
  */
 
@@ -44,7 +44,7 @@ global.debugError = () => {};
 global.debugWarn = () => {};
 global.PINCHAT_PROTOCOL_VERSION = 1;
 
-// Load the real production modules — we test the wrapper, not a copy.
+// Load the real production modules - we test the wrapper, not a copy.
 require('../static/js/crypto.js');
 const { IdentityKeyManager } = require('../static/js/identity.js');
 
@@ -73,7 +73,7 @@ function loadVectors(filename) {
 // ── ECDSA P-256 / SHA-256 / P1363 ───────────────────────────────────────
 //
 // Per-group setup: import the public key as a non-extractable ECDSA verify
-// key — same path the production `importPeerIdentityPublicKey` takes. Each
+// key - same path the production `importPeerIdentityPublicKey` takes. Each
 // test then drives `IdentityKeyManager.verify` with the message bytes and
 // the signature bytes, comparing the WebCrypto result against the
 // Wycheproof expectation.
@@ -112,7 +112,7 @@ async function runEcdsaWycheproof() {
             // Some Wycheproof groups carry intentionally-malformed public
             // keys (point not on curve, point at infinity). If importKey
             // rejects, every test in the group is automatically "invalid"
-            // from our side — but Wycheproof may still mark individual
+            // from our side - but Wycheproof may still mark individual
             // tests as "valid" against that key. We record the rejection
             // and continue; this is a known divergence between Wycheproof's
             // group-level public key and WebCrypto's import-time validation.
@@ -181,7 +181,7 @@ async function runEcdsaWycheproof() {
 //
 // The production `DoubleRatchet.hkdf(ikm, salt, info_string, length)`
 // helper encodes `info` as UTF-8 internally. Wycheproof's vectors pass
-// `info` as arbitrary bytes — including non-UTF8 sequences — so we cannot
+// `info` as arbitrary bytes - including non-UTF8 sequences - so we cannot
 // always go through the string-typed wrapper. We mirror the wrapper's
 // WebCrypto sequence here exactly: `importKey('raw', ikm, 'HKDF', false,
 // ['deriveBits'])` + `deriveBits({HKDF, SHA-256, salt, info}, ikmKey,
@@ -252,7 +252,7 @@ async function runHkdfWycheproof() {
             } else if (t.result === 'invalid') {
                 totalInvalid++;
                 // Wycheproof's "invalid" HKDF cases are SizeTooLarge (size
-                // > 255 × hash output length) — RFC 5869 mandates rejection
+                // > 255 × hash output length) - RFC 5869 mandates rejection
                 // and WebCrypto throws. Anything else is a wrapper bug.
                 if (threw) {
                     passedInvalid++;
@@ -296,7 +296,7 @@ function printSummary(label, r) {
             if (f.comment) console.log(`      "${f.comment}"`);
         }
         if (r.failures.length > 20) {
-            console.log(`    … and ${r.failures.length - 20} more`);
+            console.log(`    ... and ${r.failures.length - 20} more`);
         }
     }
 }
@@ -325,7 +325,7 @@ function printSummary(label, r) {
         console.log('All Wycheproof suites PASSED.');
         process.exit(0);
     } else {
-        console.log('SOME Wycheproof tests FAILED — see failure listing above.');
+        console.log('SOME Wycheproof tests FAILED - see failure listing above.');
         process.exit(1);
     }
 })().catch(err => {

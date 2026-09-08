@@ -12,13 +12,6 @@ const MAX_IMAGE_DIMENSION = 8192;
 const MAX_IMAGE_PIXELS = 8 * 1024 * 1024;
 const MAX_PENDING_IMAGE_DECODES = 2;
 const MAX_PENDING_IMAGE_DECODE_BYTES = 4 * 1024 * 1024;
-const SAFE_IMAGE_MIME_TYPES = new Set([
-    'image/png',
-    'image/jpeg',
-    'image/webp',
-    'image/avif',
-]);
-
 window.ROOM_CONFIG = {
     roomId: urlParams.get('room')
     // roomType, ttlMinutes, maxParticipants will be set by server via WebSocket
@@ -122,11 +115,21 @@ document.addEventListener('alpine:init', () => {
         // Set true when the peer's identity key changed AFTER the user had
         // explicitly verified SAS in this session. The user has already
         // committed to verifying, so they can't downgrade to 'skipped' from
-        // this state — they must either confirm the new code matches
+        // this state - they must either confirm the new code matches
         // (handleSasVerified) or declare mismatch (handleSasMismatch).
         sasReverifyRequired: false,
         sasCopied: false,           // For copy button feedback
         pendingECDHKey: null,
+
+        // Encrypted application frames received before the user makes an
+        // explicit SAS decision. Keeping ciphertext (rather than decrypted
+        // content) out of the UI prevents an unauthenticated peer/server from
+        // influencing the conversation before verification or an explicit
+        // opt-out. The queue is deliberately bounded to avoid memory DoS.
+        pendingSecureMessages: [],
+        secureMessageReleaseInProgress: false,
+        secureMessageQueueEpoch: 0,
+        maxPendingSecureMessages: 32,
 
         // Emoji picker state
         emojiPickerOpen: false,
@@ -147,7 +150,7 @@ document.addEventListener('alpine:init', () => {
 
             debugLog('Initializing chat room:', this.roomId);
 
-            // Capture MLS role BEFORE wsManager.connect() — the WS layer
+            // Capture MLS role BEFORE wsManager.connect() - the WS layer
             // clears `ws_token_<roomId>` from sessionStorage on first use
             // (single-use creator token), so reading it later loses the
             // creator signal. Note: we capture unconditionally because
@@ -262,7 +265,7 @@ document.addEventListener('alpine:init', () => {
                 // Transient transport failure after N retries: distinct message
                 // ("check network", not "protocol mismatch").
                 if (msg === 'CONNECTION_EXHAUSTED') {
-                    this.error = '⚠️ Connection lost — please check your network and try again later.';
+                    this.error = '⚠️ Connection lost - please check your network and try again later.';
                     return;
                 }
                 if (msg === 'ON_CONNECTED_FAILED') {
@@ -334,11 +337,11 @@ document.addEventListener('alpine:init', () => {
 
             this.wsManager.onPowProgress = (attempts) => {
                 if (attempts === 0) {
-                    this.connectingMessage = 'Computing challenge…';
+                    this.connectingMessage = 'Computing challenge...';
                 } else if (attempts === -1) {
                     this.connectingMessage = '✓ Challenge solved, connecting...';
                 } else {
-                    this.connectingMessage = `Computing… (${Math.floor(attempts / 100000) * 100}k attempts)`;
+                    this.connectingMessage = `Computing... (${Math.floor(attempts / 100000) * 100}k attempts)`;
                 }
             };
 
@@ -391,7 +394,7 @@ document.addEventListener('alpine:init', () => {
                         if (message.created_at) {
                             const createdAtMs = new Date(message.created_at).getTime();
                             this.expiresAt = createdAtMs + (this.ttlMinutes * 60 * 1000);
-                            debugLog('[COUNTDOWN] Using server created_at:', message.created_at, '→ expires at:', new Date(this.expiresAt).toISOString());
+                            debugLog('[COUNTDOWN] Using server created_at:', message.created_at, '-> expires at:', new Date(this.expiresAt).toISOString());
                         } else {
                             // Fallback to client time if created_at not provided (backwards compatibility)
                             this.expiresAt = Date.now() + (this.ttlMinutes * 60 * 1000);
@@ -412,7 +415,7 @@ document.addEventListener('alpine:init', () => {
                     // after userId has been updated from the Connected frame.
                     if (this.transportReconnectPending
                         && message.room_type === 'onetoone' && this.pfsActive) {
-                        debugLog('[RECONNECT] Stable/fresh relay admission confirmed → restarting 1:1 handshake');
+                        debugLog('[RECONNECT] Stable/fresh relay admission confirmed -> restarting 1:1 handshake');
                         await this.restartECDHHandshake();
                     }
                     this.transportReconnectPending = false;
@@ -432,7 +435,7 @@ document.addEventListener('alpine:init', () => {
 
                         // Start handshake if not already started
                         if (this.ecdhHandshakeStatus === 'none') {
-                            debugLog('[ECDH] Second participant joined → starting handshake');
+                            debugLog('[ECDH] Second participant joined -> starting handshake');
                             await this.startECDHHandshake();
                         }
                     }
@@ -543,7 +546,7 @@ document.addEventListener('alpine:init', () => {
 
                         // Start handshake if not already started
                         if (this.ecdhHandshakeStatus === 'none') {
-                            debugLog('[ECDH] Other participant joined → starting handshake');
+                            debugLog('[ECDH] Other participant joined -> starting handshake');
                             await this.startECDHHandshake();
                         }
                     }
@@ -591,20 +594,25 @@ document.addEventListener('alpine:init', () => {
                     // When participant count drops below 2, cleanup ECDH state
                     if (this.participantCount < 2) {
                         if (this.ecdhHandshakeStatus === 'waiting') {
-                            // Handshake was in progress → hard abort (peer left)
-                            debugLog('[ECDH] Resetting status to none (handshake aborted, peer left)');
-                            await this.handleECDHAborted(true);  // hardReset: peer is gone
+                            // Handshake was in progress: tear it down, but keep
+                            // the identity manager (audit M-1, see
+                            // handlePeerDeparted for why).
+                            debugLog('[ECDH] Peer left mid-handshake, tearing down (identity retained)');
+                            await this.handlePeerDeparted();
                             // Reset status to 'none' so handshake can restart when room becomes ready again
                             this.ecdhHandshakeStatus = 'none';
                         } else if (this.pfsActive) {
-                            // PFS was active → hard abort (peer left, need fresh identity with new peer)
-                            debugLog('[ECDH] PFS was active, peer left → hard reset');
-                            await this.handleECDHAborted(true);  // hardReset: peer is gone
+                            // PFS was active: tear down the session but keep the
+                            // identity, so a peer that comes back is diffed
+                            // against the one the user verified rather than
+                            // silently re-trusted (audit M-1).
+                            debugLog('[ECDH] PFS was active, peer left, retaining identity for re-verify');
+                            await this.handlePeerDeparted();
                             this.ecdhHandshakeStatus = 'none';
                             this.sasBackup = null;
                             this.addSystemMessage('⚠️ Secure connection lost (other participant left)');
                         } else if (this.ecdhHandshakeStatus === 'aborted') {
-                            // Status was stuck on 'aborted' → reset to 'none'
+                            // Status was stuck on 'aborted' -> reset to 'none'
                             debugLog('[ECDH] Resetting status from aborted to none (room not ready)');
                             this.ecdhHandshakeStatus = 'none';
                             // Reset to bootstrap key for clean state.
@@ -615,7 +623,7 @@ document.addEventListener('alpine:init', () => {
                                 await window.cryptoManager.resetToBootstrapKey();
                             } catch (e) {
                                 if (e && e.message === 'BOOTSTRAP_KEY_LOST') {
-                                    this.addSystemMessage('🔒 Cannot reconnect securely — please re-open the original room link.');
+                                    this.addSystemMessage('🔒 Cannot reconnect securely - please re-open the original room link.');
                                     this.ecdhHandshakeStatus = 'failed';
                                     if (this.wsManager) this.wsManager.disconnect();
                                 } else {
@@ -711,7 +719,7 @@ document.addEventListener('alpine:init', () => {
 
         async _validateImageBlob(blob) {
             if (!(blob instanceof Blob)
-                || !SAFE_IMAGE_MIME_TYPES.has(blob.type)) {
+                || !isAllowedImageMimeType(blob.type)) {
                 throw new Error('unsupported image format');
             }
             let width;
@@ -764,12 +772,21 @@ document.addEventListener('alpine:init', () => {
          * If this is a NEW key, decryption will trigger DH ratchet automatically.
          */
         async handleIncomingMessage(message) {
-            // A changed peer identity is not trusted until the user confirms
-            // the new SAS. Do not display authenticated-but-unverified
-            // plaintext during that decision window.
-            if (this.sasReverifyRequired) {
+            // 1:1 application data is accepted only after the authenticated
+            // handshake is active. During the SAS decision window, retain the
+            // encrypted frame without decrypting or rendering it.
+            if (this.roomType === 'onetoone' && !this.pfsActive) {
                 return;
             }
+            if (this.shouldQuarantineSecureMessage()) {
+                await this.quarantineSecureMessage('message', message);
+                return;
+            }
+            await this.processIncomingMessage(message);
+        },
+
+        /** Decrypts and renders a message that has passed the SAS gate. */
+        async processIncomingMessage(message) {
             try {
                 // Pass header to decryption (contains DH public key for ratchet)
                 const { text: plaintext, outOfOrder } = await window.cryptoManager.decryptMessage(
@@ -814,7 +831,9 @@ document.addEventListener('alpine:init', () => {
         async sendMessage() {
             const text = this.messageInput.trim();
             // Block sending if image upload is in progress (prevents Double Ratchet race condition)
-            if (!text || !this.connected || this.sendingImage) {
+            // isComposerLocked() is also enforced here so programmatic calls
+            // cannot bypass the disabled controls while SAS is undecided.
+            if (!text || !this.connected || this.sendingImage || this.isComposerLocked()) {
                 return;
             }
 
@@ -909,11 +928,11 @@ document.addEventListener('alpine:init', () => {
 
         /**
          * Initialise the MLSSession on first use for a group room. Role
-         * was captured at init() time — WebSocketManager.connect() wipes
+         * was captured at init() time - WebSocketManager.connect() wipes
          * the ws_token side-channel on first use, so reading it here would
          * always resolve to 'joiner'.
          *
-         * Idempotent — safe to call from 'connected' and 'userjoined'.
+         * Idempotent - safe to call from 'connected' and 'userjoined'.
          */
         async _ensureMlsSession() {
             if (this.mlsSession) return;
@@ -929,7 +948,7 @@ document.addEventListener('alpine:init', () => {
                 ? window.cryptoManager.mlsPskSecret
                 : null;
             if (!pskSecret) {
-                this.error = '⚠️ MLS bootstrap PSK missing — cannot start group session securely';
+                this.error = '⚠️ MLS bootstrap PSK missing - cannot start group session securely';
                 return;
             }
 
@@ -1058,7 +1077,7 @@ document.addEventListener('alpine:init', () => {
                     break;
                 }
                 case 'keypackage-published':
-                    this.addSystemMessage('🔑 KeyPackage published; waiting for Welcome…');
+                    this.addSystemMessage('🔑 KeyPackage published; waiting for Welcome...');
                     break;
                 case 'welcome-sent':
                     if (!this.mlsRosterValid) {
@@ -1247,9 +1266,13 @@ document.addEventListener('alpine:init', () => {
             const file = event.target.files[0];
             if (!file) return;
 
-            // Validate file type
-            if (!SAFE_IMAGE_MIME_TYPES.has(file.type)) {
-                this.error = '⚠️ Please select a PNG, JPEG, WebP, or AVIF image.';
+            // Validate file type against the same allowlist crypto.js enforces
+            // on both encrypt and decrypt (audit F-1 / L-1). The old test was
+            // `startsWith('image/')`, which let image/svg+xml through. Checking
+            // here as well as in encryptImage gives the user a specific error
+            // at pick time instead of an opaque encryption failure at send.
+            if (!isAllowedImageMimeType(file.type)) {
+                this.error = '⚠️ Unsupported image type. Use PNG, JPEG, GIF or WebP.';
                 return;
             }
 
@@ -1298,7 +1321,7 @@ document.addEventListener('alpine:init', () => {
          * Cancels pending image
          */
         cancelImage() {
-            // Free the blob URL — the user discarded the preview, no message
+            // Free the blob URL - the user discarded the preview, no message
             // will reference it. Without this, the underlying File data stays
             // alive until the page unloads.
             if (this.pendingImage && this.pendingImage.previewUrl) {
@@ -1314,7 +1337,7 @@ document.addEventListener('alpine:init', () => {
          * delivered via the MLSSession transport.
          */
         async sendImage() {
-            if (!this.pendingImage || !this.connected || this.sendingImage) {
+            if (!this.pendingImage || !this.connected || this.sendingImage || this.isComposerLocked()) {
                 return;
             }
             if (this.roomType === 'group' && (!this.mlsSession || !this.mlsReady)) {
@@ -1373,7 +1396,7 @@ document.addEventListener('alpine:init', () => {
                         header: encrypted.header
                     });
                     if (!sent) {
-                        // Remove local message on failure — the only reference
+                        // Remove local message on failure - the only reference
                         // to the blob URL goes with it, so revoke to free it.
                         this._removeMessageById(
                             localMessageId, { revokeImage: false },
@@ -1383,7 +1406,7 @@ document.addEventListener('alpine:init', () => {
                     }
                 }
                 // Clear pending image (do NOT revoke previewUrl here on the
-                // happy path — it is now owned by the local message entry).
+                // happy path - it is now owned by the local message entry).
                 this.pendingImage = null;
             } catch (error) {
                 console.error('Failed to send image:', error);
@@ -1404,9 +1427,18 @@ document.addEventListener('alpine:init', () => {
          * Handles incoming encrypted image message
          */
         async handleIncomingImage(message) {
-            if (this.sasReverifyRequired) {
+            if (this.roomType === 'onetoone' && !this.pfsActive) {
                 return;
             }
+            if (this.shouldQuarantineSecureMessage()) {
+                await this.quarantineSecureMessage('image', message);
+                return;
+            }
+            await this.processIncomingImage(message);
+        },
+
+        /** Decrypts and renders an image that has passed the SAS gate. */
+        async processIncomingImage(message) {
             try {
                 // Decrypt image data
                 const imageData = await window.cryptoManager.decryptImage(
@@ -1487,9 +1519,9 @@ document.addEventListener('alpine:init', () => {
         ownDisplayName() {
             if (this.roomType === 'group') {
                 return this.mlsSelfIdentity
-                    ? this.mlsSelfIdentity.displayName : 'Authenticating…';
+                    ? this.mlsSelfIdentity.displayName : 'Authenticating...';
             }
-            return this.myNickname || '…';
+            return this.myNickname || '...';
         },
 
         ownIdentityTitle() {
@@ -1501,7 +1533,7 @@ document.addEventListener('alpine:init', () => {
 
         ownAvatarLetter() {
             const name = this.ownDisplayName();
-            return name && name !== 'Authenticating…'
+            return name && name !== 'Authenticating...'
                 ? name.charAt(0).toUpperCase() : '?';
         },
 
@@ -1550,7 +1582,7 @@ document.addEventListener('alpine:init', () => {
             // (Policy Violation) so the server and logs record the cause.
             // No auto-reconnect: the user must refresh to start a fresh session.
             if (error && error.message === 'SIGNATURE_INVALID') {
-                this.addSystemMessage('🚨 Session integrity violated — connection closed');
+                this.addSystemMessage('🚨 Session integrity violated - connection closed');
                 this.decryptionError = true;
                 try {
                     await this.handleECDHAborted(true);
@@ -1576,6 +1608,15 @@ document.addEventListener('alpine:init', () => {
                     break;
                 case 'SENDER_AUTH_FAILED':
                     warningMessage += 'Message authentication failed (sender impersonation or tampering detected)';
+                    break;
+                case 'UNSUPPORTED_IMAGE_TYPE':
+                    warningMessage += 'Image rejected (declared type is not an allowed image format)';
+                    break;
+                case 'PROTOCOL_MISMATCH':
+                    warningMessage += 'Malformed message header (rejected before decryption)';
+                    break;
+                case 'CHAIN_COUNTER_REGRESSION':
+                    warningMessage += 'Ratchet counter went backwards (message rejected)';
                     break;
                 default:
                     warningMessage += 'Message could not be verified (possible attack)';
@@ -1637,7 +1678,7 @@ document.addEventListener('alpine:init', () => {
          * User-initiated reconnect.
          *
          * UX early return: if the session is in terminal auth/protocol state,
-         * the banner already asks the user to refresh the page — don't show
+         * the banner already asks the user to refresh the page - don't show
          * "Retrying..." or kick connect() (which would be a no-op anyway
          * thanks to the `_fatalAuthFailure` guard in connect()).
          *
@@ -1720,7 +1761,7 @@ document.addEventListener('alpine:init', () => {
         /**
          * Splits the SAS emoji string into an array of grapheme-aware glyphs.
          * Used by the SAS modal to render each emoji into its own <span> via
-         * x-for + x-text — keeping all rendering on the safe DOM-text path
+         * x-for + x-text - keeping all rendering on the safe DOM-text path
          * and never going through x-html.
          */
         sasEmojiArray(emojiString) {
@@ -1833,6 +1874,10 @@ document.addEventListener('alpine:init', () => {
         async restartECDHHandshake() {
             debugLog('[RECONNECT] Restarting ECDH handshake to resynchronize Chain Ratchet...');
 
+            // Frames are bound to the old ratchet state and must never cross a
+            // reconnect/rekey boundary.
+            this.clearPendingSecureMessages();
+
             // Check if we had a verified identity before reconnect.
             // Capture the raw bytes (not the CryptoKey) so identity-change
             // detection after reconnect can compare bytes without needing
@@ -1870,7 +1915,7 @@ document.addEventListener('alpine:init', () => {
                 await window.cryptoManager.resetToBootstrapKey();
             } catch (e) {
                 if (e && e.message === 'BOOTSTRAP_KEY_LOST') {
-                    this.addSystemMessage('🔒 Cannot reconnect securely — please re-open the original room link.');
+                    this.addSystemMessage('🔒 Cannot reconnect securely - please re-open the original room link.');
                     this.ecdhHandshakeStatus = 'failed';
                     if (this.wsManager) this.wsManager.disconnect();
                     return;
@@ -1905,7 +1950,7 @@ document.addEventListener('alpine:init', () => {
             // Second-joiner path: we never saw a userjoined event for the peer
             // (they were already in the room when we connected). Their sender_id
             // on the ECDH handshake packet is the first authoritative source we
-            // have for their identity — record it so the sidebar can show the
+            // have for their identity - record it so the sidebar can show the
             // correct nickname immediately.
             if (!this.peerUserId && message.sender_id) {
                 this.peerUserId = message.sender_id;
@@ -1988,17 +2033,17 @@ document.addEventListener('alpine:init', () => {
                         this.identityManager.previousPeerIdentityRaw = null;
 
                         if (wasVerified) {
-                            console.warn('[SECURITY] ⚠️ Peer identity key changed after SAS verification — forcing re-verify');
+                            console.warn('[SECURITY] ⚠️ Peer identity key changed after SAS verification - forcing re-verify');
                             this.identityManager.sasVerified = false;
                             // Force the SAS modal to reopen (set BEFORE the later
                             // pending/verified branch so it isn't overridden).
                             this.sasReverifyRequired = true;
-                            this.addSystemMessage('⚠️ Contact\'s identity key changed since verification — please confirm the new security code before continuing');
+                            this.addSystemMessage('⚠️ Contact\'s identity key changed since verification - please confirm the new security code before continuing');
                         } else {
                             // Identity wasn't verified before: warn + force first-time
                             // verification. No prior commitment to break, so the user
                             // can still skip if they accept the trust trade-off.
-                            console.warn('[SECURITY] ⚠️ Peer identity key changed (pre-verification) — re-verify required');
+                            console.warn('[SECURITY] ⚠️ Peer identity key changed (pre-verification) - re-verify required');
                             this.identityManager.sasVerified = false;
                             this.addSystemMessage('⚠️ WARNING: Contact\'s identity key changed! Please re-verify the security code.');
                         }
@@ -2022,7 +2067,7 @@ document.addEventListener('alpine:init', () => {
 
                 // Initialize Double Ratchet (PFS + PCS) with identity manager and ECDH keypairs.
                 // We hand the RATCHET keypair to the ratchet, never the handshake
-                // keypair that derived S — that one is destroyed below so S cannot
+                // keypair that derived S - that one is destroyed below so S cannot
                 // be recomputed from any state the ratchet retains.
                 await window.cryptoManager.initializeDoubleRatchet(
                     this.identityManager,                  // Identity manager for signing ephemeral keys
@@ -2089,19 +2134,77 @@ document.addEventListener('alpine:init', () => {
         // happens on RECEIVE, not via separate messages.
 
         /**
+         * Peer-departure teardown that PRESERVES the identity manager.
+         *
+         * Audit M-1: `userleft` used to call handleECDHAborted(true), which
+         * destroys the identity manager and, with it, sasVerificationStatus and
+         * sasReverifyRequired. Membership frames are relay-controlled and
+         * carry no authentication, so a hostile relay could forge a single
+         * `userleft` to erase every trace of the user's out-of-band
+         * verification and let the next handshake come up as a first-time,
+         * freely-skippable SAS prompt. The reconnect path
+         * (restartECDHHandshake) already handled this correctly by keeping the
+         * identity alive; the leave path did not.
+         *
+         * This mirrors that reconnect handling: stash the peer's identity bytes
+         * so the next completed handshake runs hasPeerIdentityChanged(), and
+         * leave sasVerified intact. What the peer's return then produces:
+         *
+         *   - same identity key: SAS carries over, no re-prompt (this is the
+         *     ordinary case, since identities persist in IndexedDB for 24h).
+         *   - different identity key, previously verified: sasReverifyRequired
+         *     is set, the composer stays locked, and skipping is refused until
+         *     the user confirms the new code out of band. Strictly stronger
+         *     than the old behaviour, which offered a skippable prompt.
+         *   - different identity key, never verified: a warning plus a normal
+         *     first-time prompt, unchanged from before.
+         *
+         * Genuine MITM detection (SIGNATURE_INVALID) and quarantine overflow
+         * still call handleECDHAborted(true). Destroying the identity is the
+         * right answer there; a peer walking out of the room is not.
+         */
+        async handlePeerDeparted() {
+            // Capture raw bytes, not the CryptoKey: peer identities are
+            // imported non-extractable, so the cached *Raw copy is the only
+            // way to diff them after the fact.
+            const previousPeerIdentityRaw =
+                this.identityManager && this.identityManager.peerIdentityPublicKeyRaw
+                    ? new Uint8Array(this.identityManager.peerIdentityPublicKeyRaw)
+                    : null;
+
+            // Soft abort: clears the ratchet, the ECDH manager and the pending
+            // quarantine, re-reads the bootstrap key, and leaves the identity
+            // manager (and therefore the SAS verdict) untouched.
+            await this.handleECDHAborted(false);
+
+            if (this.identityManager) {
+                this.identityManager.previousPeerIdentityRaw = previousPeerIdentityRaw;
+                debugLog(
+                    '[ECDH] Peer departed, identity retained (SAS verified:',
+                    this.identityManager.isSASVerified(),
+                    ')'
+                );
+            }
+        },
+
+        /**
          * Handles ECDH handshake aborted
          *
          * Cleans up ECDH state but does NOT permanently set status to 'aborted'.
          * The caller should reset status to 'none' when appropriate to allow
          * handshake to restart when room becomes ready again.
          *
-         * @param {boolean} hardReset - If true, destroys identity manager and SAS verification.
-         *                              Use for: user leave, peer change, MITM detection.
+         * @param {boolean} hardReset - If true, destroys identity manager and SAS
+         *                              verification. Use for MITM detection and
+         *                              quarantine overflow. A departing peer uses
+         *                              handlePeerDeparted() instead (audit M-1).
          *                              Default false preserves identity for retry.
          */
         async handleECDHAborted(hardReset) {
             if (hardReset === undefined) hardReset = false;
             console.warn('[ECDH] Handshake aborted (hardReset:', hardReset, ')');
+
+            this.clearPendingSecureMessages();
 
             // Cleanup ECDH manager
             this.pfsActive = false;
@@ -2130,7 +2233,7 @@ document.addEventListener('alpine:init', () => {
                 await window.cryptoManager.resetToBootstrapKey();
             } catch (e) {
                 if (e && e.message === 'BOOTSTRAP_KEY_LOST') {
-                    this.addSystemMessage('🔒 Cannot reconnect securely — please re-open the original room link.');
+                    this.addSystemMessage('🔒 Cannot reconnect securely - please re-open the original room link.');
                     this.ecdhHandshakeStatus = 'failed';
                     if (this.wsManager) this.wsManager.disconnect();
                     return;
@@ -2156,16 +2259,18 @@ document.addEventListener('alpine:init', () => {
          * shows a security warning to the user.
          */
         handleSasMismatch() {
-            console.warn('[SECURITY] SAS mismatch — treating as active MITM, aborting session');
+            console.warn('[SECURITY] SAS mismatch - treating as active MITM, aborting session');
+
+            this.clearPendingSecureMessages();
 
             // Destroy ratchet and identity state so the compromised chain cannot be reused.
             // Note: cryptoManager is a module-level singleton on `window`, NOT a property
             // of this Alpine store. The previous `this.cryptoManager` reference was a
-            // silent no-op — keys would persist in memory until tab close.
+            // silent no-op - keys would persist in memory until tab close.
             if (window.cryptoManager) {
                 window.cryptoManager.resetToBootstrapKey().catch(() => {});
             }
-            // IdentityKeyManager exposes destroy(), not reset() — calling the wrong
+            // IdentityKeyManager exposes destroy(), not reset() - calling the wrong
             // name guarded by typeof was a silent no-op. We want the keys gone now.
             if (this.identityManager && typeof this.identityManager.destroy === 'function') {
                 this.identityManager.destroy();
@@ -2186,7 +2291,7 @@ document.addEventListener('alpine:init', () => {
 
             // Close WebSocket with 1008 Policy Violation; suppress auto-reconnect
             if (this.wsManager) {
-                this.wsManager.disconnectWithError(1008, 'SAS mismatch — session aborted');
+                this.wsManager.disconnectWithError(1008, 'SAS mismatch - session aborted');
             }
 
             // Free decrypted image blobs eagerly: this session is dead.
@@ -2210,7 +2315,7 @@ document.addEventListener('alpine:init', () => {
         /**
          * Handles SAS verification success (user clicked "Verified")
          */
-        handleSasVerified() {
+        async handleSasVerified() {
             debugLog('[SECURITY] SAS code verified by user - connection is secure');
 
             // Mark SAS as verified in identity manager (persists for session)
@@ -2233,6 +2338,8 @@ document.addEventListener('alpine:init', () => {
                     ? '✅ New key verified - secure connection re-confirmed'
                     : '✅ Key verified - secure connection confirmed'
             );
+
+            await this.releasePendingSecureMessages();
         },
 
         /**
@@ -2240,11 +2347,11 @@ document.addEventListener('alpine:init', () => {
          *
          * SECURITY: Skipping SAS leaves the chat encrypted but unauthenticated
          * against the server operator (operator could substitute identity keys
-         * during the handshake — see SECURITY.md F-1 / "SAS Verification is
+         * during the handshake - see SECURITY.md F-1 / "SAS Verification is
          * Optional"). We require an explicit second confirmation so a stray
          * tap on the skip button doesn't silently downgrade the security model.
          */
-        handleSasSkipped() {
+        async handleSasSkipped() {
             // If this SAS prompt was triggered by a *change* of peer identity
             // after a previous verified handshake, skipping is disabled: the
             // user already committed to verification, allowing a silent
@@ -2252,7 +2359,7 @@ document.addEventListener('alpine:init', () => {
             if (this.sasReverifyRequired) {
                 debugLog('[SECURITY] SAS skip rejected: re-verification required after identity change');
                 window.alert(
-                    'Cannot skip — your contact\'s identity key changed since you ' +
+                    'Cannot skip - your contact\'s identity key changed since you ' +
                     'last verified it. Please confirm whether the new security code ' +
                     'matches (out-of-band) or declare a mismatch.'
                 );
@@ -2261,7 +2368,7 @@ document.addEventListener('alpine:init', () => {
 
             // Browser-native confirm: works under our strict CSP (no eval/inline)
             // and is keyboard-accessible. The text states the consequence in
-            // plain language — short enough to read, specific enough to deter.
+            // plain language - short enough to read, specific enough to deter.
             const ok = window.confirm(
                 'Skip identity verification?\n\n' +
                 'Your messages will still be encrypted, but you will NOT detect ' +
@@ -2283,6 +2390,8 @@ document.addEventListener('alpine:init', () => {
 
             // Show info message
             this.addSystemMessage('ℹ️ Key verification skipped - connection security not confirmed');
+
+            await this.releasePendingSecureMessages();
         },
 
         /**
@@ -2315,7 +2424,7 @@ document.addEventListener('alpine:init', () => {
         /**
          * Global Escape handler. Closes the topmost dismissible overlay:
          * emoji picker first, then fullscreen image viewer. The SAS modal is
-         * intentionally NOT handled here — dismissing it must be an explicit
+         * intentionally NOT handled here - dismissing it must be an explicit
          * "match / don't match / skip" decision by the user.
          *
          * Needed as a named method (not an inline expression) because this
@@ -2332,6 +2441,68 @@ document.addEventListener('alpine:init', () => {
             }
         },
 
+        /** True while 1:1 ciphertext must remain behind the SAS decision gate. */
+        isSasDecisionPending() {
+            if (this.roomType !== 'onetoone' || !this.pfsActive) return false;
+            if (this.sasReverifyRequired) return true;
+            return this.sasVerificationStatus !== 'verified'
+                && this.sasVerificationStatus !== 'skipped';
+        },
+
+        /**
+         * New frames must also queue while an existing quarantine is draining,
+         * otherwise a fresh WebSocket frame could overtake an older frame at
+         * the Double Ratchet mutex.
+         */
+        shouldQuarantineSecureMessage() {
+            return this.isSasDecisionPending() || this.secureMessageReleaseInProgress;
+        },
+
+        async quarantineSecureMessage(kind, message) {
+            if (this.pendingSecureMessages.length >= this.maxPendingSecureMessages) {
+                this.clearPendingSecureMessages();
+                await this.handleECDHAborted(true);
+                this.ecdhHandshakeStatus = 'failed';
+                this.error = '🔒 Too many messages arrived before identity verification. The secure session was closed; please open a new chat.';
+                if (this.wsManager) {
+                    this.wsManager.disconnectWithError(1008, 'SAS verification queue limit exceeded');
+                }
+                return;
+            }
+            this.pendingSecureMessages.push({ kind, message });
+        },
+
+        /** Releases quarantined ciphertext strictly in arrival order. */
+        async releasePendingSecureMessages() {
+            if (this.secureMessageReleaseInProgress || this.isSasDecisionPending()) return;
+
+            const epoch = this.secureMessageQueueEpoch;
+            this.secureMessageReleaseInProgress = true;
+            try {
+                while (this.pendingSecureMessages.length > 0
+                    && epoch === this.secureMessageQueueEpoch
+                    && !this.isSasDecisionPending()) {
+                    const pending = this.pendingSecureMessages.shift();
+                    if (pending.kind === 'message') {
+                        await this.processIncomingMessage(pending.message);
+                    } else if (pending.kind === 'image') {
+                        await this.processIncomingImage(pending.message);
+                    }
+                }
+            } finally {
+                if (epoch === this.secureMessageQueueEpoch) {
+                    this.secureMessageReleaseInProgress = false;
+                }
+            }
+        },
+
+        /** Invalidates any active drain and forgets ciphertext from that epoch. */
+        clearPendingSecureMessages() {
+            this.secureMessageQueueEpoch++;
+            this.pendingSecureMessages = [];
+            this.secureMessageReleaseInProgress = false;
+        },
+
         /**
          * True while the composer (text input, emoji, image, send) must be
          * disabled: WebSocket not open, not enough participants to talk to,
@@ -2339,7 +2510,7 @@ document.addEventListener('alpine:init', () => {
          *
          * Reading this as a method (instead of duplicating the boolean
          * expression on every `:disabled` attribute) keeps the template
-         * readable AND CSP-safe — Alpine CSP build only accepts method
+         * readable AND CSP-safe - Alpine CSP build only accepts method
          * calls in directive values, not arbitrary expressions.
          */
         isComposerLocked() {
@@ -2351,25 +2522,28 @@ document.addEventListener('alpine:init', () => {
             // block sends until the new code is re-confirmed (or declared
             // mismatch, which transitions to sasMismatchFatal above).
             if (this.sasReverifyRequired) return true;
+            if (this.isSasDecisionPending()) return true;
             return false;
         },
 
         /** Placeholder copy that mirrors the current lock reason. */
         composerPlaceholder() {
-            if (this.sasMismatchFatal) return 'Session destroyed — open a new chat.';
-            if (!this.connected) return 'Connecting…';
-            if (this.participantCount < 2) return 'Waiting for someone to join this room…';
-            if (this.roomType === 'onetoone' && !this.pfsActive) return 'Establishing secure connection…';
-            if (this.sasReverifyRequired) return 'Re-verify the new security code to continue…';
-            return 'Write an encrypted message…';
+            if (this.sasMismatchFatal) return 'Session destroyed - open a new chat.';
+            if (!this.connected) return 'Connecting...';
+            if (this.participantCount < 2) return 'Waiting for someone to join this room...';
+            if (this.roomType === 'onetoone' && !this.pfsActive) return 'Establishing secure connection...';
+            if (this.sasReverifyRequired) return 'Re-verify the new security code to continue...';
+            if (this.isSasDecisionPending()) return 'Verify the security code to continue...';
+            return 'Write an encrypted message...';
         },
 
         /** Short tooltip shown on the send button in blocked states. */
         composerLockedLabel() {
             if (!this.connected) return 'Not connected';
             if (this.participantCount < 2) return 'Waiting for peer to join';
-            if (this.roomType === 'onetoone' && !this.pfsActive) return 'Waiting for secure connection…';
+            if (this.roomType === 'onetoone' && !this.pfsActive) return 'Waiting for secure connection...';
             if (this.sasReverifyRequired) return 'Re-verify identity to send';
+            if (this.isSasDecisionPending()) return 'Verify identity before sending';
             return 'Send message';
         },
 

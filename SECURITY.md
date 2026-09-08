@@ -141,13 +141,13 @@ timestamp (24 h from creation, aligned with the default `session_ttl_secs`).
 
 **Properties:**
 - The private side is created `extractable: false` directly from
-  `crypto.subtle.generateKey` — no PKCS#8 round-trip. WebCrypto §13
+  `crypto.subtle.generateKey` - no PKCS#8 round-trip. WebCrypto §13
   applies `[[extractable]]` per side; for asymmetric ECDSA keypairs the
   *public* side is always extractable regardless of the parameter, so
   `exportKey('raw', publicKey)` for peer exchange and SAS continues to
   work. The private bytes never become reachable to JS, even
   momentarily. The pre-v0.2.5 build did this via a
-  `generateKey(true)` → `exportKey('pkcs8')` → `importKey(..., false)`
+  `generateKey(true)` -> `exportKey('pkcs8')` -> `importKey(..., false)`
   round-trip with a best-effort `fill(0)` on the buffer; that pattern
   briefly placed the raw private key bytes in the JS heap, and is gone
   as of v0.2.5 (finding F-02).
@@ -330,7 +330,7 @@ this in two ways:
 ### SAS Generation (v2, v0.3.x, retained for historical context)
 
 **Algorithm**: HKDF-SHA256
-- Output: 72 bits (12 emoji from a 64-character alphabet — 6 bits per emoji)
+- Output: 72 bits (12 emoji from a 64-character alphabet - 6 bits per emoji)
 - Also displayed as 18 hex characters
 
 **Input binding**:
@@ -343,7 +343,7 @@ info  = "SAS-display-v2"                                         // domain separ
 **Security properties**:
 - *Stable.* The SAS is a function of `(IK_A, IK_B, room_id)` only. Two
   honest peers who retain their identity keypair across a reconnect
-  derive the same emoji code on every handshake — no per-handshake
+  derive the same emoji code on every handshake - no per-handshake
   nonces or timestamps are mixed into the salt. Identity persistence
   (IndexedDB, 24 h TTL) keeps both identity keys alive for that window,
   so a user who verified the code once does not face a different code
@@ -352,11 +352,11 @@ info  = "SAS-display-v2"                                         // domain separ
 - *Domain-separated.* The literal `"pinchat-sas-v2"` tag in the salt
   prevents collisions with any other HKDF use of the same identity-key
   pair (future safety-number computations, alternative display formats,
-  protocol-v3, …). The `"SAS-display-v2"` info string adds a second
+  protocol-v3, ...). The `"SAS-display-v2"` info string adds a second
   layer of context separation in the HKDF expand stage.
 - *Symmetric.* Both peers sort the two identity public keys
-  lexicographically before concatenating, so the IKM bytes — and thus
-  the SAS output — are identical regardless of who initiated the
+  lexicographically before concatenating, so the IKM bytes - and thus
+  the SAS output - are identical regardless of who initiated the
   handshake.
 - *Grinding-resistant within a static identity.* 72 bits of output
   defeats commodity GPU brute force at the timescale of a verification
@@ -366,7 +366,7 @@ info  = "SAS-display-v2"                                         // domain separ
   collision search on a 72-bit space requires ~`2^36` derivations per
   pool, i.e. ~43 seconds per pool * two pools = ~90 s of pure SHA work.
   This is borderline but assumes the attacker can mint arbitrary
-  identity public keys at the same rate — which they cannot, because
+  identity public keys at the same rate - which they cannot, because
   forging a SAS match requires also finding ECDSA keypairs whose
   raw exports hash into the target SAS. ECDSA keypair generation is
   ~10000× slower than a SHA-256 op on a GPU, so the practical wall
@@ -386,8 +386,8 @@ of the v0.3.x design.
 **Why HKDF and not PBKDF2 (rationale, deferred-audit response):**
 PBKDF2 is a *password stretcher*. It is the correct tool when the input
 is a low-entropy human-chosen secret and the goal is to make brute force
-expensive. The SAS inputs are uniformly-random P-256 public keys — high
-entropy, zero password character — and the goal is deterministic
+expensive. The SAS inputs are uniformly-random P-256 public keys - high
+entropy, zero password character - and the goal is deterministic
 display-byte derivation. HKDF is the keyed-PRF construction designed
 for exactly this. The pre-v0.3.0 path used PBKDF2 with 100 000 iterations,
 spending ~30-100 ms per derivation to slow down an attack that could
@@ -397,13 +397,13 @@ cost differential doesn't tilt the balance in either direction when
 the search space is the bottleneck). The 100K iterations were paying
 cost for no security property. v0.3.0 drops them.
 
-### SAS Generation (v1 — pre-v0.3.0, retained for historical context)
+### SAS Generation (v1 - pre-v0.3.0, retained for historical context)
 
 The pre-v0.3.0 SAS used PBKDF2-SHA256 with 100K iterations, a 48-bit
 output (8 emoji), and a salt that incorporated `roomId || sorted_nonces
 || sorted_timestamps`. The per-handshake nonces and timestamps made the
 SAS change on every reconnect even when both peers retained the same
-identity keypair, which trained users to skip verification — exactly
+identity keypair, which trained users to skip verification - exactly
 the failure mode the SAS is supposed to prevent. v0.3.0 dropped the
 per-handshake material, widened to 72 bits, and switched to HKDF (see
 above). Pre-v0.3.0 clients still ship the old construction; mixed-version
@@ -477,7 +477,7 @@ AAD = TLV_encode([
 After a message key or chain key is used, PinChat calls `Uint8Array.fill(0)` on the raw key material. This is a best-effort mitigation: JavaScript engines (V8, SpiderMonkey) do not guarantee that the backing buffer is zeroed in native memory or that the GC reclaims it promptly. A memory dump of the browser process may still recover key material.
 
 **What does help:**
-- Identity private keys are imported with `extractable: false` — WebCrypto's opaque `CryptoKey` objects cannot be exported or read by JS, even with a memory dump via `exportKey`.
+- Identity private keys are imported with `extractable: false` - WebCrypto's opaque `CryptoKey` objects cannot be exported or read by JS, even with a memory dump via `exportKey`.
 - Double Ratchet chain keys are zeroized (`fill(0)`) after ratchet progression; the old material is no longer reachable from JS once the typed array reference is released.
 
 **Recommendation:** Use incognito/private mode for sensitive chats. Close the tab immediately after the conversation ends. Do not use PinChat on shared or potentially compromised devices.
@@ -486,7 +486,7 @@ After a message key or chain key is used, PinChat calls `Uint8Array.fill(0)` on 
 
 ### Server-Side Anti-Replay is Advisory, Not Authoritative
 
-The server maintains a per-room set of SHA-256 hashes of received encrypted payloads (bounded at `REPLAY_CACHE_MAX_PER_ROOM`, default 1 000 entries — see `src/config.rs`). If a ciphertext is resent verbatim, the server drops it.
+The server maintains a per-room set of SHA-256 hashes of received encrypted payloads (bounded at `REPLAY_CACHE_MAX_PER_ROOM`, default 1 000 entries - see `src/config.rs`). If a ciphertext is resent verbatim, the server drops it.
 
 **Limitation:** AES-GCM with a random 96-bit IV produces a different ciphertext for every encryption of the same plaintext, so identical ciphertexts are already an extremely strong indicator of a replay attack. The *authoritative* replay protection is the Double Ratchet's monotone message counter `n` (checked client-side against the AAD). The server-side hash check is a defense-in-depth layer that complements, but does not replace, the cryptographic guarantees of the protocol.
 
@@ -494,13 +494,13 @@ The server maintains a per-room set of SHA-256 hashes of received encrypted payl
 
 ---
 
-### SAS Verification is Optional — Skipping Enables Operator MITM
+### SAS Verification is Optional - Skipping Enables Operator MITM
 
 Short Authentication String (SAS) verification is the mechanism by which users confirm that no man-in-the-middle has replaced their peer's ECDH identity key during the handshake. When both participants compare and confirm the emoji codes match, the session is authenticated end-to-end.
 
-**If SAS is skipped:** the chat is encrypted, but not authenticated against the server operator. The server (or anyone with full relay access) could have substituted both parties' identity public keys with its own at the ECDH exchange step, establishing a session it can decrypt. The ECDSA signatures on the DH ratchet keys only prove self-consistency of those keys — they do not prove ownership by the expected human peer. Only SAS ties the cryptographic identity to a real-world identity.
+**If SAS is skipped:** the chat is encrypted, but not authenticated against the server operator. The server (or anyone with full relay access) could have substituted both parties' identity public keys with its own at the ECDH exchange step, establishing a session it can decrypt. The ECDSA signatures on the DH ratchet keys only prove self-consistency of those keys - they do not prove ownership by the expected human peer. Only SAS ties the cryptographic identity to a real-world identity.
 
-**Current UX:** skipping SAS sets `sasVerificationStatus = 'skipped'` and displays a persistent "Key verification skipped — connection security not confirmed" indicator. Sending and receiving messages remains possible. This is a deliberate usability trade-off: requiring SAS for all chats would add significant friction, and users can make an informed choice.
+**Current UX:** while the SAS decision is pending, the composer is locked and inbound application ciphertext is kept in a bounded quarantine without being decrypted or rendered. Verification releases it in arrival order. Explicitly confirming the skip sets `sasVerificationStatus = 'skipped'`, releases the quarantine, and displays a persistent "Key verification skipped - connection security not confirmed" indicator. This is a deliberate usability trade-off: the unsafe state requires an informed user choice rather than occurring silently.
 
 **Recommendation:** Always complete SAS verification for sensitive conversations, especially with new contacts. Never skip SAS if you received the room link from an untrusted channel.
 
@@ -508,9 +508,9 @@ Short Authentication String (SAS) verification is the mechanism by which users c
 
 | Configuration | Effective property | What can the relay see / do? |
 |---|---|---|
-| SAS verified + integrity extension installed | Double-Ratchet AEAD over an SRI-checked client. Peer identity confirmed out of band. **No external crypto audit.** | Relay sees ciphertext only. JavaScript tampering requires defeating SRI + signed manifest. |
-| SAS verified, no integrity extension | Double-Ratchet AEAD. Peer identity confirmed out of band. | Relay sees ciphertext only, but can serve modified JS on the next page load and read everything from that moment forward — undetected. |
-| SAS skipped | Double-Ratchet AEAD — **encryption is still active**. Peer identity has not been confirmed. | Relay can mount an active MITM at handshake time by substituting identity keys for both peers, establish two ratchets it owns, and read/modify everything in plaintext. |
+| SAS verified + integrity extension installed | Double-Ratchet AEAD over a client protected by a packaged hash-only script CSP and checked against a signed manifest. Peer identity confirmed out of band. **No external crypto audit.** | Relay sees ciphertext only. Arbitrary injected scripts are blocked before execution; remaining delivery risks include altered HTML abusing trusted-code bugs. |
+| SAS verified, no integrity extension | Double-Ratchet AEAD. Peer identity confirmed out of band. | Relay sees ciphertext only, but can serve modified JS on the next page load and read everything from that moment forward - undetected. |
+| SAS skipped | Double-Ratchet AEAD - **encryption is still active**. Peer identity has not been confirmed. | Relay can mount an active MITM at handshake time by substituting identity keys for both peers, establish two ratchets it owns, and read/modify everything in plaintext. |
 
 The phrase "the server cannot read your messages" is only true in the first two rows. In the third row the chat is *encrypted* but *not authenticated against an active server operator*. Avoid promising the absolute version of the claim in user-facing copy.
 
@@ -524,13 +524,13 @@ The bootstrap key is normally kept only in the URL fragment (`#key=<base64url>`)
 sessionStorage["pinchat_hash:/c/<room_id>"] = "#key=<base64url_key>"
 ```
 
-**Exposure windows** — there are two paths that put the bootstrap key into `sessionStorage`:
+**Exposure windows** - there are two paths that put the bootstrap key into `sessionStorage`:
 
 1. **Login-bounce path** (`static/js/login-stash.js`): triggered when an unauthenticated user clicks an invite link and the server redirects to `/login`. The fragment is moved to `sessionStorage` so it can be restored after the login round-trip. A 5-minute `setTimeout` safety net fires on `/login` to clear an abandoned stash; on successful post-login restore the chat page consumes and overwrites the stash.
 
 2. **Direct path** (`static/js/crypto.js` `extractKeyFromURL`): on a normal authenticated invite-link open, the fragment is read once, used to import a non-extractable `CryptoKey`, then written back to `sessionStorage` while the URL bar is scrubbed via `history.replaceState`. The stash lives for the lifetime of the tab. This is an **accepted trade-off**: the stash is required by `copyLink()` (v0.2.4) to reconstruct the shareable URL after the URL bar scrub, and by `resetToBootstrapKey()` for handshake-retry resilience. `sessionStorage` is tab-scoped and auto-cleared by the browser on tab close.
 
-**Risk:** any same-origin JavaScript executing during the exposure window (e.g., an XSS that bypassed the strict CSP, or a hostile browser extension running in the page) can read the raw key bytes from `sessionStorage`. The bootstrap key derives only the initial ECDH handshake AEAD — not message content (which is protected by the Double Ratchet chains established after the handshake). However, capture of the bootstrap key plus the initial handshake ciphertext allows recovery of the ECDH public keys and from there the session key; the SAS verification step is the only defense against that recovery in the absence of identity-key persistence.
+**Risk:** any same-origin JavaScript executing during the exposure window (e.g., an XSS that bypassed the strict CSP, or a hostile browser extension running in the page) can read the raw key bytes from `sessionStorage`. The bootstrap key derives only the initial ECDH handshake AEAD - not message content (which is protected by the Double Ratchet chains established after the handshake). However, capture of the bootstrap key plus the initial handshake ciphertext allows recovery of the ECDH public keys and from there the session key; the SAS verification step is the only defense against that recovery in the absence of identity-key persistence.
 
 **Mitigations in place:**
 - `sessionStorage` is scoped to the tab (not shared across tabs or persisted after the tab closes)
@@ -595,17 +595,21 @@ This is known as the "JavaScript delivery problem" and affects all web-based E2E
 
 ### Browser Extension Solution with SRI
 
-PinChat provides browser extensions for Chrome and Firefox that verify file integrity using **Subresource Integrity (SRI)** combined with signed manifests.
+PinChat provides browser extensions for Chrome and Firefox that combine a
+**preventive hash-only CSP**, **Subresource Integrity (SRI)**, and signed
+manifests.
 
 #### Why SRI?
 
 The previous approach (extension fetches files separately and computes hashes) was vulnerable to bypass attacks: a sophisticated attacker could detect extension requests (via headers, timing) and serve clean files to the extension while serving malicious code to the browser.
 
-With SRI:
-1. HTML files contain hardcoded `integrity="sha256-..."` attributes
-2. Browser **natively refuses** to execute any JS/CSS that doesn't match the hash
-3. Extension verifies the actual DOM contains correct integrity attributes
-4. Manifest is signed and hosted on GitHub (out of server's control)
+With the packaged CSP and SRI:
+1. Declarative Net Request replaces the response CSP before parsing
+2. Each known page permits only its signed script hashes; unknown paths permit no scripts
+3. HTML files contain hardcoded `integrity="sha256-..."` attributes
+4. Browser refuses to execute modified script bytes
+5. Extension verifies the actual DOM and served files against the signed manifest
+6. Manifest is signed and hosted on GitHub (out of the application server's control)
 
 #### Architecture
 
@@ -680,6 +684,7 @@ With SRI:
 - Compromised signing key (attacker could sign malicious hashes)
 - Malicious browser extension updates
 - Users ignoring warning overlays
+- HTML/UI manipulation that can exploit behavior in an already allowlisted script
 - Dynamic content manipulation (API responses)
 - First-page-load without extension (user must install extension first)
 
@@ -701,17 +706,18 @@ Trust Chain:
 
 #### Verification Process
 
-The extension uses a **dual verification** approach:
+The extension uses prevention plus verification:
 
-1. **Fetch Manifest**: Extension retrieves `hashes.json.signed` from GitHub
-2. **Verify Signature**: ECDSA P-256 signature validated using embedded public key
-3. **DOM SRI Check**: Content script reads `<script>` and `<link>` elements, verifies `integrity` attributes match signed manifest
-4. **File Hash Verification**: Fetches ALL files listed in manifest (not just DOM) and computes SHA-256 hashes
-5. **Detect Unauthorized Resources**: Inline scripts, external resources, same-origin scripts outside `/static/`, iframes, external forms
-6. **Browser Enforcement**: Browser independently blocks any file not matching its SRI hash
-7. **Alert**: Visual feedback (badge + overlay) based on verification result
+1. **Preventive CSP**: Static extension rules set a per-page hash-only script policy before parsing.
+2. **Fetch Manifest**: Extension retrieves `hashes.json.signed` from GitHub.
+3. **Verify Signature**: ECDSA P-256 signature is validated using the embedded public key.
+4. **DOM SRI Check**: Content script verifies `integrity` attributes against the signed manifest.
+5. **File Hash Verification**: Fetches all files listed in the manifest and computes SHA-256 hashes.
+6. **Detect Unauthorized Resources**: Inline scripts, external resources, same-origin scripts outside `/static/`, iframes, and external forms.
+7. **Browser Enforcement**: CSP blocks non-allowlisted scripts and SRI blocks modified allowlisted bytes.
+8. **Alert**: Visual feedback (badge + overlay) based on verification result.
 
-This dual approach catches:
+These layers catch:
 - Lazy-loaded or deferred scripts not yet in DOM
 - Server serving modified files (even with correct SRI in HTML)
 - Files blocked by browser SRI (hash mismatch detected independently)
@@ -720,7 +726,8 @@ This dual approach catches:
 
 | Layer | Protection | Bypassed by |
 |-------|------------|-------------|
-| Browser SRI | Blocks tampered files | N/A (native browser security) |
+| Packaged hash-only CSP | Blocks arbitrary injected scripts before execution | Signed trusted-code gadget/bug; extension not installed |
+| Browser SRI | Blocks modified bytes for allowlisted external scripts | SRI removed without the packaged CSP |
 | Extension SRI check | Detects missing/wrong integrity | User ignoring warnings |
 | Extension hash verification | Detects file tampering (all manifest files) | User ignoring warnings |
 | Manifest signature | Authenticates hash list | Key compromise |
@@ -750,7 +757,7 @@ This dual approach catches:
 2. **Update Window**: Between file changes and hash list update, verification may fail
 3. **Key Compromise**: If signing key is compromised, protection is void
 4. **User Override**: Determined users can dismiss warnings
-5. **Extension Required**: Browser SRI protects against file tampering, but without extension, HTML could be modified to remove/change SRI
+5. **Extension Required**: Without the packaged CSP, compromised HTML can remove/change SRI and restore same-origin script execution
 
 #### Recommendations
 

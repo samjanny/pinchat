@@ -18,7 +18,7 @@ pub struct PowChallenge {
     /// inputs to SHA-256.
     pub challenge: String,
 
-    /// Hexadecimal mask for the client's convenience — derived from
+    /// Hexadecimal mask for the client's convenience - derived from
     /// `difficulty` at construction time and sent down the wire so the
     /// browser can short-circuit nonce search without recomputing the mask.
     ///
@@ -68,8 +68,8 @@ impl PowChallenge {
     /// the rest are 0.
     ///
     /// # Examples
-    /// - difficulty = 8  → mask = [0xFF, 0x00, ..., 0x00] (first byte must be 0xFF)
-    /// - difficulty = 12 → mask = [0xFF, 0xF0, ..., 0x00] (first 12 bits must be 1)
+    /// - difficulty = 8  -> mask = [0xFF, 0x00, ..., 0x00] (first byte must be 0xFF)
+    /// - difficulty = 12 -> mask = [0xFF, 0xF0, ..., 0x00] (first 12 bits must be 1)
     fn build_mask_bytes(difficulty: u8) -> [u8; 32] {
         let difficulty = difficulty.min(255);
 
@@ -102,11 +102,11 @@ impl PowChallenge {
     ///
     /// # Algorithm
     /// 1. Re-derive the 32-byte mask from `self.difficulty` (NOT from any
-    ///    cached field — audit H-1 defense-in-depth). The challenge string
+    ///    cached field - audit H-1 defense-in-depth). The challenge string
     ///    already embeds the difficulty (see `new()`), so the SHA-256 input
     ///    is bound to the same difficulty the mask enforces.
     /// 2. Compute SHA-256(challenge || nonce).
-    /// 3. Verify `(hash & mask) == mask` — the high `difficulty` bits of the
+    /// 3. Verify `(hash & mask) == mask` - the high `difficulty` bits of the
     ///    hash must all be 1.
     pub fn verify(&self, nonce: u64) -> bool {
         let mask = Self::build_mask_bytes(self.difficulty);
@@ -226,17 +226,17 @@ mod tests {
     #[test]
     fn test_difficulty_calculation() {
         // Test the default difficulty range (15-20 bits)
-        assert_eq!(calculate_difficulty(0, 1000, 15, 20), 15); // 0% → 15 bits (baseline)
-        assert_eq!(calculate_difficulty(300, 1000, 15, 20), 15); // 30% → 15 bits
-        assert_eq!(calculate_difficulty(400, 1000, 15, 20), 16); // 40% → 16 bits
-        assert_eq!(calculate_difficulty(600, 1000, 15, 20), 17); // 60% → 17 bits
-        assert_eq!(calculate_difficulty(800, 1000, 15, 20), 18); // 80% → 18 bits
-        assert_eq!(calculate_difficulty(900, 1000, 15, 20), 19); // 90% → 19 bits
-        assert_eq!(calculate_difficulty(980, 1000, 15, 20), 20); // 98% → 20 bits (max)
+        assert_eq!(calculate_difficulty(0, 1000, 15, 20), 15); // 0% -> 15 bits (baseline)
+        assert_eq!(calculate_difficulty(300, 1000, 15, 20), 15); // 30% -> 15 bits
+        assert_eq!(calculate_difficulty(400, 1000, 15, 20), 16); // 40% -> 16 bits
+        assert_eq!(calculate_difficulty(600, 1000, 15, 20), 17); // 60% -> 17 bits
+        assert_eq!(calculate_difficulty(800, 1000, 15, 20), 18); // 80% -> 18 bits
+        assert_eq!(calculate_difficulty(900, 1000, 15, 20), 19); // 90% -> 19 bits
+        assert_eq!(calculate_difficulty(980, 1000, 15, 20), 20); // 98% -> 20 bits (max)
 
         // Test a custom difficulty range (10-15 bits)
-        assert_eq!(calculate_difficulty(0, 1000, 10, 15), 10); // 0% → 10 bits (baseline)
-        assert_eq!(calculate_difficulty(980, 1000, 10, 15), 15); // 98% → 15 bits (max)
+        assert_eq!(calculate_difficulty(0, 1000, 10, 15), 10); // 0% -> 10 bits (baseline)
+        assert_eq!(calculate_difficulty(980, 1000, 10, 15), 15); // 98% -> 15 bits (max)
 
         // Edge case: fixed difficulty
         assert_eq!(calculate_difficulty(0, 1000, 18, 18), 18); // Always 18
@@ -292,7 +292,7 @@ mod tests {
     fn test_verify_ignores_tampered_mask_field() {
         // The `mask` field is sent down the wire as a convenience for the
         // client. If anything ever round-trips it through untrusted input,
-        // verify() must NOT consult it — the mask must be re-derived from
+        // verify() must NOT consult it - the mask must be re-derived from
         // self.difficulty every call.
         //
         // Find a nonce that satisfies a 4-bit challenge, then swap the mask
@@ -327,7 +327,7 @@ mod tests {
     #[test]
     fn test_low_difficulty_nonce_fails_high_difficulty_challenge() {
         // A nonce that satisfies a 4-bit challenge MUST NOT satisfy a fresh
-        // 16-bit challenge — both because the challenge strings differ
+        // 16-bit challenge - both because the challenge strings differ
         // (different UUIDs and embedded difficulty) and because the
         // re-derived 16-bit mask is strictly stricter than the 4-bit mask.
         let low = PowChallenge::new(4);

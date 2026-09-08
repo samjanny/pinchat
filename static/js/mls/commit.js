@@ -1,5 +1,5 @@
 /**
- * PinChat MLS — Commit + ProposalOrRef (RFC 9420 §12.4).
+ * PinChat MLS - Commit + ProposalOrRef (RFC 9420 §12.4).
  *
  *   struct {
  *       ProposalOrRefType type;           // u8

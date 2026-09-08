@@ -60,7 +60,7 @@ pub async fn create_room(
 ) -> Result<Response, Response> {
     // CSRF: defence-in-depth on top of SameSite=Strict + session auth.
     // Required because /api/rooms is a state-creating endpoint reachable
-    // from any authenticated context (XSS, sibling-subdomain takeover, …).
+    // from any authenticated context (XSS, sibling-subdomain takeover, ...).
     verify_csrf_for_api(&headers, &state.csrf_secret)?;
     if config.room_type == RoomType::Group && !state.config.group_chat_enabled {
         return Err((
@@ -255,7 +255,7 @@ pub async fn create_room(
     // Atomic check+insert (prevents concurrent requests from exceeding capacity)
     match state.try_create_room(room) {
         Ok(created_room_id) => {
-            tracing::info!("Created room id={}…", short_room_id(&created_room_id));
+            tracing::info!("Created room id={}...", short_room_id(&created_room_id));
 
             if ws_token.is_some() {
                 tracing::info!(
@@ -326,7 +326,7 @@ pub async fn room_page(
         ),
         None => {
             tracing::warn!(
-                "Room page access failed - Room {}… not found",
+                "Room page access failed - Room {}... not found",
                 short_room_id(&room_id)
             );
             return Err((StatusCode::NOT_FOUND, "Room not found").into_response());
@@ -346,15 +346,21 @@ pub async fn room_page(
         );
     }
 
-    // Verify that the room has not expired
+    // Verify that the room has not expired.
+    //
+    // Audit L-4: this used to answer 410 Gone while a missing or full room
+    // answered 404. That distinction told a caller holding a room id whether
+    // the room had ever existed, which is the one bit UUIDv4 was chosen to
+    // withhold. All three states now share a single response; the room is
+    // still removed eagerly rather than waiting for the cleanup tick.
     if room_is_expired {
         tracing::warn!(
-            "Room page access failed - Room {}… has expired (ttl_minutes: {})",
+            "Room page access failed - Room {}... has expired (ttl_minutes: {})",
             short_room_id(&room_id),
             ttl_minutes
         );
         state.remove_room(&room_id);
-        return Err((StatusCode::GONE, "Room has expired").into_response());
+        return Err((StatusCode::NOT_FOUND, "Room not found").into_response());
     }
 
     // Verify that the room is not full.
@@ -364,7 +370,7 @@ pub async fn room_page(
     // enumeration infeasible, but unified responses remove a metadata side-channel.
     if room_is_full {
         tracing::warn!(
-            "Room page access failed - Room {}… is full",
+            "Room page access failed - Room {}... is full",
             short_room_id(&room_id)
         );
         return Err((StatusCode::NOT_FOUND, "Room not found").into_response());
@@ -448,7 +454,10 @@ mod tests {
     /// `state.remove_room` cleanup path. Before the fix the room read guard
     /// was still alive at that call and the handler deadlocked. The fix reads
     /// the needed fields and drops the guard first, so this must complete
-    /// promptly and return 410 GONE while removing the room.
+    /// promptly while removing the room.
+    ///
+    /// L-4 regression: the response must be 404, indistinguishable from a room
+    /// that never existed. A 410 here would leak the existence of the id.
     #[tokio::test]
     async fn expired_room_page_does_not_deadlock_and_removes_room() {
         let state = AppState::new(1000, test_config());
@@ -479,13 +488,13 @@ mod tests {
         let handler_result =
             result.expect("room_page deadlocked on expired-room cleanup (audit H2)");
 
-        // Expired room -> Err(GONE).
+        // Expired room -> Err(NOT_FOUND), same as a room that never existed.
         let response =
             handler_result.expect_err("expired room must return an error response, not a redirect");
         assert_eq!(
             response.status(),
-            StatusCode::GONE,
-            "expired room must yield 410 GONE"
+            StatusCode::NOT_FOUND,
+            "expired room must be indistinguishable from a missing room (audit L-4)"
         );
 
         // The cleanup path must actually have removed the room.
@@ -493,6 +502,90 @@ mod tests {
             !state.rooms.contains_key(&room_id),
             "expired room must be removed by room_page"
         );
+    }
+
+    /// M-4 regression: the API must refuse `room_type: group`.
+    ///
+    /// The variant still deserializes off the wire and Room::new preserves it
+    /// while capping participants at two, but the client only runs the ECDH +
+    /// Double Ratchet handshake for `onetoone`. Both encryptMessage and
+    /// decryptMessage throw without an initialised ratchet, so a group room
+    /// cannot carry a single message. Reject at creation, before the PoW gate,
+    /// so the caller sees a clear 400 rather than an opaque encryption failure
+    /// at first send.
+    /// Build the CSRF cookie + header pair `/api/rooms` requires. The token is
+    /// minted from the state's own secret, so this exercises the real check
+    /// rather than bypassing it.
+    fn csrf_headers(state: &AppState) -> HeaderMap {
+        let token = crate::auth::generate_csrf_token(&state.csrf_secret);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::COOKIE,
+            format!("csrf_token={token}").parse().unwrap(),
+        );
+        headers.insert("x-csrf-token", token.parse().unwrap());
+        headers
+    }
+
+    #[tokio::test]
+    async fn create_room_refuses_group_when_the_flag_is_off() {
+        // Group rooms are gated behind GROUP_CHAT_ENABLED, which defaults to
+        // false. With the flag off the endpoint answers 404 rather than
+        // describing a feature this deployment does not run.
+        let mut config = test_config();
+        config.group_chat_enabled = false;
+        let state = AppState::new(1000, config);
+        let addr: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+
+        let result = create_room(
+            State(state.clone()),
+            ConnectInfo(addr),
+            csrf_headers(&state),
+            Json(RoomConfig {
+                room_type: RoomType::Group,
+                ttl_minutes: 60,
+                max_participants: 2,
+            }),
+        )
+        .await;
+
+        let response = result.expect_err("group rooms must be refused while the flag is off");
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "a disabled feature must not be described to the caller"
+        );
+        assert_eq!(state.total_rooms(), 0, "no room may be created");
+    }
+
+    /// Counterpart to the above: a 1:1 request is NOT short-circuited by the
+    /// type check. It falls through to the PoW gate and stops there with 428
+    /// because this call carries no nonce, which shows the group branch is
+    /// type-specific rather than a blanket rejection.
+    #[tokio::test]
+    async fn create_room_onetoone_reaches_pow_gate() {
+        let state = AppState::new(1000, test_config());
+        let addr: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+
+        let result = create_room(
+            State(state.clone()),
+            ConnectInfo(addr),
+            csrf_headers(&state),
+            Json(RoomConfig {
+                room_type: RoomType::OneToOne,
+                ttl_minutes: 60,
+                max_participants: 2,
+            }),
+        )
+        .await;
+
+        let response = result.expect_err("no PoW nonce supplied, so this cannot succeed");
+        assert_eq!(
+            response.status(),
+            StatusCode::PRECONDITION_REQUIRED,
+            "a 1:1 request must reach the PoW challenge"
+        );
+        assert_eq!(state.total_rooms(), 0);
     }
 
     /// Sanity counterpart: a live, non-full room redirects to the chat page

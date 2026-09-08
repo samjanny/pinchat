@@ -4,10 +4,10 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>PinChat - E2E Encrypted Chat</title>
-    <link rel="stylesheet" href="/static/css/style.css" integrity="sha256-I7jppwH+0/qRDZPZftMjmb3TS6Ou3wlt+aZx9qF6oZ0=" crossorigin="anonymous" >
-    <script src="/static/js/theme.js" integrity="sha256-vc83MC35lVoXBnYkFcbi+cE5EgJ+drCEfcjEryWT40A=" crossorigin="anonymous" ></script>
-    <script src="/static/js/pow.js" integrity="sha256-4jyDkg400LlXkyi0zC+QbIJhh6pEYjneo43JWuFVRZc=" crossorigin="anonymous" ></script>
-    <script src="/static/js/homepage.js" integrity="sha256-az0nhCQipPf9yA4lU2CpdUvFSrEit9hBpCd7W2UYRuk=" crossorigin="anonymous" ></script>
+    <link rel="stylesheet" href="/static/css/style.css" integrity="sha256-EsvGJwz+p98MSvMTLq6Evv71AuXRtjCZYFOjWpsSa2c=" crossorigin="anonymous" >
+    <script src="/static/js/theme.js" integrity="sha256-IFPp16c490XqfYw01UQmSLORmfv7DKKWOXNpQOdw2X0=" crossorigin="anonymous" ></script>
+    <script src="/static/js/pow.js" integrity="sha256-dPmlfH5GU0VsCkR6UpDNPzSRAjhm+xm7SNCDyNSnUqQ=" crossorigin="anonymous" ></script>
+    <script src="/static/js/homepage.js" integrity="sha256-p7E0rA/mvQrZ9DMn8DR/rguB17vQ3i3XBJQ/t7M3WiE=" crossorigin="anonymous" ></script>
     <script src="/static/js/alpine-csp.min.js" integrity="sha256-58hj2liWaS9dR44Q2uCJ5hZP7RxcG2offLv3qbCT8FU=" crossorigin="anonymous" defer></script>
 </head>
 <body class="page-home">
@@ -87,7 +87,7 @@
                         <!-- Submit -->
                         <button type="submit" class="btn btn-primary" :disabled="$store.homepage.loading">
                             <span x-show="!$store.homepage.loading">Create room</span>
-                            <span x-show="$store.homepage.loading" x-text="$store.homepage.loadingMessage">Creating…</span>
+                            <span x-show="$store.homepage.loading" x-text="$store.homepage.loadingMessage">Creating...</span>
                         </button>
 
                         <!-- Feedback -->
@@ -100,7 +100,7 @@
                 <aside class="info-stack" id="security">
                     <div class="info-card">
                         <h3>How the link works</h3>
-                        <p>Your room URL looks like <code>/c/&lt;id&gt;#key=&lt;b64&gt;</code>. The fragment after <code>#</code> stays on the client — RFC 3986 — so the server never sees the symmetric key.</p>
+                        <p>Your room URL looks like <code>/c/&lt;id&gt;#key=&lt;b64&gt;</code>. The fragment after <code>#</code> stays on the client - RFC 3986 - so the server never sees the symmetric key.</p>
                     </div>
                     <div class="info-card">
                         <h3>What the server sees</h3>
@@ -108,7 +108,7 @@
                     </div>
                     <div class="info-card">
                         <h3>Identity verification</h3>
-                        <p>Before any message goes through, you'll see a <strong>Short Authentication String</strong> — 8 emoji derived from both parties' identity keys. Confirm it out-of-band to rule out MITM.</p>
+                        <p>Before any message goes through, you'll see a <strong>Short Authentication String</strong> - 8 emoji derived from both parties' identity keys. Confirm it out-of-band to rule out MITM.</p>
                     </div>
                 </aside>
 
@@ -134,7 +134,7 @@
                 <div class="feature">
                     <div class="feature-icon"><svg class="icon" aria-hidden="true"><use href="#i-timer"/></svg></div>
                     <div class="feature-title">Auto-destruction</div>
-                    <div class="feature-desc">Rooms delete themselves at expiration. Short or long — you decide up front.</div>
+                    <div class="feature-desc">Rooms delete themselves at expiration. Short or long - you decide up front.</div>
                 </div>
                 <div class="feature">
                     <div class="feature-icon"><svg class="icon" aria-hidden="true"><use href="#i-code"/></svg></div>
@@ -156,7 +156,7 @@
                 </div>
 
                 <div class="info-box warning">
-                    <h3><svg class="icon" aria-hidden="true"><use href="#i-alert"/></svg>Experimental software — use at your own risk</h3>
+                    <h3><svg class="icon" aria-hidden="true"><use href="#i-alert"/></svg>Experimental software - use at your own risk</h3>
                     <p>PinChat is an experimental prototype provided strictly for educational and research purposes. It is <strong>NOT designed, intended, or warranted</strong> for production use, the protection of real-world sensitive, personal, financial, or confidential data, or safety-critical, life-critical, or mission-critical communications.</p>
                     <p style="margin-top:0.75rem">Although it uses modern cryptographic techniques, it has <strong>not undergone a formal security review or audit</strong>, and may contain serious vulnerabilities. You can audit the code yourself on <a href="https://github.com/samjanny/pinchat" target="_blank" rel="noopener noreferrer">GitHub</a>.</p>
                 </div>
@@ -219,11 +219,11 @@
         </symbol>
     </svg>
 
-    <!-- Cookie notice (informational, dismissible — see static/js/cookie-notice.js) -->
+    <!-- Cookie notice (informational, dismissible - see static/js/cookie-notice.js) -->
     <div id="cookie-notice" class="cookie-notice hidden" role="region" aria-label="Cookie notice">
-        <span class="cookie-notice-text">This site uses only strictly necessary cookies (session, CSRF). No tracking, no analytics. <a href="/static/privacy.html">Privacy</a></span>
+        <span class="cookie-notice-text">This site uses only strictly necessary cookies (session, CSRF, and a short-lived proof-of-work cookie). No tracking, no analytics. <a href="/static/privacy.html">Privacy</a></span>
         <button type="button" class="cookie-notice-ok">OK</button>
     </div>
-    <script src="/static/js/cookie-notice.js" integrity="sha256-rvb/bHQ2W2jurmYIKaOUhoCD4mg3w94+UbuljCqwDdI=" crossorigin="anonymous" ></script>
+    <script src="/static/js/cookie-notice.js" integrity="sha256-JefnNU1ms64X4lDQibD4l8z4rVAi+15sb4hle0uE0yM=" crossorigin="anonymous" ></script>
 </body>
 </html>

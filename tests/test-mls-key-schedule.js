@@ -24,7 +24,7 @@
  *      `init_secret_[n-1]`.
  *
  * We also cross-check `exporter`: vector.exporter = {label, context, length,
- * secret} — secret must equal mlsExporter(exporter_secret, label,
+ * secret} - secret must equal mlsExporter(exporter_secret, label,
  * SHA-256(context), length).
  */
 
@@ -41,7 +41,7 @@ function assert(cond, name, detail) {
     if (cond) {
         passed += 1;
     } else {
-        console.log(`  FAIL ${name}${detail ? `  — ${detail}` : ''}`);
+        console.log(`  FAIL ${name}${detail ? `  - ${detail}` : ''}`);
         failed += 1;
     }
 }
@@ -117,7 +117,7 @@ async function main() {
         process.exit(1);
     }
 
-    console.log(`# MLS key schedule — cipher_suite=2, group_id=${group.group_id.slice(0, 16)}…`);
+    console.log(`# MLS key schedule - cipher_suite=2, group_id=${group.group_id.slice(0, 16)}...`);
 
     let prevInitSecret = hexDecode(group.initial_init_secret);
     for (let i = 0; i < group.epochs.length; i += 1) {

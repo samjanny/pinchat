@@ -4,14 +4,14 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Login</title>
-    <link rel="stylesheet" href="/static/css/style.css" integrity="sha256-I7jppwH+0/qRDZPZftMjmb3TS6Ou3wlt+aZx9qF6oZ0=" crossorigin="anonymous" >
+    <link rel="stylesheet" href="/static/css/style.css" integrity="sha256-EsvGJwz+p98MSvMTLq6Evv71AuXRtjCZYFOjWpsSa2c=" crossorigin="anonymous" >
     <!--
         Head-loaded synchronously so the bootstrap key fragment is scrubbed
         from the URL bar before any other script (or the user) can observe
         it. See static/js/login-stash.js and finding C-03 in the audit log.
     -->
-    <script src="/static/js/login-stash.js" integrity="sha256-DD4V2qth6q+/FQP66jysQ1s7TA4xfiAo5t6etfb6xog=" crossorigin="anonymous" ></script>
-    <script src="/static/js/theme.js" integrity="sha256-vc83MC35lVoXBnYkFcbi+cE5EgJ+drCEfcjEryWT40A=" crossorigin="anonymous" ></script>
+    <script src="/static/js/login-stash.js" integrity="sha256-nZVXHQyP6NFAX/uvbxioVeAql2otcUFi5bYFJtweelg=" crossorigin="anonymous" ></script>
+    <script src="/static/js/theme.js" integrity="sha256-IFPp16c490XqfYw01UQmSLORmfv7DKKWOXNpQOdw2X0=" crossorigin="anonymous" ></script>
 </head>
 <body>
     <div class="login-container">
@@ -57,11 +57,11 @@
 
     <script src="/static/js/login.js" integrity="sha256-OZ1in+Y/J5HSZFw2fTUVBNtT5fkGtORNMz8/1yp00Qw=" crossorigin="anonymous" ></script>
 
-    <!-- Cookie notice (informational, dismissible — see static/js/cookie-notice.js) -->
+    <!-- Cookie notice (informational, dismissible - see static/js/cookie-notice.js) -->
     <div id="cookie-notice" class="cookie-notice hidden" role="region" aria-label="Cookie notice">
-        <span class="cookie-notice-text">This site uses only strictly necessary cookies (session, CSRF). No tracking, no analytics. <a href="/static/privacy.html">Privacy</a></span>
+        <span class="cookie-notice-text">This site uses only strictly necessary cookies (session, CSRF, and a short-lived proof-of-work cookie). No tracking, no analytics. <a href="/static/privacy.html">Privacy</a></span>
         <button type="button" class="cookie-notice-ok">OK</button>
     </div>
-    <script src="/static/js/cookie-notice.js" integrity="sha256-rvb/bHQ2W2jurmYIKaOUhoCD4mg3w94+UbuljCqwDdI=" crossorigin="anonymous" ></script>
+    <script src="/static/js/cookie-notice.js" integrity="sha256-JefnNU1ms64X4lDQibD4l8z4rVAi+15sb4hle0uE0yM=" crossorigin="anonymous" ></script>
 </body>
 </html>

@@ -1,8 +1,8 @@
 /**
- * PinChat MLS — ECDSA P-256 + SHA-256 signature primitives.
+ * PinChat MLS - ECDSA P-256 + SHA-256 signature primitives.
  *
  * Ciphersuite 0x0002 specifies `ecdsa_secp256r1_sha256` as the signature
- * scheme, with signatures serialized in the TLS 1.3 way — i.e. DER-encoded
+ * scheme, with signatures serialized in the TLS 1.3 way - i.e. DER-encoded
  * ECDSA signatures (RFC 8446 §4.2.3 + ASN.1 DER). WebCrypto's `subtle.sign` / `verify`
  * for ECDSA use raw IEEE P1363 r||s instead, so we convert between the
  * two at the module boundary:

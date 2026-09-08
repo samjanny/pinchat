@@ -1,5 +1,5 @@
 /**
- * PinChat MLS — HPKE (RFC 9180) for ciphersuite 0x0002.
+ * PinChat MLS - HPKE (RFC 9180) for ciphersuite 0x0002.
  *
  *   KEM   : DHKEM(P-256, HKDF-SHA256)     kem_id  = 0x0010
  *   KDF   : HKDF-SHA256                   kdf_id  = 0x0001
@@ -8,7 +8,7 @@
  * This is a from-scratch implementation built *only* on WebCrypto primitives
  * (HMAC-SHA256, ECDH-P256, AES-GCM). There is no vendored HPKE library and
  * no cross-compile of a C/WASM implementation. Only the base mode is
- * implemented — MLS never uses PSK or auth mode at the HPKE layer.
+ * implemented - MLS never uses PSK or auth mode at the HPKE layer.
  *
  * All labeled operations use the "HPKE-v1" prefix per RFC 9180 §4.
  *
@@ -25,7 +25,7 @@
  * Uint8Arrays. `enc` is the serialised ephemeral public key (65 bytes).
  *
  * Cross-checked against RFC 9180 §A.3 (DHKEM(P-256, HKDF-SHA256) + HKDF-SHA256
- * + AES-128-GCM) test vectors — see tests/test-mls-hpke.js.
+ * + AES-128-GCM) test vectors - see tests/test-mls-hpke.js.
  */
 (function (root, factory) {
     if (typeof module !== 'undefined' && module.exports) {
@@ -43,7 +43,7 @@
         if (typeof globalThis !== 'undefined' && globalThis.crypto && globalThis.crypto.subtle) {
             return globalThis.crypto.subtle;
         }
-        // Node <19 — should not happen in our target environments but kept for safety.
+        // Node <19 - should not happen in our target environments but kept for safety.
         try {
             // eslint-disable-next-line global-require
             const { webcrypto } = require('crypto');
@@ -238,7 +238,7 @@
     }
 
     /**
-     * DHKEM DeriveKeyPair for P-256 — RFC 9180 §7.1.3 "rejection sampling".
+     * DHKEM DeriveKeyPair for P-256 - RFC 9180 §7.1.3 "rejection sampling".
      *
      *   dkp_prk = LabeledExtract("", "dkp_prk", ikm)
      *   for counter = 0..255:
@@ -412,7 +412,7 @@
         const x = rawPubBytes.slice(1, 33);
         const y = rawPubBytes.slice(33, 65);
 
-        // Minimal base64url encoder — we don't want to require the Codec
+        // Minimal base64url encoder - we don't want to require the Codec
         // module here (would create a circular dependency with labeled.js).
         const b64url = (u8) => {
             let binary = '';

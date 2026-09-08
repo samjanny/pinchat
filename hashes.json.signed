@@ -1,13 +1,13 @@
 {
   "data": {
     "version": "1.2.0",
-    "sequence": 80,
-    "generated": "2026-07-16T15:23:45.730Z",
+    "sequence": 46,
+    "generated": "2026-09-08T09:49:55.033Z",
     "site": "https://pinchat.io",
     "files": [
       {
         "path": "/static/css/style.css",
-        "hash": "23b8e9a701fed3fa910d93d97ed32399bdd34ba3aedf096df9a671f6a17aa19d"
+        "hash": "12cbc6270cfea7df0c4af3132eae84befef502e5d1b630996053a35a9b126b67"
       },
       {
         "path": "/static/js/alpine-csp.min.js",
@@ -15,39 +15,39 @@
       },
       {
         "path": "/static/js/app.js",
-        "hash": "16241d18e56caaa93c98d9f12d7ce79458cbf2b14a1a3393b0e9175437f8ada1"
+        "hash": "e29eb2a76834df35a09470c4a9a64a871b36db88f11283901ab09e03dcd3154e"
       },
       {
         "path": "/static/js/cookie-notice.js",
-        "hash": "aef6ff6c74365b68eeae660829a394868083e26837c3de3e51bba58c2ab00dd2"
+        "hash": "25e7e7354d66b3ae17e250d089b0f897ccf8ad5022fb5e6c6f88657b4b84d323"
       },
       {
         "path": "/static/js/crypto.js",
-        "hash": "3fe66efdc37f1cb53599f6054efd9330ffa7e440b67935951a09caa45927bd1c"
+        "hash": "70a1e4068575325d07a02050cfd5c6b577b886c96dbed72eb6cdfd308be4bb6c"
       },
       {
         "path": "/static/js/double-ratchet.js",
-        "hash": "577474cc9e9802fc466142d72928f9a60d4a74929d96774ccfd8368072b85ba6"
+        "hash": "d165860124707d1f3b751b0ea5b571429a39ff09d08a6ffeec589bde1ef7c901"
       },
       {
         "path": "/static/js/ecdh.js",
-        "hash": "23ab8a1ddfaeb35bbe0000932e6ed8a16d1f52ab368775bc49b26da1a10ccee5"
+        "hash": "33cb0aab254c8397b39bbdf0490727bac8aa7f6e983e70e8f25f8d4bd0f842c4"
       },
       {
         "path": "/static/js/emoji.js",
-        "hash": "c3aef301e0151c503d001f919db0db69d05283a2c3779452fb89af664b0b52ff"
+        "hash": "7a0a88c0b11759cd9d9603fa375b05ec22d82f231ed357d2532f5d3bfb8b3e68"
       },
       {
         "path": "/static/js/homepage.js",
-        "hash": "6b3d27842422a4f7fdc80e255360a9754bc54ab122b7d841a4277b5b651846e9"
+        "hash": "a7b134ac0fe6bd0ad9f43327f0347fae0b81d7bbd0de2dd704943fb7b3375a21"
       },
       {
         "path": "/static/js/identity.js",
-        "hash": "9b27f881f49ac5fd7e1f287e759c577ef7523ebfee5671ad0ce3fa907c8d3a3e"
+        "hash": "a461ec3cfda280b01539e6ec21b6ce4ebc50814b060b3f1e8f3534c900635221"
       },
       {
         "path": "/static/js/legal.js",
-        "hash": "7fe319127b68de2349832590bca754034c5cab562a5c70f82e267ae737433ff9"
+        "hash": "ff498142d34c9a9683293ac8d18a0630ba742e172bf55ee1171de1043e08fc5b"
       },
       {
         "path": "/static/js/login.js",
@@ -55,7 +55,7 @@
       },
       {
         "path": "/static/js/login-stash.js",
-        "hash": "0c3e15daab61eaafbf1503faea3cac435b3b4c0e317e2028e6de9eb5f6fac688"
+        "hash": "9d95571d0c8fe8d1405ffbaf6f18a855e02a976a2d714162e5b60526dc1e7a58"
       },
       {
         "path": "/static/js/nicknames.js",
@@ -63,153 +63,45 @@
       },
       {
         "path": "/static/js/pow.js",
-        "hash": "e23c83920e34d0b9579328b4cc2f906c826187aa446239dea38dc95ae1554597"
+        "hash": "74f9a57c7e4653456c0a447a5290cd3f3491023866fb19bb48d083c8d4a752a4"
       },
       {
         "path": "/static/js/theme.js",
-        "hash": "bdcf37302df9955a1706762415c6e2f9c13912027e76b0847dc8c4af2593e340"
+        "hash": "2053e9d7a738f745ea7d8c34d5442648b39199fbfb0ca29639736940e770d97d"
       },
       {
         "path": "/static/js/websocket.js",
-        "hash": "203710c2d3592d47d8564e1702605ba9ef21d093f6f3c547636b7c9ec1346671"
+        "hash": "8163d4219313006c942a1ecaf60a832f097d239fce1d9fc762a049bc433b3b16"
       },
       {
         "path": "/static/js/debug.js",
         "hash": "9d8df390554a17bc7a2956d6ab59b0707ab863f83c3b5d223a62c015f883b09f"
       },
       {
-        "path": "/static/js/mls/codec.js",
-        "hash": "54ae5b8eecbc2a753df1dc6a4fc270ffd6290d78d47b604a72e702404bea4cf8"
-      },
-      {
-        "path": "/static/js/mls/tree-math.js",
-        "hash": "c26a3ce986f46bee5dfd7a4043905b756073278b9135d648ab385040ffbb552e"
-      },
-      {
-        "path": "/static/js/mls/p256.js",
-        "hash": "8cc749d0c4935877a463bdd000f9b95d88711d230ecca2b36f6a4f3f66119eba"
-      },
-      {
-        "path": "/static/js/mls/ciphersuite.js",
-        "hash": "7d67e4c8e4afcb8492ccb8cbc82562d4d05e549c63471992d0590f818d526fd7"
-      },
-      {
-        "path": "/static/js/mls/hpke.js",
-        "hash": "71c6089586c86ae725b78dc254cd1070ad5d5bf62bbf6e60013b6ba180384522"
-      },
-      {
-        "path": "/static/js/mls/signature.js",
-        "hash": "b1c5af2d1b2da9752a14e92ad85f9782e638d0ee7380aae68afd511e3daee6db"
-      },
-      {
-        "path": "/static/js/mls/labeled.js",
-        "hash": "c3376a248485dbe1576bc1044acf347a67e2f9c17c2813bcda3b8ac2fcf19c32"
-      },
-      {
-        "path": "/static/js/mls/key-schedule.js",
-        "hash": "3bde1ab50c5eeb464debc074a63ef6efccbd241def080f09c26305aa98047fb2"
-      },
-      {
-        "path": "/static/js/mls/transcript-hashes.js",
-        "hash": "4c8e96daebd03f7eff0df4ebe2a94861aa2ef6c416983198cd8df283234e28f3"
-      },
-      {
-        "path": "/static/js/mls/nodes.js",
-        "hash": "0f012a87d9a70f80c9752fd7ce64bb876e92881b5cece2311039bed4f78aea31"
-      },
-      {
-        "path": "/static/js/mls/tree-hash.js",
-        "hash": "11e8212556af4309fa39093ca5c6d3d504cff819de2ed92f37a448d7bffa06f5"
-      },
-      {
-        "path": "/static/js/mls/parent-hash.js",
-        "hash": "13a4339f5c239c486bc9c5ebfe49a19ff2da212529b6bf93a14386a6f42c6cf6"
-      },
-      {
-        "path": "/static/js/mls/ratchet-tree.js",
-        "hash": "ea36a0596d7ece7c009990bdd3bd002bd83c2dedaf31eb572462459bab3f1093"
-      },
-      {
-        "path": "/static/js/mls/tree-kem.js",
-        "hash": "bdb55a33e3233580c5b157992575e4d1eafe40eb9e7547e80944fac446f5744c"
-      },
-      {
-        "path": "/static/js/mls/group-context.js",
-        "hash": "5976ff745876c257a6d7bd8b51ef98a9a2e6d7e54c1c047ae8fb4798c4cf594d"
-      },
-      {
-        "path": "/static/js/mls/key-package.js",
-        "hash": "f0c4deb48ff02f516af3f1790ca5959a226294e66bce9e6a417140f5cd8f1f89"
-      },
-      {
-        "path": "/static/js/mls/mls-message.js",
-        "hash": "9e7ddf6fd50901be3ab74bf306a326c95c59d9063c606fdbda542961f20fb7d8"
-      },
-      {
-        "path": "/static/js/mls/group-info.js",
-        "hash": "9313e6ff9d27549fcb3bd8768fb358c272bec7f94b74f5a766fbc72e21c823be"
-      },
-      {
-        "path": "/static/js/mls/welcome.js",
-        "hash": "c4510e53078fa402adcf2be1b8a03d32aeb2c5e09b84e74a3943e9a786762ea6"
-      },
-      {
-        "path": "/static/js/mls/framing.js",
-        "hash": "973ca9ace60275c8aa8f588d823b02b093ec3e9f7d38dbf82b413f391747dd42"
-      },
-      {
-        "path": "/static/js/mls/proposal.js",
-        "hash": "0356cace2929f0d118c05a816e044bd5f027ee8c8562eb716d011b479f74d455"
-      },
-      {
-        "path": "/static/js/mls/commit.js",
-        "hash": "a834be1ad64c542ff942cbebdb2615c890de80da297416bcc132c9297e359870"
-      },
-      {
-        "path": "/static/js/mls/public-message.js",
-        "hash": "08899e6ee72757e9357aafc5ffa12a55dd2c46a4fda80cc73f438c071a1851d8"
-      },
-      {
-        "path": "/static/js/mls/secret-tree.js",
-        "hash": "dcceec75bb4a308db6f107d16620dc360aa8b3cce3e28cac6b83fb435b62fe54"
-      },
-      {
-        "path": "/static/js/mls/private-message.js",
-        "hash": "06c306b0e07387c44f75f4267dabb99b3056822a18e63cbbccf3264614995e80"
-      },
-      {
-        "path": "/static/js/mls/group.js",
-        "hash": "4f07b49fb12a28875bd6c378710d416f9aae5740874d9c3f92b98520af4c2735"
-      },
-      {
-        "path": "/static/js/mls-session.js",
-        "hash": "51ba56c5393d5ed3061f2d5f3a902aab56ff45fd9c819641b1cca3a37ab5ae70"
-      },
-      {
         "path": "/static/index.html",
-        "hash": "3252f557c830a97597ed235f26c6bc01713d0edef3f166870abcab1aea49078f"
+        "hash": "ad37d8c2059853fff60657978c70de991f79be31a23a23838760e9a6f08b9654"
       },
       {
         "path": "/static/login.html",
-        "hash": "0896ba07fa04e4a8b68310311591449124d5b79daeec53dea457d76882404cb5"
+        "hash": "37b18b69d2226947bb5c7c88a2a74f45f72b67da3575c7f6d1af7f268a9141ab"
       },
       {
         "path": "/static/chat.html",
-        "hash": "4495a5ca46d0a43caeac60b7a58783d5cc2bb3609b85459f036c550fe65685f8"
+        "hash": "2f9e07c1f57ced7a6d9534570fb85a054b059fd990c4fd74f69d28f32bdf0e0d"
       },
       {
         "path": "/static/terms.html",
-        "hash": "8457709f2db604845542591b17719a3d68d1d76102a7c8b8c4ad371602160a8f"
+        "hash": "e1537858c8168bf57704e28266809d8024424f154d1b34243af084049564a926"
       },
       {
         "path": "/static/privacy.html",
-        "hash": "43800aea69a3bc61f5eb5b14972f232484bf43b7e057bf68b55abc8b32d81d93"
+        "hash": "1de7ccc535c0684548794cd2116f81cf25b638a4c5467af3558c2b813c40cd5a"
       },
       {
         "path": "/static/operator.json",
-        "hash": "8661ebd78776c6b7032502f92c1ff65c559fbff75ea3599dff85365a0a1e41e1"
+        "hash": "6ba2bc734b34fe4a68866fa5b8cfc4f46c7a2ce3050fdef58e4c46f7e039f21f"
       }
     ]
   },
-  "signature": "MEYCIQChfhS2GKlP2LW62z/aZxtLcYUW2AHDW6qmlADRH9qO3AIhAOWrH8IXIU9BFbgeodcFdONA3EGrQboue5GS2GYlI2VD"
+  "signature": "MEUCIQCnU85osVnCKU78IA13lo7iSNcBwS1MIdDA6c3i8X2vIQIgWzZ3oUtlFxHDBQa81Zy2c1l02o9vF6hyhd6Zpo4WUmM="
 }

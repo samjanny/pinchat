@@ -7,9 +7,9 @@
  *   - MLSMessage framing: welcome.json stores `key_package` as an
  *     MLSMessage(mls_key_package). We parse the framing and verify the
  *     wire_format and version.
- *   - KeyPackage struct round-trip: bytes → struct → bytes must match.
+ *   - KeyPackage struct round-trip: bytes -> struct -> bytes must match.
  *   - KeyPackage signature: the signature carried in the KeyPackage is a
- *     SignWithLabel("KeyPackageTBS", …) produced by the leaf's
+ *     SignWithLabel("KeyPackageTBS", ...) produced by the leaf's
  *     signature_key; importing that signature key and verifying must
  *     return true.
  *   - keyPackageRef: RefHash("MLS 1.0 KeyPackage Reference", kp_bytes) is
@@ -38,7 +38,7 @@ function assert(cond, name, detail) {
         console.log(`  OK   ${name}`);
         passed += 1;
     } else {
-        console.log(`  FAIL ${name}${detail ? `  — ${detail}` : ''}`);
+        console.log(`  FAIL ${name}${detail ? `  - ${detail}` : ''}`);
         failed += 1;
     }
 }
@@ -56,7 +56,7 @@ async function main() {
     // ---------------------------------------------------------------------
     // KeyPackage from welcome.json (cipher_suite=2)
     // ---------------------------------------------------------------------
-    console.log('# KeyPackage — welcome.json cs=2');
+    console.log('# KeyPackage - welcome.json cs=2');
     {
         const v = WELCOME_VECTORS.find((x) => x.cipher_suite === 2);
         const wrapped = hexDecode(v.key_package);
@@ -98,7 +98,7 @@ async function main() {
     // ---------------------------------------------------------------------
     // GroupContext round-trip vs key-schedule.json (cs=2)
     // ---------------------------------------------------------------------
-    console.log('# GroupContext — key-schedule.json cs=2');
+    console.log('# GroupContext - key-schedule.json cs=2');
     {
         const v = KEY_SCHEDULE_VECTORS.find((x) => x.cipher_suite === 2);
         for (let i = 0; i < v.epochs.length; i += 1) {

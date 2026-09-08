@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 /**
- * MLS Group orchestrator — steady-state application message flow.
+ * MLS Group orchestrator - steady-state application message flow.
  *
  * This commit lands Group.create + encrypt/decrypt but not yet the
  * Add/Commit/Welcome epoch-transition path, so two-member tests need to
@@ -12,7 +12,7 @@
  *      ratchet tree (skipping UpdatePath cryptography), then derive the
  *      epoch-0 secrets one more time so Alice is aware of the 2-leaf
  *      shape.
- *   3. Bob gets the same state via Group.fromState() — this mirrors
+ *   3. Bob gets the same state via Group.fromState() - this mirrors
  *      what a Welcome would give him once the Add/Commit/Welcome flow
  *      lands. The init_secret used for derivation has to match on both
  *      sides, so we capture Alice's and reuse it for Bob.
@@ -44,7 +44,7 @@ function assert(cond, name, detail) {
         console.log(`  OK   ${name}`);
         passed += 1;
     } else {
-        console.log(`  FAIL ${name}${detail ? `  — ${detail}` : ''}`);
+        console.log(`  FAIL ${name}${detail ? `  - ${detail}` : ''}`);
         failed += 1;
     }
 }
@@ -104,17 +104,17 @@ async function buildSynthetic2LeafGroup() {
         bobId.signaturePrivateKey, bobLeaf,
     );
 
-    // Grow Alice's tree: width goes from 1 → 3 (leaf 0, parent 1, leaf 2).
+    // Grow Alice's tree: width goes from 1 -> 3 (leaf 0, parent 1, leaf 2).
     initialAlice.ratchetTree = [
-        initialAlice.ratchetTree[0], // leaf 0 — Alice
-        null,                        // parent 1 — blank (would be set by Commit)
+        initialAlice.ratchetTree[0], // leaf 0 - Alice
+        null,                        // parent 1 - blank (would be set by Commit)
         { nodeType: Nodes.NodeType.LEAF, leaf: bobLeaf },
     ];
     initialAlice.nLeaves = 2;
     initialAlice.treeHash = await TreeHash.hashRoot(initialAlice.ratchetTree);
 
     // Re-derive epoch 0 with the new group_context (tree_hash changed).
-    // init_secret, commit_secret, psk_secret are all zero here — the
+    // init_secret, commit_secret, psk_secret are all zero here - the
     // point is just that Alice and Bob end up with identical epoch
     // secrets, so any shared-zero seed works.
     const initSecretSeed = new Uint8Array(HPKE.Nh);
@@ -170,7 +170,7 @@ async function buildSynthetic2LeafGroup() {
 }
 
 async function main() {
-    console.log('# Group.create — single-leaf group basic sanity');
+    console.log('# Group.create - single-leaf group basic sanity');
     {
         const identity = await freshIdentity();
         const group = await Group.Group.create({ identity });
@@ -206,11 +206,11 @@ async function main() {
         const pt = (await receiver.decryptApplicationMessage(ct)).plaintext;
         assert(
             new TextDecoder().decode(pt) === 'hello self',
-            'single-leaf loopback encrypt → decrypt'
+            'single-leaf loopback encrypt -> decrypt'
         );
     }
 
-    console.log('# Group — send ratchet advances only after encryption succeeds');
+    console.log('# Group - send ratchet advances only after encryption succeeds');
     {
         const { alice } = await buildSynthetic2LeafGroup();
         const before = receiveStateSnapshot(alice);
@@ -239,7 +239,7 @@ async function main() {
         'successful retry consumes the original generation exactly once');
     }
 
-    console.log('# Group — Alice ↔ Bob application messages (synthesised 2-leaf)');
+    console.log('# Group - Alice ↔ Bob application messages (synthesised 2-leaf)');
     {
         const { alice, bob } = await buildSynthetic2LeafGroup();
 
@@ -249,19 +249,19 @@ async function main() {
             'Alice and Bob share epoch_authenticator'
         );
 
-        // Alice → Bob
+        // Alice -> Bob
         const m1 = 'hey bob from alice';
         const wire1 = await alice.encryptApplicationMessage(m1);
         const got1 = new TextDecoder().decode((await bob.decryptApplicationMessage(wire1)).plaintext);
-        assert(got1 === m1, 'Alice → Bob message 0 decrypts');
+        assert(got1 === m1, 'Alice -> Bob message 0 decrypts');
 
-        // Bob → Alice
+        // Bob -> Alice
         const m2 = 'hey alice from bob';
         const wire2 = await bob.encryptApplicationMessage(m2);
         const got2 = new TextDecoder().decode((await alice.decryptApplicationMessage(wire2)).plaintext);
-        assert(got2 === m2, 'Bob → Alice message 0 decrypts');
+        assert(got2 === m2, 'Bob -> Alice message 0 decrypts');
 
-        // Sequential messages — generation chain advances.
+        // Sequential messages - generation chain advances.
         const messages = ['one', 'two', 'three', 'four'];
         const wires = [];
         for (const m of messages) {

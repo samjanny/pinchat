@@ -1,13 +1,13 @@
 /**
- * PinChat MLS — stateful Group orchestrator (RFC 9420 §§8, 12, 6.3).
+ * PinChat MLS - stateful Group orchestrator (RFC 9420 §§8, 12, 6.3).
  *
  * This module ties together the bottom-layer primitives into a
  * member-facing API:
  *
- *   Group.create({ identity, groupId? })                 → Group
- *   Group.joinFromEpochState(state)                       → Group
- *   group.encryptApplicationMessage(plaintext)            → MLSMessage bytes
- *   group.decryptApplicationMessage(mlsMessageBytes)      → { plaintext,
+ *   Group.create({ identity, groupId? })                 -> Group
+ *   Group.joinFromEpochState(state)                       -> Group
+ *   group.encryptApplicationMessage(plaintext)            -> MLSMessage bytes
+ *   group.decryptApplicationMessage(mlsMessageBytes)      -> { plaintext,
  *                                                             senderLeafIndex }
  *
  * Scope
@@ -15,7 +15,7 @@
  * This commit lands the *steady-state* part: creating a 1-leaf group,
  * ingesting an externally-built state, and encrypting / decrypting
  * application messages against the current epoch. The Add+Commit+Welcome
- * flow (which advances the epoch) is implemented in a follow-up — it
+ * flow (which advances the epoch) is implemented in a follow-up - it
  * needs UpdatePath encryption cryptography that is substantial enough
  * to keep separate.
  *
@@ -29,7 +29,7 @@
  *   myLeafIndex         : our leaf position
  *   identity            : { signaturePrivateKey, signaturePublicKeyBytes }
  *   leafKeyPair         : our leaf's HPKE init keypair (from the
- *                         KeyPackage we published — used for Welcome
+ *                         KeyPackage we published - used for Welcome
  *                         decryption; not rotated per message)
  *   senderRatchetGeneration
  *                       : next app-message generation to send, per
@@ -46,7 +46,7 @@
  * Random sources
  * --------------
  * All "random" inputs (group_id default, reuse_guard, etc.) flow from
- * WebCrypto's crypto.getRandomValues — the same CSPRNG the 1:1
+ * WebCrypto's crypto.getRandomValues - the same CSPRNG the 1:1
  * protocol already relies on.
  */
 (function (root, factory) {
@@ -458,7 +458,7 @@
             }
             // Hard cap: if a sender exhausts more than 4096 distinct
             // generations within one epoch, drop the oldest (smallest)
-            // entries. In practice we're nowhere near this — generations
+            // entries. In practice we're nowhere near this - generations
             // are reset on every commit.
             if (set.size >= 4096) {
                 const sorted = [...set].sort((a, b) => a - b);
@@ -1127,7 +1127,7 @@
                 // The legitimate sender increments senderRatchetGeneration once
                 // per send, so seeing the same (leaf, gen) twice means either
                 // a relay-level retransmission or an attacker replaying a
-                // captured ciphertext — both must be dropped to preserve
+                // captured ciphertext - both must be dropped to preserve
                 // AES-GCM nonce uniqueness guarantees.
                 if (this._isGenerationConsumed(senderLeafIndex, generation)) {
                     throw new Error(
@@ -1283,10 +1283,10 @@
     }
 
     // ------------------------------------------------------------------
-    // Add/Commit/Welcome flow — generic for N-leaf groups.
+    // Add/Commit/Welcome flow - generic for N-leaf groups.
     //
     // The committer invokes
-    //   alice.commitAddMember({ keyPackageBytes }) → { commitMessage,
+    //   alice.commitAddMember({ keyPackageBytes }) -> { commitMessage,
     //                                                 welcomeMessage }
     // New member invokes
     //   Group.joinFromWelcomeWithTree({ welcomeMessage, ... })
@@ -1300,7 +1300,7 @@
     // Tree growth: new members are always appended at the next free leaf
     // (newLeafIndex = nLeaves). The ratchet tree is padded to the new
     // node-width on each Add. Parent nodes that are NOT on the
-    // committer's direct path stay blank — TreeKEM resolution recurses
+    // committer's direct path stay blank - TreeKEM resolution recurses
     // through them automatically.
     //
     // Every Commit stamps the committer's parent-hash chain (§7.9).
@@ -1588,7 +1588,7 @@
         // ---- 6. Encrypt each path_secret to resolution(copath_sibling) ----
         // For each parent on the committer's direct path, encrypt that
         // parent's path_secret to every node in the resolution of the
-        // copath sibling. The new member's leaf is excluded — they
+        // copath sibling. The new member's leaf is excluded - they
         // receive their copy via the Welcome's group_secrets.path_secret
         // at the LCA between the committer and their leaf.
         const newLeafNodeIdx = TreeMath.leafToNode(newLeafIndex);
@@ -1718,7 +1718,7 @@
         const encryptedGroupInfo = await Welcome.sealEncryptedGroupInfo(wKey, wNonce, giBytes);
 
         // The path_secret to ship in the Welcome is the chain entry at
-        // the LCA of the committer and the new leaf — i.e. the lowest
+        // the LCA of the committer and the new leaf - i.e. the lowest
         // direct-path entry whose subtree contains the new leaf.
         let lcaIndexForNewMember = -1;
         for (let i = 0; i < committerDirectPath.length; i += 1) {
@@ -1785,13 +1785,13 @@
             publicKeyBytes: leafNodePair.keyPair.publicKeyBytes,
         };
         // Replace parent keypairs wholesale with the freshly-derived
-        // entries — anything not on our new direct path is unreachable
+        // entries - anything not on our new direct path is unreachable
         // and only weakens forward secrecy by lingering in memory.
         this.parentKeyPairs = new Map();
         for (let i = 0; i < committerDirectPath.length; i += 1) {
             this.parentKeyPairs.set(committerDirectPath[i], chain[i].keyPair);
         }
-        // Replay protection state is per-epoch — every commit advances
+        // Replay protection state is per-epoch - every commit advances
         // the epoch and re-keys the secret tree, so old generations no
         // longer collide with anything new. The old consumed set and
         // chain states now live in the grace-window snapshot; fresh
@@ -1819,7 +1819,7 @@
      * Commit a Remove proposal: blank the target leaf, blank every
      * parent on its direct path, then re-key the committer's direct
      * path so the removed member can no longer derive any subsequent
-     * epoch secret. Returns { commitMessage } (no Welcome — Remove
+     * epoch secret. Returns { commitMessage } (no Welcome - Remove
      * doesn't admit anyone). The removed leaf's index slot stays in
      * place (we don't prune the tree); other members converge to the
      * same blanked-tree shape via processCommit.
@@ -2803,7 +2803,7 @@
         // Verify the committer's NEW LeafNode is properly signed by the
         // same identity key that signed the FramedContent. Without this
         // check, a malicious party who somehow holds the committer's
-        // signing key (or a relay that forged FramedContentTBS — already
+        // signing key (or a relay that forged FramedContentTBS - already
         // rejected above) could splice in a leaf with an attacker-
         // controlled encryption_key.
         await verifyCommitLeafBinding(
@@ -3089,7 +3089,7 @@
         // Forward secrecy: keep only entries that are on our direct
         // path in the new tree. Any prior entry not in this set was
         // either a node-of-no-current-relevance (tree grew past it) or
-        // got re-keyed in this commit — either way, the old keypair
+        // got re-keyed in this commit - either way, the old keypair
         // shouldn't survive the epoch transition.
         const myNewDirectPath = TreeMath.directPathWithRoot(
             TreeMath.leafToNode(this.myLeafIndex), newNLeaves,
@@ -3099,13 +3099,13 @@
             if (newParentKeyPairs.has(nodeIdx)) {
                 survivors.set(nodeIdx, newParentKeyPairs.get(nodeIdx));
             } else if (this.parentKeyPairs && this.parentKeyPairs.has(nodeIdx)) {
-                // Below LCA — committer didn't re-key this node, but it's
+                // Below LCA - committer didn't re-key this node, but it's
                 // still on our path so we need the previously-known key.
                 survivors.set(nodeIdx, this.parentKeyPairs.get(nodeIdx));
             }
         }
         this.parentKeyPairs = survivors;
-        // Replay protection state is per-epoch — drop the consumed
+        // Replay protection state is per-epoch - drop the consumed
         // generations now that we've advanced past the epoch they
         // applied to. The old consumed set and chain states now live in
         // the grace-window snapshot; fresh maps start the new epoch.
@@ -3158,7 +3158,7 @@
      *   keyPackageBytes   : our published KeyPackage's serialised bytes
      *   initPrivateKey    : ECDH CryptoKey matching keyPackage.init_key
      *   identity          : our signature identity (as in Group.create)
-     *   leafEncKeyPair    : the full HPKE keypair for the leaf — the
+     *   leafEncKeyPair    : the full HPKE keypair for the leaf - the
      *                       distinct encryption_key advertised by the
      *                       KeyPackage LeafNode
      *   ratchetTreeBytes  : serialised tree (out-of-band from Welcome)
@@ -3644,7 +3644,7 @@
     /**
      * Verify a KeyPackage's two signatures: the inner LeafNode (signed
      * with source = KEY_PACKAGE, so the TBS is just the LeafNode bytes)
-     * and the outer KeyPackageTBS. Both use the leaf's signature_key —
+     * and the outer KeyPackageTBS. Both use the leaf's signature_key -
      * our credential model identifies a member by their signature key,
      * so a forgery would have to forge ECDSA-P-256.
      *
@@ -3711,7 +3711,7 @@
      * Verify a COMMIT-source LeafNode: the TBS includes group_id and
      * leaf_index appended after the LeafNode body. The signing key in
      * the new leaf must match the OLD leaf's signing key (we don't
-     * support identity rotation in this MVP) — that ties the commit's
+     * support identity rotation in this MVP) - that ties the commit's
      * new leaf back to the same member who signed the FramedContent.
      */
     async function verifyCommitLeafBinding(

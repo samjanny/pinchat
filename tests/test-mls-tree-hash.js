@@ -10,7 +10,7 @@
  *   3. Compute tree_hash for every node and compare to the vector's
  *      `tree_hashes` array.
  *
- * tree-validation.json also carries a `resolutions` array per node — the
+ * tree-validation.json also carries a `resolutions` array per node - the
  * resolution check is handled by the ratchet-tree module once it lands.
  */
 
@@ -27,7 +27,7 @@ function assert(cond, name, detail) {
         passed += 1;
     } else {
         failed += 1;
-        console.log(`  FAIL ${name}${detail ? `  — ${detail}` : ''}`);
+        console.log(`  FAIL ${name}${detail ? `  - ${detail}` : ''}`);
     }
 }
 
@@ -42,7 +42,7 @@ function hex(u8) {
 
 async function main() {
     const cs2 = VECTORS.filter((v) => v.cipher_suite === 2);
-    console.log(`# tree-hash — cipher_suite=2 (${cs2.length} trees)`);
+    console.log(`# tree-hash - cipher_suite=2 (${cs2.length} trees)`);
 
     for (let i = 0; i < cs2.length; i += 1) {
         const v = cs2[i];
@@ -56,7 +56,7 @@ async function main() {
             `entry ${i}: ratchet-tree round-trip (${parsed.length} wire nodes)`
         );
 
-        // 2. Pad to full node_width for hashing — the IETF tree_hashes
+        // 2. Pad to full node_width for hashing - the IETF tree_hashes
         //    array is always sized to node_width(nLeaves).
         const tree = Nodes.padRatchetTree(parsed, v.tree_hashes.length);
 

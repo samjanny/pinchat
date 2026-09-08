@@ -20,7 +20,7 @@ function assert(condition, name, detail = '') {
         console.log(`  OK   ${name}`);
         passed += 1;
     } else {
-        console.log(`  FAIL ${name}${detail ? ` — ${detail}` : ''}`);
+        console.log(`  FAIL ${name}${detail ? ` - ${detail}` : ''}`);
         failed += 1;
     }
 }
@@ -66,6 +66,15 @@ global.document = {
         if (name === 'alpine:init') callback();
     },
 };
+
+// chat.html loads crypto.js before app.js, so isAllowedImageMimeType is a
+// shared global there. Under CommonJS each file gets its own scope, so publish
+// the real helper the same way the page does instead of letting app.js fall
+// back to something laxer: this check decides which decoded blobs get an
+// object URL.
+global.isAllowedImageMimeType =
+    require(path.join(__dirname, '..', 'static', 'js', 'crypto.js'))
+        .isAllowedImageMimeType;
 
 require(path.join(__dirname, '..', 'static', 'js', 'app.js'));
 

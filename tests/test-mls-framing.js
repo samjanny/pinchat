@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 /**
- * MLS framing — synthetic round-trip tests for FramedContent +
+ * MLS framing - synthetic round-trip tests for FramedContent +
  * FramedContentAuthData + AuthenticatedContent.
  *
  * This commit lands the framing layer with application-content support
@@ -29,7 +29,7 @@ function assert(cond, name, detail) {
         console.log(`  OK   ${name}`);
         passed += 1;
     } else {
-        console.log(`  FAIL ${name}${detail ? `  — ${detail}` : ''}`);
+        console.log(`  FAIL ${name}${detail ? `  - ${detail}` : ''}`);
         failed += 1;
     }
 }
@@ -43,7 +43,7 @@ function makeBytes(n, start = 0) {
 }
 
 function main() {
-    console.log('# framing — Sender encoding');
+    console.log('# framing - Sender encoding');
     const senders = [
         { senderType: Framing.SenderType.MEMBER, leafIndex: 7 },
         { senderType: Framing.SenderType.EXTERNAL, senderIndex: 42 },
@@ -61,7 +61,7 @@ function main() {
         );
     }
 
-    console.log('# framing — FramedContent(application) round-trip');
+    console.log('# framing - FramedContent(application) round-trip');
     {
         const fc = {
             groupId: makeBytes(16),
@@ -89,7 +89,7 @@ function main() {
         );
     }
 
-    console.log('# framing — FramedContentAuthData (commit vs non-commit tail)');
+    console.log('# framing - FramedContentAuthData (commit vs non-commit tail)');
     {
         // Non-commit: signature only.
         const encAppl = new Codec.Encoder();
@@ -121,7 +121,7 @@ function main() {
         );
     }
 
-    console.log('# framing — AuthenticatedContent round-trip (application)');
+    console.log('# framing - AuthenticatedContent round-trip (application)');
     {
         const ac = {
             wireFormat: 0x0001,
@@ -155,7 +155,7 @@ function main() {
         assert(hex(roundtrip) === hex(bytes), 'ac bytes round-trip');
     }
 
-    console.log('# framing — AuthenticatedContent with callback payload parser (commit)');
+    console.log('# framing - AuthenticatedContent with callback payload parser (commit)');
     {
         // A commit body of 10 arbitrary bytes, plus signature+conf_tag.
         const commitBody = makeBytes(10, 0xee);

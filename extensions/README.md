@@ -1,24 +1,26 @@
 # PinChat Integrity Verifier Browser Extensions
 
-Browser extensions that verify the integrity of files served by pinchat.io using Subresource Integrity (SRI) verification.
+Browser extensions that prevent unapproved scripts from executing on pinchat.io and verify served files using Subresource Integrity (SRI).
 
 ## How It Works
 
-The extension uses a defense-in-depth approach combining SRI with signed manifests:
+The extension uses a defense-in-depth approach combining a packaged CSP, SRI, and signed manifests:
 
-1. **Manifest Verification**: Extension fetches signed hash list from GitHub
-2. **Signature Verification**: Verifies ECDSA P-256 signature using embedded public key
-3. **SRI DOM Verification**: Content script checks that all `<script>` and `<link>` tags in the actual page DOM have correct `integrity` attributes matching the signed manifest
-4. **Browser Enforcement**: Browser natively enforces SRI - blocks any file that doesn't match its integrity hash
-5. **Visual Feedback**: Green checkmark if verified, red warning overlay if issues detected
+1. **Preventive CSP**: A static Declarative Net Request rule replaces the response CSP before parsing. Each official page gets only its signed script hashes; unknown paths get `script-src 'none'`.
+2. **Manifest Verification**: Extension fetches the signed hash list from GitHub.
+3. **Signature Verification**: Verifies its ECDSA P-256 signature using the embedded public key.
+4. **SRI DOM Verification**: Content script checks that all `<script>` and `<link>` tags in the actual page DOM have correct `integrity` attributes matching the signed manifest.
+5. **Browser Enforcement**: CSP + SRI block injected or modified scripts before execution.
+6. **Visual Feedback**: Green checkmark if verified, red warning overlay if issues are detected.
 
 ### Why SRI?
 
 Previous approach (separate fetches) was vulnerable to bypass attacks: a compromised server could serve clean files to the extension while serving malicious code to the browser.
 
-With SRI:
+With the preventive CSP and SRI:
 - The `integrity` attribute is hardcoded in HTML files
-- Browser refuses to execute any JS/CSS that doesn't match the hash
+- The extension-packaged CSP does not trust `'self'` for scripts and permits only per-page signed hashes
+- Browser refuses to execute injected scripts or JS that does not match the permitted hash
 - Extension verifies the HTML contains correct integrity attributes
 - Both the manifest AND integrity values are signed/verified
 
@@ -69,19 +71,21 @@ node generate-hashes.js --private-key private.pem --dry-run
 
 ```bash
 # Add both HTML files (with SRI) and signed manifest
-git add static/*.html hashes.json.signed
+git add static/*.html hashes.json.signed extensions/chrome/rules.json extensions/firefox/rules.json
 git commit -m "Update SRI attributes and signed hash list"
 git push
 ```
 
 The extensions fetch the manifest from the immutable release tag configured by
-`GITHUB_TAG` in both background scripts. For the handshake-v2 release this is:
-`https://raw.githubusercontent.com/samjanny/pinchat/v0.6.0/hashes.json.signed`.
+`GITHUB_TAG` in both background scripts. For the current security release this is:
+`https://raw.githubusercontent.com/samjanny/pinchat/v0.6.1/hashes.json.signed`.
 
 On every extension release, update both background scripts to the new tag,
 raise `MIN_KNOWN_SEQUENCE` to the signed manifest sequence, and bump both
 extension manifest versions. The release tag must contain the exact signed
-manifest before the extensions are published.
+manifest before the extensions are published. `generate-hashes.js` also
+regenerates `chrome/rules.json` and `firefox/rules.json` from that exact signed
+manifest; commit those files with the release.
 
 ### 5. Generate Icon PNGs
 
@@ -113,7 +117,45 @@ Or manually convert `chrome/icons/icon.svg` to PNG files:
 2. Click "Load Temporary Add-on..."
 3. Select `firefox/manifest.json`
 
-For permanent Firefox installation, the extension needs to be signed by Mozilla.
+A temporary add-on is removed when Firefox restarts. A permanent install needs
+a package signed by Mozilla; see Packaging below.
+
+## Packaging
+
+Store packages are built from a committed tree, never from the working
+directory:
+
+```bash
+extensions/package.sh            # package HEAD
+extensions/package.sh v0.7.2     # package a specific tag
+```
+
+The script writes `dist/pinchat-verifier-<browser>-<version>.zip` and prints a
+SHA-256 for each, so a published package can be checked against a local
+rebuild.
+
+It uses `git archive`, which has three properties that matter here. The output
+is reproducible from the repository by anyone. Only tracked files are included,
+so Chromium's `_metadata/` directory (written whenever the folder is loaded
+unpacked, and a reserved name in extensions) cannot leak into a release.
+And `manifest.json` lands at the archive root, which is what both stores
+require.
+
+Before building, the script checks that both browsers agree on `GITHUB_TAG`,
+`MIN_KNOWN_SEQUENCE` and the manifest version, that the pinned tag exists, and
+that its signed manifest is at or above the floor. That last check matters:
+store review takes days, and a build whose floor sits above the sequence at
+its own tag rejects every manifest it can fetch.
+
+### Release order
+
+Cut and push the release tag first, then submit to the stores. The extension
+fetches its manifest from the pinned tag, so a build that goes live before the
+tag exists leaves every fresh install in an error state, with no cached
+manifest to fall back on.
+
+Auto-update on both stores is driven by one thing only: a higher `version` in
+`manifest.json`. Bump it in both browsers, in the same commit.
 
 ## Extension Behavior
 
@@ -121,7 +163,7 @@ For permanent Firefox installation, the extension needs to be signed by Mozilla.
 
 | Badge | Meaning |
 |-------|---------|
-| ✓ (green) | Manifest signature verified, SRI attributes checked |
+| green tick | Manifest signature verified, SRI attributes checked |
 | ! (red) | Verification failed - possible compromise |
 | ? (yellow) | Error fetching/verifying manifest |
 | ... (blue) | Verification in progress |
@@ -150,7 +192,7 @@ If verification fails, a full-screen red overlay appears with:
 
 ### Verification Approach
 
-The extension uses a **dual verification** approach:
+The extension uses prevention plus two verification paths:
 
 1. **DOM SRI Check**: Verifies that all `<script>` and `<link>` tags have correct `integrity` attributes matching the signed manifest
 2. **File Hash Verification**: Fetches ALL files listed in the manifest (not just those in DOM) and computes their SHA-256 hashes to detect tampering
@@ -175,13 +217,41 @@ The manifest includes an incrementing `sequence` number to prevent replay attack
 | New manifest (sequence >= stored) | Accept, update stored |
 | Old manifest (sequence < stored) | **REJECT - Downgrade attack** |
 | Storage cleared | Like first install (acceptable risk) |
+| Manifest host unreachable | Fall back to the cached copy, re-validated |
+| Cached copy fails re-validation | Drop it and report an error |
 
 ### Verification Interval
 
 The extension verifies integrity:
 - On extension install/update
-- Every 5 minutes (configurable in `CONFIG.CHECK_INTERVAL_MINUTES`)
-- When manually triggered via popup
+- On every navigation to pinchat.io
+- On the `CONFIG.CHECK_INTERVAL_MINUTES` alarm (default 5 minutes), but only
+  while a pinchat.io tab is open, or while no usable manifest is cached yet
+- When manually triggered via the popup, which always re-fetches
+
+The alarm is gated on purpose. An unconditional timer means every install
+contacts the manifest host every few minutes for the life of the profile,
+which tells that host and every network observer in between that this
+browser runs the extension and roughly when. An idle extension has nothing
+to verify, so it stays silent. Two consecutive live fetches are also kept at
+least 60 seconds apart (`MIN_LIVE_FETCH_INTERVAL_MS`).
+
+### Offline and Blocked-Network Behaviour
+
+The last manifest that passed both the signature and the sequence gate is
+kept in extension storage and re-validated on every read. When the manifest
+host cannot be reached, that copy is used and the popup shows
+**Valid (cached)** with the date it was stored.
+
+This is a security control, not a convenience. Without it, anyone able to
+drop the connection to the manifest host - a hostile network, a filtering
+proxy, a state-level block, or a plain GitHub outage - switches the whole
+detection layer off simply by making a request fail, and leaves no trace on
+the page. Storage tampering buys nothing: a stored manifest still has to
+clear the same two gates as a freshly fetched one.
+
+A bad signature or a sequence downgrade is never rescued by the cache. Those
+are attack signals rather than transport problems, and they fail closed.
 
 ## Updating Hashes
 
@@ -189,7 +259,8 @@ After deploying changes to pinchat.io:
 
 1. Run the hash generator with your private key
 2. Commit and push the new `hashes.json.signed`
-3. Extensions will automatically pick up changes within 5 minutes
+3. Extensions pick up the change on the next navigation to pinchat.io, or
+   within `CHECK_INTERVAL_MINUTES` if a tab is already open
 
 ## Security Considerations
 
@@ -233,20 +304,26 @@ The public key (`PINCHAT_PUBLIC_KEY`) and domain (`OFFICIAL_DOMAIN`) are **inten
 
 ### Defense in Depth
 
-The SRI approach provides multiple layers of protection:
+The integrity approach provides multiple layers of protection:
 
-1. **Browser-level enforcement**: Even without the extension, browsers block any script/stylesheet that doesn't match its `integrity` hash
-2. **Extension verification**: Verifies that the HTML contains the correct integrity values (matching signed manifest from GitHub)
-3. **Signed manifest**: Hash list is signed, so attackers can't forge a valid manifest even with server access
+1. **Extension-packaged preventive CSP**: Before HTML parsing, permits only the signed script hashes assigned to that page and blocks scripts on unknown paths.
+2. **Browser SRI enforcement**: For scripts carrying `integrity`, blocks bytes that do not match the declared hash.
+3. **Extension verification**: Detects altered HTML, missing/wrong SRI, and modified static files.
+4. **Signed manifest**: Hash list is signed, so attackers cannot forge a valid allowlist with server access alone.
 
 ### Attack Prevention
 
 | Attack | Protection |
 |--------|------------|
-| Server serves malicious JS | Browser blocks (SRI mismatch) |
-| Server removes SRI from HTML | Extension detects missing integrity |
+| Server serves malicious JS | Packaged hash-only CSP blocks before execution |
+| Server removes SRI from HTML | Hash-only CSP blocks the external script; extension also warns |
 | Server changes SRI in HTML | Extension detects SRI doesn't match manifest |
 | Server serves different content to extension vs browser | N/A - Extension checks actual DOM, not separate fetch |
+
+The extension substantially narrows, but does not eliminate, the web-delivery
+trust problem. It does not make the HTML immutable, prevent abuse of a bug in
+already trusted client code, protect a compromised signing key/browser store,
+or defend against a malicious higher-privilege browser extension.
 
 ## Self-Hosted Instances
 
@@ -306,10 +383,12 @@ If you are running your own PinChat instance (not using the official pinchat.io)
 extensions/
 ├── README.md              # This file
 ├── generate-hashes.js     # Hash generation and signing script
+├── generate-csp-rules.js  # Per-page preventive CSP generator
 ├── generate-icons.sh      # Icon generation script
 ├── hashes.json.example    # Example hash file format
 ├── chrome/
 │   ├── manifest.json      # Chrome extension manifest (MV3)
+│   ├── rules.json         # Preventive CSP response-header rules
 │   ├── background.js      # Service worker
 │   ├── content.js         # Content script for overlay
 │   ├── popup.html         # Extension popup UI
@@ -319,6 +398,7 @@ extensions/
 │   └── icons/             # Extension icons
 └── firefox/
     ├── manifest.json      # Firefox extension manifest (MV3)
+    ├── rules.json         # Preventive CSP response-header rules
     ├── background.js      # Background script
     ├── content.js         # Content script for overlay
     ├── popup.html         # Extension popup UI
@@ -388,7 +468,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add hashes.json.signed
+          git add static/*.html hashes.json.signed extensions/chrome/rules.json extensions/firefox/rules.json
           git diff --staged --quiet || git commit -m "Update signed hash list [skip ci]"
           git push
 ```

@@ -4,9 +4,9 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>PinChat - Secure Chat</title>
-    <link rel="stylesheet" href="/static/css/style.css" integrity="sha256-I7jppwH+0/qRDZPZftMjmb3TS6Ou3wlt+aZx9qF6oZ0=" crossorigin="anonymous" >
-    <script src="/static/js/theme.js" integrity="sha256-vc83MC35lVoXBnYkFcbi+cE5EgJ+drCEfcjEryWT40A=" crossorigin="anonymous" ></script>
-    <script src="/static/js/pow.js" integrity="sha256-4jyDkg400LlXkyi0zC+QbIJhh6pEYjneo43JWuFVRZc=" crossorigin="anonymous" ></script>
+    <link rel="stylesheet" href="/static/css/style.css" integrity="sha256-EsvGJwz+p98MSvMTLq6Evv71AuXRtjCZYFOjWpsSa2c=" crossorigin="anonymous" >
+    <script src="/static/js/theme.js" integrity="sha256-IFPp16c490XqfYw01UQmSLORmfv7DKKWOXNpQOdw2X0=" crossorigin="anonymous" ></script>
+    <script src="/static/js/pow.js" integrity="sha256-dPmlfH5GU0VsCkR6UpDNPzSRAjhm+xm7SNCDyNSnUqQ=" crossorigin="anonymous" ></script>
     <script src="/static/js/nicknames.js" integrity="sha256-FFlmH12HLY/cK10Uu5ALIabktzw+KiCJdF2p60qlSuc=" crossorigin="anonymous" ></script>
 </head>
 <body class="chat-page">
@@ -25,7 +25,7 @@
             <!-- You (current user) -->
             <div class="sidebar-item active" :title="ownIdentityTitle()">
                 <span class="dot" :class="connected ? 'on' : 'off'"></span>
-                <span class="sidebar-item-label"><span x-text="ownDisplayName()">…</span></span>
+                <span class="sidebar-item-label"><span x-text="ownDisplayName()">...</span></span>
                 <span class="sidebar-item-badge">you</span>
             </div>
 
@@ -58,28 +58,28 @@
             <template x-if="roomType === 'onetoone' && participantCount < 2">
                 <div class="sidebar-item sidebar-item-muted">
                     <span class="dot off"></span>
-                    <span class="sidebar-item-label">Waiting for peer…</span>
+                    <span class="sidebar-item-label">Waiting for peer...</span>
                 </div>
             </template>
             <template x-if="roomType === 'group' && groupPeers.length === 0">
                 <div class="sidebar-item sidebar-item-muted">
                     <span class="dot off"></span>
-                    <span class="sidebar-item-label">Waiting for peers…</span>
+                    <span class="sidebar-item-label">Waiting for peers...</span>
                 </div>
             </template>
 
             <div class="sidebar-group">Room</div>
             <div class="sidebar-item sidebar-item-static">
-                <span class="sidebar-item-label" x-text="roomType === 'onetoone' ? '1 : 1' : (roomType === 'group' ? 'Group' : '…')">1 : 1</span>
-                <span class="sidebar-item-badge" x-text="roomId ? roomId.substring(0,6) + '…' : '—'">—</span>
+                <span class="sidebar-item-label" x-text="roomType === 'onetoone' ? '1 : 1' : (roomType === 'group' ? 'Group' : '...')">1 : 1</span>
+                <span class="sidebar-item-badge" x-text="roomId ? roomId.substring(0,6) + '...' : '-'">-</span>
             </div>
 
             <div class="sidebar-group">Session</div>
             <div class="sidebar-info">
-                <div class="row"><span class="k">Room</span><b x-text="roomId ? roomId.substring(0,8) + '…' : '—'">—</b></div>
-                <div class="row"><span class="k">Time left</span><b x-text="timeRemaining ? formatTime(timeRemaining).replace('⏱️ ', '') : '—'">—</b></div>
+                <div class="row"><span class="k">Room</span><b x-text="roomId ? roomId.substring(0,8) + '...' : '-'">-</b></div>
+                <div class="row"><span class="k">Time left</span><b x-text="timeRemaining ? formatTime(timeRemaining).replace('⏱️ ', '') : '-'">-</b></div>
                 <div class="row"><span class="k" x-text="roomType === 'group' ? 'MLS members' : 'Participants'">Participants</span><b><span x-text="authenticatedMemberCount()">0</span>/<span x-text="maxParticipants !== null ? maxParticipants : '-'">-</span></b></div>
-                <div class="row"><span class="k">Max image</span><b x-text="maxImageSize ? (Math.round(maxImageSize/1024) + ' KB') : '—'">—</b></div>
+                <div class="row"><span class="k">Max image</span><b x-text="maxImageSize ? (Math.round(maxImageSize/1024) + ' KB') : '-'">-</b></div>
             </div>
 
             <div class="sidebar-foot">
@@ -115,7 +115,7 @@
                 </div>
                 <div class="room-details">
                     <!-- Show loading state until server sends room config -->
-                    <span class="badge" x-text="roomType ? (roomType === 'onetoone' ? '1:1' : 'Group') : 'Loading…'"></span>
+                    <span class="badge" x-text="roomType ? (roomType === 'onetoone' ? '1:1' : 'Group') : 'Loading...'"></span>
                     <span class="participants"><svg class="icon" aria-hidden="true"><use href="#i-users"/></svg><span x-text="authenticatedMemberCount()"></span>/<span x-text="maxParticipants !== null ? maxParticipants : '-'"></span></span>
                     <span class="ttl-countdown" x-show="timeRemaining" x-text="formatTime(timeRemaining).replace('⏱️ ', '')"></span>
 
@@ -153,19 +153,19 @@
 
         <!-- Context strip: static room metadata shown once handshake is complete -->
         <div class="chat-context-strip" x-show="connected && roomId">
-            <span class="kv"><span class="k">Room</span> <b x-text="roomId ? roomId.substring(0,8) + '…' : ''"></b></span>
+            <span class="kv"><span class="k">Room</span> <b x-text="roomId ? roomId.substring(0,8) + '...' : ''"></b></span>
             <span class="sep"></span>
-            <span class="kv"><span class="k">TTL</span> <b x-text="ttlMinutes ? (ttlMinutes < 60 ? ttlMinutes + 'm' : (ttlMinutes % 60 === 0 ? (ttlMinutes/60) + 'h' : Math.floor(ttlMinutes/60) + 'h ' + (ttlMinutes%60) + 'm')) : '—'"></b></span>
+            <span class="kv"><span class="k">TTL</span> <b x-text="ttlMinutes ? (ttlMinutes < 60 ? ttlMinutes + 'm' : (ttlMinutes % 60 === 0 ? (ttlMinutes/60) + 'h' : Math.floor(ttlMinutes/60) + 'h ' + (ttlMinutes%60) + 'm')) : '-'"></b></span>
             <span class="sep"></span>
             <span class="kv"><span class="k" x-text="roomType === 'group' ? 'MLS members' : 'Participants'">Participants</span> <b><span x-text="authenticatedMemberCount()"></span>/<span x-text="maxParticipants !== null ? maxParticipants : '-'"></span></b></span>
             <span class="sep"></span>
-            <span class="kv"><span class="k">Max image</span> <b x-text="maxImageSize ? (Math.round(maxImageSize/1024) + ' KB') : '—'"></b></span>
+            <span class="kv"><span class="k">Max image</span> <b x-text="maxImageSize ? (Math.round(maxImageSize/1024) + ' KB') : '-'"></b></span>
         </div>
 
         <!-- Status -->
         <div x-show="!connected" class="status-banner warning">
             <span x-show="connecting" x-text="connectingMessage || 'Connecting...'"></span>
-            <span x-show="!connecting && !connected"><svg class="icon" aria-hidden="true"><use href="#i-alert"/></svg> Disconnected — <button @click="reconnect" class="link-button">Reconnect</button></span>
+            <span x-show="!connecting && !connected"><svg class="icon" aria-hidden="true"><use href="#i-alert"/></svg> Disconnected - <button @click="reconnect" class="link-button">Reconnect</button></span>
         </div>
 
         <div x-show="error" class="status-banner error">
@@ -258,7 +258,7 @@
 
             <!-- PFS Handshake Status Banner (1:1 chats only, peer present) -->
             <div x-show="connected && roomType === 'onetoone' && participantCount === 2 && !pfsActive" class="security-status-banner">
-                <svg class="icon" aria-hidden="true"><use href="#i-lock"/></svg> Establishing secure end-to-end encryption… Please wait.
+                <svg class="icon" aria-hidden="true"><use href="#i-lock"/></svg> Establishing secure end-to-end encryption... Please wait.
             </div>
 
 
@@ -396,7 +396,7 @@
                         </div>
                     </div>
 
-                    <!-- Emoji SAS (Primary) — rendered via x-for + x-text so the SAS string never touches innerHTML. -->
+                    <!-- Emoji SAS (Primary) - rendered via x-for + x-text so the SAS string never touches innerHTML. -->
                     <div class="sas-code-emoji" aria-label="Short Authentication String">
                         <template x-for="(emoji, index) in sasEmojiArray(sas ? (sas.emoji || '') : '')" :key="'sas-' + index">
                             <span x-text="emoji"></span>
@@ -461,7 +461,7 @@
     <script src="/static/js/double-ratchet.js" integrity="sha256-V3R0zJ6YAvxGYULXKSj5pg1KdJKdlndMz9g2gHK4W6Y=" crossorigin="anonymous" ></script>
     <script src="/static/js/ecdh.js" integrity="sha256-I6uKHd+us1u+AACTLm7YoW0fUqs2h3W8SbJtoaEMzuU=" crossorigin="anonymous" ></script>
     <!--
-      MLS (RFC 9420) custom implementation — loaded in topological dependency
+      MLS (RFC 9420) custom implementation - loaded in topological dependency
       order. Each module attaches its exports to window.MLS. The signed
       hash manifest under hashes.json.signed is regenerated separately;
       SRI attributes will be re-added when the branch stabilises.
@@ -563,11 +563,11 @@
         </symbol>
     </svg>
 
-    <!-- Cookie notice (informational, dismissible — see static/js/cookie-notice.js) -->
+    <!-- Cookie notice (informational, dismissible - see static/js/cookie-notice.js) -->
     <div id="cookie-notice" class="cookie-notice hidden" role="region" aria-label="Cookie notice">
-        <span class="cookie-notice-text">This site uses only strictly necessary cookies (session, CSRF). No tracking, no analytics. <a href="/static/privacy.html">Privacy</a></span>
+        <span class="cookie-notice-text">This site uses only strictly necessary cookies (session, CSRF, and a short-lived proof-of-work cookie). No tracking, no analytics. <a href="/static/privacy.html">Privacy</a></span>
         <button type="button" class="cookie-notice-ok">OK</button>
     </div>
-    <script src="/static/js/cookie-notice.js" integrity="sha256-rvb/bHQ2W2jurmYIKaOUhoCD4mg3w94+UbuljCqwDdI=" crossorigin="anonymous" ></script>
+    <script src="/static/js/cookie-notice.js" integrity="sha256-JefnNU1ms64X4lDQibD4l8z4rVAi+15sb4hle0uE0yM=" crossorigin="anonymous" ></script>
 </body>
 </html>

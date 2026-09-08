@@ -1208,7 +1208,7 @@ async function runTests() {
             messages[2].payload, messages[2].header, ROOM_ID, ALICE_ID);
         console.log(`  Bob received msg 2 first: "${dec2.text}"`);
 
-        // Bob now receives the delayed messages 0 and 1 — both must decrypt
+        // Bob now receives the delayed messages 0 and 1 - both must decrypt
         // from stored skipped keys.
         const dec0 = await bob.decryptMessage(
             messages[0].payload, messages[0].header, ROOM_ID, ALICE_ID);
@@ -1261,7 +1261,7 @@ async function runTests() {
         await bob.initialize(new Uint8Array(sharedSecret), false, bobKeypair, null);
 
         // Phase 1: Alice sends 2, Bob receives them
-        console.log('  Phase 1: Alice → Bob (2 msgs)');
+        console.log('  Phase 1: Alice -> Bob (2 msgs)');
         for (let i = 1; i <= 2; i++) {
             const enc = await alice.encryptMessage(`A-phase1-${i}`, ROOM_ID, ALICE_ID);
             const dec = await bob.decryptMessage(enc.payload, enc.header, ROOM_ID, ALICE_ID);
@@ -1401,7 +1401,7 @@ async function runTests() {
     console.log('');
 
     // =========================================================================
-    // Test 14: v1 authenticated ratchet — happy path (sig verified)
+    // Test 14: v1 authenticated ratchet - happy path (sig verified)
     // =========================================================================
     console.log('--- Test 14: v1 Authenticated Ratchet (happy path) ---');
     try {
@@ -1448,7 +1448,7 @@ async function runTests() {
         await bob.initialize(shared, false, bobKp, null);
 
         const enc = await alice.encryptMessage('tamper target', 'room-x', 'alice');
-        // Flip one byte in the signature (decode → mutate → re-encode).
+        // Flip one byte in the signature (decode -> mutate -> re-encode).
         const sigBytes = alice.base64urlToArrayBuffer(enc.header.sig);
         sigBytes[0] ^= 0xFF;
         enc.header.sig = alice.arrayBufferToBase64url(sigBytes);
@@ -1565,10 +1565,10 @@ async function runTests() {
         }
 
         if (threw && nrBefore === nrAfter && rcBefore === rcAfter && canStillDecrypt) {
-            console.log(`PASSED: corrupted payload rejected, Nr ${nrBefore}→${nrAfter}, rc ${rcBefore}→${rcAfter}, retry succeeds`);
+            console.log(`PASSED: corrupted payload rejected, Nr ${nrBefore}->${nrAfter}, rc ${rcBefore}->${rcAfter}, retry succeeds`);
             passed++;
         } else {
-            console.log(`FAILED: threw=${threw}, Nr ${nrBefore}→${nrAfter}, rc ${rcBefore}→${rcAfter}, canStillDecrypt=${canStillDecrypt}`);
+            console.log(`FAILED: threw=${threw}, Nr ${nrBefore}->${nrAfter}, rc ${rcBefore}->${rcAfter}, canStillDecrypt=${canStillDecrypt}`);
             failed++;
         }
     } catch (e) {
@@ -1579,9 +1579,9 @@ async function runTests() {
     console.log('');
 
     // =========================================================================
-    // Test 18: msgType AAD binding — cross-type replay rejected
+    // Test 18: msgType AAD binding - cross-type replay rejected
     // =========================================================================
-    console.log('--- Test 18: msgType AAD Binding — Cross-Type Rejection ---');
+    console.log('--- Test 18: msgType AAD Binding - Cross-Type Rejection ---');
     try {
         const sharedSecret = hexToBytes('dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd');
         const aliceKp = await subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveKey', 'deriveBits']);
@@ -1593,7 +1593,7 @@ async function runTests() {
         // Alice encrypts as 'image'
         const enc = await alice.encryptMessage('image-envelope', ROOM_ID, ALICE_ID, 'image');
 
-        // Bob (instance 1) tries to decrypt as 'message' — AEAD must fail
+        // Bob (instance 1) tries to decrypt as 'message' - AEAD must fail
         const bob1 = new DoubleRatchet();
         await bob1.initialize(new Uint8Array(sharedSecret), false, bobKp, null);
         let crossTypeRejected = false;
@@ -1604,7 +1604,7 @@ async function runTests() {
             console.log(`  Cross-type rejected (expected): ${e.message}`);
         }
 
-        // Bob (instance 2) decrypts as 'image' — must succeed
+        // Bob (instance 2) decrypts as 'image' - must succeed
         const bob2 = new DoubleRatchet();
         await bob2.initialize(new Uint8Array(sharedSecret), false, bobKp, null);
         let correctDecrypt = false;
@@ -1658,7 +1658,7 @@ async function runTests() {
             console.log('PASSED: AAD wire format matches expected (little-endian numerics)');
             passed++;
         } else {
-            console.log('FAILED: AAD wire format changed — all clients must be updated atomically');
+            console.log('FAILED: AAD wire format changed - all clients must be updated atomically');
             failed++;
         }
     } catch (e) {

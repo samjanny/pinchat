@@ -1,5 +1,5 @@
 /**
- * PinChat MLS — PrivateMessage (RFC 9420 §6.3).
+ * PinChat MLS - PrivateMessage (RFC 9420 §6.3).
  *
  *   struct {
  *       opaque group_id<V>;
@@ -33,7 +33,7 @@
  *   } PrivateContentAAD;
  *
  * The `encrypted_sender_data` AEAD uses sender_data_key / sender_data_nonce
- * (derived from sender_data_secret and a sample of `ciphertext` — see
+ * (derived from sender_data_secret and a sample of `ciphertext` - see
  * secret-tree.js), with AAD = SenderDataAAD:
  *
  *   struct {
@@ -349,7 +349,7 @@
      * plus the senderData and padding length.
      *
      * `payloadBytes` is the *inner* payload (raw application_data or
-     * serialised Proposal/Commit — not wrapped for application case;
+     * serialised Proposal/Commit - not wrapped for application case;
      * this function wraps as opaque<V> when content_type is application).
      */
     async function encryptPrivateMessage({

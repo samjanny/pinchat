@@ -12,7 +12,7 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
   schedule:
-    # Monday 06:00 UTC — catch newly-published advisories without waiting
+    # Monday 06:00 UTC - catch newly-published advisories without waiting
     # for the next dependency bump.
     - cron: '0 6 * * 1'
 

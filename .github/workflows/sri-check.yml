@@ -6,20 +6,18 @@ on:
     paths:
       - 'static/**'
       - 'hashes.json.signed'
-      - 'extensions/chrome/background.js'
-      - 'extensions/chrome/manifest.json'
-      - 'extensions/firefox/background.js'
-      - 'extensions/firefox/manifest.json'
+      - 'extensions/chrome/**'
+      - 'extensions/firefox/**'
+      - 'extensions/generate-csp-rules.js'
       - '.github/scripts/verify-sri.js'
       - '.github/workflows/sri-check.yml'
   pull_request:
     paths:
       - 'static/**'
       - 'hashes.json.signed'
-      - 'extensions/chrome/background.js'
-      - 'extensions/chrome/manifest.json'
-      - 'extensions/firefox/background.js'
-      - 'extensions/firefox/manifest.json'
+      - 'extensions/chrome/**'
+      - 'extensions/firefox/**'
+      - 'extensions/generate-csp-rules.js'
       - '.github/scripts/verify-sri.js'
 
 jobs:

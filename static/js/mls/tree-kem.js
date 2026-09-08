@@ -1,5 +1,5 @@
 /**
- * PinChat MLS — TreeKEM path-secret chain (RFC 9420 §7.5).
+ * PinChat MLS - TreeKEM path-secret chain (RFC 9420 §7.5).
  *
  * When a member commits an update, it generates a random leaf secret and
  * derives a chain of path secrets along the direct path to the root. Each
@@ -14,7 +14,7 @@
  * The chain has the same length as the direct path plus the leaf level,
  * i.e. one entry per node on `directPathWithRoot(leaf) ∪ {leaf}`.
  *
- * `commit_secret` — the key schedule input for the next epoch — is
+ * `commit_secret` - the key schedule input for the next epoch - is
  * DeriveSecret(path_secret_root, "path"), i.e. one more "path" iteration
  * after the root's path_secret. (See RFC 9420 §7.5, final paragraph.)
  */
@@ -44,7 +44,7 @@
      *   { nodeIndex, pathSecret, keyPair }
      * where keyPair comes from HPKE.deriveKeyPair.
      *
-     * The leaf itself is NOT included in the returned array — the leaf's
+     * The leaf itself is NOT included in the returned array - the leaf's
      * own keypair is derived separately by the LeafNode update logic.
      */
     async function pathSecretChain(leafSecret, leafIndex, nLeaves) {
@@ -108,7 +108,7 @@
 
     /**
      * The commit_secret fed into the next epoch's key schedule (RFC 9420
-     * §7.5 / §8). Defined as DeriveSecret(path_secret[root], "path") —
+     * §7.5 / §8). Defined as DeriveSecret(path_secret[root], "path") -
      * one more "path" step beyond the root's entry.
      */
     async function commitSecret(rootPathSecret) {

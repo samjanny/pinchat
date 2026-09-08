@@ -1,8 +1,8 @@
 /**
- * PinChat MLS — tree math (RFC 9420 §4.1).
+ * PinChat MLS - tree math (RFC 9420 §4.1).
  *
  * Array-based left-balanced binary tree arithmetic. All functions here are
- * *pure* — they operate on integer indices only and never touch key material.
+ * *pure* - they operate on integer indices only and never touch key material.
  *
  * Node indexing
  * -------------
@@ -23,7 +23,7 @@
  * When N is not a power of two, the right half of the tree is truncated:
  * some "infinite tree" parent indices would fall past nodeWidth(N). The
  * RFC defines truncation rules for parent/right/sibling so that every
- * operation returns a *valid* in-tree index — we implement those rules
+ * operation returns a *valid* in-tree index - we implement those rules
  * here and stress-test them in test-mls-tree-math.js.
  */
 (function (root, factory) {
@@ -158,7 +158,7 @@
     /**
      * Copath: sibling of each node on the path from `x` up to the child of
      * the root. Matches `directPath` index-for-index: copath[i] is the
-     * sibling of `directPathWithRoot[i]` — useful for TreeKEM encryption.
+     * sibling of `directPathWithRoot[i]` - useful for TreeKEM encryption.
      */
     function copath(x, nLeaves) {
         if (nLeaves === 0) return [];

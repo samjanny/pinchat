@@ -35,7 +35,7 @@ function assert(cond, name, detail) {
         console.log(`  OK   ${name}`);
         passed += 1;
     } else {
-        console.log(`  FAIL ${name}${detail ? `  — ${detail}` : ''}`);
+        console.log(`  FAIL ${name}${detail ? `  - ${detail}` : ''}`);
         failed += 1;
     }
 }
@@ -114,7 +114,7 @@ async function main() {
             assert(chain[i].keyPair.publicKeyBytes.length === 65, `chain[${i}].keyPair.pub is 65 bytes`);
         }
 
-        // Adjacent path secrets must differ — "path" is a one-way step.
+        // Adjacent path secrets must differ - "path" is a one-way step.
         assert(
             hex(chain[0].pathSecret) !== hex(chain[1].pathSecret),
             'path_secret[0] != path_secret[1]'
@@ -144,7 +144,7 @@ async function main() {
     // IETF treekem.json cross-check (ciphersuite 0x0002 only).
     //
     // The vector ships:
-    //   - ratchet_tree (parsed → derive nLeaves)
+    //   - ratchet_tree (parsed -> derive nLeaves)
     //   - update_paths[]: each carries `sender`, `update_path` (raw bytes
     //                    of the UpdatePath struct), `path_secrets`
     //                    (one entry per leaf, null for the sender's slot
@@ -202,7 +202,7 @@ async function main() {
                 // receiver can decrypt them, so the vector ships null.
                 // We validate what we *can* see and skip the rest.
 
-                // (a) closure under DeriveSecret(_, "path") — only across
+                // (a) closure under DeriveSecret(_, "path") - only across
                 //     consecutive populated entries.
                 for (let i = 1; i < chain.length; i += 1) {
                     if (chain[i - 1] === null || chain[i] === null) continue;
@@ -213,7 +213,7 @@ async function main() {
                     );
                 }
 
-                // (b) commit_secret — only when we know the root chain
+                // (b) commit_secret - only when we know the root chain
                 //     entry. Empty rootChain means every recipient leaf
                 //     is on the sender's side of the tree (no possible
                 //     receivers), which doesn't happen for the standard

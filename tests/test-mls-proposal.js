@@ -29,7 +29,7 @@ function assert(cond, name, detail) {
         console.log(`  OK   ${name}`);
         passed += 1;
     } else {
-        console.log(`  FAIL ${name}${detail ? `  — ${detail}` : ''}`);
+        console.log(`  FAIL ${name}${detail ? `  - ${detail}` : ''}`);
         failed += 1;
     }
 }
@@ -47,9 +47,9 @@ function main() {
     const v = VECTORS.find((x) => x.cipher_suite === 2);
 
     // ---------------------------------------------------------------------
-    // Proposal — Remove variant from the IETF vector
+    // Proposal - Remove variant from the IETF vector
     // ---------------------------------------------------------------------
-    console.log('# Proposal round-trip — message-protection.json cs=2');
+    console.log('# Proposal round-trip - message-protection.json cs=2');
     {
         const bytes = hexDecode(v.proposal);
         const p = Proposal.parseProposal(bytes);
@@ -60,9 +60,9 @@ function main() {
     }
 
     // ---------------------------------------------------------------------
-    // Commit — single inline PSK Proposal, no UpdatePath
+    // Commit - single inline PSK Proposal, no UpdatePath
     // ---------------------------------------------------------------------
-    console.log('# Commit round-trip — message-protection.json cs=2');
+    console.log('# Commit round-trip - message-protection.json cs=2');
     {
         const bytes = hexDecode(v.commit);
         const c = Commit.parseCommit(bytes);

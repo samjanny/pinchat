@@ -223,7 +223,7 @@ mod tests {
 
     #[test]
     fn v0_header_without_v_or_sig_fails_deserialize() {
-        // Pre-v1 wire format had neither `v` nor `sig` — serde rejects it now.
+        // Pre-v1 wire format had neither `v` nor `sig` - serde rejects it now.
         let v0 = r#"{"dh":"AA","pn":0,"n":1,"rc":0}"#;
         let res: Result<MessageHeader, _> = serde_json::from_str(v0);
         assert!(res.is_err(), "v0 header must fail without v and sig");
