@@ -175,6 +175,54 @@ try {
   // signed hashes. Reject stale or hand-edited browser rulesets.
   const { buildRules } = require('../../extensions/generate-csp-rules');
   const expectedRules = buildRules(signed);
+
+  // Coverage gate. Comparing a ruleset against buildRules() only proves it is
+  // not stale; it says nothing about whether the policy covers the page. It
+  // did not, for a long time: chat.html loads theme.js, pow.js and
+  // nicknames.js, the hand-maintained list omitted all three, and because
+  // script-src carries no 'self' they were blocked outright for every
+  // extension user while this gate stayed green.
+  //
+  // This must read the ruleset that actually ships, not the one buildRules()
+  // just derived: the derived one is correct by construction and would make
+  // the check vacuous.
+  const sriFromHex = (hex) => `sha256-${Buffer.from(hex, 'hex').toString('base64')}`;
+  const signedByPath = new Map(signed.data.files.map((f) => [f.path, f.hash]));
+
+  function checkRuleCoverage(browser, rules) {
+    let bad = 0;
+    for (const rule of rules) {
+      const filter = rule.condition.regexFilter;
+      const pagePath = filter
+        .replace('^https://(www\\.)?pinchat\\.io', '')
+        .replace('(?:\\?.*)?$', '')
+        .replace(/\\/g, '');
+      if (!pagePath.endsWith('.html')) continue; // catch-all rule, nothing to cover
+      const pageFile = '.' + pagePath;
+      if (!fs.existsSync(pageFile)) {
+        console.error(`CSP COVERAGE: ${browser} has a rule for ${pagePath}, which does not exist`);
+        bad++;
+        continue;
+      }
+      const policy = rule.action.responseHeaders[0].value.split(';')[0];
+      const html = fs.readFileSync(pageFile, 'utf8');
+      const loaded = [...html.matchAll(/<script\b[^>]*\ssrc="([^"]+)"/g)].map((m) => m[1]);
+      for (const src of loaded) {
+        const hex = signedByPath.get(src);
+        if (!hex) {
+          console.error(`CSP COVERAGE: ${browser}: ${pagePath} loads ${src}, absent from the signed manifest`);
+          bad++;
+          continue;
+        }
+        if (!policy.includes(`'${sriFromHex(hex)}'`)) {
+          console.error(`CSP COVERAGE: ${browser}: ${pagePath} loads ${src}, whose hash is not in its script-src`);
+          bad++;
+        }
+      }
+    }
+    return bad;
+  }
+
   for (const browser of ['chrome', 'firefox']) {
     const rulesPath = `extensions/${browser}/rules.json`;
     const actualRules = JSON.parse(fs.readFileSync(rulesPath, 'utf8'));
@@ -183,6 +231,12 @@ try {
       totalBad++;
     } else {
       console.log(`Preventive CSP: ${browser} rules match signed manifest`);
+    }
+    const coverageBad = checkRuleCoverage(browser, actualRules);
+    if (coverageBad === 0) {
+      console.log(`Preventive CSP: ${browser} rules cover every script tag on every page`);
+    } else {
+      totalBad += coverageBad;
     }
   }
 } catch (error) {

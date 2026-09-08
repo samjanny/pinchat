@@ -10,46 +10,83 @@
  * warning layer for HTML/SRI tampering.
  */
 
+const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 
-const PAGE_SCRIPTS = {
-    '/static/index.html': [
-        '/static/js/theme.js',
-        '/static/js/pow.js',
-        '/static/js/homepage.js',
-        '/static/js/alpine-csp.min.js',
-        '/static/js/cookie-notice.js'
-    ],
-    '/static/login.html': [
-        '/static/js/login-stash.js',
-        '/static/js/theme.js',
-        '/static/js/login.js',
-        '/static/js/cookie-notice.js'
-    ],
-    '/static/chat.html': [
-        '/static/js/debug.js',
-        '/static/js/crypto.js',
-        '/static/js/identity.js',
-        '/static/js/double-ratchet.js',
-        '/static/js/ecdh.js',
-        '/static/js/websocket.js',
-        '/static/js/emoji.js',
-        '/static/js/app.js',
-        '/static/js/alpine-csp.min.js',
-        '/static/js/cookie-notice.js'
-    ],
-    '/static/terms.html': [
-        '/static/js/theme.js',
-        '/static/js/legal.js',
-        '/static/js/cookie-notice.js'
-    ],
-    '/static/privacy.html': [
-        '/static/js/theme.js',
-        '/static/js/legal.js',
-        '/static/js/cookie-notice.js'
-    ]
-};
+// Pages that get a per-page, hash-pinned script-src. The script list for
+// each one is READ FROM THE PAGE ITSELF rather than repeated here.
+//
+// It used to be a hand-maintained map, and it had silently drifted: chat.html
+// loads theme.js, pow.js and nicknames.js, none of which were listed, so the
+// generated policy pinned ten hashes for a page that loads thirteen scripts.
+// Because script-src does not include 'self', the three unlisted files were
+// blocked outright for anyone running the extension, and app.js calls
+// generateNickname() from nicknames.js on every connection.
+//
+// Deriving the list makes that class of drift impossible: adding a <script>
+// to a page automatically adds its hash to that page's policy on the next
+// regeneration, and verify-sri.js fails the build if a page ever loads a
+// script the rules do not cover.
+const PAGES = [
+    '/static/index.html',
+    '/static/login.html',
+    '/static/chat.html',
+    '/static/terms.html',
+    '/static/privacy.html',
+];
+
+const SCRIPT_SRC_RE = /<script\b[^>]*\ssrc="([^"]+)"/g;
+
+/**
+ * Collect, in document order, the same-origin scripts a page loads.
+ * Absolute URLs are rejected rather than ignored: the CSP has no 'self' and
+ * no third-party host, so a cross-origin script tag would be blocked at
+ * runtime and silently breaking the page is worse than failing the build.
+ */
+function pageScripts(pagePath, hashesByPath) {
+    const filePath = path.join(__dirname, '..', pagePath.replace(/^\//, ''));
+    const html = fs.readFileSync(filePath, 'utf8');
+
+    // Prove this is the signed page before trusting anything in it.
+    //
+    // Deriving the allowlist from a document is only safe while that document
+    // is itself covered by the signed manifest: an unsigned edit that added a
+    // <script> would otherwise widen the very policy meant to constrain it.
+    // verify-sri.js checks every static file against the manifest too, but
+    // relying on that would make this generator's safety depend on a separate
+    // script having run first. Check it here so the property is local.
+    const expected = hashesByPath.get(pagePath);
+    if (!expected) {
+        throw new Error(`Signed manifest is missing ${pagePath}`);
+    }
+    const actual = crypto.createHash('sha256')
+        .update(Buffer.from(html.replace(/\r\n/g, '\n'), 'utf8'))
+        .digest('hex');
+    if (actual !== expected) {
+        throw new Error(
+            `${pagePath} does not match the signed manifest `
+            + `(signed ${expected}, actual ${actual}); re-sign before regenerating rules`,
+        );
+    }
+    const scripts = [];
+    SCRIPT_SRC_RE.lastIndex = 0;
+    let match;
+    while ((match = SCRIPT_SRC_RE.exec(html)) !== null) {
+        const src = match[1];
+        if (/^[a-z]+:|^\/\//i.test(src)) {
+            throw new Error(`${pagePath} loads an off-origin script: ${src}`);
+        }
+        if (!src.startsWith('/static/')) {
+            throw new Error(`${pagePath} loads an unexpected script path: ${src}`);
+        }
+        if (!scripts.includes(src)) scripts.push(src);
+    }
+    if (scripts.length === 0) {
+        throw new Error(`${pagePath} declares no scripts; refusing to emit an empty allowlist`);
+    }
+    return scripts;
+}
 
 const CSP_BASE = [
     "default-src 'none'",
@@ -111,7 +148,8 @@ function buildRules(manifestDocument) {
     ];
 
     let id = 2;
-    for (const [pagePath, scripts] of Object.entries(PAGE_SCRIPTS)) {
+    for (const pagePath of PAGES) {
+        const scripts = pageScripts(pagePath, hashesByPath);
         rules.push({
             id: id++,
             priority: 2,
@@ -151,4 +189,4 @@ if (require.main === module) {
     writeRulesFromManifest(manifestPath);
 }
 
-module.exports = { PAGE_SCRIPTS, buildRules, writeRulesFromManifest };
+module.exports = { PAGES, pageScripts, buildRules, writeRulesFromManifest };

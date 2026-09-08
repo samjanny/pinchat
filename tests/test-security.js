@@ -281,11 +281,11 @@ async function runTests() {
             return match[1];
         };
 
-        const pinsOk = chromeTag === 'v0.7.4'
+        const pinsOk = chromeTag === 'v0.7.5'
             && firefoxTag === chromeTag
             && chromeFloor === signed.data.sequence
             && firefoxFloor === chromeFloor
-            && chromeManifest.version === '1.2.6'
+            && chromeManifest.version === '1.2.7'
             && firefoxManifest.version === chromeManifest.version
             && readPublicKey(chromeBackground) === readPublicKey(firefoxBackground);
         if (!pinsOk) {
@@ -330,6 +330,31 @@ async function runTests() {
             const csp = rule.action.responseHeaders[0].value;
             assert(!/script-src[^;]*'self'/.test(csp), 'script-src must not trust the origin');
             assert(csp.includes("'sha256-"), 'page rule must pin at least one signed script');
+        }
+
+
+        // Coverage, not just freshness. The rules used to be derived from a
+        // hand-maintained script list that had drifted: chat.html loaded
+        // theme.js, pow.js and nicknames.js, none were pinned, and with no
+        // 'self' in script-src all three were blocked for extension users.
+        const sriOf = (hex) => `sha256-${Buffer.from(hex, 'hex').toString('base64')}`;
+        const signedHashes = new Map(signed.data.files.map((f) => [f.path, f.hash]));
+        for (const rule of chromeRules) {
+            const page = rule.condition.regexFilter
+                .replace('^https://(www\\.)?pinchat\\.io', '')
+                .replace('(?:\\?.*)?$', '')
+                .replace(/\\/g, '');
+            if (!page.endsWith('.html')) continue;
+            const html = fs.readFileSync(path.join(root, page.replace(/^\//, '')), 'utf8');
+            const policy = rule.action.responseHeaders[0].value.split(';')[0];
+            for (const m of html.matchAll(/<script\b[^>]*\ssrc="([^"]+)"/g)) {
+                const hex = signedHashes.get(m[1]);
+                assert(hex, `${page} loads ${m[1]}, absent from the signed manifest`);
+                assert(
+                    policy.includes(`'${sriOf(hex)}'`),
+                    `${page} loads ${m[1]} but its hash is not pinned in script-src`,
+                );
+            }
         }
 
         console.log('PASSED: packaged DNR rules replace origin trust with per-page signed hashes');
