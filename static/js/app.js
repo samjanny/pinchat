@@ -17,6 +17,22 @@ window.ROOM_CONFIG = {
     // roomType, ttlMinutes, maxParticipants will be set by server via WebSocket
 };
 
+// app.js relies on two globals that other classic scripts define:
+// isAllowedImageMimeType from crypto.js (the one audited image allowlist,
+// enforced on both encrypt and decrypt) and generateNickname from
+// nicknames.js. chat.html loads both first. If either is missing, fail here
+// and now: a ReferenceError raised later inside the decrypt path would be
+// caught by handleSecurityError and reported as message tampering, which is
+// the wrong diagnosis and, for the image path, a silently rejected image.
+for (const [name, source] of [
+    ['isAllowedImageMimeType', 'crypto.js'],
+    ['generateNickname', 'nicknames.js'],
+]) {
+    if (typeof globalThis[name] !== 'function') {
+        throw new Error(`app.js requires ${source} to be loaded first (${name} is missing)`);
+    }
+}
+
 // Validate room ID is present
 if (!window.ROOM_CONFIG.roomId) {
     alert('⚠️ Room ID missing in URL. Redirecting to homepage...');
@@ -1607,6 +1623,14 @@ document.addEventListener('alpine:init', () => {
          * this method (see handleIncomingMessage / handleIncomingImage).
          */
         async handleSecurityError(error, senderId) {
+            // A ReferenceError or TypeError here is a bug in this page, not
+            // evidence about the peer. Say so, and do not let it wear the
+            // tamper-detection label or trigger the MITM tear-down below.
+            if (error instanceof ReferenceError || error instanceof TypeError) {
+                console.error('[BUG] Exception in the message path (not a security event):', error);
+                this.error = '⚠️ An internal error occurred while processing a message. Reload the page.';
+                return;
+            }
             console.error('[SECURITY] Message authentication failed:', error);
 
             // Protocol v1 authenticated ratchet: a signature failure means the
