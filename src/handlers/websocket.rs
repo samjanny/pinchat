@@ -668,9 +668,13 @@ fn append_ordered_group_departure(
         .ok()
     });
     if let Err(error) = append_result {
+        // Error output names the failure, never the room it happened in.
+        // Strict privacy mode still emits error level, so anything
+        // interpolated here survives in the container log and becomes a
+        // record of which room was live at which time. The variant alone
+        // is what diagnosis needs (docs/design-decisions.md, entry 1).
         tracing::error!(
-            "Failed to append ordered group departure in room {}; closing the room fail-closed: {:?}",
-            room_id,
+            "Failed to append ordered group departure; closing the room fail-closed: {:?}",
             error
         );
         state.remove_room(&room_id);
@@ -991,11 +995,8 @@ async fn handle_socket(
             .ok()
         });
         if let Err(error) = append_result {
-            tracing::error!(
-                "Failed to append ordered group join in room {}: {:?}",
-                room_id,
-                error
-            );
+            // No room identifier in error output (docs/design-decisions.md).
+            tracing::error!("Failed to append ordered group join: {:?}", error);
             // Existing members must never continue in a room whose relay
             // lifecycle can no longer be represented in the authenticated
             // control order.
@@ -1871,9 +1872,10 @@ async fn handle_socket(
                                 );
                                 if let Err(error) = append_result {
                                     seen_hashes.remove(&payload_hash);
+                                    // No room identifier in error output
+                                    // (docs/design-decisions.md).
                                     tracing::error!(
-                                        "Failed to append MLS control envelope in room {}: {:?}",
-                                        room_id,
+                                        "Failed to append MLS control envelope: {:?}",
                                         error
                                     );
                                     if let Some(rejection) =

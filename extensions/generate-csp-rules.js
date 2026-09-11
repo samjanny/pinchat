@@ -116,9 +116,16 @@ function buildCsp(scriptPaths, hashesByPath) {
     return [`script-src ${hashSources.join(' ')}`, ...CSP_BASE].join('; ') + ';';
 }
 
+// Chrome matches a declarativeNetRequest regexFilter against the full URL,
+// fragment included, even though the fragment never reaches the server. A
+// tail that only allowed an optional query string therefore missed
+// `/static/index.html#features`, the page rule did not apply, and the
+// catch-all `script-src 'none'` rule blocked every script on the page. The
+// chat page never showed it because it always carries `?room=`. The tail
+// now accepts a query, a fragment, or both.
 function pageRegex(pagePath) {
     const escapedPath = pagePath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    return `^https://(www\\.)?pinchat\\.io${escapedPath}(?:\\?.*)?$`;
+    return `^https://(www\\.)?pinchat\\.io${escapedPath}(?:[?#].*)?$`;
 }
 
 function buildRules(manifestDocument) {

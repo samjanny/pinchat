@@ -4,7 +4,53 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Dates are the repository-local commit dates; entries are curated for user-visible impact
 rather than being a 1:1 mirror of `git log`.
 
-## [Unreleased]
+## [2026-09-11] - v0.8.5
+
+### Added - no mandatory-retention mode is a recorded design decision
+
+`docs/design-decisions.md` collects standing decisions about what PinChat is
+and is not, starting with the one that constrains everything about logging:
+the service keeps no persistent record of who connected, when, from where or
+with whom, beyond the state a live room needs, and logging, retention or
+per-user identity will not be introduced to make a deployment publicly
+available. If applicable law ever required that, the deployment stays private
+and access-restricted instead. The entry is deliberately a refusal rather than
+a mitigation, it rules out per-user accounts as well as logs because an
+identity-based gate produces exactly the record being excluded, and it states
+plainly that a running room does hold server-side state so the claim is not
+mistaken for statelessness. Section 2 of the log policy now points at it and
+the entry points back at section 3.6, which records that no such retention
+duty has been identified in the first place. The homepage carries a short
+version of the same statement next to "What the server sees".
+
+### Fixed - the homepage described the wrong Short Authentication String
+
+The identity verification card announced 8 emoji derived from both parties'
+identity keys. That was the v1 layout and the v2 derivation. Since v3 the code
+is 96 bits rendered as 16 emoji, and it binds the live handshake keys of the
+session in addition to the identity pair, which is what closed the offline
+grinding weakness that audit finding H1 described. The chat page already said
+16; only the homepage was stale.
+
+### Changed - error output no longer names the room it happened in
+
+Three `tracing::error!` sites in the WebSocket handler interpolated the room
+identifier. Strict privacy mode filters at error level, so those lines were
+emitted, and the container writes stdout to disk, which made them a record of
+which room was live at which time. They now report the failure alone. The
+error value is still printed: `MlsControlAppendError` is a fieldless enum, so
+its `Debug` output is the variant name and nothing else.
+
+### Fixed - the extension CSP rule missed URLs carrying a fragment
+
+Chrome matches a declarativeNetRequest `regexFilter` against the whole URL,
+fragment included. The generated page rule ended in an optional query string
+only, so `/static/index.html#features` did not match its own rule and fell
+through to the catch-all `script-src 'none'`, blocking every script on the
+page. The chat page was never affected because it always carries `?room=`.
+The tail now accepts a query, a fragment, or both. The reverse proxy carries
+a temporary redirect that works around this for 1.3.6 and earlier; it can be
+removed once installs have moved to 1.3.7.
 
 ### Fixed - 1:1 reconnection and image relay limits
 
@@ -21,9 +67,12 @@ or image payloads produce an explicit error instead of being silently dropped.
 The chat page and its script changed, so the site manifest was re-signed
 at sequence 52 and the preventive CSP rules shipped inside both extensions
 now list the new `app.js` hash. An installed 1.3.6 still enforces the
-previous hash list and would block the updated script, so the next release
-must rebuild and republish both extensions, raise their sequence floor to
-52 and move their manifest pin to the new tag in the same commit.
+previous hash list and would block the updated script. This release closes
+that gap: the homepage changed too, the manifest is signed at sequence 53,
+and both extensions move to 1.3.7 with their manifest pin on v0.8.5 and
+their sequence floor raised to 53 in the same commit. An installed 1.3.6
+verifies against the manifest at v0.8.4, which is sequence 51, so it will
+report a mismatch on the updated pages until it is replaced by 1.3.7.
 
 ### Changed - extension 1.3.6 declares that it collects no data
 

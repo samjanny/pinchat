@@ -34,7 +34,7 @@
       ]
     },
     "condition": {
-      "regexFilter": "^https://(www\\.)?pinchat\\.io/static/index\\.html(?:\\?.*)?$",
+      "regexFilter": "^https://(www\\.)?pinchat\\.io/static/index\\.html(?:[?#].*)?$",
       "resourceTypes": [
         "main_frame",
         "sub_frame"
@@ -55,7 +55,7 @@
       ]
     },
     "condition": {
-      "regexFilter": "^https://(www\\.)?pinchat\\.io/static/login\\.html(?:\\?.*)?$",
+      "regexFilter": "^https://(www\\.)?pinchat\\.io/static/login\\.html(?:[?#].*)?$",
       "resourceTypes": [
         "main_frame",
         "sub_frame"
@@ -76,7 +76,7 @@
       ]
     },
     "condition": {
-      "regexFilter": "^https://(www\\.)?pinchat\\.io/static/chat\\.html(?:\\?.*)?$",
+      "regexFilter": "^https://(www\\.)?pinchat\\.io/static/chat\\.html(?:[?#].*)?$",
       "resourceTypes": [
         "main_frame",
         "sub_frame"
@@ -97,7 +97,7 @@
       ]
     },
     "condition": {
-      "regexFilter": "^https://(www\\.)?pinchat\\.io/static/terms\\.html(?:\\?.*)?$",
+      "regexFilter": "^https://(www\\.)?pinchat\\.io/static/terms\\.html(?:[?#].*)?$",
       "resourceTypes": [
         "main_frame",
         "sub_frame"
@@ -118,7 +118,7 @@
       ]
     },
     "condition": {
-      "regexFilter": "^https://(www\\.)?pinchat\\.io/static/privacy\\.html(?:\\?.*)?$",
+      "regexFilter": "^https://(www\\.)?pinchat\\.io/static/privacy\\.html(?:[?#].*)?$",
       "resourceTypes": [
         "main_frame",
         "sub_frame"

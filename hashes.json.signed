@@ -1,8 +1,8 @@
 {
   "data": {
     "version": "1.2.0",
-    "sequence": 52,
-    "generated": "2026-09-08T14:49:59.575Z",
+    "sequence": 53,
+    "generated": "2026-09-11T12:14:11.116Z",
     "site": "https://pinchat.io",
     "files": [
       {
@@ -187,7 +187,7 @@
       },
       {
         "path": "/static/index.html",
-        "hash": "f29799d6e6fe59fe221a2b6d599dfc712edcb2a1232039c470ebd8c775500ee4"
+        "hash": "c2a021f207f8ec8a4f2abb867cd1e0f3a2d48bf6c68dd07b6663118249510771"
       },
       {
         "path": "/static/login.html",
@@ -211,5 +211,5 @@
       }
     ]
   },
-  "signature": "MEYCIQCuaOme4P5CD1nwCtFlucYgCaQE9EpnC3JCS09ivlStYwIhANEsYxjJGI+WmGxmdsQ9dsoA7E8p7ZGlLbCDOWlbcYSI"
+  "signature": "MEUCIQCthA0SLd+MCt9shp+ZC0D8qRnU+CMvhxdz7ndlR4+3BwIgRMvqLoTzfBlN7M3QuJrmMbuNEhal0lp+bUVYfcHI5J4="
 }

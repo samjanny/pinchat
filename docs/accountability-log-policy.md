@@ -34,6 +34,13 @@ The reverse proxy is configured not to write access logs to disk.
 The application server operates in strict privacy mode with no
 access logging.
 
+This is a standing design decision recorded in `design-decisions.md`
+(entry 1, "No mandatory-retention mode"), not a deployment setting.
+That entry also records the consequence should the assessment in
+section 3.6 ever change: a deployment that would be required to retain
+connection records stays private and access-restricted rather than
+being offered publicly.
+
 ## 3. Rationale
 
 ### 3.1 Data minimisation (Art. 5(1)(c) GDPR)

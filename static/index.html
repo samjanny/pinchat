@@ -118,8 +118,12 @@
                         <p>A room ID, a TTL, and opaque encrypted payloads. No message content, no metadata, no persistent identifier tying sessions together.</p>
                     </div>
                     <div class="info-card">
+                        <h3>No retention, by design</h3>
+                        <p>Nothing records who connected, when, or with whom, beyond the live state a running room needs. Logging or per-user accounts will not be added to make the service public - if that were ever required, this deployment would stay private instead.</p>
+                    </div>
+                    <div class="info-card">
                         <h3>Identity verification</h3>
-                        <p>Before any message goes through, you'll see a <strong>Short Authentication String</strong> - 8 emoji derived from both parties' identity keys. Confirm it out-of-band to rule out MITM.</p>
+                        <p>Before any message goes through, you'll see a <strong>Short Authentication String</strong> - 16 emoji derived from both parties' identity keys and from the live handshake keys of that session. Confirm it out-of-band to rule out MITM.</p>
                     </div>
                 </aside>
 
