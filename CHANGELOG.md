@@ -4,6 +4,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Dates are the repository-local commit dates; entries are curated for user-visible impact
 rather than being a 1:1 mirror of `git log`.
 
+## [2026-09-11] - v0.8.6
+
+### Fixed - the gap between the two warning paragraphs never rendered
+
+The second paragraph of the "Experimental software" box carried its spacing
+in an inline `style` attribute. The page's own Content Security Policy allows
+styles only from the origin, so the attribute was blocked, and because the
+stylesheet resets every margin to zero the two paragraphs sat flush against
+each other. The rule now lives in the stylesheet as `.info-box.warning p + p`
+and the spacing appears for the first time. It was the last inline style
+attribute in the five pages; there are now none.
+
+Changing the stylesheet changes the `integrity` attribute that every page
+carries for it, so all five pages were re-signed. The manifest is at sequence
+54 and both extensions move to 1.3.8 with their pin on v0.8.6 and their floor
+raised to 54. An installed 1.3.7 verifies against v0.8.5 at sequence 53 and
+will report a mismatch until it is replaced.
+
 ## [2026-09-11] - v0.8.5
 
 ### Added - no mandatory-retention mode is a recorded design decision

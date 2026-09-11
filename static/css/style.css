@@ -2724,6 +2724,12 @@ input[type="password"]:focus {
     color: var(--text-medium);
     line-height: 1.55;
 }
+/* Spacing between stacked paragraphs. This lived as an inline style
+   attribute on the second paragraph, which the page's own style-src 'self'
+   blocked, so the gap never rendered. */
+.info-box.warning p + p {
+    margin-top: 0.75rem;
+}
 .info-box.warning ul {
     margin: 0;
     padding-left: 20px;

@@ -1,13 +1,13 @@
 {
   "data": {
     "version": "1.2.0",
-    "sequence": 53,
-    "generated": "2026-09-11T12:14:11.116Z",
+    "sequence": 54,
+    "generated": "2026-09-11T12:37:46.434Z",
     "site": "https://pinchat.io",
     "files": [
       {
         "path": "/static/css/style.css",
-        "hash": "d800cae9e94e92ad75c570c7578fd9c151e772c012b0dbd5f6c76243be28d613"
+        "hash": "5d2dc439d870ae5bac4edef65636f9b38c8b812bdca38a820d2a5e09056e0b3d"
       },
       {
         "path": "/static/js/alpine-csp.min.js",
@@ -187,23 +187,23 @@
       },
       {
         "path": "/static/index.html",
-        "hash": "c2a021f207f8ec8a4f2abb867cd1e0f3a2d48bf6c68dd07b6663118249510771"
+        "hash": "fbd75f17011ae6f45c454956d84ad7a7edb393312fdc5eaf142d05fa07b01ada"
       },
       {
         "path": "/static/login.html",
-        "hash": "2826096f1f34adeda868b519fb6848e7e6f635a33691c0ce31c758de59cab217"
+        "hash": "ebfa693d82e621698bc491a728f34f1ccde8d998fc659a593ac439aad7c424d1"
       },
       {
         "path": "/static/chat.html",
-        "hash": "9e456f4b674e45c9f93b4300cfceedac157c436d06e427f7b21d7caa74fe0a1c"
+        "hash": "c2d6ba4be9a4940f937c38cbdfda47ebc31718d85006633b843a11228cbac2cd"
       },
       {
         "path": "/static/terms.html",
-        "hash": "89cb2113991378446ad55f3603ef6c31de3ffcf8aad44a8bd34f6e71867410a8"
+        "hash": "dc63ee93887391e0e57a388fbe26db2f8ac329bc9f2ae7f70473b8d9b9016e3a"
       },
       {
         "path": "/static/privacy.html",
-        "hash": "9787aba2ff01a16bd4dbf0facf879bf17abd7f6c9128d78013efbd7561d9d6eb"
+        "hash": "6656a6d601e7cdd8b843655bee5bfa19dbb92a729ef90e498762794fd1b35820"
       },
       {
         "path": "/static/operator.json",
@@ -211,5 +211,5 @@
       }
     ]
   },
-  "signature": "MEUCIQCthA0SLd+MCt9shp+ZC0D8qRnU+CMvhxdz7ndlR4+3BwIgRMvqLoTzfBlN7M3QuJrmMbuNEhal0lp+bUVYfcHI5J4="
+  "signature": "MEYCIQCWvmevklTJeHFlIbHtzQFOBSjq05cObjZKwb78yWfhNQIhALBqap/7mswrgDom3BDJ0XlOJzpeY5lIB5xOqSfcO381"
 }
