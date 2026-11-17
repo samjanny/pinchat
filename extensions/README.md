@@ -171,48 +171,101 @@ Auto-update on both stores is driven by one thing only: a higher `version` in
 
 ## Extension Behavior
 
-### Status Badge
+### One state per page
 
-| Badge | Meaning |
-|-------|---------|
-| green tick | Manifest signature verified, SRI attributes checked |
-| ! (red) | Verification failed - possible compromise |
-| ? (yellow) | Error fetching/verifying manifest |
-| ... (blue) | Verification in progress |
+The extension keeps a state for the page shown in each tab, and only for that
+page. A result obtained in one tab, or for an earlier page in the same tab,
+is never shown for another. What each state may be based on is defined in one
+file, `verdict.js`, and pinned by `tests/test-verifier-verdict.js`.
 
-### Warning Overlay
+| Badge | State | Meaning |
+|-------|-------|---------|
+| `OK` (green) | Verified | The bytes of the page were compared with the signed hash before the browser parsed them, and the script policy is in force. Firefox only |
+| `~` (blue) | Partially verified | The script policy is in force, so only signed scripts can run. The page itself could not be attested. This is the best state Chromium can reach |
+| `!` (red) | Failed | A mismatch with the signed release was established |
+| `?` (amber) | Unverifiable | The check could not be made: no manifest, or the page did not pass through the verifier |
+| `!` (amber) | Notice | Something on the page was blocked, or looks wrong, without proof against the server |
+| `...` (grey) | Checking | Not decided yet |
 
-If verification fails, a full-screen red overlay appears with:
-- **UNAUTHORIZED RESOURCES DETECTED!** warning
-- List of issues (missing SRI, SRI mismatch, unauthorized scripts, etc.)
-- "Leave This Site" button
-- "Dismiss (Unsafe)" button with confirmation
+Green is shown for the first row only. "Verified" is a statement about what
+the server delivered; it says nothing about the browser, the device, or other
+extensions.
 
-**CSP Compatibility**: The warning overlay uses Shadow DOM with external CSS loaded from the extension's `web_accessible_resources`. This ensures the overlay displays correctly even on pages with strict Content Security Policy (CSP) that blocks inline styles. Firefox MV3 exposes only `warning.css` and restricts it to `https://pinchat.io/*` via `matches`.
+### What is shown on the page
 
-### What the Extension Detects
+- **Failed**: a full-page red overlay with the reason. It has no dismiss
+  button. An established mismatch with the signed release is not something to
+  click through.
+- **Unverifiable, in Firefox**: a full-page amber overlay with a reload
+  button. Nothing was found wrong, but the page was not checked.
+- **Notice**: a bar at the top of the page that can be dismissed. Something
+  was blocked, or could not be checked, while the script policy stayed in
+  force.
+- **Changes of unattested origin**: nothing on the page. They are listed in
+  the popup.
 
-- Missing `integrity` attribute on scripts/stylesheets
-- SRI hash mismatch with signed manifest
-- **File hash mismatch** (fetches ALL manifest files and verifies hashes)
-- Inline scripts (not allowed)
-- External scripts/stylesheets (not allowed)
-- **Unauthorized same-origin scripts/stylesheets** (outside `/static/` path)
-- External iframes
-- Forms submitting to external URLs
-- CSS `@import` directives
+The overlay uses a closed Shadow DOM with a stylesheet loaded from the
+extension's `web_accessible_resources`, so it renders under the page's strict
+CSP. Firefox MV3 exposes only `warning.css` and restricts it to
+`https://pinchat.io/*` via `matches`.
 
-### Verification Approach
+### Server integrity and page changes are separate questions
 
-The extension uses prevention plus two verification paths:
+Other extensions add elements to pages. A password manager typically adds
+script elements, some of them inline. Nothing in the DOM says who added a
+node, so the verifier does not try to decide whether an element is
+"authorized":
 
-1. **DOM SRI Check**: Verifies that all `<script>` and `<link>` tags have correct `integrity` attributes matching the signed manifest
-2. **File Hash Verification**: Fetches ALL files listed in the manifest (not just those in DOM) and computes their SHA-256 hashes to detect tampering
+- What may **run** is decided by the script policy, which the browser
+  enforces: scripts whose hash is in the signed manifest, nothing inline.
+- An inline script element, a resource of another extension, or a policy
+  violation that cannot be attributed to the page is recorded as a **change
+  of unattested origin**. It is listed in the popup, it is never called safe,
+  and it never changes the integrity state.
+- A policy violation that the browser attributes to the page itself raises a
+  **notice**. It points at the page but proves nothing about the server:
+  another extension can write markup into a document.
+- **Failed** is reserved for what is established: the page bytes differ from
+  the signed hash (Firefox), a file the site served to the extension differs
+  from its signed hash, a stylesheet from the site that is not in the signed
+  release was loaded, the script policy is not in force, a service worker
+  answered the navigation, the manifest failed its signature or rollback
+  check, or the server tried to redirect a link off the site.
 
-This catches:
-- Lazy-loaded or deferred scripts not yet in DOM
-- Server serving modified files (even with correct SRI in HTML)
-- Files blocked by browser SRI (hash mismatch detected independently)
+There is no allowlist of other extensions and no exception for inline
+scripts.
+
+### What is checked, and how
+
+1. **Script policy** (both browsers). `declarativeNetRequest` replaces the
+   CSP of every document on the site, on any port, before parsing. Each known
+   page permits only its signed script hashes; everything else permits no
+   script. The same rules remove the `Link` and `Refresh` response headers,
+   which act on a document without being part of its body.
+2. **Policy probe** (both). At `document_start` the content script checks,
+   synchronously, that inline handlers are in fact blocked and that no
+   service worker controls the document. A document answered by a service
+   worker never receives the extension's header rules. If either check
+   fails, the document is stopped and marked failed. Service workers
+   registered for the site are removed; the site uses none.
+3. **Redirect guard** (both). A document navigation on the site may only be
+   redirected to the site itself. An invite link carries its key after the
+   `#`, and browsers carry that fragment across redirects, to another origin
+   too. Chromium enforces this with a rule on the `Location` response header
+   (which is why the minimum version is 128); Firefox enforces it in the
+   background script.
+4. **Page bytes** (Firefox). `webRequest.filterResponseData` holds the body
+   of every document navigation on the site. It is hashed and compared with
+   the signed hash for that address, and only then released to the parser,
+   byte for byte. Anything else is replaced by a block page that contains
+   nothing the server sent. If the filter cannot attach to a response, the
+   response is cancelled.
+5. **DOM inspection** (both). Script, stylesheet, base, frame and form
+   elements are compared with the manifest, as described above.
+6. **File re-download** (both). Every file of the manifest is downloaded
+   again and hashed. A match is not counted towards any positive state,
+   because a server can answer this request differently from the page's own;
+   a mismatch is a failure.
 
 ### Anti-Downgrade Protection
 
@@ -320,43 +373,58 @@ The integrity approach provides multiple layers of protection:
 
 1. **Extension-packaged preventive CSP**: Before HTML parsing, permits only the signed script hashes assigned to that page and blocks scripts on unknown paths.
 2. **Browser SRI enforcement**: For scripts carrying `integrity`, blocks bytes that do not match the declared hash.
-3. **Extension verification**: Detects missing or wrong SRI, unlisted scripts and stylesheets in the DOM, and modified static files. It re-downloads each file, the HTML pages included, and compares that copy with the manifest. It does not see the bytes the browser parsed for the navigation, so it cannot detect HTML that a server alters only for the navigation (see below).
+3. **Extension verification**: In Firefox, compares the bytes of every page with the signed hash before the browser parses them. In both browsers, inspects the DOM and re-downloads every file of the manifest; a mismatch there is a failure, a match is not counted as proof (see "What is checked, and how").
 4. **Signed manifest**: Hash list is signed, so attackers cannot forge a valid allowlist with server access alone.
 
 ### Attack Prevention
 
-| Attack | Protection |
-|--------|------------|
-| Server serves malicious JS | Packaged hash-only CSP blocks before execution |
-| Server removes SRI from HTML | Hash-only CSP blocks the external script; extension also warns |
-| Server changes SRI in HTML | Extension detects SRI doesn't match manifest |
-| Server serves different scripts to extension vs browser | Does not matter for execution: the packaged CSP lets the browser run only the signed script hashes, whatever the extension was shown |
-| Server serves different HTML to extension vs browser | **Not detected.** The altered markup is parsed and shown; its inline scripts and event handlers are still blocked by the packaged CSP |
-| Server adds an unsigned same-origin stylesheet | Detected and warned about, not blocked (`style-src 'self'`) |
-| Server redirects to another port or scheme of the same host | The packaged CSP denies every script there and the extension shows a warning instead of a status |
+| Attack | Chromium | Firefox |
+|--------|----------|---------|
+| Server serves malicious JS | Blocked before execution by the hash-only policy | Same |
+| Server adds an inline script or handler to the HTML | Not run. Shown as a notice | Page replaced by the block page |
+| Server serves different HTML to the navigation than to any other request | **Not detected.** State stays "partially verified" | Page replaced by the block page |
+| Server adds markup with framework directives and no script | **Not prevented**: the signed framework evaluates it (see below) | Page replaced by the block page |
+| Server links an unsigned same-origin stylesheet | Loaded; state "failed" | Page replaced by the block page |
+| Server sends `Link: rel=stylesheet` | Header removed | Header removed |
+| Server redirects an invite link to another origin | Navigation blocked | Navigation blocked |
+| Server redirects to another port or scheme of the host | Blocked, as above | Blocked, as above |
+| Service worker registered before the extension answers the navigation | Document stopped, worker removed, page reloaded | Same |
+| Manifest host unreachable, nothing stored | "Unverifiable"; script policy still in force | Navigation replaced by the block page |
 
 The extension substantially narrows, but does not eliminate, the web-delivery
-trust problem. It does not make the HTML immutable, prevent abuse of a bug in
-already trusted client code, protect a compromised signing key/browser store,
-or defend against a malicious higher-privilege browser extension.
+trust problem. It does not prevent abuse of a bug in already trusted client
+code, protect a compromised signing key or browser store, or defend against a
+malicious higher-privilege browser extension.
 
-#### What is and is not verified about the HTML
+#### What Chromium cannot do
 
-The page HTML is checked through a second request that the content script
-makes after the page has loaded. A server can tell that request from the
-navigation (different fetch metadata, no cookies, no query string) and answer
-the two differently, so a matching hash says the server is able to serve the
-signed HTML, not that it served it to the page. This was reproduced against
-the 1.3.8 extension: the navigation received an extra element, the verifier's
-request received the signed bytes, and no warning was shown.
+Manifest V3 in Chromium gives an extension no way to read or hold the body of
+a navigation response. The page HTML therefore cannot be compared with the
+signed hash before it is parsed, and a second download proves nothing, since
+the server can answer it differently. In Chromium the script policy is the
+only thing that binds what the page does to the signed release, and it binds
+scripts, not markup.
 
-What still holds in that situation is the packaged CSP, which the browser
-applies to the navigation response itself: only scripts whose hashes are in
-the signed manifest run, and inline scripts and inline event handlers do not.
-What does not hold is everything the markup alone decides: which elements and
-attributes exist, what the signed scripts find in the DOM, what the user is
-shown. Treat a green badge as "the scripts are the signed ones", not as "the
-page is the signed page".
+That gap is not theoretical. The client uses a framework that reads
+directives from markup. Reproduced against the real client: one element with
+a binding attribute and no script, added to the navigation response only,
+makes the signed framework put a value from the application into the URL of
+an image, which the page then requests from the server. The same mechanism
+reaches anything the application holds, decrypted messages included. The
+state shown in that situation is "partially verified", which is accurate, and
+it is not a verified state.
+
+Closing it needs a change in the client, not in the extension: pages reduced
+to a fixed shell whose single signed bootstrap script discards whatever
+markup arrived and builds the document from signed templates. Until then,
+use Firefox when the server must not be trusted with the page.
+
+#### Without the extension
+
+None of the above applies. In particular a server can redirect an invite link
+to an origin of its choice and read the key from the fragment there. No
+change to the site can prevent that, because the first response to an invite
+link is always the server's.
 
 ## Self-Hosted Instances
 
@@ -419,26 +487,24 @@ extensions/
 ├── generate-csp-rules.js  # Per-page preventive CSP generator
 ├── generate-icons.sh      # Icon generation script
 ├── hashes.json.example    # Example hash file format
-├── chrome/
-│   ├── manifest.json      # Chrome extension manifest (MV3)
-│   ├── rules.json         # Preventive CSP response-header rules
-│   ├── background.js      # Service worker
-│   ├── content.js         # Content script for overlay
+├── chrome/                # Chromium build
+│   ├── manifest.json      # Extension manifest (MV3)
+│   ├── rules.json         # Script policy, header removals, redirect rule
+│   ├── verdict.js         # What each state means (pure logic, unit tested)
+│   ├── background.js      # Manifest validation, per-tab state, response check
+│   ├── content.js         # Probes, DOM inspection, overlay
 │   ├── popup.html         # Extension popup UI
 │   ├── popup.js           # Popup logic
-│   ├── warning.html       # Warning overlay page (web_accessible_resource)
-│   ├── warning.css        # Warning overlay styles (CSP-compliant)
+│   ├── blocked.html       # Shown in place of a refused navigation
+│   ├── blocked.js
+│   ├── blocked.css
+│   ├── warning.css        # Overlay styles (web_accessible_resource limited to pinchat.io)
 │   └── icons/             # Extension icons
-└── firefox/
-    ├── manifest.json      # Firefox extension manifest (MV3)
-    ├── rules.json         # Preventive CSP response-header rules
-    ├── background.js      # Background script
-    ├── content.js         # Content script for overlay
-    ├── popup.html         # Extension popup UI
-    ├── popup.js           # Popup logic
-    ├── warning.html       # Warning overlay page
-    ├── warning.css        # Warning overlay styles (web_accessible_resource limited to pinchat.io)
-    └── icons/             # Extension icons
+└── firefox/               # Firefox build: same sources, own manifest and rules
+    ├── manifest.json      # Adds the webRequest permissions for the response check
+    ├── rules.json         # No redirect rule: enforced in background.js instead
+    └── ...                # verdict.js, background.js, content.js, popup.*,
+                           # blocked.* and warning.css are identical to chrome/
 ```
 
 ## Troubleshooting

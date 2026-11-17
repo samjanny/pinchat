@@ -638,7 +638,7 @@ An extension that only fetches files separately and compares hashes is open to s
 5. Extension checks the elements in the DOM, and a separately fetched copy of every file, against the signed manifest
 6. Manifest is signed and hosted on GitHub (out of the application server's control)
 
-Step 5 is still a separate fetch. For scripts that does not matter, because steps 1 to 4 bind what runs. For the HTML document it does: nothing binds the markup the browser parsed to the signed hash, so a server that alters the HTML only for the navigation is not detected. See "Security Properties" below.
+Step 5 is still a separate fetch. For scripts that does not matter, because steps 1 to 4 bind what runs. For the HTML document it does, which is why that copy is never counted towards a positive state. In Firefox the extension additionally holds the navigation response itself and compares its bytes with the signed hash before the parser sees them. In Chromium no API allows that. See "Security Properties" below.
 
 #### Architecture
 
@@ -702,57 +702,52 @@ Step 5 is still a separate fetch. For scripts that does not matter, because step
 
 #### Security Properties
 
-**What This Protects Against**:
-- Server compromise serving malicious JavaScript
-- CDN/proxy tampering with static files
-- DNS hijacking serving fake content
-- Supply chain attacks on deployment
-- **Split serving of scripts**, where the server detects the extension and serves it clean files: the packaged CSP makes the browser refuse any script whose hash is not signed, whatever the extension was shown
-- A redirect to another port or scheme of the same host: the packaged CSP denies every script there, and the extension shows a warning instead of a verification status
+The extension keeps one state per page and per tab. Green ("verified") means
+that the bytes of the page were compared with the signed hash before the
+browser parsed them and that the script policy is in force. Only Firefox can
+do that. In Chromium the best state is "partially verified": only signed
+scripts can run, the page itself is not attested. `extensions/README.md`
+describes every state and what each may be based on.
+
+**What This Protects Against, in both browsers**:
+- Server compromise serving malicious JavaScript, including when the server
+  detects the extension and serves it clean files: the packaged CSP makes
+  the browser refuse any script whose hash is not signed
+- Inline scripts and inline event handlers in altered HTML
+- A redirect of an invite link to another origin, which would hand the key
+  in the URL fragment to that origin: document navigations on the site may
+  only be redirected to the site
+- A redirect to another port or scheme of the same host
+- A service worker registered before the extension was installed answering
+  navigations with content of its own: such a document is stopped, the
+  worker is removed and the page is reloaded from the network
+- A stylesheet attached through a `Link` response header
+
+**Additionally, in Firefox**:
+- Altered HTML of any kind. The body of every document navigation on the
+  site is held, hashed and compared with the signed hash, and only then
+  released to the parser. Anything else is replaced by a block page
 
 **What This Does NOT Protect Against**:
-- **Split serving of the HTML document.** The extension compares a second download of the page with the manifest, not the bytes the browser parsed. A server can serve altered markup to the navigation and the signed bytes to that second request, and no warning appears (reproduced against extension 1.3.8). Inline scripts and inline event handlers in the altered markup are still blocked by the packaged CSP, so the exposure is what markup alone can do with the signed scripts
-- Unsigned same-origin stylesheets: detected and warned about, not blocked
+- **Altered HTML in Chromium.** Manifest V3 gives an extension no access to
+  the body of a navigation response, and a second download proves nothing.
+  Markup that the signed client-side framework interprets can be added by
+  the server without any script: reproduced against the real client, a
+  single element with a binding attribute sends a value held by the
+  application to the server as part of an image URL. Decrypted messages are
+  within reach of the same mechanism. The state shown is "partially
+  verified", never "verified"
+- Unsigned same-origin stylesheets in Chromium: detected, shown as a
+  failure, not blocked
+- Anything at all when the extension is not installed, is disabled, or has
+  had its host permission revoked. In particular the redirect of an invite
+  link cannot be prevented by the site itself
 - Compromised signing key (attacker could sign malicious hashes)
-- Malicious browser extension updates
-- Users ignoring warning overlays
-- HTML/UI manipulation that can exploit behavior in an already allowlisted script
+- Malicious browser extension updates, and other extensions: an extension
+  with access to the site can read and change everything. Changes to the
+  page whose origin cannot be attested are listed, never judged
+- Abuse of a bug in already signed client code
 - Dynamic content manipulation (API responses)
-- First-page-load without extension (user must install extension first)
-
-#### Trust Model
-
-```
-Trust Chain:
-1. User trusts the extension (installed from browser store or self-hosted)
-2. Extension contains hardcoded ECDSA public key
-3. Hash list signed with corresponding private key
-4. Private key held securely by project maintainer
-5. Any file modification breaks the signature chain
-```
-
-**Key Management**:
-- Private key: Stored securely, never committed to repository
-- Public key: Embedded in extension source code
-- Key rotation: Requires extension update
-
-#### Verification Process
-
-The extension uses prevention plus verification:
-
-1. **Preventive CSP**: Static extension rules set a per-page hash-only script policy before parsing.
-2. **Fetch Manifest**: Extension retrieves `hashes.json.signed` from GitHub.
-3. **Verify Signature**: ECDSA P-256 signature is validated using the embedded public key.
-4. **DOM SRI Check**: Content script verifies `integrity` attributes against the signed manifest.
-5. **File Hash Verification**: Fetches all files listed in the manifest and computes SHA-256 hashes.
-6. **Detect Unauthorized Resources**: Inline scripts, external resources, same-origin scripts outside `/static/`, iframes, and external forms.
-7. **Browser Enforcement**: CSP blocks non-allowlisted scripts and SRI blocks modified allowlisted bytes.
-8. **Alert**: Visual feedback (badge + overlay) based on verification result.
-
-These layers catch:
-- Lazy-loaded or deferred scripts not yet in DOM
-- Server serving modified files (even with correct SRI in HTML)
-- Files blocked by browser SRI (hash mismatch detected independently)
 
 #### Defense in Depth
 
@@ -768,35 +763,41 @@ These layers catch:
 
 #### Failure Modes
 
-| Condition | Badge | Action |
-|-----------|-------|--------|
-| All checks pass | ✓ Green | Safe to proceed |
-| Manifest signature invalid | ! Red | **Full-screen warning overlay** |
-| **Manifest downgrade detected** | ! Red | **Full-screen warning overlay** |
-| SRI attribute missing | ! Red | **Full-screen warning overlay** |
-| SRI mismatch with manifest | ! Red | **Full-screen warning overlay** |
-| **File hash mismatch** | ! Red | **Full-screen warning overlay** |
-| Inline script detected | ! Red | **Full-screen warning overlay** |
-| External resource detected | ! Red | **Full-screen warning overlay** |
-| Unauthorized same-origin script | ! Red | **Full-screen warning overlay** |
-| Network error fetching manifest | ? Yellow | Retry, inform user |
-| GitHub unavailable | ? Yellow | Cached result or warning |
-| File hash ≠ SRI attribute | N/A | **Browser blocks the file** |
+| Condition | State | What the user sees |
+|-----------|-------|--------------------|
+| Page bytes match the signed hash, policy in force (Firefox) | Verified | Green badge |
+| Policy in force, page not attestable (Chromium) | Partially verified | Blue badge |
+| Page bytes differ from the signed hash (Firefox) | Failed | Block page, red overlay without dismiss |
+| A file served to the extension differs from its signed hash | Failed | Red overlay without dismiss |
+| Unsigned stylesheet from the site loaded | Failed | Red overlay without dismiss |
+| Script policy not in force, or service worker controls the page | Failed | Document stopped, red overlay |
+| Manifest signature invalid or sequence too low | Failed | Red overlay without dismiss |
+| Redirect of a document off the site | Failed | Navigation blocked |
+| Policy violation attributed to the page | Notice | Amber bar, dismissible |
+| Manifest unavailable and nothing stored | Unverifiable | Amber bar (Chromium), block page (Firefox) |
+| Page did not pass through the response filter (Firefox) | Unverifiable | Amber overlay with reload |
+| Inline script element or other extension's resource in the DOM | unchanged | Listed in the popup only |
+| File hash differs from its SRI attribute | n/a | Browser blocks the file |
 
 #### Limitations
 
 1. **First-Use Trust**: User must trust the initial extension installation
-2. **Update Window**: Between file changes and hash list update, verification may fail
+2. **Update Window**: Between file changes and hash list update, verification fails
 3. **Key Compromise**: If signing key is compromised, protection is void
-4. **User Override**: Determined users can dismiss warnings
-5. **Extension Required**: Without the packaged CSP, compromised HTML can remove/change SRI and restore same-origin script execution
+4. **Chromium**: the page HTML cannot be attested, see above
+5. **Extension Required**: Without the extension none of this applies
+6. **Firefox filter gaps**: the response filter does not attach to
+   navigations started from some internal pages (`about:preferences`) and to
+   documents answered by a service worker. Both are handled by cancelling
+   the response; the service worker case is covered by a browser test, the
+   internal-page case only by a check in code
 
 #### Recommendations
 
 For maximum security:
 1. Install extensions from source code review, not pre-built packages
 2. Verify the embedded public key matches the project's published key
-3. Never dismiss integrity warnings without investigation
+3. Prefer Firefox when the server must not be trusted with the page itself
 4. Report any unexpected verification failures
 
 ---
