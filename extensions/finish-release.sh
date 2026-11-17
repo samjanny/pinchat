@@ -143,7 +143,7 @@ cat <<MSG
 
 Next, in this order:
 
-  git add -A
+  git add -u    # tracked files only; add any new file by name after reviewing the list above
   git commit -m "chore(release): re-sign at sequence $NEW_SEQ, pin extension $EXT_VERSION at $TAG"
 MSG
 if [ "$BRANCH" != "main" ]; then

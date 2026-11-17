@@ -611,15 +611,16 @@ manifests.
 
 #### Why SRI?
 
-The previous approach (extension fetches files separately and computes hashes) was vulnerable to bypass attacks: a sophisticated attacker could detect extension requests (via headers, timing) and serve clean files to the extension while serving malicious code to the browser.
+An extension that only fetches files separately and compares hashes is open to split serving: the server can recognise the extension's requests (headers, cookies, timing) and answer them with clean files while the browser gets something else. For script execution this is closed by making the browser itself enforce the signed hashes:
 
-With the packaged CSP and SRI:
-1. Declarative Net Request replaces the response CSP before parsing
-2. Each known page permits only its signed script hashes; unknown paths permit no scripts
+1. Declarative Net Request replaces the response CSP of the navigation before parsing
+2. Each known page permits only its signed script hashes; unknown paths, and any other port of the same host, permit no scripts
 3. HTML files contain hardcoded `integrity="sha256-..."` attributes
 4. Browser refuses to execute modified script bytes
-5. Extension verifies the actual DOM and served files against the signed manifest
+5. Extension checks the elements in the DOM, and a separately fetched copy of every file, against the signed manifest
 6. Manifest is signed and hosted on GitHub (out of the application server's control)
+
+Step 5 is still a separate fetch. For scripts that does not matter, because steps 1 to 4 bind what runs. For the HTML document it does: nothing binds the markup the browser parsed to the signed hash, so a server that alters the HTML only for the navigation is not detected. See "Security Properties" below.
 
 #### Architecture
 
@@ -688,9 +689,12 @@ With the packaged CSP and SRI:
 - CDN/proxy tampering with static files
 - DNS hijacking serving fake content
 - Supply chain attacks on deployment
-- **Bypass attacks** where server detects extension and serves clean files to it
+- **Split serving of scripts**, where the server detects the extension and serves it clean files: the packaged CSP makes the browser refuse any script whose hash is not signed, whatever the extension was shown
+- A redirect to another port or scheme of the same host: the packaged CSP denies every script there, and the extension shows a warning instead of a verification status
 
 **What This Does NOT Protect Against**:
+- **Split serving of the HTML document.** The extension compares a second download of the page with the manifest, not the bytes the browser parsed. A server can serve altered markup to the navigation and the signed bytes to that second request, and no warning appears (reproduced against extension 1.3.8). Inline scripts and inline event handlers in the altered markup are still blocked by the packaged CSP, so the exposure is what markup alone can do with the signed scripts
+- Unsigned same-origin stylesheets: detected and warned about, not blocked
 - Compromised signing key (attacker could sign malicious hashes)
 - Malicious browser extension updates
 - Users ignoring warning overlays

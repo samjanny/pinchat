@@ -320,7 +320,7 @@ The integrity approach provides multiple layers of protection:
 
 1. **Extension-packaged preventive CSP**: Before HTML parsing, permits only the signed script hashes assigned to that page and blocks scripts on unknown paths.
 2. **Browser SRI enforcement**: For scripts carrying `integrity`, blocks bytes that do not match the declared hash.
-3. **Extension verification**: Detects altered HTML, missing/wrong SRI, and modified static files.
+3. **Extension verification**: Detects missing or wrong SRI, unlisted scripts and stylesheets in the DOM, and modified static files. It re-downloads each file, the HTML pages included, and compares that copy with the manifest. It does not see the bytes the browser parsed for the navigation, so it cannot detect HTML that a server alters only for the navigation (see below).
 4. **Signed manifest**: Hash list is signed, so attackers cannot forge a valid allowlist with server access alone.
 
 ### Attack Prevention
@@ -330,12 +330,33 @@ The integrity approach provides multiple layers of protection:
 | Server serves malicious JS | Packaged hash-only CSP blocks before execution |
 | Server removes SRI from HTML | Hash-only CSP blocks the external script; extension also warns |
 | Server changes SRI in HTML | Extension detects SRI doesn't match manifest |
-| Server serves different content to extension vs browser | N/A - Extension checks actual DOM, not separate fetch |
+| Server serves different scripts to extension vs browser | Does not matter for execution: the packaged CSP lets the browser run only the signed script hashes, whatever the extension was shown |
+| Server serves different HTML to extension vs browser | **Not detected.** The altered markup is parsed and shown; its inline scripts and event handlers are still blocked by the packaged CSP |
+| Server adds an unsigned same-origin stylesheet | Detected and warned about, not blocked (`style-src 'self'`) |
+| Server redirects to another port or scheme of the same host | The packaged CSP denies every script there and the extension shows a warning instead of a status |
 
 The extension substantially narrows, but does not eliminate, the web-delivery
 trust problem. It does not make the HTML immutable, prevent abuse of a bug in
 already trusted client code, protect a compromised signing key/browser store,
 or defend against a malicious higher-privilege browser extension.
+
+#### What is and is not verified about the HTML
+
+The page HTML is checked through a second request that the content script
+makes after the page has loaded. A server can tell that request from the
+navigation (different fetch metadata, no cookies, no query string) and answer
+the two differently, so a matching hash says the server is able to serve the
+signed HTML, not that it served it to the page. This was reproduced against
+the 1.3.8 extension: the navigation received an extra element, the verifier's
+request received the signed bytes, and no warning was shown.
+
+What still holds in that situation is the packaged CSP, which the browser
+applies to the navigation response itself: only scripts whose hashes are in
+the signed manifest run, and inline scripts and inline event handlers do not.
+What does not hold is everything the markup alone decides: which elements and
+attributes exist, what the signed scripts find in the DOM, what the user is
+shown. Treat a green badge as "the scripts are the signed ones", not as "the
+page is the signed page".
 
 ## Self-Hosted Instances
 
@@ -442,56 +463,18 @@ extensions/
 - Verify files exist at the expected URLs on pinchat.io
 - Update `FILES_TO_HASH` in generate-hashes.js if paths changed
 
-## Automated Hash Updates (GitHub Actions)
+## Signing Stays Offline
 
-Automatically update the signed hash list when static files change:
+Do not automate signing in CI. A workflow that holds the private key as a
+repository secret and re-signs on every push to `static/` turns "can push to
+the repository" into "can produce a manifest every installed extension
+accepts", which is exactly the capability the signature exists to withhold
+from the server and from the repository. Sign on a machine you control, as in
+"Generate Signed Hash List" above, and commit the result.
 
-```yaml
-# .github/workflows/update-hashes.yml
-name: Update Hash List
-
-on:
-  push:
-    branches: [main]
-    paths:
-      - 'static/**'
-
-jobs:
-  update-hashes:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-
-      - name: Write private key
-        run: echo "${{ secrets.HASH_SIGNING_KEY }}" > private.pem
-
-      - name: Generate signed hashes
-        run: node extensions/generate-hashes.js -k private.pem -o hashes.json.signed
-
-      - name: Clean up private key
-        run: rm -f private.pem
-
-      - name: Commit and push
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add static/*.html hashes.json.signed extensions/chrome/rules.json extensions/firefox/rules.json
-          git diff --staged --quiet || git commit -m "Update signed hash list [skip ci]"
-          git push
-```
-
-### Setting up the GitHub Action
-
-1. Go to repository **Settings > Secrets and variables > Actions**
-2. Create a new secret named `HASH_SIGNING_KEY`
-3. Paste your private key content (from `private.pem`)
-
-Now every push to `static/` will automatically update the signed hash list.
+Keep the key file out of the working tree. `*.pem` is ignored by git as a
+safety net, not as a place to store it: `git add -f`, a different extension
+or an editor backup would still pick it up.
 
 ## License
 

@@ -24,6 +24,12 @@ target/
 # Certificates (never commit these!)
 certs/
 
+# Key material. The manifest signing key must not live in the working tree
+# at all (see extensions/README.md); this only catches the accident.
+*.pem
+*.pem.enc
+*.key
+
 # IDE
 .idea/
 .vscode/
