@@ -13,7 +13,7 @@
       ]
     },
     "condition": {
-      "regexFilter": "^https://(www\\.)?pinchat\\.io/",
+      "regexFilter": "^https://(www\\.)?pinchat\\.io\\.?(:[0-9]+)?/",
       "resourceTypes": [
         "main_frame",
         "sub_frame"

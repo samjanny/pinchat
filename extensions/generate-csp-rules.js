@@ -123,6 +123,8 @@ function buildCsp(scriptPaths, hashesByPath) {
 // catch-all `script-src 'none'` rule blocked every script on the page. The
 // chat page never showed it because it always carries `?room=`. The tail
 // now accepts a query, a fragment, or both.
+const CATCH_ALL_REGEX = '^https://(www\\.)?pinchat\\.io\\.?(:[0-9]+)?/';
+
 function pageRegex(pagePath) {
     const escapedPath = pagePath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     return `^https://(www\\.)?pinchat\\.io${escapedPath}(?:[?#].*)?$`;
@@ -148,7 +150,14 @@ function buildRules(manifestDocument) {
                 }]
             },
             condition: {
-                regexFilter: '^https://(www\\.)?pinchat\\.io/',
+                // Every document on the site's host names, on any port and
+                // with or without the trailing root dot. The page rules
+                // below only match the default port, so anything else keeps
+                // this policy and can run no script at all. Anchoring this
+                // rule to the default port left https://pinchat.io:<port>
+                // without any packaged policy, while the content script and
+                // the badge still treated it as the site.
+                regexFilter: CATCH_ALL_REGEX,
                 resourceTypes: ['main_frame', 'sub_frame']
             }
         }
@@ -196,4 +205,11 @@ if (require.main === module) {
     writeRulesFromManifest(manifestPath);
 }
 
-module.exports = { PAGES, pageScripts, buildRules, writeRulesFromManifest };
+module.exports = {
+    PAGES,
+    CATCH_ALL_REGEX,
+    pageRegex,
+    pageScripts,
+    buildRules,
+    writeRulesFromManifest,
+};

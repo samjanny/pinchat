@@ -67,8 +67,9 @@ async function checkCurrentTab() {
         const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
         const banner = document.getElementById('not-on-site-banner');
         if (tab && tab.url) {
-            const url = new URL(tab.url);
-            const isPinChat = url.hostname === 'pinchat.io' || url.hostname === 'www.pinchat.io';
+            // Whole origin, not hostname: another scheme or port is another site.
+            const isPinChat = ['https://pinchat.io', 'https://www.pinchat.io']
+                .includes(new URL(tab.url).origin);
             banner.style.display = isPinChat ? 'none' : 'block';
         } else {
             banner.style.display = 'block';

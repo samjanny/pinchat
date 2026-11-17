@@ -10,6 +10,15 @@
  * - This prevents bypass attacks where server serves different content
  */
 
+// The origins this extension vouches for. The signed manifest and the
+// packaged Content-Security-Policy rules describe exactly these two. The
+// content script's match patterns ignore the port, so it is also injected on
+// https://pinchat.io:<any port>, which is a different origin that the server
+// operator controls just as well: a redirect is enough to send a visitor
+// there, URL fragment included. Such a page must never be treated as PinChat.
+const OFFICIAL_ORIGINS = ['https://pinchat.io', 'https://www.pinchat.io'];
+const ON_OFFICIAL_ORIGIN = OFFICIAL_ORIGINS.includes(window.location.origin);
+
 let overlayElement = null;
 let domObserver = null;
 let unauthorizedResources = [];
@@ -24,9 +33,28 @@ let reVerifyTimeout = null;  // Debounce timer for re-verification
 let overlayPersistentState = {
     active: false,           // True between showWarningOverlay() and an explicit dismiss
     mismatches: [],
-    isUnauthorized: false
+    isUnauthorized: false,
+    foreignOrigin: false
 };
 let overlayWatchdogTimer = null;
+
+/**
+ * Whether an element is a stylesheet link.
+ *
+ * `rel` is a list of space-separated, case-insensitive tokens. A link with
+ * rel="stylesheet nofollow" or rel="StyleSheet" loads its stylesheet exactly
+ * like rel="stylesheet", so comparing the attribute to that one string let a
+ * tampered page load an unsigned stylesheet without it ever being checked.
+ */
+function isStylesheetLink(element) {
+    if (!element || element.tagName !== 'LINK') return false;
+    const rel = element.getAttribute('rel') || '';
+    return rel.toLowerCase().split(/\s+/).includes('stylesheet');
+}
+
+// Selector counterpart of isStylesheetLink: `~=` matches one token of a
+// space-separated list, `i` makes the match ASCII case-insensitive.
+const STYLESHEET_LINK_SELECTOR = 'link[rel~="stylesheet" i]';
 
 /**
  * Extract pathname from a URL
@@ -94,7 +122,7 @@ function buildManifestSRIMap(manifest) {
  */
 function validateResourceAgainstManifest(element) {
     const isScript = element.tagName === 'SCRIPT';
-    const isStylesheet = element.tagName === 'LINK' && element.rel === 'stylesheet';
+    const isStylesheet = isStylesheetLink(element);
 
     if (!isScript && !isStylesheet) {
         return null;
@@ -451,7 +479,7 @@ function verifySRIInDOM(manifest) {
     });
 
     // Check all stylesheet links
-    const stylesheets = document.querySelectorAll('link[rel="stylesheet"]');
+    const stylesheets = document.querySelectorAll(STYLESHEET_LINK_SELECTOR);
     stylesheets.forEach(link => {
         const href = link.getAttribute('href');
         const path = getPathFromUrl(href);
@@ -652,7 +680,7 @@ function setupDOMObserver() {
                 const attrName = mutation.attributeName;
 
                 // Process script, stylesheet, and base elements
-                if (target.tagName === 'SCRIPT' || (target.tagName === 'LINK' && target.rel === 'stylesheet')) {
+                if (target.tagName === 'SCRIPT' || isStylesheetLink(target)) {
                     console.log(`[PinChat Verify] Attribute '${attrName}' modified on ${target.tagName}`);
 
                     const issue = validateResourceAgainstManifest(target);
@@ -679,7 +707,7 @@ function setupDOMObserver() {
                     if (node.nodeType !== Node.ELEMENT_NODE) return;
 
                     // Validate the node itself if it's a resource or <base> element
-                    if (node.tagName === 'SCRIPT' || (node.tagName === 'LINK' && node.rel === 'stylesheet')) {
+                    if (node.tagName === 'SCRIPT' || isStylesheetLink(node)) {
                         const issue = validateResourceAgainstManifest(node);
                         if (issue) {
                             console.warn(`[PinChat Verify] Dynamic resource injection detected:`, issue);
@@ -697,7 +725,7 @@ function setupDOMObserver() {
 
                     // Check children recursively for nested resource/base elements
                     if (node.querySelectorAll) {
-                        node.querySelectorAll('script, link[rel="stylesheet"]').forEach(el => {
+                        node.querySelectorAll(`script, ${STYLESHEET_LINK_SELECTOR}`).forEach(el => {
                             const issue = validateResourceAgainstManifest(el);
                             if (issue) {
                                 console.warn(`[PinChat Verify] Nested resource injection detected:`, issue);
@@ -869,31 +897,38 @@ async function performDOMSecurityCheck() {
  * Create and show the warning overlay using Shadow DOM
  * Shadow DOM isolates styles from page CSP and allows direct content injection
  */
-function showWarningOverlay(mismatches = [], isUnauthorized = false) {
+function showWarningOverlay(mismatches = [], isUnauthorized = false, foreignOrigin = false) {
     // Persist args so the watchdog can re-mount if the page tries to remove the
     // overlay. We take a defensive copy of `mismatches` so a later mutation of
     // the source array doesn't change what we render on re-mount.
     overlayPersistentState = {
         active: true,
         mismatches: Array.isArray(mismatches) ? [...mismatches] : [],
-        isUnauthorized
+        isUnauthorized,
+        foreignOrigin
     };
 
     if (overlayElement) {
         overlayElement.remove();
     }
 
-    const title = isUnauthorized
+    let title = isUnauthorized
         ? 'UNAUTHORIZED RESOURCES DETECTED!'
         : 'POSSIBLE SERVER COMPROMISE!';
 
-    const description = isUnauthorized
+    let description = isUnauthorized
         ? 'This page contains scripts or stylesheets that are not in the authorized whitelist. This could indicate a compromised server or malicious injection.'
         : 'The files served by this website do not match the verified hashes.';
 
-    const listTitle = isUnauthorized
+    let listTitle = isUnauthorized
         ? 'Unauthorized Resources:'
         : 'Failed Files:';
+
+    if (foreignOrigin) {
+        title = 'THIS IS NOT THE VERIFIED PINCHAT ADDRESS!';
+        description = 'This page uses the PinChat name on an address that this extension does not verify. Nothing on it has been checked, and it may have been sent here to get around the verification.';
+        listTitle = 'Address:';
+    }
 
     // Create host element - NO inline styles, everything via Shadow DOM
     overlayElement = document.createElement('div');
@@ -1002,7 +1037,11 @@ function restoreOverlayIfTampered() {
     if (!overlayElement || !document.contains(overlayElement)) {
         console.warn('[PinChat Verify] Overlay missing - re-mounting');
         overlayElement = null;
-        showWarningOverlay(overlayPersistentState.mismatches, overlayPersistentState.isUnauthorized);
+        showWarningOverlay(
+            overlayPersistentState.mismatches,
+            overlayPersistentState.isUnauthorized,
+            overlayPersistentState.foreignOrigin
+        );
         return;
     }
 
@@ -1065,43 +1104,61 @@ function handleVerificationStatus(state) {
     }
 }
 
-// Listen for messages from background script
-chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-    if (message.type === 'VERIFICATION_STATUS') {
-        handleVerificationStatus(message.state);
-    }
-    if (message.type === 'MANIFEST_DATA') {
-        manifestData = message.manifest;
-        buildManifestSRIMap(manifestData);
-        performDOMSecurityCheck();
-    }
-});
-
-// Request current status and manifest when page loads
-chrome.runtime.sendMessage({ type: 'GET_STATUS' }, (response) => {
-    if (response) {
-        if (response.manifest) {
-            manifestData = response.manifest;
-            buildManifestSRIMap(manifestData);
-        }
-        handleVerificationStatus(response);
-    }
-});
-
-// Setup MutationObserver IMMEDIATELY at document_start, before any page script
-// can execute. Initial DOM check is deferred to DOMContentLoaded (it depends on
-// the manifest arriving from background and on a fully-parsed DOM), but the
-// observer must be live as soon as possible so injections during parse are
-// caught - even if the script tag has already started fetching, we'll flag it
-// and trigger the warning overlay before the user trusts the page.
-setupDOMObserver();
-
-if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', () => {
-        performDOMSecurityCheck();
-    });
+if (!ON_OFFICIAL_ORIGIN) {
+    // Not an origin the manifest or the packaged CSP covers. Do not ask the
+    // background for a verification state and do not report one: say so, and
+    // keep saying so. The catch-all CSP rule denies every script here, this
+    // overlay covers the case where that rule did not apply.
+    const warnForeignOrigin = () => {
+        // At document_start the root element may not exist yet.
+        if (!document.documentElement) return;
+        showWarningOverlay(
+            [{ path: window.location.origin, error: 'not one of ' + OFFICIAL_ORIGINS.join(', ') }],
+            true,
+            true
+        );
+    };
+    warnForeignOrigin();
+    document.addEventListener('DOMContentLoaded', warnForeignOrigin);
 } else {
-    performDOMSecurityCheck();
+    // Listen for messages from background script
+    chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+        if (message.type === 'VERIFICATION_STATUS') {
+            handleVerificationStatus(message.state);
+        }
+        if (message.type === 'MANIFEST_DATA') {
+            manifestData = message.manifest;
+            buildManifestSRIMap(manifestData);
+            performDOMSecurityCheck();
+        }
+    });
+
+    // Request current status and manifest when page loads
+    chrome.runtime.sendMessage({ type: 'GET_STATUS' }, (response) => {
+        if (response) {
+            if (response.manifest) {
+                manifestData = response.manifest;
+                buildManifestSRIMap(manifestData);
+            }
+            handleVerificationStatus(response);
+        }
+    });
+
+    // Setup MutationObserver IMMEDIATELY at document_start, before any page script
+    // can execute. Initial DOM check is deferred to DOMContentLoaded (it depends on
+    // the manifest arriving from background and on a fully-parsed DOM), but the
+    // observer must be live as soon as possible so injections during parse are
+    // caught - even if the script tag has already started fetching, we'll flag it
+    // and trigger the warning overlay before the user trusts the page.
+    setupDOMObserver();
+
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', () => {
+            performDOMSecurityCheck();
+        });
+    } else {
+        performDOMSecurityCheck();
+    }
 }
 
 console.log('[PinChat Verify] Content script loaded with SRI verification');

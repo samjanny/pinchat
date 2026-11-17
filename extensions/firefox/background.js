@@ -40,6 +40,9 @@ OqRJNIZ5zBHCr2HbJsHCtrPQUOKd4cBqfDZlQZ62rzF7ofA39ITBUyLxaA==
 
 // Official domain - DO NOT MODIFY for official pinchat.io usage
 const OFFICIAL_DOMAIN = 'pinchat.io';
+// The only origins whose pages are treated as PinChat. Keep in step with
+// OFFICIAL_ORIGINS in content.js and popup.js.
+const OFFICIAL_ORIGINS = [`https://${OFFICIAL_DOMAIN}`, `https://www.${OFFICIAL_DOMAIN}`];
 
 // Official GitHub repository for manifest - DO NOT MODIFY for official pinchat.io usage
 const GITHUB_REPO = 'samjanny/pinchat';
@@ -290,7 +293,8 @@ async function verifySignature(data, signatureBase64, publicKey) {
  */
 async function hasPinChatTabOpen() {
     try {
-        const tabs = await browser.tabs.query({ url: [`https://${OFFICIAL_DOMAIN}/*`, `https://www.${OFFICIAL_DOMAIN}/*`] });
+        const tabs = (await browser.tabs.query({ url: [`https://${OFFICIAL_DOMAIN}/*`, `https://www.${OFFICIAL_DOMAIN}/*`] }))
+            .filter((tab) => isPinChatUrl(tab.url));
         return tabs.length > 0;
     } catch {
         return false;
@@ -613,8 +617,11 @@ const BADGES = {
 function isPinChatUrl(url) {
     if (!url) return false;
     try {
-        const parsed = new URL(url);
-        return parsed.hostname === OFFICIAL_DOMAIN || parsed.hostname === `www.${OFFICIAL_DOMAIN}`;
+        // Compare the whole origin. Hostname alone also accepted
+        // http://pinchat.io and https://pinchat.io:<any port>, which are
+        // other origins: the packaged CSP rules do not cover them and the
+        // signed manifest says nothing about what they serve.
+        return OFFICIAL_ORIGINS.includes(new URL(url).origin);
     } catch {
         return false;
     }
@@ -658,7 +665,8 @@ async function updateAllTabsBadges() {
  */
 async function notifyContentScripts() {
     try {
-        const tabs = await browser.tabs.query({ url: [`https://${OFFICIAL_DOMAIN}/*`, `https://www.${OFFICIAL_DOMAIN}/*`] });
+        const tabs = (await browser.tabs.query({ url: [`https://${OFFICIAL_DOMAIN}/*`, `https://www.${OFFICIAL_DOMAIN}/*`] }))
+            .filter((tab) => isPinChatUrl(tab.url));
         for (const tab of tabs) {
             browser.tabs.sendMessage(tab.id, {
                 type: 'VERIFICATION_STATUS',
@@ -695,8 +703,7 @@ function isSenderTrusted(sender, profile) {
     const fromPinChatContentScript = () => {
         if (!sender.tab || !sender.tab.url) return false;
         try {
-            const u = new URL(sender.tab.url);
-            return u.hostname === OFFICIAL_DOMAIN || u.hostname === `www.${OFFICIAL_DOMAIN}`;
+            return OFFICIAL_ORIGINS.includes(new URL(sender.tab.url).origin);
         } catch {
             return false;
         }
