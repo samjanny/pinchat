@@ -1,42 +1,123 @@
 /**
- * PinChat Integrity Verifier - Content Script
- * Verifies SRI (Subresource Integrity) attributes in the actual DOM
+ * PinChat Integrity Verifier - content script
  *
- * Security model:
- * - Extension fetches signed manifest from GitHub
- * - Manifest contains expected SRI hashes for all JS/CSS files
- * - Content script verifies that DOM has correct integrity attributes
- * - Browser enforces SRI (blocks tampered files)
- * - This prevents bypass attacks where server serves different content
+ * Runs at document_start in every document on the site's host names. For the
+ * top-level document of an official origin it:
+ *
+ * 1. Probes, synchronously and before the page has parsed anything, whether
+ *    the packaged script policy is in force and whether a service worker
+ *    controls the document. Either one failing means nothing the verifier
+ *    promises holds for this document.
+ * 2. Announces the document to the background script and receives the signed
+ *    manifest and, where the browser can provide it, the result of the check
+ *    of the navigation response itself.
+ * 3. Inspects the DOM and listens for policy violations.
+ * 4. Reports what it saw. The background script decides the state; this
+ *    script only displays it.
+ *
+ * What it deliberately does not do is decide that an element in the DOM is
+ * "unauthorized". Other extensions add elements, script elements included,
+ * and nothing in the DOM says who added a node. What can run is decided by
+ * the script policy, which the browser enforces. An inline script element is
+ * therefore recorded as an unattested change to the page, not as tampering,
+ * and never changes the integrity state on its own. See verdict.js.
  */
+
+const ext = globalThis.browser || globalThis.chrome;
+const V = globalThis.PinChatVerdict;
 
 // The origins this extension vouches for. The signed manifest and the
 // packaged Content-Security-Policy rules describe exactly these two. The
 // content script's match patterns ignore the port, so it is also injected on
 // https://pinchat.io:<any port>, which is a different origin that the server
 // operator controls just as well: a redirect is enough to send a visitor
-// there, URL fragment included. Such a page must never be treated as PinChat.
+// there. Such a page must never be treated as PinChat.
 const OFFICIAL_ORIGINS = ['https://pinchat.io', 'https://www.pinchat.io'];
 const ON_OFFICIAL_ORIGIN = OFFICIAL_ORIGINS.includes(window.location.origin);
+const IS_TOP_LEVEL = window.top === window;
 
-let overlayElement = null;
-let domObserver = null;
-let unauthorizedResources = [];
-let manifestData = null;  // Will be populated from background script
-let fileHashVerificationDone = false;  // Track if we've verified file hashes
-let manifestSRIMap = {};  // Map of path -> expected SRI for O(1) lookups
-let reVerifyTimeout = null;  // Debounce timer for re-verification
+// Identifies this document towards the background script. A report carrying
+// this token can only ever update the record of this document.
+const DOCUMENT_TOKEN = Array.from(crypto.getRandomValues(new Uint8Array(16)))
+    .map((byte) => byte.toString(16).padStart(2, '0')).join('');
 
-// Overlay persistence - a compromised page could try to remove or hide our
-// warning host element. We retain the args used to render the overlay so a
-// watchdog (and the main MutationObserver) can re-mount/restore on tamper.
-let overlayPersistentState = {
-    active: false,           // True between showWarningOverlay() and an explicit dismiss
-    mismatches: [],
-    isUnauthorized: false,
-    foreignOrigin: false
-};
-let overlayWatchdogTimer = null;
+let manifestData = null;
+let manifestSRIMap = {};
+let inspectionTimer = null;
+let fileCheck = null;          // { checked, failed, issues } once the files were re-fetched
+let checksDone = false;
+let canaryViolationsToSkip = 0;
+
+// code + detail -> finding. Kept for the life of the document: an element
+// that was added and removed again is still something that happened.
+const findings = new Map();
+const environment = new Map();
+
+function note(entry) {
+    const target = entry.class === V.CLASS.ENVIRONMENT ? environment : findings;
+    const key = `${entry.code}\n${entry.detail}`;
+    if (target.size >= 200 || target.has(key)) return false;
+    target.set(key, entry);
+    return true;
+}
+
+// =============================================================================
+// Probes
+// =============================================================================
+
+/**
+ * Is the packaged script policy in force for this document?
+ *
+ * The policy forbids inline event handlers. An element with one is created
+ * here and clicked: if the handler runs, no such policy applies, whatever
+ * the reason (a document answered by a service worker never receives the
+ * extension's response header rules, for one). The answer is available
+ * synchronously, before the parser has produced a single element of the
+ * page. It cannot tell a weakened policy from the intact one, only an absent
+ * one from a present one.
+ */
+function policyIsInForce() {
+    const probe = document.createElement('div');
+    probe.setAttribute('onclick', 'this.setAttribute("data-ran", "1")');
+    canaryViolationsToSkip += 1;
+    try {
+        probe.click();
+    } catch {
+        /* a throwing dispatch is not an executed handler */
+    }
+    const blocked = probe.getAttribute('data-ran') !== '1';
+    if (!blocked) canaryViolationsToSkip = 0;
+    return blocked;
+}
+
+function workerControlsDocument() {
+    try {
+        return !!(navigator.serviceWorker && navigator.serviceWorker.controller);
+    } catch {
+        return false;
+    }
+}
+
+/**
+ * Remove every service worker registered for the origin. The site uses
+ * none, and under the packaged policy a page cannot register one, so a
+ * registration dates from a visit made without the extension, or with it
+ * disabled. Returns how many were removed.
+ */
+async function removeServiceWorkers() {
+    try {
+        if (!navigator.serviceWorker) return 0;
+        const registrations = await navigator.serviceWorker.getRegistrations();
+        await Promise.all(registrations.map((registration) => registration.unregister()));
+        return registrations.length;
+    } catch {
+        return 0;
+    }
+}
+
+// =============================================================================
+// DOM inspection
+// =============================================================================
 
 /**
  * Whether an element is a stylesheet link.
@@ -52,964 +133,451 @@ function isStylesheetLink(element) {
     return rel.toLowerCase().split(/\s+/).includes('stylesheet');
 }
 
-// Selector counterpart of isStylesheetLink: `~=` matches one token of a
-// space-separated list, `i` makes the match ASCII case-insensitive.
-const STYLESHEET_LINK_SELECTOR = 'link[rel~="stylesheet" i]';
-
-/**
- * Extract pathname from a URL
- */
 function getPathFromUrl(url) {
     if (!url) return null;
     try {
-        if (url.startsWith('/')) {
-            return url.split('?')[0].split('#')[0];
-        }
-        const parsed = new URL(url, window.location.origin);
+        const parsed = new URL(url, window.location.href);
         if (parsed.origin === window.location.origin) {
             return parsed.pathname;
         }
-        return url;
-    } catch (e) {
+        return parsed.href;
+    } catch {
         return url;
     }
 }
 
-/**
- * Check if path is an internal resource that should have SRI
- */
-function isInternalResource(path) {
-    if (!path) return false;
-    if (path.startsWith('http://') || path.startsWith('https://')) {
-        return false;
-    }
-    return path.startsWith('/static/');
-}
-
-/**
- * Convert hex hash to SRI format (sha256-base64)
- */
 function hexToSRI(hexHash) {
-    // Convert hex to bytes
-    const bytes = new Uint8Array(hexHash.match(/.{1,2}/g).map(byte => parseInt(byte, 16)));
-    // Convert to base64
-    const base64 = btoa(String.fromCharCode(...bytes));
-    return `sha256-${base64}`;
+    const bytes = new Uint8Array(hexHash.match(/.{1,2}/g).map((byte) => parseInt(byte, 16)));
+    return `sha256-${btoa(String.fromCharCode(...bytes))}`;
 }
 
-/**
- * Build the SRI map from manifest for O(1) lookups
- * Should be called whenever manifest is updated
- */
 function buildManifestSRIMap(manifest) {
     manifestSRIMap = {};
-    if (manifest && manifest.files) {
-        manifest.files.forEach(file => {
-            if (file.path && file.hash) {
-                manifestSRIMap[file.path] = hexToSRI(file.hash);
-            }
-        });
+    for (const file of (manifest && manifest.files) || []) {
+        if (file.path && file.hash) manifestSRIMap[file.path] = hexToSRI(file.hash);
     }
-    console.log(`[PinChat Verify] Built SRI map with ${Object.keys(manifestSRIMap).length} entries`);
 }
 
 /**
- * Validate a single resource element against the manifest
- * Returns null if valid, or an issue object if invalid
- *
- * @param {HTMLElement} element - Script or Link element to validate
- * @returns {Object|null} - Issue object or null if valid
+ * Compare one script or stylesheet element with the signed manifest.
+ * Returns null when there is nothing to say about it, or an issue whose
+ * `type` verdict.js maps to a finding.
  */
-function validateResourceAgainstManifest(element) {
+function inspectResourceElement(element) {
     const isScript = element.tagName === 'SCRIPT';
     const isStylesheet = isStylesheetLink(element);
+    if (!isScript && !isStylesheet) return null;
 
-    if (!isScript && !isStylesheet) {
+    const url = element.getAttribute(isScript ? 'src' : 'href');
+    if (!url) {
+        const type = (element.getAttribute('type') || '').toLowerCase();
+        const dataBlock = type.includes('json') || type === 'text/plain' || type.includes('template');
+        if (isScript && (element.textContent || '').trim() && !dataBlock) {
+            // The policy does not run inline scripts. Who added the element
+            // is not knowable from here.
+            return { path: '[inline script]', error: 'inline script element', type: 'inline-script' };
+        }
         return null;
     }
 
-    const urlAttr = isScript ? 'src' : 'href';
-    const url = element.getAttribute(urlAttr);
+    let absolute = url;
+    try {
+        absolute = new URL(url, window.location.href).href;
+    } catch {
+        /* judged below as written */
+    }
+    if (V.isExtensionUrl(absolute)) {
+        return {
+            path: absolute.split('/').slice(0, 3).join('/'),
+            error: `${isScript ? 'script' : 'stylesheet'} of another extension`,
+            type: 'extension-script',
+        };
+    }
 
-    if (!url) {
-        // Inline script without src
-        if (isScript && element.textContent?.trim() && !element.type?.includes('application/json')) {
+    const lower = url.trim().toLowerCase();
+    for (const scheme of ['data:', 'blob:', 'javascript:', 'filesystem:']) {
+        if (lower.startsWith(scheme)) {
             return {
-                path: '[inline]',
-                error: 'Dynamic inline script injection',
-                type: 'inline-script'
+                path: url.substring(0, 50),
+                error: `'${scheme}' URL`,
+                type: isScript ? 'dangerous-script' : 'dangerous-stylesheet',
             };
         }
-        return null;
     }
 
     const path = getPathFromUrl(url);
+    if (!path || !path.startsWith('/')) {
+        return {
+            path: String(path).slice(0, 120),
+            error: `${isScript ? 'script' : 'stylesheet'} from another origin`,
+            type: isScript ? 'external-script' : 'external-stylesheet',
+        };
+    }
+    if (!path.startsWith('/static/')) {
+        return {
+            path,
+            error: `site ${isScript ? 'script' : 'stylesheet'} outside /static/`,
+            type: isScript ? 'unauthorized-script' : 'unauthorized-stylesheet',
+        };
+    }
+
+    // A script element must point at a .js file and a stylesheet at a .css
+    // file. Otherwise a tampered page could load another signed file, such
+    // as a JSON document, as code under that file's valid hash.
+    const pathLower = path.toLowerCase();
+    if (isScript && !pathLower.endsWith('.js')) {
+        return { path, error: 'script element pointing at a non-script file', type: 'type-confusion-script' };
+    }
+    if (isStylesheet && !pathLower.endsWith('.css')) {
+        return { path, error: 'stylesheet link pointing at a non-stylesheet file', type: 'type-confusion-stylesheet' };
+    }
+
+    // No verdict without the manifest; the inspection runs again once it is
+    // here.
+    if (!manifestData) return null;
+
+    const expected = manifestSRIMap[path];
+    if (!expected) {
+        return { path, error: 'not in the signed manifest', type: isScript ? 'unknown-script' : 'unknown-stylesheet' };
+    }
     const integrity = element.getAttribute('integrity');
-
-    // Block dangerous URL schemes that could execute arbitrary code
-    const dangerousSchemes = ['data:', 'blob:', 'javascript:', 'filesystem:'];
-    const urlLower = url.toLowerCase();
-    for (const scheme of dangerousSchemes) {
-        if (urlLower.startsWith(scheme)) {
-            return {
-                path: url.substring(0, 50) + (url.length > 50 ? '...' : ''),
-                error: `Dangerous URL scheme '${scheme}' not allowed`,
-                type: isScript ? 'dangerous-script' : 'dangerous-stylesheet'
-            };
-        }
+    if (!integrity) {
+        return { path, error: 'no integrity attribute', type: isScript ? 'missing-sri' : 'stylesheet-missing-sri' };
     }
-
-    // Check external resources
-    if (path && (path.startsWith('http://') || path.startsWith('https://'))) {
+    if (integrity !== expected) {
         return {
-            path: path,
-            error: isScript ? 'External script not allowed' : 'External stylesheet not allowed',
-            type: isScript ? 'external-script' : 'external-stylesheet'
+            path,
+            error: 'integrity attribute differs from the signed hash',
+            type: isScript ? 'sri-mismatch' : 'stylesheet-sri-mismatch',
         };
     }
-
-    // Check same-origin resources outside /static/
-    if (path && path.startsWith('/') && !path.startsWith('/static/')) {
-        return {
-            path: path,
-            error: `Unauthorized same-origin ${isScript ? 'script' : 'stylesheet'} (not in /static/)`,
-            type: isScript ? 'unauthorized-script' : 'unauthorized-stylesheet'
-        };
-    }
-
-    // Validate internal resources against manifest
-    if (isInternalResource(path)) {
-        // Defense-in-depth: enforce that <script> points to .js and
-        // <link rel=stylesheet> to .css. Without this, a compromised server
-        // could inject <script src="/static/operator.json" integrity="..."> with
-        // a valid manifest hash, bypassing the manifest check via type confusion.
-        const pathLower = path.toLowerCase();
-        if (isScript && !pathLower.endsWith('.js')) {
-            return {
-                path: path,
-                error: 'Script src must reference a .js file',
-                type: 'type-confusion-script'
-            };
-        }
-        if (isStylesheet && !pathLower.endsWith('.css')) {
-            return {
-                path: path,
-                error: 'Stylesheet href must reference a .css file',
-                type: 'type-confusion-stylesheet'
-            };
-        }
-
-        const expectedSRI = manifestSRIMap[path];
-
-        if (!expectedSRI) {
-            // Race-condition guard: the MutationObserver runs at document_start
-            // and fires for every <script>/<link> the page parser inserts, but
-            // the manifest arrives asynchronously from the background script
-            // (browser.runtime.sendMessage callback). Until the manifest lands,
-            // manifestSRIMap is empty and every legitimate resource would be
-            // wrongly flagged "not in manifest". Defer to performDOMSecurityCheck,
-            // which already waits for the manifest and re-scans the full DOM
-            // once it arrives - so any genuinely unknown resource is still
-            // caught, just slightly later.
-            if (!manifestData || !manifestData.files) {
-                return null;
-            }
-            return {
-                path: path,
-                error: `${isScript ? 'Script' : 'Stylesheet'} not in manifest`,
-                type: isScript ? 'unknown-script' : 'unknown-stylesheet'
-            };
-        }
-
-        if (!integrity) {
-            return {
-                path: path,
-                error: 'Missing integrity attribute',
-                type: 'missing-sri'
-            };
-        }
-
-        if (integrity !== expectedSRI) {
-            return {
-                path: path,
-                error: `SRI mismatch (expected ${expectedSRI.substring(0, 25)}...)`,
-                type: 'sri-mismatch'
-            };
-        }
-    }
-
-    return null; // Valid resource
+    return null;
 }
 
-/**
- * Schedule a full re-verification with debouncing
- * Prevents excessive re-checks when multiple mutations occur
- */
-function scheduleReVerification() {
-    if (reVerifyTimeout) {
-        clearTimeout(reVerifyTimeout);
-    }
-    reVerifyTimeout = setTimeout(() => {
-        reVerifyTimeout = null;
-        console.log('[PinChat Verify] Scheduled re-verification triggered');
-        fileHashVerificationDone = false;
-        performDOMSecurityCheck();
-    }, 500); // 500ms debounce
-}
-
-/**
- * Calculate SHA-256 hash of content
- * @param {ArrayBuffer} buffer - Content to hash
- * @returns {Promise<string>} - Hex-encoded hash
- */
-async function calculateHash(buffer) {
-    const hashBuffer = await crypto.subtle.digest('SHA-256', buffer);
-    const hashArray = Array.from(new Uint8Array(hashBuffer));
-    return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
-}
-
-/**
- * Fetch a file and calculate its hash
- * @param {string} path - Path to fetch
- * @returns {Promise<{path: string, hash: string, error?: string}>}
- */
-async function fetchAndHashFile(path) {
+function inspectBaseElement(element) {
+    const href = element.getAttribute('href');
+    if (!href) return null;
+    let origin = null;
     try {
-        const url = new URL(path, window.location.origin);
-        const response = await fetch(url.href, {
-            cache: 'no-store',
-            credentials: 'omit' // Don't send cookies - static files should be public
-        });
-
-        if (!response.ok) {
-            return { path, hash: null, error: `HTTP ${response.status}` };
-        }
-
-        const buffer = await response.arrayBuffer();
-        const hash = await calculateHash(buffer);
-        return { path, hash, error: null };
-    } catch (e) {
-        return { path, hash: null, error: e.message };
+        origin = new URL(href, window.location.href).origin;
+    } catch {
+        return { path: href.slice(0, 120), error: 'invalid <base href>', type: 'base-invalid' };
     }
+    return origin !== window.location.origin
+        ? { path: href.slice(0, 120), error: '<base href> to another origin', type: 'base-cross-origin' }
+        : { path: href.slice(0, 120), error: 'unexpected <base> element', type: 'base-unexpected' };
 }
 
-/**
- * Verify file hashes by fetching and comparing with manifest
- * This is the definitive check - it catches:
- * - Server serving modified files (even if SRI in DOM is correct)
- * - Files blocked by browser SRI (we'll get the actual content and see mismatch)
- *
- * @param {Object} manifest - Manifest with expected hashes
- * @returns {Promise<{issues: Array, verified: Array}>}
- */
-async function verifyFileHashes(manifest) {
+/** Issues for one element and everything under it. */
+function inspectSubtree(root) {
     const issues = [];
-    const verified = [];
-
-    if (!manifest || !manifest.files) {
-        return { issues: [{ path: 'manifest', error: 'No manifest data', type: 'no-manifest' }], verified: [] };
-    }
-
-    // Build expected hash map from manifest and get all files to check
-    const expectedHashes = {};
-    const resourcesToCheck = [];
-
-    manifest.files.forEach(file => {
-        if (file.path && file.hash) {
-            expectedHashes[file.path] = file.hash;
-            // Iterate on ALL manifest files, not just DOM nodes
-            if (isInternalResource(file.path)) {
-                resourcesToCheck.push(file.path);
+    const visit = (element) => {
+        if (element.id === 'pinchat-integrity-warning-host') return;
+        const tag = element.tagName;
+        let issue = null;
+        if (tag === 'SCRIPT' || tag === 'LINK') {
+            issue = inspectResourceElement(element);
+        } else if (tag === 'BASE') {
+            issue = inspectBaseElement(element);
+        } else if (tag === 'STYLE') {
+            if ((element.textContent || '').trim()) {
+                issue = { path: '[inline style]', error: 'inline style element', type: 'css-import' };
             }
-        }
-    });
-
-    console.log(`[PinChat Verify] Fetching and hashing ${resourcesToCheck.length} files from manifest...`);
-
-    // Fetch and hash all files in parallel
-    const results = await Promise.all(resourcesToCheck.map(fetchAndHashFile));
-
-    for (const result of results) {
-        const expectedHash = expectedHashes[result.path];
-
-        if (result.error) {
-            // Failed to fetch file
-            issues.push({
-                path: result.path,
-                error: `Failed to fetch: ${result.error}`,
-                type: 'fetch-error'
-            });
-            console.error(`[PinChat Verify] ✗ ${result.path}: fetch failed - ${result.error}`);
-        } else if (!expectedHash) {
-            // File not in manifest
-            issues.push({
-                path: result.path,
-                error: 'File not in manifest',
-                type: 'unknown-file'
-            });
-            console.warn(`[PinChat Verify] ? ${result.path}: not in manifest`);
-        } else if (result.hash !== expectedHash) {
-            // Hash mismatch - this is the critical security check
-            issues.push({
-                path: result.path,
-                error: 'Hash mismatch - file may have been tampered',
-                type: 'hash-mismatch',
-                expected: expectedHash,
-                actual: result.hash
-            });
-            console.error(`[PinChat Verify] ✗ ${result.path}: HASH MISMATCH`);
-            console.error(`[PinChat Verify]   Expected: ${expectedHash}`);
-            console.error(`[PinChat Verify]   Actual:   ${result.hash}`);
-        } else {
-            // Hash matches
-            verified.push({ path: result.path, hash: result.hash });
-            console.log(`[PinChat Verify] ✓ ${result.path}: hash verified`);
-        }
-    }
-
-    return { issues, verified };
-}
-
-/**
- * Verify SRI attributes in the DOM against manifest
- */
-function verifySRIInDOM(manifest) {
-    const issues = [];
-
-    // Build a map of path -> expected SRI from manifest
-    const expectedSRI = {};
-    if (manifest && manifest.files) {
-        manifest.files.forEach(file => {
-            if (file.path && file.hash) {
-                // Convert hex hash to SRI format
-                expectedSRI[file.path] = hexToSRI(file.hash);
-            }
-        });
-    }
-
-    // Dangerous URL schemes that could execute arbitrary code
-    const dangerousSchemes = ['data:', 'blob:', 'javascript:', 'filesystem:'];
-
-    // Check all script tags
-    const scripts = document.querySelectorAll('script[src]');
-    scripts.forEach(script => {
-        const src = script.getAttribute('src');
-        const path = getPathFromUrl(src);
-        const integrity = script.getAttribute('integrity');
-
-        // Block dangerous URL schemes
-        const srcLower = (src || '').toLowerCase();
-        for (const scheme of dangerousSchemes) {
-            if (srcLower.startsWith(scheme)) {
-                issues.push({
-                    path: src.substring(0, 50) + (src.length > 50 ? '...' : ''),
-                    error: `Dangerous URL scheme '${scheme}' not allowed`,
-                    type: 'dangerous-script'
-                });
-                return; // Continue to next script
-            }
-        }
-
-        if (isInternalResource(path)) {
-            // Defense-in-depth: <script> must reference a .js file
-            if (!path.toLowerCase().endsWith('.js')) {
-                issues.push({
-                    path: path,
-                    error: 'Script src must reference a .js file',
-                    type: 'type-confusion-script'
-                });
-                return;
-            }
-
-            const expected = expectedSRI[path];
-
-            if (!expected) {
-                // Unknown script - not in manifest
-                issues.push({
-                    path: path,
-                    error: 'Script not in manifest',
-                    type: 'unknown-script'
-                });
-            } else if (!integrity) {
-                // Missing SRI attribute
-                issues.push({
-                    path: path,
-                    error: 'Missing integrity attribute',
-                    type: 'missing-sri'
-                });
-            } else if (integrity !== expected) {
-                // SRI mismatch - server may have modified HTML
-                issues.push({
-                    path: path,
-                    error: `SRI mismatch (expected ${expected.substring(0, 20)}...)`,
-                    type: 'sri-mismatch'
-                });
-            }
-        } else if (path && (path.startsWith('http://') || path.startsWith('https://'))) {
-            // External script - flag it
-            issues.push({
-                path: path,
-                error: 'External script not allowed',
-                type: 'external-script'
-            });
-        } else if (path && path.startsWith('/')) {
-            // Same-origin script outside /static/ - unauthorized
-            issues.push({
-                path: path,
-                error: 'Unauthorized same-origin script (not in /static/)',
-                type: 'unauthorized-script'
-            });
-        }
-    });
-
-    // Check for inline scripts (always unauthorized)
-    const allScripts = document.querySelectorAll('script');
-    allScripts.forEach(script => {
-        if (!script.getAttribute('src')) {
-            const content = (script.textContent || '').trim();
-            // Skip JSON data scripts and empty scripts
-            if (content.length > 0 && !script.type?.includes('application/json')) {
-                issues.push({
-                    path: '[inline]',
-                    error: 'Inline script not allowed',
-                    type: 'inline-script'
-                });
-            }
-        }
-    });
-
-    // Check all stylesheet links
-    const stylesheets = document.querySelectorAll(STYLESHEET_LINK_SELECTOR);
-    stylesheets.forEach(link => {
-        const href = link.getAttribute('href');
-        const path = getPathFromUrl(href);
-        const integrity = link.getAttribute('integrity');
-
-        // Block dangerous URL schemes
-        const hrefLower = (href || '').toLowerCase();
-        for (const scheme of dangerousSchemes) {
-            if (hrefLower.startsWith(scheme)) {
-                issues.push({
-                    path: href.substring(0, 50) + (href.length > 50 ? '...' : ''),
-                    error: `Dangerous URL scheme '${scheme}' not allowed`,
-                    type: 'dangerous-stylesheet'
-                });
-                return; // Continue to next stylesheet
-            }
-        }
-
-        if (isInternalResource(path)) {
-            // Defense-in-depth: stylesheet must reference a .css file
-            if (!path.toLowerCase().endsWith('.css')) {
-                issues.push({
-                    path: path,
-                    error: 'Stylesheet href must reference a .css file',
-                    type: 'type-confusion-stylesheet'
-                });
-                return;
-            }
-
-            const expected = expectedSRI[path];
-
-            if (!expected) {
-                issues.push({
-                    path: path,
-                    error: 'Stylesheet not in manifest',
-                    type: 'unknown-stylesheet'
-                });
-            } else if (!integrity) {
-                issues.push({
-                    path: path,
-                    error: 'Missing integrity attribute',
-                    type: 'missing-sri'
-                });
-            } else if (integrity !== expected) {
-                issues.push({
-                    path: path,
-                    error: `SRI mismatch`,
-                    type: 'sri-mismatch'
-                });
-            }
-        } else if (path && (path.startsWith('http://') || path.startsWith('https://'))) {
-            issues.push({
-                path: path,
-                error: 'External stylesheet not allowed',
-                type: 'external-stylesheet'
-            });
-        } else if (path && path.startsWith('/')) {
-            // Same-origin stylesheet outside /static/ - unauthorized
-            issues.push({
-                path: path,
-                error: 'Unauthorized same-origin stylesheet (not in /static/)',
-                type: 'unauthorized-stylesheet'
-            });
-        }
-    });
-
-    // Check for CSS @import in style tags
-    const styles = document.querySelectorAll('style');
-    styles.forEach(style => {
-        const content = style.textContent || '';
-        if (/@import/i.test(content)) {
-            issues.push({
-                path: '[style @import]',
-                error: 'CSS @import not allowed',
-                type: 'css-import'
-            });
-        }
-    });
-
-    // Check for iframes (potential phishing)
-    const iframes = document.querySelectorAll('iframe');
-    iframes.forEach(iframe => {
-        // Skip our own warning iframe
-        if (iframe.id === 'pinchat-integrity-warning-frame') {
-            return;
-        }
-        const src = iframe.getAttribute('src');
-        if (src) {
-            // Skip extension URLs (chrome-extension:// or moz-extension://)
-            if (src.startsWith('chrome-extension://') || src.startsWith('moz-extension://')) {
-                return;
-            }
+        } else if (tag === 'IFRAME' || tag === 'FRAME' || tag === 'EMBED' || tag === 'OBJECT') {
+            const src = element.getAttribute('src') || element.getAttribute('data') || '';
+            let absolute = src;
             try {
-                const parsed = new URL(src, window.location.origin);
-                if (parsed.origin !== window.location.origin) {
-                    issues.push({
-                        path: src,
-                        error: 'External iframe detected',
-                        type: 'external-iframe'
-                    });
-                }
-            } catch (e) {
-                // Invalid URL
+                absolute = new URL(src, window.location.href).href;
+            } catch {
+                /* judged as written */
             }
-        }
-    });
-
-    // Check for forms pointing to external URLs
-    const forms = document.querySelectorAll('form[action]');
-    forms.forEach(form => {
-        const action = form.getAttribute('action');
-        if (action) {
+            issue = V.isExtensionUrl(absolute)
+                ? { path: absolute.split('/').slice(0, 3).join('/'), error: 'frame of another extension', type: 'extension-frame' }
+                : { path: (src || `<${tag.toLowerCase()}>`).slice(0, 120), error: 'embedded document', type: 'external-iframe' };
+        } else if (tag === 'FORM' && element.hasAttribute('action')) {
             try {
-                const parsed = new URL(action, window.location.origin);
-                if (parsed.origin !== window.location.origin) {
-                    issues.push({
-                        path: action,
-                        error: 'Form submits to external URL',
-                        type: 'external-form'
-                    });
+                const action = element.getAttribute('action');
+                if (new URL(action, window.location.href).origin !== window.location.origin) {
+                    issue = { path: action.slice(0, 120), error: 'form submitting to another origin', type: 'external-form' };
                 }
-            } catch (e) {
-                // Invalid URL
+            } catch {
+                /* unparsable action: the browser will not submit it anywhere */
             }
         }
-    });
-
-    // Check for <base> elements. The site does not legitimately use one, so any
-    // <base> at all is suspicious. A <base href="https://attacker.com/"> rewrites
-    // the resolution of every relative URL in the page (form actions, link hrefs,
-    // images, fetch()) - an injection point for phishing/exfiltration.
-    const bases = document.querySelectorAll('base[href]');
-    bases.forEach(base => {
-        const issue = validateBaseElement(base);
         if (issue) issues.push(issue);
-    });
-
+    };
+    if (root.nodeType === Node.ELEMENT_NODE) visit(root);
+    if (root.querySelectorAll) {
+        root.querySelectorAll('script, link, base, style, iframe, frame, embed, object, form[action]').forEach(visit);
+    }
     return issues;
 }
 
-/**
- * Validate a <base> element. Returns an issue object or null.
- * Any <base> on a pinchat.io page is unexpected and gets flagged.
- */
-function validateBaseElement(element) {
-    if (element.tagName !== 'BASE') return null;
-    const href = element.getAttribute('href');
-    if (!href) return null;
-
-    let parsedOrigin = null;
-    try {
-        parsedOrigin = new URL(href, window.location.origin).origin;
-    } catch (e) {
-        return {
-            path: href,
-            error: 'Invalid <base href>',
-            type: 'base-invalid'
-        };
+function recordIssues(issues) {
+    let changed = false;
+    for (const issue of issues) {
+        if (note(V.findingForIssue(issue))) changed = true;
     }
+    return changed;
+}
 
-    if (parsedOrigin !== window.location.origin) {
-        return {
-            path: href,
-            error: 'Cross-origin <base href> hijacks relative URLs',
-            type: 'base-cross-origin'
-        };
-    }
-
-    // Even same-origin <base> is unexpected on this site - flag it.
-    return {
-        path: href,
-        error: 'Unexpected <base> element',
-        type: 'base-unexpected'
-    };
+async function sha256Hex(buffer) {
+    const digest = await crypto.subtle.digest('SHA-256', buffer);
+    return Array.from(new Uint8Array(digest)).map((byte) => byte.toString(16).padStart(2, '0')).join('');
 }
 
 /**
- * Setup MutationObserver to detect dynamically injected resources
- * and attribute modifications that could bypass initial verification
+ * Download every file of the signed manifest again and compare hashes.
  *
- * Monitors:
- * - New script/link elements (childList)
- * - Changes to src, href, integrity, type attributes (attributes)
+ * This is a second request, separate from whatever the page itself loaded,
+ * and a server can answer the two differently. So a match proves only that
+ * the server is able to serve the signed file. It is never counted towards
+ * a positive state. A mismatch, on the other hand, is real: the server
+ * handed this extension bytes that are not the signed ones.
  */
-function setupDOMObserver() {
-    if (domObserver) {
-        domObserver.disconnect();
+async function recheckFiles(manifest) {
+    const expected = new Map();
+    for (const file of manifest.files || []) {
+        if (file.path && file.hash && file.path.startsWith('/static/')) expected.set(file.path, file.hash);
     }
+    const issues = [];
+    await Promise.all([...expected].map(async ([path, hash]) => {
+        try {
+            const response = await fetch(new URL(path, window.location.origin).href, {
+                cache: 'no-store',
+                credentials: 'omit',
+            });
+            if (!response.ok) {
+                issues.push({ path, error: `HTTP ${response.status}`, type: 'fetch-error' });
+            } else if (await sha256Hex(await response.arrayBuffer()) !== hash) {
+                issues.push({ path, error: 'differs from the signed hash', type: 'hash-mismatch' });
+            }
+        } catch (error) {
+            issues.push({ path, error: String(error.message || error).slice(0, 80), type: 'fetch-error' });
+        }
+    }));
+    return { checked: expected.size, failed: issues.length, issues };
+}
 
-    domObserver = new MutationObserver((mutations) => {
-        let foundUnauthorized = false;
-        let needsReVerification = false;
+// =============================================================================
+// Reporting
+// =============================================================================
 
-        mutations.forEach(mutation => {
-            // Handle attribute changes on existing elements
+function sendMessage(message) {
+    return ext.runtime.sendMessage(message).catch(() => null);
+}
+
+async function report() {
+    const response = await sendMessage({
+        type: 'DOCUMENT_REPORT',
+        token: DOCUMENT_TOKEN,
+        checksDone,
+        findings: [...findings.values()],
+        environment: [...environment.values()],
+        files: fileCheck ? { checked: fileCheck.checked, failed: fileCheck.failed } : null,
+    });
+    if (response && response.verdict) applyVerdict(response.verdict);
+}
+
+/** Inspect the whole document and report. Debounced by scheduleInspection. */
+async function inspect({ files = false } = {}) {
+    if (!manifestData) return;
+    recordIssues(inspectSubtree(document.documentElement));
+    if (files || !fileCheck) {
+        fileCheck = fileCheck || { checked: 0, failed: 0, issues: [] };
+        fileCheck = await recheckFiles(manifestData);
+        recordIssues(fileCheck.issues);
+    }
+    if (document.readyState !== 'loading') checksDone = true;
+    await report();
+}
+
+function scheduleInspection() {
+    if (inspectionTimer) clearTimeout(inspectionTimer);
+    inspectionTimer = setTimeout(() => {
+        inspectionTimer = null;
+        inspect();
+    }, 300);
+}
+
+function watchDocument() {
+    const observer = new MutationObserver((mutations) => {
+        let changed = false;
+        for (const mutation of mutations) {
             if (mutation.type === 'attributes') {
-                const target = mutation.target;
-                const attrName = mutation.attributeName;
-
-                // Process script, stylesheet, and base elements
-                if (target.tagName === 'SCRIPT' || isStylesheetLink(target)) {
-                    console.log(`[PinChat Verify] Attribute '${attrName}' modified on ${target.tagName}`);
-
-                    const issue = validateResourceAgainstManifest(target);
-                    if (issue) {
-                        console.warn(`[PinChat Verify] Resource validation failed after attribute change:`, issue);
-                        unauthorizedResources.push(issue);
-                        foundUnauthorized = true;
-                    }
-
-                    needsReVerification = true;
-                } else if (target.tagName === 'BASE') {
-                    const issue = validateBaseElement(target);
-                    if (issue) {
-                        console.warn(`[PinChat Verify] <base href> modification detected:`, issue);
-                        unauthorizedResources.push(issue);
-                        foundUnauthorized = true;
-                    }
-                }
+                if (recordIssues(inspectSubtree(mutation.target))) changed = true;
+                continue;
             }
-
-            // Handle new nodes
-            if (mutation.type === 'childList') {
-                mutation.addedNodes.forEach(node => {
-                    if (node.nodeType !== Node.ELEMENT_NODE) return;
-
-                    // Validate the node itself if it's a resource or <base> element
-                    if (node.tagName === 'SCRIPT' || isStylesheetLink(node)) {
-                        const issue = validateResourceAgainstManifest(node);
-                        if (issue) {
-                            console.warn(`[PinChat Verify] Dynamic resource injection detected:`, issue);
-                            unauthorizedResources.push(issue);
-                            foundUnauthorized = true;
-                        }
-                    } else if (node.tagName === 'BASE') {
-                        const issue = validateBaseElement(node);
-                        if (issue) {
-                            console.warn(`[PinChat Verify] <base> injection detected:`, issue);
-                            unauthorizedResources.push(issue);
-                            foundUnauthorized = true;
-                        }
-                    }
-
-                    // Check children recursively for nested resource/base elements
-                    if (node.querySelectorAll) {
-                        node.querySelectorAll(`script, ${STYLESHEET_LINK_SELECTOR}`).forEach(el => {
-                            const issue = validateResourceAgainstManifest(el);
-                            if (issue) {
-                                console.warn(`[PinChat Verify] Nested resource injection detected:`, issue);
-                                unauthorizedResources.push(issue);
-                                foundUnauthorized = true;
-                            }
-                        });
-                        node.querySelectorAll('base[href]').forEach(el => {
-                            const issue = validateBaseElement(el);
-                            if (issue) {
-                                console.warn(`[PinChat Verify] Nested <base> injection detected:`, issue);
-                                unauthorizedResources.push(issue);
-                                foundUnauthorized = true;
-                            }
-                        });
-                    }
-                });
+            for (const node of mutation.addedNodes) {
+                if (node.nodeType !== Node.ELEMENT_NODE) continue;
+                // Recorded when seen: a node that is removed again right
+                // away is still reported, as what it was.
+                if (recordIssues(inspectSubtree(node))) changed = true;
             }
-        });
-
-        if (foundUnauthorized) {
-            showWarningOverlay(unauthorizedResources, true);
         }
-
-        if (needsReVerification) {
-            scheduleReVerification();
-        }
-
-        // Fast path: if the overlay should be visible but isn't, re-mount NOW
-        // rather than waiting for the next watchdog tick. childList mutations
-        // include removals of the overlay host element.
+        if (changed) scheduleInspection();
         restoreOverlayIfTampered();
     });
-
-    domObserver.observe(document.documentElement, {
+    observer.observe(document.documentElement, {
         childList: true,
         subtree: true,
         attributes: true,
-        attributeFilter: ['src', 'href', 'integrity', 'type']
+        attributeFilter: ['src', 'href', 'integrity', 'type', 'rel', 'action', 'data'],
     });
 
-    // Safe-fail deadline: validateResourceAgainstManifest defers verdicts
-    // when manifestData is still null (race with the async manifest delivery
-    // from the background script). If the manifest never lands - network
-    // blocked, hashes.json.signed deleted, background script crashed/disabled,
-    // service worker not yet woken - we MUST surface that as an overlay
-    // rather than silently treat the page as trusted.
-    //
-    // 10s is generous enough to absorb cold-start service worker spin-up
-    // and slow links (cargo audit / hashes.json.signed fetch + signature
-    // verification on a contested CPU), and short enough that real users
-    // notice before they trust the page.
-    setTimeout(() => {
-        if (!manifestData || !manifestData.files) {
-            console.error('[PinChat Verify] Manifest not delivered within 10s - treating page as unverified');
-            showWarningOverlay([{
-                path: 'Manifest',
-                error: 'Manifest unavailable - cannot verify page integrity. The background script may be blocked, the network may be filtering hashes.json.signed, or the service worker is not running.',
-                type: 'manifest-unavailable'
-            }], true);
+    document.addEventListener('securitypolicyviolation', (event) => {
+        if (canaryViolationsToSkip > 0 && event.effectiveDirective === 'script-src-attr') {
+            // The probe in policyIsInForce, not the page.
+            canaryViolationsToSkip -= 1;
+            return;
         }
-    }, 10000);
-}
-
-/**
- * Perform DOM security verification
- * Only runs if manifest is available
- *
- * Security model:
- * 1. Verify SRI attributes in DOM match the signed manifest
- * 2. Fetch each file and verify its hash matches the manifest
- *
- * This dual approach catches:
- * - Server modifying HTML (SRI attributes different from manifest)
- * - Server modifying files (hash different from manifest)
- * - Browser blocking files due to SRI mismatch (we fetch and see the bad hash)
- */
-async function performDOMSecurityCheck() {
-    // Don't verify without manifest - wait for it
-    if (!manifestData || !manifestData.files) {
-        console.log('[PinChat Verify] Waiting for manifest...');
-        return;
-    }
-
-    // Prevent concurrent verifications
-    if (fileHashVerificationDone) {
-        console.log('[PinChat Verify] Verification already completed, skipping...');
-        return;
-    }
-
-    console.log('[PinChat Verify] Starting security verification...');
-
-    // Step 1: Verify SRI attributes in DOM
-    console.log('[PinChat Verify] Step 1: Checking SRI attributes in DOM...');
-    const domIssues = verifySRIInDOM(manifestData);
-
-    if (domIssues.length > 0) {
-        console.warn('[PinChat Verify] DOM SRI issues found:', domIssues);
-    } else {
-        console.log('[PinChat Verify] ✓ DOM SRI attributes match manifest');
-    }
-
-    // Step 2: Fetch files and verify hashes
-    console.log('[PinChat Verify] Step 2: Fetching and verifying file hashes...');
-    const { issues: hashIssues, verified } = await verifyFileHashes(manifestData);
-
-    // Combine all issues
-    const allIssues = [...domIssues, ...hashIssues];
-
-    // Mark verification as done
-    fileHashVerificationDone = true;
-
-    // Build complete file list with all statuses (passed, failed, errors)
-    const allFiles = [
-        ...verified.map(v => ({ path: v.path, status: 'ok' })),
-        ...hashIssues.map(i => ({ path: i.path, status: 'failed', error: i.error, type: i.type })),
-        ...domIssues.map(i => ({ path: i.path, status: 'dom-issue', error: i.error, type: i.type }))
-    ];
-
-    // Build summary with correct totals (include domIssues in failed count)
-    const summary = {
-        total: manifestData.files ? manifestData.files.length : (verified.length + hashIssues.length),
-        checked: verified.length + hashIssues.length,
-        passed: verified.length,
-        failed: hashIssues.length + domIssues.length,  // Include DOM issues in failed count
-        hashMismatches: hashIssues.filter(i => i.type === 'hash-mismatch').length,
-        fetchErrors: hashIssues.filter(i => i.type === 'fetch-error').length,
-        domIssues: domIssues.length
-    };
-
-    console.log('[PinChat Verify] ========================================');
-    console.log('[PinChat Verify] VERIFICATION COMPLETE');
-    console.log(`[PinChat Verify] Files checked: ${summary.checked}/${summary.total}`);
-    console.log(`[PinChat Verify] Passed: ${summary.passed}, Failed: ${summary.failed}`);
-    if (domIssues.length > 0) {
-        console.log(`[PinChat Verify] DOM issues: ${domIssues.length}`);
-    }
-    if (hashIssues.length > 0) {
-        console.log(`[PinChat Verify] Hash issues: ${hashIssues.length}`);
-    }
-    console.log('[PinChat Verify] ========================================');
-
-    // Notify background script with results (include ALL files, not just passed)
-    browser.runtime.sendMessage({
-        type: 'FILE_HASH_VERIFICATION_COMPLETE',
-        success: allIssues.length === 0,
-        files: allFiles,  // Complete list with all statuses
-        issues: allIssues,
-        summary: summary
+        const entry = V.findingForViolation({
+            sourceFile: event.sourceFile,
+            blockedURI: event.blockedURI,
+            effectiveDirective: event.effectiveDirective,
+            violatedDirective: event.violatedDirective,
+        }, window.location.href);
+        if (note(entry)) scheduleInspection();
     });
+}
 
-    // Handle all issues
-    if (allIssues.length > 0) {
-        console.warn('[PinChat Verify] Security issues detected:', allIssues);
-        unauthorizedResources = allIssues;
-        showWarningOverlay(allIssues, true);
-    } else {
-        console.log('[PinChat Verify] ✓ All files verified successfully');
-        hideWarningOverlay();
+// =============================================================================
+// Display
+// =============================================================================
+
+let overlayElement = null;
+let overlayState = null;        // what is shown, so the watchdog can restore it
+let overlayWatchdogTimer = null;
+let noticeDismissed = false;
+
+function stopDocument() {
+    try {
+        window.stop();
+    } catch {
+        /* nothing left to stop */
     }
 }
 
-// Security verification now uses a dual approach:
-// 1. SRI verification in DOM (check integrity attributes match manifest)
-// 2. File hash verification (fetch files and compare hash with manifest)
-// This catches both HTML tampering and file tampering.
-
 /**
- * Create and show the warning overlay using Shadow DOM
- * Shadow DOM isolates styles from page CSP and allows direct content injection
+ * Decide what to show for a verdict.
  *
- * Note: Firefox MV2 requires web_accessible_resources for the CSS file.
- * This creates a minor fingerprinting vector, but only on pinchat.io domain.
- * The adoptedStyleSheets API doesn't work in Firefox content scripts due to Xray wrappers.
+ * - FAILED: a blocking overlay that cannot be dismissed. An established
+ *   mismatch with the signed release is not something to click through.
+ * - UNVERIFIABLE where the browser could have attested the document: also
+ *   blocking, with a reload, because the page was not checked at all.
+ * - UNVERIFIABLE elsewhere, and suspicious findings: a notice bar. The
+ *   script policy is still in force; this is information, not an alarm.
+ * - Changes of unattested origin: nothing on the page. They are listed in
+ *   the popup.
  */
-async function showWarningOverlay(mismatches = [], isUnauthorized = false, foreignOrigin = false) {
-    // Persist args so the watchdog can re-mount if the page tries to remove the
-    // overlay. We take a defensive copy of `mismatches` so a later mutation of
-    // the source array doesn't change what we render on re-mount.
-    overlayPersistentState = {
-        active: true,
-        mismatches: Array.isArray(mismatches) ? [...mismatches] : [],
-        isUnauthorized,
-        foreignOrigin
-    };
-
-    if (overlayElement) {
-        overlayElement.remove();
+function applyVerdict(verdict) {
+    const reasons = verdict.reasons || [];
+    if (verdict.integrity === V.INTEGRITY.FAILED) {
+        const confirmed = reasons.filter((entry) => entry.class === V.CLASS.CONFIRMED);
+        showOverlay({
+            kind: 'failed',
+            title: 'This page does not match the signed PinChat release',
+            lead: 'Do not enter anything here. Close this page.',
+            items: confirmed.length ? confirmed : reasons,
+        });
+        return;
     }
-
-    let title = isUnauthorized
-        ? 'UNAUTHORIZED RESOURCES DETECTED!'
-        : 'POSSIBLE SERVER COMPROMISE!';
-
-    let description = isUnauthorized
-        ? 'This page contains scripts or stylesheets that are not in the authorized whitelist. This could indicate a compromised server or malicious injection.'
-        : 'The files served by this website do not match the verified hashes.';
-
-    let listTitle = isUnauthorized
-        ? 'Unauthorized Resources:'
-        : 'Failed Files:';
-
-    if (foreignOrigin) {
-        title = 'THIS IS NOT THE VERIFIED PINCHAT ADDRESS!';
-        description = 'This page uses the PinChat name on an address that this extension does not verify. Nothing on it has been checked, and it may have been sent here to get around the verification.';
-        listTitle = 'Address:';
+    if (verdict.integrity === V.INTEGRITY.UNVERIFIABLE && verdict.canAttest) {
+        showOverlay({
+            kind: 'unverifiable',
+            title: 'This page could not be verified',
+            lead: 'Nothing was found wrong, but the page was not checked. Reload it.',
+            items: reasons,
+        });
+        return;
     }
+    const worthANotice = reasons.filter((entry) => entry.class !== V.CLASS.CONFIRMED);
+    const noticeDue = verdict.integrity === V.INTEGRITY.UNVERIFIABLE || verdict.attention;
+    if (noticeDue && worthANotice.length && !noticeDismissed) {
+        showOverlay({
+            kind: 'notice',
+            title: verdict.integrity === V.INTEGRITY.UNVERIFIABLE
+                ? 'PinChat Verifier: this page could not be fully checked'
+                : 'PinChat Verifier: something on this page was blocked',
+            lead: 'Only signed code can run here. Details are in the extension popup.',
+            items: worthANotice.slice(0, 3),
+        });
+        return;
+    }
+    if (overlayState && overlayState.kind !== 'foreign') hideOverlay();
+}
 
-    // Create host element
+function showOverlay(state) {
+    const same = overlayState && overlayElement && document.contains(overlayElement)
+        && JSON.stringify(overlayState) === JSON.stringify(state);
+    if (same) return;
+    overlayState = state;
+    if (overlayElement) overlayElement.remove();
+    if (!document.documentElement) return;
+
+    // The host element carries no inline style; everything comes from the
+    // stylesheet loaded inside the closed shadow tree.
     overlayElement = document.createElement('div');
     overlayElement.id = 'pinchat-integrity-warning-host';
-
-    // Create closed Shadow DOM
+    overlayElement.setAttribute('data-kind', state.kind);
     const shadow = overlayElement.attachShadow({ mode: 'closed' });
 
-    // Get CSS URL from extension
-    const cssUrl = browser.runtime.getURL('warning.css');
+    const link = document.createElement('link');
+    link.setAttribute('rel', 'stylesheet');
+    link.setAttribute('href', ext.runtime.getURL('warning.css'));
+    shadow.appendChild(link);
 
-    // Build DOM structure with external stylesheet link
-    // Using <link> is CSP-safe and works with Firefox Xray wrappers (unlike adoptedStyleSheets).
-    // The skeleton is a string literal with no interpolation; every dynamic
-    // value below goes in through DOM properties, never through markup.
-    shadow.innerHTML = `
-        <link rel="stylesheet">
-        <div class="overlay">
-            <div class="icon">⚠️</div>
-            <h1></h1>
-            <p class="description"></p>
-            <div class="file-list">
-                <h3></h3>
-                <ul></ul>
-            </div>
-            <div class="buttons">
-                <button class="btn-leave">Leave This Site</button>
-                <button class="btn-dismiss">Dismiss (Unsafe)</button>
-            </div>
-            <p class="footer">This warning is shown by the PinChat Integrity Verifier extension.</p>
-        </div>
-    `;
-    shadow.querySelector('link').setAttribute('href', cssUrl);
-
-    // Text goes in as text
-    shadow.querySelector('h1').textContent = title;
-    const descriptionEl = shadow.querySelector('.description');
-    descriptionEl.textContent = description;
-    descriptionEl.appendChild(document.createElement('br'));
-    const emphasis = document.createElement('strong');
-    emphasis.textContent = 'Do not enter any sensitive information.';
-    descriptionEl.appendChild(emphasis);
-    shadow.querySelector('.file-list h3').textContent = listTitle;
-
-    // Build file list with proper sanitization
-    const ul = shadow.querySelector('.file-list ul');
-    mismatches.forEach(m => {
-        const li = document.createElement('li');
-        li.textContent = `${m.path}: ${m.error}`;
-        ul.appendChild(li);
-    });
-
-    // Event listeners
-    shadow.querySelector('.btn-leave').addEventListener('click', () => {
-        window.location.href = 'about:blank';
-    });
-
-    shadow.querySelector('.btn-dismiss').addEventListener('click', () => {
-        if (confirm('WARNING: You are choosing to ignore a security warning. Continue at your own risk.')) {
-            hideWarningOverlay();
+    const box = document.createElement('div');
+    box.className = `overlay overlay-${state.kind}`;
+    const add = (tag, className, text) => {
+        const element = document.createElement(tag);
+        if (className) element.className = className;
+        if (text) element.textContent = text;
+        box.appendChild(element);
+        return element;
+    };
+    add('h1', '', state.title);
+    add('p', 'description', state.lead);
+    if (state.items && state.items.length) {
+        const list = add('ul', 'file-list');
+        for (const item of state.items.slice(0, 12)) {
+            const entry = document.createElement('li');
+            entry.textContent = item.detail ? `${item.message} (${item.detail})` : item.message;
+            list.appendChild(entry);
         }
-    });
+    }
+    const buttons = add('div', 'buttons');
+    const button = (label, className, action) => {
+        const element = document.createElement('button');
+        element.className = className;
+        element.textContent = label;
+        element.addEventListener('click', action);
+        buttons.appendChild(element);
+    };
+    if (state.kind === 'notice') {
+        button('Dismiss', 'btn-dismiss', () => {
+            noticeDismissed = true;
+            hideOverlay();
+        });
+    } else {
+        if (state.kind === 'unverifiable') {
+            button('Reload', 'btn-leave', () => window.location.reload());
+        }
+        button('Leave this site', state.kind === 'unverifiable' ? 'btn-dismiss' : 'btn-leave', () => {
+            window.location.href = 'about:blank';
+        });
+    }
+    add('p', 'footer', 'Shown by the PinChat Integrity Verifier extension.');
+    shadow.appendChild(box);
 
-    // Append to DOM
     (document.body || document.documentElement).appendChild(overlayElement);
-
-    // Start the watchdog now that an overlay is live. Idempotent.
-    ensureOverlayWatchdog();
+    if (state.kind !== 'notice' && overlayWatchdogTimer === null) {
+        overlayWatchdogTimer = setInterval(restoreOverlayIfTampered, 500);
+    }
 }
 
-/**
- * Hide the warning overlay. Called from explicit user "Dismiss" action and
- * from the verification path when issues are resolved. Marks the persistent
- * state inactive so the watchdog stops re-mounting.
- */
-function hideWarningOverlay() {
-    overlayPersistentState.active = false;
+function hideOverlay() {
+    overlayState = null;
     if (overlayElement) {
         overlayElement.remove();
         overlayElement = null;
@@ -1021,155 +589,146 @@ function hideWarningOverlay() {
 }
 
 /**
- * Ensure the overlay watchdog is running. The watchdog catches tampering that
- * the main MutationObserver may miss or that arrives via property/style
- * setters: removal of the host element, style attributes that hide it, and
- * the `hidden` attribute. Cheap (a periodic poll) and idempotent.
- */
-function ensureOverlayWatchdog() {
-    if (overlayWatchdogTimer !== null) return;
-    overlayWatchdogTimer = setInterval(restoreOverlayIfTampered, 500);
-}
-
-/**
- * If the overlay should be visible but the page has tampered with it, restore
- * the original state. Called both periodically (watchdog) and synchronously
- * from the main MutationObserver for fast reaction to childList removals.
+ * A page could try to remove or hide a blocking overlay. Put it back.
  */
 function restoreOverlayIfTampered() {
-    if (!overlayPersistentState.active) return;
-
-    // Removed entirely (or never reattached after a page-driven detach).
+    if (!overlayState || overlayState.kind === 'notice') return;
     if (!overlayElement || !document.contains(overlayElement)) {
-        console.warn('[PinChat Verify] Overlay missing - re-mounting');
+        const state = overlayState;
         overlayElement = null;
-        // showWarningOverlay re-creates and re-appends. It will also reset
-        // overlayPersistentState.active = true (idempotent).
-        showWarningOverlay(
-            overlayPersistentState.mismatches,
-            overlayPersistentState.isUnauthorized,
-            overlayPersistentState.foreignOrigin
-        );
+        overlayState = null;
+        showOverlay(state);
         return;
     }
-
-    // Style attribute tampering - strip it. The Shadow DOM stylesheet sets
-    // :host with !important properties, so removing the host's inline style
-    // restores correct positioning and visibility.
-    if (overlayElement.hasAttribute('style')) {
-        console.warn('[PinChat Verify] Overlay style attribute tampered - clearing');
-        overlayElement.removeAttribute('style');
-    }
-    if (overlayElement.hidden) {
-        console.warn('[PinChat Verify] Overlay `hidden` attribute set - clearing');
-        overlayElement.hidden = false;
-    }
-    if (overlayElement.getAttribute('class')) {
-        overlayElement.removeAttribute('class');
+    if (overlayElement.hasAttribute('style')) overlayElement.removeAttribute('style');
+    if (overlayElement.hidden) overlayElement.hidden = false;
+    if (overlayElement.getAttribute('class')) overlayElement.removeAttribute('class');
+    if (overlayElement.getAttribute('data-kind') !== overlayState.kind) {
+        overlayElement.setAttribute('data-kind', overlayState.kind);
     }
 }
 
-/**
- * Handle verification status from background script
- */
-function handleVerificationStatus(state) {
-    // Store manifest if present (regardless of overall status)
-    // This is critical: signature may be valid (manifest available) while file check is still pending/checking
-    if (state.manifest) {
-        const isNewManifest = !manifestData ||
-                             state.manifest.version !== manifestData.version ||
-                             state.manifest.generated !== manifestData.generated;
+// =============================================================================
+// Start
+// =============================================================================
 
-        if (isNewManifest) {
-            console.log('[PinChat Verify] Received new manifest from background, starting verification...');
-            manifestData = state.manifest;
-            // Build SRI map for O(1) lookups in MutationObserver
-            buildManifestSRIMap(manifestData);
-            // Reset the flag to allow new verification
-            fileHashVerificationDone = false;
-            // Start DOM and file hash checks
-            performDOMSecurityCheck();
-        } else if (fileHashVerificationDone && state.signatureStatus === 'valid' && state.fileStatus === 'checking') {
-            // User pressed "Verify Now" again - reset and re-verify
-            console.log('[PinChat Verify] Re-verification requested, resetting flag...');
-            fileHashVerificationDone = false;
-            performDOMSecurityCheck();
+function warnForeignOrigin() {
+    if (!document.documentElement) return;
+    showOverlay({
+        kind: 'foreign',
+        title: 'This is not the verified PinChat address',
+        lead: 'This page uses the PinChat name on an address the extension does not verify. '
+            + 'Nothing on it has been checked, and it may have been sent here to get around the verification.',
+        items: [{ message: window.location.origin, detail: `not one of ${OFFICIAL_ORIGINS.join(', ')}` }],
+    });
+}
+
+async function start({ restored = false } = {}) {
+    const policyInForce = policyIsInForce();
+    const workerControlled = workerControlsDocument();
+
+    if (!restored) watchDocument();
+
+    if (!policyInForce || workerControlled) {
+        // Nothing constrains this document. Stop it before it does anything
+        // and say so without waiting for the background script.
+        stopDocument();
+        applyVerdict({
+            integrity: V.INTEGRITY.FAILED,
+            reasons: [V.finding(workerControlled ? 'service-worker-controlled' : 'policy-not-in-force')],
+        });
+    }
+
+    const opened = await sendMessage({
+        type: 'DOCUMENT_OPENED',
+        token: DOCUMENT_TOKEN,
+        policyInForce,
+        workerControlled,
+    });
+
+    // The site registers no service worker. Remove any that exists, whether
+    // or not it answered this navigation.
+    const removed = await removeServiceWorkers();
+    if (removed > 0) {
+        if (!workerControlled) note(V.finding('service-worker-removed', `${removed} registration(s)`));
+        if (workerControlled) {
+            // Load the page again, from the network this time.
+            const reply = await sendMessage({ type: 'WORKER_RELOAD_ALLOWED' });
+            if (reply && reply.allowed) {
+                window.location.reload();
+                return;
+            }
         }
     }
 
-    // Handle final failure/error status with overlay
-    // Show overlay for both 'failed' (verification failed) and 'error' (system errors)
-    if (state.status === 'failed' || state.status === 'error') {
-        if (state.mismatches && state.mismatches.length > 0) {
-            // File verification failures - show specific mismatches
-            showWarningOverlay(state.mismatches, false);
-        } else if (state.errors && state.errors.length > 0) {
-            // Global failures/errors (signature invalid, network errors, timeouts, etc.)
-            // Convert errors array to mismatch format for overlay display
-            const errorItems = state.errors.map(err => ({
-                path: state.status === 'error' ? 'System Error' : 'Verification Error',
-                error: err
-            }));
-            showWarningOverlay(errorItems, true);
+    if (!opened) {
+        // The background script did not answer. Without it there is no
+        // manifest and no state to show.
+        applyVerdict({
+            integrity: V.INTEGRITY.UNVERIFIABLE,
+            canAttest: false,
+            reasons: [V.finding('manifest-unavailable', 'the extension background did not respond')],
+        });
+        return;
+    }
+    if (opened.manifest) {
+        manifestData = opened.manifest;
+        buildManifestSRIMap(manifestData);
+    }
+    if (opened.verdict) applyVerdict(opened.verdict);
+
+    const run = () => {
+        if (manifestData) {
+            inspect();
+        } else {
+            checksDone = true;
+            report();
         }
+    };
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', run, { once: true });
+    } else {
+        run();
     }
 }
+
+ext.runtime.onMessage.addListener((message) => {
+    if (!ON_OFFICIAL_ORIGIN || !IS_TOP_LEVEL || !message) return;
+    if (message.type === 'VERDICT' && message.token === DOCUMENT_TOKEN) {
+        applyVerdict(message.verdict);
+    }
+    if (message.type === 'RECHECK') {
+        sendMessage({ type: 'GET_STATUS' }).then((status) => {
+            if (status && status.manifest) {
+                manifestData = status.manifest;
+                buildManifestSRIMap(manifestData);
+                inspect({ files: true });
+            }
+        });
+    }
+});
+
+window.addEventListener('pageshow', (event) => {
+    // A document brought back from the back/forward cache was not fetched
+    // again, so no response passed through the verifier this time and the
+    // record of this tab now describes the page that was shown in between.
+    // Announce the document again; whatever was established for it earlier
+    // is not carried over.
+    if (event.persisted && ON_OFFICIAL_ORIGIN && IS_TOP_LEVEL) {
+        checksDone = false;
+        start({ restored: true });
+    }
+});
 
 if (!ON_OFFICIAL_ORIGIN) {
-    // Not an origin the manifest or the packaged CSP covers. Do not ask the
-    // background for a verification state and do not report one: say so, and
-    // keep saying so. The catch-all CSP rule denies every script here, this
-    // overlay covers the case where that rule did not apply.
-    const warnForeignOrigin = () => {
-        // At document_start the root element may not exist yet.
-        if (!document.documentElement) return;
-        showWarningOverlay(
-            [{ path: window.location.origin, error: 'not one of ' + OFFICIAL_ORIGINS.join(', ') }],
-            true,
-            true
-        );
-    };
+    // Not an origin the manifest or the packaged policy covers. Ask for no
+    // state and report none: say so, and keep saying so. The catch-all rule
+    // denies every script here; this covers the case where it did not apply.
     warnForeignOrigin();
     document.addEventListener('DOMContentLoaded', warnForeignOrigin);
-} else {
-    // Listen for messages from background script
-    browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
-        if (message.type === 'VERIFICATION_STATUS') {
-            handleVerificationStatus(message.state);
-        }
-        if (message.type === 'MANIFEST_DATA') {
-            manifestData = message.manifest;
-            buildManifestSRIMap(manifestData);
-            performDOMSecurityCheck();
-        }
-    });
-
-    // Request current status and manifest when page loads
-    browser.runtime.sendMessage({ type: 'GET_STATUS' }, (response) => {
-        if (response) {
-            if (response.manifest) {
-                manifestData = response.manifest;
-                buildManifestSRIMap(manifestData);
-            }
-            handleVerificationStatus(response);
-        }
-    });
-
-    // Setup MutationObserver IMMEDIATELY at document_start, before any page script
-    // can execute. Initial DOM check is deferred to DOMContentLoaded (it depends on
-    // the manifest arriving from background and on a fully-parsed DOM), but the
-    // observer must be live as soon as possible so injections during parse are
-    // caught - even if the script tag has already started fetching, we'll flag it
-    // and trigger the warning overlay before the user trusts the page.
-    setupDOMObserver();
-
-    if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', () => {
-            performDOMSecurityCheck();
-        });
-    } else {
-        performDOMSecurityCheck();
-    }
+    overlayWatchdogTimer = setInterval(restoreOverlayIfTampered, 500);
+} else if (IS_TOP_LEVEL) {
+    start();
 }
-
-console.log('[PinChat Verify] Content script loaded with SRI verification');
+// A framed document on the site is not inspected on its own: the policy
+// allows no frames, and the top-level document's inspection reports any.

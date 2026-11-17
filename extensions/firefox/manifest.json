@@ -6,7 +6,10 @@
     "permissions": [
         "storage",
         "alarms",
-        "declarativeNetRequestWithHostAccess"
+        "declarativeNetRequestWithHostAccess",
+        "webRequest",
+        "webRequestBlocking",
+        "webRequestFilterResponse"
     ],
     "host_permissions": [
         "https://pinchat.io/*",
@@ -14,7 +17,7 @@
         "https://raw.githubusercontent.com/samjanny/pinchat/*"
     ],
     "background": {
-        "scripts": ["background.js"]
+        "scripts": ["verdict.js", "background.js"]
     },
     "declarative_net_request": {
         "rule_resources": [
@@ -28,7 +31,7 @@
     "content_scripts": [
         {
             "matches": ["https://pinchat.io/*", "https://www.pinchat.io/*"],
-            "js": ["content.js"],
+            "js": ["verdict.js", "content.js"],
             "run_at": "document_start",
             "all_frames": true
         }
@@ -48,7 +51,7 @@
     "browser_specific_settings": {
         "gecko": {
             "id": "pinchat-verifier@pinchat.io",
-            "strict_min_version": "113.0",
+            "strict_min_version": "115.0",
             "data_collection_permissions": {
                 "required": ["none"]
             }

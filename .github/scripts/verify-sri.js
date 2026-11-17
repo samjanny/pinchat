@@ -176,7 +176,6 @@ try {
   const {
     buildRules, PAGES, CATCH_ALL_REGEX, pageRegex,
   } = require('../../extensions/generate-csp-rules');
-  const expectedRules = buildRules(signed);
 
   // Coverage gate. Comparing a ruleset against buildRules() only proves it is
   // not stale; it says nothing about whether the policy covers the page. It
@@ -204,7 +203,8 @@ try {
     const pageByFilter = new Map(PAGES.map((pagePath) => [pageRegex(pagePath), pagePath]));
     const filters = rules.map((rule) => rule.condition.regexFilter);
 
-    const catchAll = rules.filter((rule) => rule.condition.regexFilter === CATCH_ALL_REGEX);
+    const policyRules = rules.filter((rule) => rule.action.type === 'modifyHeaders');
+    const catchAll = policyRules.filter((rule) => rule.condition.regexFilter === CATCH_ALL_REGEX);
     if (catchAll.length !== 1) {
       console.error(`CSP COVERAGE: ${browser} must have exactly one catch-all rule, found ${catchAll.length}`);
       bad++;
@@ -213,7 +213,27 @@ try {
       bad++;
     }
 
-    for (const filter of filters) {
+    // The redirect guard. Chromium enforces it with a rule that matches the
+    // Location response header; Firefox has no such condition and enforces
+    // the same rule in its background script, so its ruleset must not carry
+    // a rule it would reject.
+    const redirectRules = rules.filter((rule) => rule.action.type === 'block');
+    const expectedRedirectRules = browser === 'chrome' ? 1 : 0;
+    if (redirectRules.length !== expectedRedirectRules
+      || redirectRules.some((rule) => !rule.condition.responseHeaders
+        || rule.condition.responseHeaders[0].header !== 'location')) {
+      console.error(`CSP COVERAGE: ${browser} must have ${expectedRedirectRules} redirect rule(s) on the Location header`);
+      bad++;
+    }
+    for (const rule of policyRules) {
+      const operations = rule.action.responseHeaders.map((header) => `${header.header}:${header.operation}`).join(',');
+      if (operations !== 'content-security-policy:set,link:remove,refresh:remove') {
+        console.error(`CSP COVERAGE: ${browser}: a policy rule does not remove Link and Refresh (${operations})`);
+        bad++;
+      }
+    }
+
+    for (const filter of policyRules.map((rule) => rule.condition.regexFilter)) {
       if (filter !== CATCH_ALL_REGEX && !pageByFilter.has(filter)) {
         console.error(`CSP COVERAGE: ${browser} has a rule this check cannot attribute to a page: ${filter}`);
         bad++;
@@ -221,7 +241,7 @@ try {
     }
 
     for (const [filter, pagePath] of pageByFilter) {
-      const rule = rules.find((candidate) => candidate.condition.regexFilter === filter);
+      const rule = policyRules.find((candidate) => candidate.condition.regexFilter === filter);
       if (!rule) {
         console.error(`CSP COVERAGE: ${browser} has no rule for ${pagePath}`);
         bad++;
@@ -265,6 +285,7 @@ try {
   for (const browser of ['chrome', 'firefox']) {
     const rulesPath = `extensions/${browser}/rules.json`;
     const actualRules = JSON.parse(fs.readFileSync(rulesPath, 'utf8'));
+    const expectedRules = buildRules(signed, browser);
     if (JSON.stringify(actualRules) !== JSON.stringify(expectedRules)) {
       console.error(`PREVENTIVE CSP: ${rulesPath} does not match signed manifest`);
       totalBad++;

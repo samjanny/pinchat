@@ -1,0 +1,328 @@
+#!/usr/bin/env node
+/**
+ * Verdict logic of the browser extension (extensions/chrome/verdict.js).
+ *
+ * The extension shows a state per document. These tests pin down what each
+ * state may be based on, so that a later change cannot quietly let an
+ * unverified document be shown as verified, let one tab's result colour
+ * another, or turn another extension's harmless additions into an alarm.
+ */
+
+'use strict';
+
+const assert = require('assert');
+const fs = require('fs');
+const path = require('path');
+
+const root = path.join(__dirname, '..');
+const V = require('../extensions/chrome/verdict.js');
+const { INTEGRITY, CLASS } = V;
+
+let passed = 0;
+function test(name, body) {
+    body();
+    passed += 1;
+    console.log(`PASSED: ${name}`);
+}
+
+/** A document on the site whose checks completed with nothing to report. */
+const base = (overrides = {}) => ({
+    manifest: 'valid',
+    official: true,
+    topLevel: true,
+    checksDone: true,
+    policyInForce: true,
+    workerControlled: false,
+    canAttest: false,
+    attested: false,
+    findings: [],
+    ...overrides,
+});
+
+test('both browser builds ship the same verdict logic', () => {
+    for (const file of ['verdict.js', 'background.js', 'content.js', 'popup.js', 'popup.html',
+        'warning.css', 'blocked.html', 'blocked.js', 'blocked.css']) {
+        assert.strictEqual(
+            fs.readFileSync(path.join(root, 'extensions/chrome', file), 'utf8'),
+            fs.readFileSync(path.join(root, 'extensions/firefox', file), 'utf8'),
+            `${file} differs between the Chrome and the Firefox build`,
+        );
+    }
+});
+
+test('verified needs an attested response body, and nothing less will do', () => {
+    // Chromium: no way to hold a response body, so never more than partial.
+    assert.strictEqual(V.decide(base()).integrity, INTEGRITY.PARTIAL);
+    assert.strictEqual(V.decide(base({ attested: true })).integrity, INTEGRITY.PARTIAL,
+        'an attestation claim is meaningless where the browser cannot attest');
+
+    // Firefox: verified only with a receipt for this very document.
+    assert.strictEqual(V.decide(base({ canAttest: true, attested: true })).integrity, INTEGRITY.VERIFIED);
+    assert.strictEqual(V.decide(base({ canAttest: true, attested: false })).integrity, INTEGRITY.UNVERIFIABLE,
+        'where attestation is possible its absence is not a lesser positive state');
+    assert.strictEqual(
+        V.decide(base({ canAttest: true, attested: true, topLevel: false })).integrity,
+        INTEGRITY.UNVERIFIABLE,
+    );
+});
+
+test('no positive state before the checks are in', () => {
+    for (const record of [
+        base({ checksDone: false }),
+        base({ canAttest: true, attested: true, checksDone: false }),
+        base({ manifest: 'unknown' }),
+        base({ policyInForce: null }),
+    ]) {
+        assert.strictEqual(V.decide(record).integrity, INTEGRITY.CHECKING);
+    }
+});
+
+test('a document outside the official origins is never vouched for', () => {
+    const verdict = V.decide(base({ official: false, canAttest: true, attested: true }));
+    assert.strictEqual(verdict.integrity, INTEGRITY.UNVERIFIABLE);
+});
+
+test('every confirmed finding fails the document, attested or not', () => {
+    const confirmed = Object.entries(V.FINDINGS).filter(([, entry]) => entry[0] === CLASS.CONFIRMED);
+    assert(confirmed.length >= 6);
+    for (const [code] of confirmed) {
+        for (const canAttest of [false, true]) {
+            const verdict = V.decide(base({ canAttest, attested: true, findings: [V.finding(code)] }));
+            assert.strictEqual(verdict.integrity, INTEGRITY.FAILED, code);
+        }
+    }
+    assert.strictEqual(V.decide(base({ policyInForce: false })).integrity, INTEGRITY.FAILED);
+    assert.strictEqual(V.decide(base({ workerControlled: true })).integrity, INTEGRITY.FAILED);
+    assert.strictEqual(V.decide(base({ manifest: 'invalid', canAttest: true, attested: true })).integrity,
+        INTEGRITY.FAILED, 'a rejected manifest is an attack signal, not a missing one');
+});
+
+test('a missing manifest is unverifiable, not failed and not verified', () => {
+    assert.strictEqual(V.decide(base({ manifest: 'unavailable' })).integrity, INTEGRITY.UNVERIFIABLE);
+    assert.strictEqual(
+        V.decide(base({ manifest: 'unavailable', canAttest: true, attested: true })).integrity,
+        INTEGRITY.UNVERIFIABLE,
+    );
+    for (const [code, entry] of Object.entries(V.FINDINGS)) {
+        if (entry[0] !== CLASS.LIMIT) continue;
+        assert.strictEqual(
+            V.decide(base({ canAttest: true, attested: true, findings: [V.finding(code)] })).integrity,
+            INTEGRITY.UNVERIFIABLE,
+            code,
+        );
+    }
+});
+
+test('changes of unattested origin never change the integrity state', () => {
+    const environment = Object.entries(V.FINDINGS)
+        .filter(([, entry]) => entry[0] === CLASS.ENVIRONMENT)
+        .map(([code]) => V.finding(code));
+    assert(environment.length >= 4);
+    for (const [record, expected] of [
+        [base({ findings: environment }), INTEGRITY.PARTIAL],
+        [base({ canAttest: true, attested: true, findings: environment }), INTEGRITY.VERIFIED],
+    ]) {
+        const verdict = V.decide(record);
+        assert.strictEqual(verdict.integrity, expected);
+        assert.strictEqual(verdict.attention, false, 'and they do not raise a notice either');
+    }
+});
+
+test('suspicious findings raise a notice without claiming tampering', () => {
+    const suspicious = Object.entries(V.FINDINGS).filter(([, entry]) => entry[0] === CLASS.SUSPICIOUS);
+    for (const [code] of suspicious) {
+        const verdict = V.decide(base({ findings: [V.finding(code)] }));
+        assert.strictEqual(verdict.integrity, INTEGRITY.PARTIAL, code);
+        assert.strictEqual(verdict.attention, true, code);
+    }
+});
+
+test('an inline script element in the DOM is an observation, not a verdict', () => {
+    // What a password manager leaves behind.
+    const inline = V.findingForIssue({ type: 'inline-script', path: '[inline script]', error: 'inline script element' });
+    assert.strictEqual(inline.class, CLASS.ENVIRONMENT);
+    const fromExtension = V.findingForIssue({ type: 'extension-script', path: 'chrome-extension://abc', error: 'x' });
+    assert.strictEqual(fromExtension.class, CLASS.ENVIRONMENT);
+
+    // A site script the policy will not run points at the page, but proves
+    // nothing about the server.
+    assert.strictEqual(
+        V.findingForIssue({ type: 'unknown-script', path: '/static/js/x.js', error: 'x' }).class,
+        CLASS.SUSPICIOUS,
+    );
+    // An unsigned stylesheet from the site's own origin was loaded: the
+    // policy allows same-origin styles, and the bytes came from the server.
+    for (const type of ['unknown-stylesheet', 'unauthorized-stylesheet', 'stylesheet-missing-sri']) {
+        assert.strictEqual(V.findingForIssue({ type, path: '/static/css/x.css', error: 'x' }).class, CLASS.CONFIRMED);
+    }
+    assert.strictEqual(
+        V.findingForIssue({ type: 'hash-mismatch', path: '/static/js/app.js', error: 'x' }).class,
+        CLASS.CONFIRMED,
+    );
+});
+
+test('policy violations are attributed conservatively', () => {
+    const page = 'https://pinchat.io/static/chat.html?room=1#key=secret';
+    const byPage = V.findingForViolation({
+        sourceFile: 'https://pinchat.io/static/chat.html?room=1', blockedURI: 'inline', effectiveDirective: 'script-src-elem',
+    }, page);
+    assert.strictEqual(byPage.class, CLASS.SUSPICIOUS, 'even a page-attributed violation is not proof against the server');
+    assert(!byPage.detail.includes('secret'), 'the fragment never ends up in a finding');
+    // Chromium names the document without its query string.
+    assert.strictEqual(V.findingForViolation({
+        sourceFile: 'https://pinchat.io/static/chat.html', blockedURI: 'inline', effectiveDirective: 'script-src-elem',
+    }, page).class, CLASS.SUSPICIOUS);
+    assert.strictEqual(V.findingForViolation({
+        sourceFile: 'https://pinchat.io/static/js/app.js', blockedURI: 'inline', effectiveDirective: 'script-src-elem',
+    }, page).class, CLASS.ENVIRONMENT, 'another file of the site is not the document');
+
+    for (const sourceFile of ['chrome-extension://abcdefghijklmnop/content.js', 'moz-extension']) {
+        const entry = V.findingForViolation({ sourceFile, blockedURI: 'inline', effectiveDirective: 'script-src-elem' }, page);
+        assert.strictEqual(entry.class, CLASS.ENVIRONMENT, sourceFile);
+    }
+    const unknown = V.findingForViolation({ sourceFile: '', blockedURI: 'inline', effectiveDirective: 'script-src-elem' }, page);
+    assert.strictEqual(unknown.class, CLASS.ENVIRONMENT, 'an unattributed violation is not pinned on the page');
+});
+
+test('only verified gets the green badge', () => {
+    const green = V.badge(INTEGRITY.VERIFIED, false);
+    for (const integrity of Object.values(INTEGRITY)) {
+        for (const attention of [false, true]) {
+            const badge = V.badge(integrity, attention);
+            if (integrity === INTEGRITY.VERIFIED && !attention) continue;
+            assert.notStrictEqual(badge.color, green.color, `${integrity}/${attention} must not look verified`);
+            assert.notStrictEqual(badge.text, green.text);
+        }
+    }
+    assert.strictEqual(V.badge('nonsense', false).text, '');
+});
+
+test('redirects off the site are refused, whatever the spelling', () => {
+    const origins = ['https://pinchat.io', 'https://www.pinchat.io'];
+    const from = 'https://pinchat.io/c/00000000-0000-4000-8000-000000000000';
+    for (const location of [
+        '/static/chat.html?room=00000000-0000-4000-8000-000000000000',
+        '/',
+        '/login?redirect=%2Fc%2Fx',
+        'static/index.html',
+        'https://pinchat.io/static/index.html',
+        'https://www.pinchat.io/',
+        'https:static/index.html',
+    ]) {
+        assert.strictEqual(V.isAllowedRedirect(from, location, origins), true, location);
+    }
+    for (const location of [
+        'https://attacker.test/collect',
+        '//attacker.test/collect',
+        '/\\attacker.test/collect',
+        '\\\\attacker.test/collect',
+        'https://pinchat.io:8444/collect',
+        'http://pinchat.io/collect',
+        'https://pinchat.io.attacker.test/',
+        'https://pinchat.io@attacker.test/',
+        'http:attacker.test',
+        'javascript:alert(1)',
+        'data:text/html,x',
+        'https://',
+    ]) {
+        assert.strictEqual(V.isAllowedRedirect(from, location, origins), false, location);
+    }
+});
+
+test('the Chromium redirect rule allows only what the same check allows', () => {
+    const { ALLOWED_REDIRECT_LOCATIONS, buildRules } = require('../extensions/generate-csp-rules');
+    const origins = ['https://pinchat.io', 'https://www.pinchat.io'];
+    const from = 'https://pinchat.io/c/00000000-0000-4000-8000-000000000000';
+    // Header value patterns as the browser reads them: "*" matches any run
+    // of characters, "?" zero or one character, and a backslash makes the
+    // next character literal. A bare "?" in a pattern is therefore a
+    // wildcard, which once turned "/?*" into "anything after a slash".
+    const literal = (character) => character.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const toRegExp = (pattern) => {
+        let out = '';
+        for (let i = 0; i < pattern.length; i += 1) {
+            const character = pattern[i];
+            if (character === '\\' && i + 1 < pattern.length) {
+                i += 1;
+                out += literal(pattern[i]);
+            } else if (character === '*') {
+                out += '.*';
+            } else if (character === '?') {
+                out += '.?';
+            } else {
+                out += literal(character);
+            }
+        }
+        return new RegExp(`^${out}$`);
+    };
+    const matchers = ALLOWED_REDIRECT_LOCATIONS.map(toRegExp);
+    assert(toRegExp('/?*').test('//attacker.test/'), 'the emulation treats a bare ? as a wildcard');
+    const allowedByRule = (location) => matchers.some((matcher) => matcher.test(location));
+
+    // Everything the rule lets through must stay on the site.
+    for (const location of [
+        'https://pinchat.io/x', 'https://www.pinchat.io/x', '/', '/?a=1', '/static/chat.html?room=1',
+        '/c/00000000-0000-4000-8000-000000000000?_=1', '/login', '/login?redirect=%2F',
+        '/static//attacker.test/', '/c/../../x', '/static/\\attacker.test',
+    ]) {
+        assert(allowedByRule(location), `rule should allow ${location}`);
+        assert(V.isAllowedRedirect(from, location, origins), `${location} leaves the site`);
+    }
+    // And the spellings that leave the site must not match any pattern.
+    for (const location of [
+        'https://attacker.test/collect', '//attacker.test/collect', '/\\attacker.test/collect',
+        'https://pinchat.io:8444/collect', 'http://pinchat.io/', 'https://pinchat.io.attacker.test/',
+        'https://pinchat.io@attacker.test/', '/loginx//attacker.test', '',
+    ]) {
+        assert(!allowedByRule(location), `rule must not allow ${JSON.stringify(location)}`);
+    }
+
+    const signed = JSON.parse(fs.readFileSync(path.join(root, 'hashes.json.signed'), 'utf8'));
+    const chrome = buildRules(signed, 'chrome');
+    const firefox = buildRules(signed, 'firefox');
+    const redirectRule = chrome.find((rule) => rule.action.type === 'block');
+    assert(redirectRule, 'the Chromium ruleset blocks off-site redirects');
+    assert.deepStrictEqual(redirectRule.condition.resourceTypes, ['main_frame', 'sub_frame']);
+    assert(!firefox.some((rule) => rule.condition.responseHeaders),
+        'Firefox does not support response header conditions; its build enforces the rule in the background script');
+    for (const rule of [...chrome, ...firefox].filter((entry) => entry.action.type === 'modifyHeaders')) {
+        const operations = rule.action.responseHeaders.map((header) => `${header.header}:${header.operation}`);
+        assert.deepStrictEqual(operations,
+            ['content-security-policy:set', 'link:remove', 'refresh:remove']);
+        assert(rule.action.responseHeaders[0].value.includes("worker-src 'none'"));
+    }
+});
+
+test('document hashes come from the signed manifest only', () => {
+    const signed = JSON.parse(fs.readFileSync(path.join(root, 'hashes.json.signed'), 'utf8'));
+    const documents = V.documentHashes(signed.data);
+    assert.deepStrictEqual([...documents.keys()].sort(), [
+        '/static/chat.html', '/static/index.html', '/static/login.html',
+        '/static/privacy.html', '/static/terms.html',
+    ]);
+    // The bytes the server serves are the bytes that were signed.
+    const crypto = require('crypto');
+    for (const [documentPath, hash] of documents) {
+        const served = fs.readFileSync(path.join(root, documentPath.slice(1)));
+        assert.strictEqual(crypto.createHash('sha256').update(served).digest('hex'), hash,
+            `${documentPath}: the file as served does not hash to the signed value`);
+    }
+    assert.strictEqual(V.documentHashes(null).size, 0);
+    assert.strictEqual(V.documentHashes({ files: [{ path: '/static/x.html', hash: 'not-a-hash' }] }).size, 0);
+});
+
+test('the background script assigns states in one place and never ahead of the facts', () => {
+    const source = fs.readFileSync(path.join(root, 'extensions/chrome/background.js'), 'utf8');
+    const assignments = source.match(/record\.integrity\s*=/g) || [];
+    assert.strictEqual(assignments.length, 1, 'a state is assigned in evaluate() and nowhere else');
+    assert(!/integrity:\s*['"]verified['"]/.test(source), 'no literal verified state');
+    assert(!/Dismiss \(Unsafe\)/.test(fs.readFileSync(path.join(root, 'extensions/chrome/content.js'), 'utf8')),
+        'a confirmed failure cannot be dismissed');
+    // The response filter must fail closed in each of its handlers.
+    for (const handler of ['function onDocumentRequest', 'function onDocumentHeaders']) {
+        const body = source.slice(source.indexOf(handler), source.indexOf('\n}\n', source.indexOf(handler)));
+        assert(/catch \(error\) \{[\s\S]*return \{ cancel: true \};/.test(body), `${handler} does not cancel on error`);
+    }
+});
+
+console.log(`\n${passed} verdict tests passed`);

@@ -93,24 +93,15 @@ h1 {
     margin-bottom: 28px;
     backdrop-filter: blur(8px);
 }
-.file-list h3 {
-    margin: 0 0 10px 0;
-    font-size: 12px;
-    font-weight: 700;
-    text-transform: uppercase;
-    letter-spacing: 0.08em;
-    color: rgba(255, 255, 255, 0.85);
-}
-.file-list ul {
-    margin: 0;
-    padding-left: 18px;
-    font-size: 13px;
-    font-family: ui-monospace, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace;
+.file-list {
     list-style: disc;
+    padding-left: 38px;
+    font-size: 14px;
+    line-height: 1.45;
 }
 .file-list li {
-    margin-bottom: 4px;
-    word-break: break-all;
+    margin-bottom: 6px;
+    overflow-wrap: anywhere;
     color: rgba(255, 255, 255, 0.92);
 }
 .buttons { display: flex; gap: 16px; flex-wrap: wrap; justify-content: center; }
@@ -158,3 +149,63 @@ h1 {
     color: rgba(255, 255, 255, 0.75);
     letter-spacing: 0.02em;
 }
+
+/* ---- Kinds of overlay -------------------------------------------------
+ * failed, foreign: full-page and red. An established mismatch, or a page
+ *   that is not the site at all.
+ * unverifiable: full-page, amber. Nothing was found wrong; the page was
+ *   simply not checked.
+ * notice: a bar along the top that leaves the page usable. Something was
+ *   blocked or could not be checked, and the script policy is in force.
+ */
+.overlay-unverifiable {
+    background:
+        radial-gradient(ellipse at center, rgba(120, 72, 8, 0.3) 0%, rgba(180, 108, 12, 0.97) 60%);
+}
+.overlay-unverifiable .btn-leave { color: #7a4a08; }
+
+:host([data-kind="notice"]) {
+    height: auto !important;
+    bottom: auto !important;
+}
+.overlay-notice {
+    position: static;
+    display: block;
+    padding: 12px 18px;
+    background: #1f2430;
+    border-bottom: 3px solid #f59e0b;
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.3);
+}
+.overlay-notice h1 {
+    font-size: 15px;
+    font-weight: 700;
+    letter-spacing: 0;
+    text-align: left;
+    text-shadow: none;
+    margin: 0 0 4px 0;
+}
+.overlay-notice .description {
+    font-size: 13px;
+    font-weight: 400;
+    text-align: left;
+    max-width: none;
+    margin: 0 0 6px 0;
+}
+.overlay-notice .file-list {
+    background: transparent;
+    border: 0;
+    padding: 0 0 0 20px;
+    margin: 0 0 8px 0;
+    max-width: none;
+    max-height: 90px;
+    font-size: 12px;
+    backdrop-filter: none;
+}
+.overlay-notice .buttons { justify-content: flex-start; }
+.overlay-notice .btn-dismiss {
+    padding: 4px 14px;
+    font-size: 12px;
+    border-width: 1px;
+}
+.overlay-notice .footer { display: none; }
+

@@ -1,360 +1,145 @@
 /**
- * PinChat Integrity Verifier - Popup Script
+ * PinChat Integrity Verifier - popup
+ *
+ * Shows the state of the document in the active tab, and only of that
+ * document. Every word of it comes from the record the background script
+ * keeps for that tab; nothing is inferred here. Text is always written with
+ * textContent.
  */
 
-/**
- * Escape HTML special characters to prevent XSS
- * @param {string} text - Text to escape
- * @returns {string} - HTML-safe escaped text
- */
-function escapeHtml(text) {
-    if (text === null || text === undefined) return '';
-    const div = document.createElement('div');
-    div.textContent = String(text);
-    return div.innerHTML;
-}
+const ext = globalThis.browser || globalThis.chrome;
+const V = globalThis.PinChatVerdict;
 
-let pollingInterval = null;
-let lastStateJson = null;
-
-/**
- * Start polling for status updates during verification
- */
-function startPolling() {
-    if (pollingInterval) return;
-    pollingInterval = setInterval(() => {
-        chrome.runtime.sendMessage({ type: 'GET_STATUS' }, (response) => {
-            if (chrome.runtime.lastError) {
-                // Extension context invalidated, stop polling
-                stopPolling();
-                return;
-            }
-            if (response) {
-                // Only update UI if state actually changed to avoid animation flicker
-                const stateJson = JSON.stringify({
-                    status: response.status,
-                    signatureStatus: response.signatureStatus,
-                    fileStatus: response.fileStatus
-                });
-                if (stateJson !== lastStateJson) {
-                    lastStateJson = stateJson;
-                    updateUI(response);
-                }
-                if (response.status !== 'checking') {
-                    stopPolling();
-                    lastStateJson = null;
-                }
-            }
-        });
-    }, 1000);
-}
-
-/**
- * Stop polling for status updates
- */
-function stopPolling() {
-    if (pollingInterval) {
-        clearInterval(pollingInterval);
-        pollingInterval = null;
-    }
-}
-
-/**
- * Check if current tab is on pinchat.io and show/hide banner
- */
-async function checkCurrentTab() {
-    try {
-        const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-        const banner = document.getElementById('not-on-site-banner');
-        if (tab && tab.url) {
-            // Whole origin, not hostname: another scheme or port is another site.
-            const isPinChat = ['https://pinchat.io', 'https://www.pinchat.io']
-                .includes(new URL(tab.url).origin);
-            banner.style.display = isPinChat ? 'none' : 'block';
-        } else {
-            banner.style.display = 'block';
-        }
-    } catch {
-        document.getElementById('not-on-site-banner').style.display = 'block';
-    }
-}
-
-const statusConfig = {
-    verified: {
-        icon: '✓',
-        text: 'All Files Verified',
-        class: 'status-verified'
-    },
-    signature_only: {
-        icon: '✓',
-        text: 'Signature Verified',
-        class: 'status-verified'
-    },
-    partial: {
-        icon: '◐',
-        text: 'Partially Verified',
-        class: 'status-partial'
-    },
-    failed: {
-        icon: '✗',
-        text: 'Verification Failed!',
-        class: 'status-failed'
-    },
-    error: {
-        icon: '⚠',
-        text: 'Verification Error',
-        class: 'status-error'
-    },
-    checking: {
-        icon: 'spinner',
-        text: 'Checking...',
-        class: 'status-checking'
-    },
-    unknown: {
-        icon: '?',
-        text: 'Status Unknown',
-        class: 'status-unknown'
-    }
+const ICONS = {
+    [V.INTEGRITY.VERIFIED]: ['OK', 'status-verified'],
+    [V.INTEGRITY.PARTIAL]: ['~', 'status-partial'],
+    [V.INTEGRITY.FAILED]: ['!', 'status-failed'],
+    [V.INTEGRITY.UNVERIFIABLE]: ['?', 'status-unverifiable'],
+    [V.INTEGRITY.CHECKING]: ['...', 'status-checking'],
 };
 
-function updateUI(state) {
-    // Determine if we're on pinchat.io
-    const onPinChat = state.debug?.onPinChat ?? false;
+const byId = (id) => document.getElementById(id);
+const show = (element, visible) => element.classList.toggle('is-hidden', !visible);
 
-    // Use signature_only status when not on pinchat.io and signature is valid
-    let effectiveStatus = state.status;
-    if (!onPinChat && state.status === 'verified' && state.signatureStatus === 'valid') {
-        effectiveStatus = 'signature_only';
+function renderList(container, entries, className) {
+    container.textContent = '';
+    for (const entry of entries) {
+        const row = document.createElement('div');
+        row.className = className;
+        row.textContent = entry.detail ? `${entry.message} (${entry.detail})` : entry.message;
+        container.appendChild(row);
     }
-
-    const config = statusConfig[effectiveStatus] || statusConfig.unknown;
-
-    const statusIcon = document.getElementById('status-icon');
-    const statusText = document.getElementById('status-text');
-    const lastCheck = document.getElementById('last-check');
-    const verificationSteps = document.getElementById('verification-steps');
-    const signatureStatus = document.getElementById('signature-status');
-    const fileStatus = document.getElementById('file-status');
-    const details = document.getElementById('details');
-    const mismatches = document.getElementById('mismatches');
-    const fileListSection = document.getElementById('file-list');
-    const fileItems = document.getElementById('file-items');
-
-    // Update status icon
-    if (config.icon === 'spinner') {
-        statusIcon.innerHTML = '<div class="spinner"></div>';
-    } else {
-        statusIcon.textContent = config.icon;
-    }
-
-    // Update status text
-    statusText.textContent = config.text;
-    statusText.className = `status-text ${config.class}`;
-
-    // Update last check time
-    if (state.lastCheck) {
-        const date = new Date(state.lastCheck);
-        lastCheck.textContent = `Last checked: ${date.toLocaleString()}`;
-    } else {
-        lastCheck.textContent = '';
-    }
-
-    // Update verification steps (show if available)
-    if (state.signatureStatus || state.fileStatus) {
-        verificationSteps.style.display = 'block';
-
-        // Update signature status
-        const sigStatus = state.signatureStatus || 'unknown';
-        switch(sigStatus) {
-            case 'valid':
-                if (state.usingCachedManifest) {
-                    // Signature and sequence both checked, but against the
-                    // stored copy: the freshness check did not happen, so do
-                    // not show an unqualified green tick.
-                    const cachedSpan = document.createElement('span');
-                    cachedSpan.style.color = '#f59e0b';
-                    cachedSpan.textContent = '✓ Valid (cached)';
-                    cachedSpan.title = state.manifestCachedAt
-                        ? `Update host unreachable. Using the manifest cached on ${new Date(state.manifestCachedAt).toLocaleString()}.`
-                        : 'Update host unreachable. Using the stored manifest.';
-                    signatureStatus.replaceChildren(cachedSpan);
-                } else {
-                    signatureStatus.innerHTML = '<span style="color: #22c55e;">✓ Valid</span>';
-                }
-                break;
-            case 'invalid':
-                signatureStatus.innerHTML = '<span style="color: #ef4444;">✗ Invalid</span>';
-                break;
-            case 'checking':
-                signatureStatus.innerHTML = '<span style="color: #3b82f6;">⏳ Checking...</span>';
-                break;
-            case 'error':
-                signatureStatus.innerHTML = '<span style="color: #f59e0b;">⚠ Error</span>';
-                break;
-            default:
-                signatureStatus.innerHTML = '<span style="color: #6b7280;">⏳ Pending</span>';
-        }
-
-        // Get file hash row element
-        const fileHashRow = document.getElementById('file-hash-row');
-
-        // Only show file hash check if we're on pinchat.io
-        const onPinChat = state.debug?.onPinChat ?? false;
-
-        if (onPinChat) {
-            fileHashRow.style.display = 'flex';
-            // Update file status
-            const fStatus = state.fileStatus || 'pending';
-            switch(fStatus) {
-                case 'verified':
-                    fileStatus.innerHTML = '<span style="color: #22c55e;">✓ Verified</span>';
-                    break;
-                case 'failed':
-                    fileStatus.innerHTML = '<span style="color: #ef4444;">✗ Failed</span>';
-                    break;
-                case 'checking':
-                    fileStatus.innerHTML = '<span style="color: #3b82f6;">⏳ Checking...</span>';
-                    break;
-                case 'pending':
-                    fileStatus.innerHTML = '<span style="color: #6b7280;">⏳ Pending</span>';
-                    break;
-                case 'error':
-                    fileStatus.innerHTML = '<span style="color: #f59e0b;">⚠ Error</span>';
-                    break;
-                default:
-                    fileStatus.innerHTML = '<span style="color: #6b7280;">⏳ Pending</span>';
-            }
-        } else {
-            // Not on pinchat.io - hide file hash row
-            fileHashRow.style.display = 'none';
-        }
-    } else {
-        verificationSteps.style.display = 'none';
-    }
-
-    // Update details from file verification if available (only on pinchat.io)
-    if (onPinChat && state.fileVerification && state.fileVerification.summary) {
-        details.style.display = 'block';
-        const summary = state.fileVerification.summary;
-        // Use 'checked' if available (new format), fallback to 'total' (legacy)
-        document.getElementById('files-checked').textContent = summary.checked ?? summary.total;
-        document.getElementById('files-matched').textContent = summary.passed;
-        // 'failed' now includes all failures (hash + DOM issues)
-        document.getElementById('files-failed').textContent = summary.failed;
-
-        // Hide auth row since we don't track that anymore
-        const authRow = document.getElementById('auth-row');
-        authRow.style.display = 'none';
-    } else if (onPinChat && state.details) {
-        details.style.display = 'block';
-        document.getElementById('files-checked').textContent = state.details.filesChecked;
-        document.getElementById('files-matched').textContent = state.details.filesMatched;
-        document.getElementById('files-failed').textContent = state.details.filesFailed;
-
-        // Show auth required row if there are any
-        const authRow = document.getElementById('auth-row');
-        const filesAuth = document.getElementById('files-auth');
-        if (state.details.filesAuthRequired > 0) {
-            authRow.style.display = 'flex';
-            filesAuth.textContent = state.details.filesAuthRequired;
-        } else {
-            authRow.style.display = 'none';
-        }
-    } else {
-        details.style.display = 'none';
-    }
-
-    // Update file list if available (only on pinchat.io)
-    if (onPinChat && state.fileVerification && state.fileVerification.files && state.fileVerification.files.length > 0) {
-        fileListSection.style.display = 'block';
-        const files = state.fileVerification.files;
-        // Clear existing items and build with DOM methods to prevent XSS
-        fileItems.innerHTML = '';
-        files.forEach(f => {
-            // Handle all status types: ok, failed, dom-issue
-            let statusIcon, statusClass;
-            if (f.status === 'ok') {
-                statusIcon = '✓';
-                statusClass = 'ok';
-            } else if (f.status === 'failed') {
-                statusIcon = '✗';
-                statusClass = 'failed';
-            } else if (f.status === 'dom-issue') {
-                statusIcon = '⚠';
-                statusClass = 'dom-issue';
-            } else {
-                statusIcon = '?';
-                statusClass = 'unknown';
-            }
-            // Extract filename from path
-            const filename = f.path ? f.path.split('/').pop() : '';
-            // Build DOM elements safely
-            const itemDiv = document.createElement('div');
-            itemDiv.className = 'file-item';
-            const statusSpan = document.createElement('span');
-            statusSpan.className = `file-status ${statusClass}`;
-            statusSpan.textContent = statusIcon;
-            const pathSpan = document.createElement('span');
-            pathSpan.className = 'file-path';
-            pathSpan.textContent = filename;
-            pathSpan.title = f.error ? `${f.path}: ${f.error}` : (f.path || '');
-            itemDiv.appendChild(statusSpan);
-            itemDiv.appendChild(pathSpan);
-            fileItems.appendChild(itemDiv);
-        });
-    } else {
-        fileListSection.style.display = 'none';
-    }
-
-    // Update mismatches if any (only show real failures, not auth-required or rate-limited)
-    const realFailures = state.mismatches ?
-        state.mismatches.filter(m => m.errorType !== 'auth' && m.errorType !== 'rate_limited') : [];
-
-    if (realFailures.length > 0) {
-        mismatches.style.display = 'block';
-        const mismatchList = document.getElementById('mismatch-list');
-        // Clear and build with DOM methods to prevent XSS
-        mismatchList.innerHTML = '';
-        realFailures.forEach(m => {
-            const itemDiv = document.createElement('div');
-            itemDiv.className = 'mismatch-item';
-            itemDiv.textContent = `${m.path || ''}: ${m.error || ''}`;
-            mismatchList.appendChild(itemDiv);
-        });
-    } else {
-        mismatches.style.display = 'none';
-    }
-
-    // Update button state
-    const verifyBtn = document.getElementById('verify-btn');
-    verifyBtn.disabled = state.status === 'checking';
-    verifyBtn.textContent = state.status === 'checking' ? 'Verifying...' : 'Verify Now';
 }
 
-// Check if we're on pinchat.io
-checkCurrentTab();
-
-// Get current status
-chrome.runtime.sendMessage({ type: 'GET_STATUS' }, (response) => {
-    if (response) {
-        updateUI(response);
-        // If already checking, start polling to get updates
-        if (response.status === 'checking') {
-            startPolling();
-        }
+function manifestLine(manifest) {
+    if (!manifest) return 'unknown';
+    if (manifest.status === 'valid') {
+        const origin = manifest.usingCached ? 'stored copy, release host unreachable' : 'from the release host';
+        return `valid, sequence ${manifest.sequence} (${origin})`;
     }
-});
+    if (manifest.status === 'invalid') return 'REJECTED: bad signature or older than the last one seen';
+    if (manifest.status === 'error') return 'not available';
+    return 'not loaded yet';
+}
 
-// Handle verify button click
-document.getElementById('verify-btn').addEventListener('click', () => {
-    updateUI({ status: 'checking' });
-    startPolling();
-    chrome.runtime.sendMessage({ type: 'VERIFY_NOW' });
-});
+function render(state) {
+    const icon = byId('status-icon');
+    const text = byId('status-text');
+    const scope = byId('status-scope');
 
-// Listen for status updates
-chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-    if (message.type === 'VERIFICATION_STATUS') {
-        updateUI(message.state);
+    show(byId('not-on-site-banner'), !state.onSite);
+    byId('manifest-status').textContent = manifestLine(state.manifest);
+
+    const verdict = state.verdict;
+    if (!state.onSite) {
+        icon.textContent = '-';
+        icon.className = 'status-icon status-unknown';
+        text.textContent = 'This tab is not showing pinchat.io. Nothing here is verified.';
+        scope.textContent = '';
+        show(byId('reasons'), false);
+        show(byId('environment'), false);
+        for (const id of ['policy-status', 'document-status', 'files-status']) byId(id).textContent = '-';
+        return;
     }
+    if (!verdict) {
+        // On the site, but the document has not announced itself: it was
+        // loaded before the extension started, or its check is not in yet.
+        icon.textContent = '?';
+        icon.className = 'status-icon status-unverifiable';
+        text.textContent = 'No result for this page yet. If this does not change, reload the page.';
+        scope.textContent = '';
+        show(byId('reasons'), false);
+        show(byId('environment'), false);
+        for (const id of ['policy-status', 'document-status', 'files-status']) byId(id).textContent = '-';
+        return;
+    }
+
+    const [symbol, className] = ICONS[verdict.integrity] || ['?', 'status-unknown'];
+    icon.textContent = symbol;
+    icon.className = `status-icon ${className}`;
+    text.textContent = verdict.headline;
+    scope.textContent = 'This describes what the server delivered. It says nothing about your browser, '
+        + 'your device or other extensions.';
+
+    const reasons = verdict.reasons || [];
+    show(byId('reasons'), reasons.length > 0);
+    byId('reasons-title').textContent = verdict.integrity === V.INTEGRITY.FAILED
+        ? 'What does not match' : 'What was noticed';
+    renderList(byId('reason-list'), reasons, 'mismatch-item');
+
+    const environment = verdict.environment || [];
+    show(byId('environment'), environment.length > 0);
+    renderList(byId('environment-list'), environment, 'file-item');
+
+    const has = (code) => reasons.some((entry) => entry.code === code);
+    byId('policy-status').textContent = has('policy-not-in-force') || has('service-worker-controlled')
+        ? 'NOT in force' : 'in force: only signed scripts can run';
+    if (verdict.attested) {
+        byId('document-status').textContent = 'compared with the signed page before it was shown';
+    } else if (verdict.canAttest) {
+        byId('document-status').textContent = 'not checked';
+    } else {
+        byId('document-status').textContent = 'cannot be checked in this browser';
+    }
+    byId('files-status').textContent = verdict.files
+        ? `${verdict.files.checked - verdict.files.failed} of ${verdict.files.checked} match `
+            + '(a second download, not proof of what the page loaded)'
+        : 'not yet';
+}
+
+async function activeTab() {
+    const [tab] = await ext.tabs.query({ active: true, currentWindow: true });
+    return tab || null;
+}
+
+async function refresh() {
+    const tab = await activeTab();
+    if (!tab) return;
+    const state = await ext.runtime.sendMessage({ type: 'GET_TAB_STATE', tabId: tab.id }).catch(() => null);
+    if (state) render(state);
+}
+
+byId('verify-btn').addEventListener('click', async () => {
+    const button = byId('verify-btn');
+    button.disabled = true;
+    const tab = await activeTab();
+    await ext.runtime.sendMessage({ type: 'VERIFY_NOW', tabId: tab ? tab.id : null }).catch(() => null);
+    setTimeout(() => {
+        button.disabled = false;
+        refresh();
+    }, 1500);
 });
+
+if (new URLSearchParams(window.location.search).get('debug') === 'states') {
+    // Diagnostic view, opened as a page: the raw records of every tab. Used
+    // by tests/extension-browser to read what the extension concluded.
+    ext.runtime.sendMessage({ type: 'GET_ALL_STATES' }).then((states) => {
+        const dump = byId('debug-states');
+        dump.textContent = JSON.stringify(states || []);
+        show(dump, true);
+    }).catch(() => {});
+} else {
+    refresh();
+    const poll = setInterval(refresh, 1000);
+    window.addEventListener('unload', () => clearInterval(poll));
+}

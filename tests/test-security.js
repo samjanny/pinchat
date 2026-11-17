@@ -396,18 +396,19 @@ async function runTests() {
         const firefoxManifest = JSON.parse(fs.readFileSync(path.join(root, 'extensions/firefox/manifest.json'), 'utf8'));
         const chromeRules = JSON.parse(fs.readFileSync(path.join(root, 'extensions/chrome/rules.json'), 'utf8'));
         const firefoxRules = JSON.parse(fs.readFileSync(path.join(root, 'extensions/firefox/rules.json'), 'utf8'));
-        const { buildRules } = require('../extensions/generate-csp-rules');
-        const expectedRules = buildRules(signed);
+        const { buildRules, PAGES, pageRegex } = require('../extensions/generate-csp-rules');
 
         for (const manifest of [chromeManifest, firefoxManifest]) {
             assert(manifest.permissions.includes('declarativeNetRequestWithHostAccess'));
             assert.strictEqual(manifest.declarative_net_request.rule_resources[0].enabled, true);
             assert.strictEqual(manifest.declarative_net_request.rule_resources[0].path, 'rules.json');
         }
-        assert.deepStrictEqual(chromeRules, expectedRules);
-        assert.deepStrictEqual(firefoxRules, expectedRules);
+        assert.deepStrictEqual(chromeRules, buildRules(signed, 'chrome'));
+        assert.deepStrictEqual(firefoxRules, buildRules(signed, 'firefox'));
         assert(chromeRules[0].action.responseHeaders[0].value.includes("script-src 'none'"));
-        for (const rule of chromeRules.slice(1)) {
+        const pageRules = chromeRules.filter((rule) => rule.action.type === 'modifyHeaders').slice(1);
+        assert.strictEqual(pageRules.length, PAGES.length, 'one policy rule per page');
+        for (const rule of pageRules) {
             const csp = rule.action.responseHeaders[0].value;
             assert(!/script-src[^;]*'self'/.test(csp), 'script-src must not trust the origin');
             assert(csp.includes("'sha256-"), 'page rule must pin at least one signed script');
@@ -420,12 +421,14 @@ async function runTests() {
         // 'self' in script-src all three were blocked for extension users.
         const sriOf = (hex) => `sha256-${Buffer.from(hex, 'hex').toString('base64')}`;
         const signedHashes = new Map(signed.data.files.map((f) => [f.path, f.hash]));
-        for (const rule of chromeRules) {
-            const page = rule.condition.regexFilter
-                .replace('^https://(www\\.)?pinchat\\.io', '')
-                .replace('(?:\\?.*)?$', '')
-                .replace(/\\/g, '');
-            if (!page.endsWith('.html')) continue;
+        // Rules are found by the exact filter the generator emits for each
+        // page. Recovering the page from the filter by string surgery made
+        // this loop skip every rule once the filter's suffix changed.
+        let pagesCovered = 0;
+        for (const page of PAGES) {
+            const rule = chromeRules.find((candidate) => candidate.condition.regexFilter === pageRegex(page));
+            assert(rule, `no policy rule for ${page}`);
+            pagesCovered++;
             const html = fs.readFileSync(path.join(root, page.replace(/^\//, '')), 'utf8');
             const policy = rule.action.responseHeaders[0].value.split(';')[0];
             for (const m of html.matchAll(/<script\b[^>]*\ssrc="([^"]+)"/g)) {
@@ -437,6 +440,7 @@ async function runTests() {
                 );
             }
         }
+        assert.strictEqual(pagesCovered, PAGES.length);
 
         console.log('PASSED: packaged DNR rules replace origin trust with per-page signed hashes');
         passed++;

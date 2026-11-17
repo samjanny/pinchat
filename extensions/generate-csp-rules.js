@@ -95,9 +95,61 @@ const CSP_BASE = [
     "font-src 'self'",
     "connect-src 'self' wss://pinchat.io wss://www.pinchat.io",
     "object-src 'none'",
+    // The site uses no worker of any kind. Stated explicitly so that it does
+    // not depend on worker-src falling back to script-src.
+    "worker-src 'none'",
     "base-uri 'none'",
     "form-action 'self'",
     "frame-ancestors 'none'"
+];
+
+/**
+ * Header changes applied to every document response on the site.
+ *
+ * Besides setting the policy, two response headers are removed because they
+ * act on the document without being part of its body, so no check of the
+ * HTML can see them: `Link: <...>; rel=stylesheet` attaches a stylesheet
+ * (honoured by Firefox), and `Refresh` navigates away.
+ */
+function documentHeaders(csp) {
+    return [
+        { header: 'content-security-policy', operation: 'set', value: csp },
+        { header: 'link', operation: 'remove' },
+        { header: 'refresh', operation: 'remove' },
+    ];
+}
+
+/**
+ * Location values a document response on the site may redirect to.
+ *
+ * An invite link carries its key in the URL fragment. Browsers carry the
+ * fragment across an HTTP redirect, to another origin as well, unless the
+ * Location header names a fragment of its own. A server that answers an
+ * invite link with a redirect to an origin it controls therefore finds the
+ * key in that origin's location.hash, without running any code on the site.
+ * Every redirect the site makes stays on the site, so anything else is
+ * blocked.
+ *
+ * These are header-value patterns: "*" matches any run of characters, "?"
+ * matches zero or one character, and a backslash makes the next character
+ * literal. A literal question mark therefore has to be escaped: written
+ * bare, "/?*" means "a slash, optionally one more character, then
+ * anything", which is every value that starts with a slash. They
+ * are an allowlist on purpose. "//host/..." and "/\\host/..." are
+ * scheme-relative to a browser and start with a slash, so "any value that
+ * begins with a slash" would let them through; each relative prefix the
+ * site actually uses is listed instead, and none of them can be extended
+ * into another authority.
+ */
+const ALLOWED_REDIRECT_LOCATIONS = [
+    'https://pinchat.io/*',
+    'https://www.pinchat.io/*',
+    '/',
+    '/\\?*',
+    '/static/*',
+    '/c/*',
+    '/login',
+    '/login\\?*',
 ];
 
 function hexToSRI(hex) {
@@ -130,7 +182,13 @@ function pageRegex(pagePath) {
     return `^https://(www\\.)?pinchat\\.io${escapedPath}(?:[?#].*)?$`;
 }
 
-function buildRules(manifestDocument) {
+/**
+ * Build the ruleset for one browser. The policy rules are the same for
+ * both. The redirect rule exists for Chromium only: it relies on matching a
+ * response header, which Firefox's declarativeNetRequest does not support.
+ * The Firefox build enforces the same rule in its background script.
+ */
+function buildRules(manifestDocument, browser = 'chrome') {
     const data = manifestDocument.data || manifestDocument;
     if (!data || !Array.isArray(data.files)) {
         throw new Error('Manifest does not contain a files array');
@@ -143,11 +201,7 @@ function buildRules(manifestDocument) {
             priority: 1,
             action: {
                 type: 'modifyHeaders',
-                responseHeaders: [{
-                    header: 'content-security-policy',
-                    operation: 'set',
-                    value: ["script-src 'none'", ...CSP_BASE].join('; ') + ';'
-                }]
+                responseHeaders: documentHeaders(["script-src 'none'", ...CSP_BASE].join('; ') + ';')
             },
             condition: {
                 // Every document on the site's host names, on any port and
@@ -171,15 +225,26 @@ function buildRules(manifestDocument) {
             priority: 2,
             action: {
                 type: 'modifyHeaders',
-                responseHeaders: [{
-                    header: 'content-security-policy',
-                    operation: 'set',
-                    value: buildCsp(scripts, hashesByPath)
-                }]
+                responseHeaders: documentHeaders(buildCsp(scripts, hashesByPath))
             },
             condition: {
                 regexFilter: pageRegex(pagePath),
                 resourceTypes: ['main_frame', 'sub_frame']
+            }
+        });
+    }
+    if (browser === 'chrome') {
+        rules.push({
+            id: id++,
+            priority: 3,
+            action: { type: 'block' },
+            condition: {
+                regexFilter: CATCH_ALL_REGEX,
+                resourceTypes: ['main_frame', 'sub_frame'],
+                responseHeaders: [{
+                    header: 'location',
+                    excludedValues: ALLOWED_REDIRECT_LOCATIONS
+                }]
             }
         });
     }
@@ -188,14 +253,14 @@ function buildRules(manifestDocument) {
 
 function writeRulesFromManifest(manifestPath) {
     const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
-    const rules = buildRules(manifest);
-    const output = JSON.stringify(rules, null, 2) + '\n';
+    const written = {};
     for (const browser of ['chrome', 'firefox']) {
+        written[browser] = buildRules(manifest, browser);
         const outputPath = path.join(__dirname, browser, 'rules.json');
-        fs.writeFileSync(outputPath, output);
+        fs.writeFileSync(outputPath, JSON.stringify(written[browser], null, 2) + '\n');
         console.log(`Preventive CSP rules written: ${outputPath}`);
     }
-    return rules;
+    return written;
 }
 
 if (require.main === module) {
@@ -208,6 +273,7 @@ if (require.main === module) {
 module.exports = {
     PAGES,
     CATCH_ALL_REGEX,
+    ALLOWED_REDIRECT_LOCATIONS,
     pageRegex,
     pageScripts,
     buildRules,

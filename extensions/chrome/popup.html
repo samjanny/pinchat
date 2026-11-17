@@ -338,72 +338,74 @@
             border-radius: 4px;
         }
         ::-webkit-scrollbar-thumb:hover { background: var(--text-light); }
+    
+        .is-hidden { display: none; }
+        .status-unverifiable { color: var(--warning); }
+        .hint {
+            font-size: 11px;
+            line-height: 1.45;
+            color: var(--text-light);
+            margin: 0 0 8px 0;
+        }
     </style>
 </head>
 <body>
-    <div id="not-on-site-banner" class="not-on-site-banner" style="display: none;">
-        You're not on pinchat.io - <a href="https://pinchat.io" target="_blank">Visit site</a>
+    <div id="not-on-site-banner" class="not-on-site-banner is-hidden">
+        This tab is not on pinchat.io - <a href="https://pinchat.io" target="_blank" rel="noopener">Visit site</a>
     </div>
     <div class="header">
         <div class="brand">
             <span class="brand-mark">P</span>
             <h1>PinChat Integrity Verifier</h1>
         </div>
-        <p>Verifying pinchat.io file integrity</p>
+        <p>State of the page in this tab</p>
     </div>
 
     <div class="status-card">
-        <div id="status-icon" class="status-icon">?</div>
+        <div id="status-icon" class="status-icon status-unknown">?</div>
         <div id="status-text" class="status-text">Loading...</div>
-        <div id="last-check" class="last-check"></div>
+        <div id="status-scope" class="last-check"></div>
     </div>
 
-    <div id="verification-steps" class="details" style="display: none;">
-        <h3>Verification Steps</h3>
-        <div class="detail-row">
-            <span class="detail-label">1. Signature Check</span>
-            <span id="signature-status" class="detail-value">⏳ Pending</span>
-        </div>
-        <div class="detail-row" id="file-hash-row">
-            <span class="detail-label">2. File Hash Check</span>
-            <span id="file-status" class="detail-value">⏳ Pending</span>
-        </div>
+    <div id="reasons" class="mismatches is-hidden">
+        <h3 id="reasons-title">Findings</h3>
+        <div id="reason-list"></div>
     </div>
 
-    <div id="details" class="details" style="display: none;">
-        <h3>File Verification Details</h3>
-        <div class="detail-row">
-            <span class="detail-label">Files Checked</span>
-            <span id="files-checked" class="detail-value">0</span>
-        </div>
-        <div class="detail-row">
-            <span class="detail-label">Files Matched</span>
-            <span id="files-matched" class="detail-value">0</span>
-        </div>
-        <div class="detail-row" id="auth-row" style="display: none;">
-            <span class="detail-label">Auth Required</span>
-            <span id="files-auth" class="detail-value" style="color: #3b82f6;">0</span>
-        </div>
-        <div class="detail-row">
-            <span class="detail-label">Files Failed</span>
-            <span id="files-failed" class="detail-value">0</span>
-        </div>
+    <div id="environment" class="details is-hidden">
+        <h3>Changes to the page of unattested origin</h3>
+        <p class="hint">Other browser extensions add elements to pages. The verifier cannot tell who added
+            what, so these are listed and not judged. The script policy decides what may run.</p>
+        <div id="environment-list"></div>
     </div>
 
-    <div id="mismatches" class="mismatches" style="display: none;">
-        <h3>Failed Files</h3>
-        <div id="mismatch-list"></div>
-    </div>
-
-    <div id="file-list" class="file-list" style="display: none;">
-        <h3>Verified Files</h3>
-        <div id="file-items"></div>
+    <div class="details">
+        <h3>What was checked</h3>
+        <div class="detail-row">
+            <span class="detail-label">Signed manifest</span>
+            <span id="manifest-status" class="detail-value">-</span>
+        </div>
+        <div class="detail-row">
+            <span class="detail-label">Script policy on this page</span>
+            <span id="policy-status" class="detail-value">-</span>
+        </div>
+        <div class="detail-row">
+            <span class="detail-label">Page as received</span>
+            <span id="document-status" class="detail-value">-</span>
+        </div>
+        <div class="detail-row">
+            <span class="detail-label">Files re-downloaded</span>
+            <span id="files-status" class="detail-value">-</span>
+        </div>
     </div>
 
     <div class="actions">
-        <button id="verify-btn">Verify Now</button>
+        <button id="verify-btn">Check again</button>
     </div>
 
+    <pre id="debug-states" class="is-hidden"></pre>
+
+    <script src="verdict.js"></script>
     <script src="popup.js"></script>
 </body>
 </html>

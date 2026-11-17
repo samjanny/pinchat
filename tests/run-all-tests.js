@@ -34,6 +34,11 @@ const TEST_SUITES = {
         file: 'test-security.js',
         description: 'Key extractability invariants (bootstrap key, identity key)'
     },
+    'verifier-verdict': {
+        name: 'Extension verdict logic',
+        file: 'test-verifier-verdict.js',
+        description: 'What each verifier state may be based on; redirect guard; per-browser rules'
+    },
     'websocket-resume': {
         name: 'WebSocket stable-identity resume',
         file: 'test-websocket-resume.js',
