@@ -245,10 +245,10 @@ hosting-provider logs.
 | `CORS_ALLOWED_ORIGINS` | `https://localhost:3000` | Comma-separated origins for CORS and the WebSocket Origin check. Required in production: must include your public origin or the WebSocket upgrade fails with 403 |
 | `MAX_TOTAL_ROOMS` | `1000` | Maximum concurrent rooms |
 | `CSP_WS_HOST` | `'self'` | Extra WebSocket origins allowed by the CSP |
-| `WS_CONN_BURST_SIZE` | `30` | WebSocket connections per period |
-| `WS_CONN_PERIOD_SECS` | `60` | Window for WebSocket connection rate limiting |
-| `ROOM_TOKEN_BURST_SIZE` | `100` | Room and token creations per period |
-| `ROOM_TOKEN_PERIOD_SECS` | `600` | Window for room and token rate limiting |
+| `WS_CONN_BURST_SIZE` | `30` | WebSocket connections per window, per client address. Also the burst a client may spend at once |
+| `WS_CONN_PERIOD_SECS` | `60` | Window over which the WebSocket connection budget refills evenly |
+| `ROOM_TOKEN_BURST_SIZE` | `100` | Room and token requests per window, per client address, counted after the session check |
+| `ROOM_TOKEN_PERIOD_SECS` | `600` | Window over which the room and token budget refills evenly |
 | `MSG_RATE_LIMIT` | `30` | Messages per connection per window |
 | `MSG_RATE_WINDOW_SECS` | `1` | Window for per-connection message rate limiting |
 | `POW_MIN_DIFFICULTY` | `12` | Minimum proof-of-work difficulty, in bits |
@@ -259,8 +259,8 @@ hosting-provider logs.
 | `CHALLENGE_CLEANUP_INTERVAL_SECS` | `60` | Proof-of-work cache cleanup interval |
 | `PINCHAT_PASSWORD_HASHES` | empty | Semicolon-separated Argon2id hashes. Empty disables password auth |
 | `SESSION_TTL_SECS` | `86400` | Session lifetime |
-| `LOGIN_BURST_SIZE` | `5` | Login attempts per period |
-| `LOGIN_PERIOD_SECS` | `900` | Window for login rate limiting |
+| `LOGIN_BURST_SIZE` | `5` | Login attempts per window, per client address |
+| `LOGIN_PERIOD_SECS` | `720` | Window over which the login budget refills evenly. Windows that would keep a hashed client address for more than 15 minutes are shortened at startup; see `.env.example` |
 | `TRUSTED_PROXIES` | empty | Comma-separated proxy IPs or CIDRs trusted for `X-Forwarded-For`. Set this behind a reverse proxy, or every client shares one rate-limit bucket |
 | `REPLAY_CACHE_MAX_PER_ROOM` | `1000` | Anti-replay entries per room. Advisory only; the authoritative check is the client-side Double Ratchet counter |
 | `MAX_IMAGE_SIZE` | `300KB` | Maximum image size, bytes or with a `KB` or `MB` suffix |

@@ -347,7 +347,10 @@ impl Config {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(86400),
 
-            // Login rate limiting (default: 5 attempts per 15 minutes)
+            // Login rate limiting (default: 5 attempts per 12 minutes).
+            // Not 15: a client's hashed address is kept for somewhat longer
+            // than the window, and the privacy policy promises at most 15
+            // minutes (see rate_limit::Quota::retention).
             login_burst_size: env::var("LOGIN_BURST_SIZE")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -355,7 +358,7 @@ impl Config {
             login_period_secs: env::var("LOGIN_PERIOD_SECS")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(900), // 15 minutes
+                .unwrap_or(720),
 
             // Trusted proxies for X-Forwarded-For (comma-separated IPs/CIDRs)
             // Example: "10.0.0.1,192.168.1.0/24,172.16.0.0/12"
@@ -563,6 +566,20 @@ impl Config {
             panic!("SESSION_TTL_SECS must be greater than 0");
         }
 
+        // An entry that is neither an address nor a CIDR range never
+        // matches. In proxy mode that means X-Forwarded-For is silently
+        // ignored and every visitor shares the proxy's rate-limit bucket.
+        if let Some(entry) = self
+            .trusted_proxies
+            .iter()
+            .find(|entry| !crate::ip_hash::is_valid_trusted_proxy_entry(entry))
+        {
+            panic!(
+                "TRUSTED_PROXIES entry {:?} is not an IP address or CIDR range",
+                entry
+            );
+        }
+
         // Validate login rate limiting
         if self.login_burst_size == 0 {
             panic!("LOGIN_BURST_SIZE must be greater than 0");
@@ -638,12 +655,10 @@ impl Config {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// A coherent non-proxy baseline; tests flip only the fields they are about.
-    fn base() -> Config {
-        Config {
+impl Config {
+    /// A coherent non-proxy configuration for unit tests in any module.
+    pub(crate) fn for_tests() -> Self {
+        Self {
             host: [127, 0, 0, 1],
             port: 3000,
             ws_conn_burst_size: 100,
@@ -685,6 +700,32 @@ mod tests {
             cors_allowed_origins: vec!["https://localhost:3000".to_string()],
             group_chat_enabled: false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A coherent non-proxy baseline; tests flip only the fields they are about.
+    fn base() -> Config {
+        Config::for_tests()
+    }
+
+    #[test]
+    fn baseline_configuration_is_valid() {
+        base().validate();
+        let mut c = base();
+        c.trusted_proxies = vec!["172.18.0.1".to_string(), "10.0.0.0/8".to_string()];
+        c.validate();
+    }
+
+    #[test]
+    #[should_panic(expected = "TRUSTED_PROXIES entry")]
+    fn unparsable_trusted_proxy_entry_is_refused_at_startup() {
+        let mut c = base();
+        c.trusted_proxies = vec!["172.18.0.1".to_string(), "nginx".to_string()];
+        c.validate();
     }
 
     #[test]

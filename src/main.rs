@@ -9,6 +9,7 @@ mod jwt;
 mod models;
 mod pow;
 mod pow_session;
+mod rate_limit;
 mod rate_limit_extractor;
 mod session;
 mod state;
@@ -23,10 +24,8 @@ use axum::{
 use axum_server::tls_rustls::RustlsConfig;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::Duration;
 use tower::ServiceBuilder;
-use tower_governor::{GovernorLayer, governor::GovernorConfigBuilder};
 use tower_http::{
     cors::{AllowOrigin, CorsLayer},
     services::ServeDir,
@@ -41,7 +40,7 @@ use crate::handlers::{
     create_room, generate_ws_token, get_csrf_token, homepage, login_page, login_submit, logout,
     room_page, ws_handler,
 };
-use crate::rate_limit_extractor::HmacIpKeyExtractor;
+use crate::rate_limit::{Quota, RetentionSweeper, ip_quota_layer};
 use crate::state::AppState;
 
 /// Build CSP header value based on environment
@@ -132,6 +131,35 @@ async fn add_security_headers(req: axum::extract::Request, next: Next) -> Respon
     );
 
     response
+}
+
+/// Room creation and WebSocket token endpoints.
+///
+/// Layer order matters. The session check is the outer layer and the quota
+/// the inner one, so a request without a valid session is refused before it
+/// reaches the bucket. With the quota outside, anyone who shared an address
+/// with a user (an office NAT, a VPN, a Tor exit) could spend that user's
+/// budget without knowing the site password. Both endpoints draw from the
+/// same bucket.
+///
+/// The token endpoint is POST (not GET) so the request cannot be forged as a
+/// top-level navigation; CSRF double-submit gating is applied inside the
+/// handlers.
+fn limited_api_routes(
+    app_state: &AppState,
+    quota: Quota,
+    sweeper: &mut RetentionSweeper,
+) -> Router {
+    let quota_layer = ip_quota_layer!(app_state, quota, sweeper);
+    Router::new()
+        .route("/api/rooms", post(create_room))
+        .route("/api/ws-token/:room_id", post(generate_ws_token))
+        .layer(quota_layer)
+        .layer(middleware::from_fn_with_state(
+            app_state.clone(),
+            require_auth_api,
+        ))
+        .with_state(app_state.clone())
 }
 
 #[tokio::main]
@@ -255,22 +283,44 @@ async fn main() {
         );
     }
 
-    // Configure rate limiting for room creation and token generation
-    // Layer 1: IP-based rate limiting with HMAC(IP) for privacy
-    // Restrictive limit (configurable) to prevent abuse while allowing legitimate use
-    let governor_config = Arc::new(
-        GovernorConfigBuilder::default()
-            .key_extractor(HmacIpKeyExtractor::new(Arc::new(app_state.clone())))
-            .per_second(0) // Disable per-second limit
-            .burst_size(config.room_token_burst_size) // Configurable burst size
-            .period(Duration::from_secs(config.room_token_period_secs)) // Configurable period
-            .finish()
-            .unwrap(),
-    );
+    // Per-client quotas, keyed by HMAC(IP). Semantics, keying and retention
+    // are documented in rate_limit.rs. The sweeper deletes buckets that are
+    // full again, which is what bounds how long a hashed address is kept.
+    let mut rate_limit_sweeper = RetentionSweeper::default();
+    let quota = |window_variable: &str, burst: u32, window_secs: u64| {
+        let (quota, clamped) = Quota::new(burst, window_secs);
+        if clamped {
+            // Visible in every privacy mode: this changes a limit the
+            // operator configured.
+            eprintln!(
+                "WARNING: {}={} would keep a hashed client address longer than the {} minutes stated in the privacy policy; using {}s.",
+                window_variable,
+                window_secs,
+                rate_limit::MAX_RETENTION.as_secs() / 60,
+                quota.window.as_secs()
+            );
+        }
+        tracing::info!(
+            "{}: {} requests per {}s per client, hashed address kept at most {}s after the last request",
+            window_variable,
+            quota.burst,
+            quota.window.as_secs(),
+            quota.retention().as_secs()
+        );
+        quota
+    };
 
-    let rate_limiter = ServiceBuilder::new().layer(GovernorLayer {
-        config: governor_config,
-    });
+    // Room creation and WebSocket token endpoints: session auth, then one
+    // shared bucket per client.
+    let rate_limited_api = limited_api_routes(
+        &app_state,
+        quota(
+            "ROOM_TOKEN_PERIOD_SECS",
+            config.room_token_burst_size,
+            config.room_token_period_secs,
+        ),
+        &mut rate_limit_sweeper,
+    );
 
     // Configure CORS using CORS_ALLOWED_ORIGINS env var (comma-separated).
     // Defaults to "https://localhost:3000" when the variable is absent.
@@ -293,20 +343,17 @@ async fn main() {
             header::HeaderName::from_static("x-pinchat-mls-control-seq"),
         ]);
 
-    // Configure rate limiting for login endpoint (brute force protection)
-    let login_governor_config = Arc::new(
-        GovernorConfigBuilder::default()
-            .key_extractor(HmacIpKeyExtractor::new(Arc::new(app_state.clone())))
-            .per_second(0)
-            .burst_size(config.login_burst_size) // 5 attempts
-            .period(Duration::from_secs(config.login_period_secs)) // per 15 minutes
-            .finish()
-            .unwrap(),
-    );
-
-    let login_rate_limiter = ServiceBuilder::new().layer(GovernorLayer {
-        config: login_governor_config,
-    });
+    // Login attempts (brute force protection). This quota necessarily runs
+    // before authentication, so clients behind one address share it.
+    let login_rate_limiter = ServiceBuilder::new().layer(ip_quota_layer!(
+        app_state,
+        quota(
+            "LOGIN_PERIOD_SECS",
+            config.login_burst_size,
+            config.login_period_secs
+        ),
+        rate_limit_sweeper
+    ));
 
     // Start session cleanup task
     {
@@ -399,56 +446,34 @@ async fn main() {
         .merge(protected_routes)
         .layer(cors);
 
-    // Apply rate limiting to room creation endpoint (with auth)
-    let rate_limited_create_room = Router::new()
-        .route("/api/rooms", post(create_room))
-        .layer(middleware::from_fn_with_state(
-            app_state.clone(),
-            require_auth_api,
-        ))
-        .layer(rate_limiter.clone())
-        .with_state(app_state.clone());
+    // WebSocket upgrades. Restrictive (configurable) to prevent connection
+    // flooding abuse.
+    let ws_rate_limiter = ServiceBuilder::new().layer(ip_quota_layer!(
+        app_state,
+        quota(
+            "WS_CONN_PERIOD_SECS",
+            config.ws_conn_burst_size,
+            config.ws_conn_period_secs
+        ),
+        rate_limit_sweeper
+    ));
 
-    // Apply rate limiting to WebSocket token endpoint (with auth + CSRF).
-    // POST (not GET) so the request body cannot be forged as a top-level
-    // navigation; CSRF double-submit token gating applied inside the
-    // handler itself.
-    let rate_limited_ws_token = Router::new()
-        .route("/api/ws-token/:room_id", post(generate_ws_token))
-        .layer(middleware::from_fn_with_state(
-            app_state.clone(),
-            require_auth_api,
-        ))
-        .layer(rate_limiter.clone())
-        .with_state(app_state.clone());
-
-    // Apply rate limiting to WebSocket upgrade endpoint (with auth)
-    // Restrictive (configurable) to prevent connection flooding abuse
-    let ws_governor_config = Arc::new(
-        GovernorConfigBuilder::default()
-            .key_extractor(HmacIpKeyExtractor::new(Arc::new(app_state.clone())))
-            .per_second(0)
-            .burst_size(config.ws_conn_burst_size) // Configurable connections per period
-            .period(Duration::from_secs(config.ws_conn_period_secs)) // Configurable period
-            .finish()
-            .unwrap(),
+    rate_limit_sweeper.spawn(rate_limit::SWEEP_INTERVAL);
+    tracing::info!(
+        "Rate limit retention sweep started ({}s interval)",
+        rate_limit::SWEEP_INTERVAL.as_secs()
     );
 
-    let ws_rate_limiter = ServiceBuilder::new().layer(GovernorLayer {
-        config: ws_governor_config,
-    });
-
-    // Note: WebSocket endpoint uses JWT token authentication (passed as query param)
-    // instead of session cookie auth. The token is obtained from /api/ws-token
-    // which already requires session authentication.
+    // Note: the WebSocket endpoint is authenticated by a single-use JWT sent
+    // in the Sec-WebSocket-Protocol header instead of the session cookie.
+    // The token is obtained from /api/ws-token, which requires a session.
     let rate_limited_websocket = Router::new()
         .route("/ws/:room_id", get(ws_handler))
         .layer(ws_rate_limiter)
         .with_state(app_state);
 
     // Merge routers
-    app = app.merge(rate_limited_create_room);
-    app = app.merge(rate_limited_ws_token);
+    app = app.merge(rate_limited_api);
     app = app.merge(rate_limited_websocket);
 
     // Add security headers middleware (CSP, X-Frame-Options, etc.)
@@ -543,5 +568,122 @@ async fn main() {
         {
             tracing::error!("Server error: {}", e);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{
+        body::Body,
+        extract::ConnectInfo,
+        http::{Request, StatusCode},
+    };
+    use tower::ServiceExt;
+    use uuid::Uuid;
+
+    const CLIENT: [u8; 4] = [203, 0, 113, 5];
+
+    async fn post_api(app: &Router, path: &str, session: Option<Uuid>) -> StatusCode {
+        let mut builder = Request::builder().method("POST").uri(path);
+        if let Some(session) = session {
+            builder = builder.header(
+                header::COOKIE,
+                format!("{}={}", crate::handlers::auth::SESSION_COOKIE_NAME, session),
+            );
+        }
+        let mut request = builder.body(Body::empty()).unwrap();
+        request
+            .extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from((CLIENT, 40000))));
+        app.clone().oneshot(request).await.unwrap().status()
+    }
+
+    fn gated_state() -> AppState {
+        let mut config = Config::for_tests();
+        // Any entry turns the password gate on; no login happens here.
+        config.password_hashes = vec!["placeholder".to_string()];
+        config.allow_anonymous = false;
+        AppState::new(10, config)
+    }
+
+    #[tokio::test]
+    async fn requests_without_a_session_cannot_spend_the_api_quota() {
+        let state = gated_state();
+        let mut sweeper = RetentionSweeper::default();
+        let (quota, _) = Quota::new(2, 600);
+        let app = limited_api_routes(&state, quota, &mut sweeper);
+        let token_path = format!("/api/ws-token/{}", Uuid::new_v4());
+
+        // Far more than the burst, from the address the user will come from.
+        for _ in 0..10 {
+            assert_eq!(
+                post_api(&app, "/api/rooms", None).await,
+                StatusCode::UNAUTHORIZED
+            );
+            assert_eq!(
+                post_api(&app, &token_path, None).await,
+                StatusCode::UNAUTHORIZED
+            );
+            assert_eq!(
+                post_api(&app, "/api/rooms", Some(Uuid::new_v4())).await,
+                StatusCode::UNAUTHORIZED,
+                "an unknown session id is not a session"
+            );
+        }
+        assert_eq!(
+            sweeper.sweep_all(),
+            0,
+            "refused requests must not even create a bucket"
+        );
+
+        // The user behind the same address still has the whole budget. The
+        // handlers reject these bodiless requests, but not as rate limited.
+        let session = Uuid::new_v4();
+        state.session_store.create(session);
+        let first = post_api(&app, "/api/rooms", Some(session)).await;
+        let second = post_api(&app, &token_path, Some(session)).await;
+        for status in [first, second] {
+            assert_ne!(status, StatusCode::UNAUTHORIZED);
+            assert_ne!(status, StatusCode::TOO_MANY_REQUESTS);
+        }
+
+        // Both endpoints draw from one bucket, and it is now empty.
+        assert_eq!(
+            post_api(&app, "/api/rooms", Some(session)).await,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        assert_eq!(
+            post_api(&app, &token_path, Some(session)).await,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        // An exhausted bucket still refuses a session-less request as
+        // unauthenticated, without telling it anything about the quota.
+        assert_eq!(
+            post_api(&app, "/api/rooms", None).await,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[tokio::test]
+    async fn anonymous_mode_keeps_the_api_quota_for_every_client() {
+        // Without a password gate there is no session to check, and the
+        // quota is the only limit on room and token requests.
+        let state = AppState::new(10, Config::for_tests());
+        let mut sweeper = RetentionSweeper::default();
+        let (quota, _) = Quota::new(2, 600);
+        let app = limited_api_routes(&state, quota, &mut sweeper);
+
+        for _ in 0..2 {
+            assert_ne!(
+                post_api(&app, "/api/rooms", None).await,
+                StatusCode::TOO_MANY_REQUESTS
+            );
+        }
+        assert_eq!(
+            post_api(&app, "/api/rooms", None).await,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        assert_eq!(sweeper.sweep_all(), 1);
     }
 }

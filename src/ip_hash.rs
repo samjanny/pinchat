@@ -26,13 +26,21 @@ type HmacSha256 = Hmac<Sha256>;
 /// # Security
 /// - Only trusts X-Forwarded-For when connection is from a trusted proxy
 /// - Takes the rightmost IP that is NOT a trusted proxy (closest to client)
-/// - Validates IP format to prevent injection attacks
+/// - Reads every X-Forwarded-For header line, in order. A proxy that adds
+///   its own line instead of appending to the client's (HAProxy does) puts
+///   the address it vouches for on the last line; reading only the first
+///   line would take the client-supplied one at face value.
+/// - Stops at the first entry that is not an IP address. Everything to its
+///   left was written by something this server has no reason to trust, so
+///   skipping it and carrying on would let a client pick its own identity.
+/// - Compares addresses in canonical form, so an IPv4 peer reported as
+///   `::ffff:a.b.c.d` matches an IPv4 TRUSTED_PROXIES entry.
 pub fn extract_client_ip_with_proxy(
     connect_info: &ConnectInfo<SocketAddr>,
     headers: &HeaderMap,
     trusted_proxies: &[String],
 ) -> String {
-    let direct_ip = connect_info.0.ip();
+    let direct_ip = connect_info.0.ip().to_canonical();
 
     // If no trusted proxies configured, always use direct IP
     if trusted_proxies.is_empty() {
@@ -45,21 +53,23 @@ pub fn extract_client_ip_with_proxy(
         return direct_ip.to_string();
     }
 
-    // Connection is from trusted proxy, check X-Forwarded-For
-    if let Some(xff) = headers.get("x-forwarded-for") {
-        if let Ok(xff_str) = xff.to_str() {
-            // X-Forwarded-For format: "client, proxy1, proxy2, ..."
-            // We want the rightmost IP that is NOT a trusted proxy
-            let ips: Vec<&str> = xff_str.split(',').map(|s| s.trim()).collect();
-
-            // Walk from right to left, find first non-proxy IP
-            for ip_str in ips.iter().rev() {
-                if let Ok(ip) = ip_str.parse::<IpAddr>() {
-                    if !is_trusted_proxy(&ip, trusted_proxies) {
-                        return ip.to_string();
-                    }
-                }
-            }
+    // Connection is from a trusted proxy. X-Forwarded-For is a list,
+    // "client, proxy1, proxy2, ...", possibly spread over several header
+    // lines; walk it from the right and return the first address that is
+    // not a trusted proxy.
+    let forwarded: Vec<&str> = headers
+        .get_all("x-forwarded-for")
+        .iter()
+        .flat_map(|value| value.to_str().unwrap_or("?").split(','))
+        .map(str::trim)
+        .collect();
+    for entry in forwarded.iter().rev() {
+        let Ok(ip) = entry.parse::<IpAddr>() else {
+            break;
+        };
+        let ip = ip.to_canonical();
+        if !is_trusted_proxy(&ip, trusted_proxies) {
+            return ip.to_string();
         }
     }
 
@@ -67,10 +77,28 @@ pub fn extract_client_ip_with_proxy(
     direct_ip.to_string()
 }
 
+/// Whether a TRUSTED_PROXIES entry is an IP address or a CIDR range this
+/// module can match against. An entry that is neither never matches
+/// anything, which silently turns proxy mode into "every visitor shares the
+/// proxy's rate-limit bucket"; configuration validation refuses it.
+pub fn is_valid_trusted_proxy_entry(entry: &str) -> bool {
+    match entry.split_once('/') {
+        None => entry.parse::<IpAddr>().is_ok(),
+        Some((network, prefix)) => {
+            let Ok(network) = network.parse::<IpAddr>() else {
+                return false;
+            };
+            let max_prefix = if network.is_ipv4() { 32 } else { 128 };
+            prefix.parse::<u8>().is_ok_and(|len| len <= max_prefix)
+        }
+    }
+}
+
 /// Check if an IP address is in the trusted proxy list
 ///
 /// Supports both exact IP matches and CIDR notation (e.g., "10.0.0.0/8")
 fn is_trusted_proxy(ip: &IpAddr, trusted_proxies: &[String]) -> bool {
+    let ip = &ip.to_canonical();
     for proxy in trusted_proxies {
         // Check for CIDR notation
         if proxy.contains('/') {
@@ -82,7 +110,7 @@ fn is_trusted_proxy(ip: &IpAddr, trusted_proxies: &[String]) -> bool {
         } else {
             // Exact IP match
             if let Ok(proxy_ip) = proxy.parse::<IpAddr>() {
-                if ip == &proxy_ip {
+                if ip == &proxy_ip.to_canonical() {
                     return true;
                 }
             }
@@ -148,8 +176,11 @@ fn ip_in_cidr(ip: &IpAddr, cidr: &str) -> Option<bool> {
 /// downstream still produces a stable hash, just without the canonical
 /// /64 collapse.
 fn canonicalize_for_rate_limit(ip: &str) -> String {
-    match ip.parse::<IpAddr>() {
-        Ok(IpAddr::V4(_)) => ip.to_string(),
+    // An IPv4 client reported in its IPv4-mapped IPv6 form (::ffff:a.b.c.d)
+    // is that IPv4 client. Without this step the /64 truncation below turned
+    // every such address into `::`, one bucket for all of them.
+    match ip.parse::<IpAddr>().map(|parsed| parsed.to_canonical()) {
+        Ok(IpAddr::V4(v4)) => v4.to_string(),
         Ok(IpAddr::V6(v6)) => {
             let s = v6.segments();
             // Zero out segments 4..8 -> /64 prefix
@@ -455,5 +486,152 @@ mod tests {
             std::env::remove_var("PRIVACY_MODE");
         }
         assert_eq!(canonicalize_for_rate_limit("192.0.2.42"), "192.0.2.42");
+    }
+
+    fn peer(ip: &str) -> ConnectInfo<SocketAddr> {
+        ConnectInfo(SocketAddr::new(ip.parse().unwrap(), 40000))
+    }
+
+    fn forwarded(lines: &[&str]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        for line in lines {
+            headers.append("x-forwarded-for", line.parse().unwrap());
+        }
+        headers
+    }
+
+    #[test]
+    fn forwarded_header_is_ignored_unless_the_peer_is_a_trusted_proxy() {
+        let trusted = vec!["172.18.0.1".to_string()];
+        let headers = forwarded(&["198.51.100.7"]);
+        assert_eq!(
+            extract_client_ip_with_proxy(&peer("203.0.113.9"), &headers, &trusted),
+            "203.0.113.9"
+        );
+        assert_eq!(
+            extract_client_ip_with_proxy(&peer("172.18.0.1"), &headers, &[]),
+            "172.18.0.1"
+        );
+        assert_eq!(
+            extract_client_ip_with_proxy(&peer("172.18.0.1"), &headers, &trusted),
+            "198.51.100.7"
+        );
+    }
+
+    #[test]
+    fn rightmost_untrusted_address_wins_over_client_supplied_entries() {
+        let trusted = vec!["172.18.0.1".to_string(), "10.0.0.0/8".to_string()];
+        // nginx style: the proxy appends to the line the client sent.
+        assert_eq!(
+            extract_client_ip_with_proxy(
+                &peer("172.18.0.1"),
+                &forwarded(&["1.2.3.4, 198.51.100.7"]),
+                &trusted
+            ),
+            "198.51.100.7"
+        );
+        // Trusted hops on the right are skipped.
+        assert_eq!(
+            extract_client_ip_with_proxy(
+                &peer("172.18.0.1"),
+                &forwarded(&["1.2.3.4, 198.51.100.7, 10.1.2.3"]),
+                &trusted
+            ),
+            "198.51.100.7"
+        );
+    }
+
+    #[test]
+    fn every_forwarded_header_line_is_read_in_order() {
+        let trusted = vec!["172.18.0.1".to_string()];
+        // HAProxy style: the client's own line comes first, the proxy adds a
+        // second line with the address it actually saw.
+        let headers = forwarded(&["1.2.3.4", "198.51.100.7"]);
+        assert_eq!(
+            extract_client_ip_with_proxy(&peer("172.18.0.1"), &headers, &trusted),
+            "198.51.100.7",
+            "a spoofed first line must not replace the proxy's own entry"
+        );
+    }
+
+    #[test]
+    fn an_unparsable_entry_ends_the_walk_instead_of_being_skipped() {
+        let trusted = vec!["172.18.0.1".to_string(), "10.0.0.0/8".to_string()];
+        // The entries left of the garbage were not written by a trusted hop.
+        for line in [
+            "1.2.3.4, not-an-address",
+            "1.2.3.4, 198.51.100.7:4711",
+            "1.2.3.4,",
+        ] {
+            assert_eq!(
+                extract_client_ip_with_proxy(&peer("172.18.0.1"), &forwarded(&[line]), &trusted),
+                "172.18.0.1",
+                "{line:?} must fall back to the peer address"
+            );
+        }
+        assert_eq!(
+            extract_client_ip_with_proxy(
+                &peer("172.18.0.1"),
+                &forwarded(&["1.2.3.4, junk, 198.51.100.7, 10.0.0.2"]),
+                &trusted
+            ),
+            "198.51.100.7"
+        );
+    }
+
+    #[test]
+    fn ipv4_mapped_addresses_are_treated_as_ipv4() {
+        let trusted = vec!["172.18.0.1".to_string()];
+        // A dual-stack listener reports the IPv4 proxy in mapped form.
+        assert_eq!(
+            extract_client_ip_with_proxy(
+                &peer("::ffff:172.18.0.1"),
+                &forwarded(&["::ffff:198.51.100.7"]),
+                &trusted
+            ),
+            "198.51.100.7"
+        );
+        assert_eq!(
+            canonicalize_for_rate_limit("::ffff:198.51.100.7"),
+            "198.51.100.7"
+        );
+        assert_ne!(
+            canonicalize_for_rate_limit("::ffff:198.51.100.7"),
+            canonicalize_for_rate_limit("::ffff:198.51.100.8"),
+            "two IPv4 clients must not share a bucket because of their notation"
+        );
+        let secret = [7u8; 32];
+        assert_eq!(
+            hash_ip("::ffff:198.51.100.7", &secret),
+            hash_ip("198.51.100.7", &secret)
+        );
+    }
+
+    #[test]
+    fn trusted_proxy_entries_are_validated() {
+        for valid in [
+            "172.18.0.1",
+            "10.0.0.0/8",
+            "::1",
+            "fd00::/8",
+            "0.0.0.0/0",
+            "2001:db8::/128",
+        ] {
+            assert!(is_valid_trusted_proxy_entry(valid), "{valid}");
+        }
+        for invalid in [
+            "",
+            "nginx",
+            "172.18.0.1:3000",
+            "172.18.0",
+            "10.0.0.0/33",
+            "fd00::/129",
+            "10.0.0.0/",
+            "/8",
+            "10.0.0.0/8/8",
+            "10.0.0.0/-1",
+        ] {
+            assert!(!is_valid_trusted_proxy_entry(invalid), "{invalid:?}");
+        }
     }
 }
