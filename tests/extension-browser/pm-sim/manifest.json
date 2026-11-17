@@ -1,0 +1,26 @@
+{
+    "manifest_version": 3,
+    "name": "Password manager simulator (test only)",
+    "version": "0.1",
+    "description": "Adds script elements to the page DOM the way autofill extensions do. Used by tests/extension-browser only.",
+    "host_permissions": ["https://pinchat.io/*"],
+    "content_scripts": [
+        {
+            "matches": ["https://pinchat.io/*"],
+            "js": ["isolated.js"],
+            "run_at": "document_end"
+        }
+    ],
+    "web_accessible_resources": [
+        {
+            "resources": ["page.js"],
+            "matches": ["https://pinchat.io/*"]
+        }
+    ],
+    "browser_specific_settings": {
+        "gecko": {
+            "id": "pm-sim@test.invalid",
+            "strict_min_version": "113.0"
+        }
+    }
+}
