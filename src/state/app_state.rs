@@ -146,6 +146,24 @@ const MAX_MLS_CONTROL_LOG_GLOBAL_BYTES: usize = 64 * 1024 * 1024;
 // UserLeft that cannot be durably sequenced would leave relay membership and
 // the authenticated MLS roster disagreeing about who is still authorised.
 pub(crate) const MLS_LIFECYCLE_RESERVED_ENTRIES: usize = 32;
+/// How long a participant may sit on a backlog of unacknowledged controls
+/// before the count-based lag rule applies to it.
+///
+/// The count threshold used to apply at once. An acknowledgement needs a
+/// network round trip plus the browser's verification of each control, so a
+/// burst of that many controls landing faster than a round trip made every
+/// honest member look stalled: a few sockets held by one link holder could
+/// have the whole group evicted and, since the creator was among them, the
+/// room closed. With the grace period a member is evicted on count only if
+/// the backlog is still there after it had time to acknowledge.
+pub(crate) const MLS_CONTROL_LAG_GRACE: Duration = Duration::from_secs(5);
+/// Backlog at which a participant is evicted without waiting for the grace
+/// period, so that a member that never acknowledges cannot hold the log at
+/// capacity. Kept below what the per-connection rate limits let a full room
+/// append within the grace period, and below the space left for client
+/// controls once the lifecycle reserve is taken out.
+pub(crate) const MLS_CONTROL_LAG_HARD_LIMIT: u64 =
+    (MAX_MLS_CONTROL_LOG_ENTRIES - 2 * MLS_LIFECYCLE_RESERVED_ENTRIES) as u64;
 const MLS_LIFECYCLE_RESERVED_BYTES: usize = 128 * 1024;
 const MAX_PENDING_MLS_WELCOME_CORRELATIONS: usize = 64;
 const MAX_CONSUMED_MLS_KEY_PACKAGE_REFS: usize = 4096;
@@ -1622,13 +1640,13 @@ impl AppState {
                     .iter()
                     .find(|entry| entry.seq > acknowledged_seq)
                     .map(|entry| entry.appended_at);
+                let stalled_for = oldest_unacknowledged_at
+                    .map(|appended_at| now.saturating_duration_since(appended_at));
                 outstanding > 0
-                    && (outstanding >= max_unacknowledged
-                        || oldest_unacknowledged_at
-                            .map(|appended_at| {
-                                now.saturating_duration_since(appended_at) >= max_stall
-                            })
-                            .unwrap_or(false))
+                    && (stalled_for.is_some_and(|age| age >= max_stall)
+                        || outstanding >= MLS_CONTROL_LAG_HARD_LIMIT
+                        || (outstanding >= max_unacknowledged
+                            && stalled_for.is_some_and(|age| age >= MLS_CONTROL_LAG_GRACE)))
             })
             .collect()
     }

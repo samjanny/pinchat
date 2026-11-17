@@ -40,7 +40,12 @@ const MAX_MLS_CONTROL_BYTES: usize = 128 * 1024;
 const MAX_MLS_KEY_PACKAGE_BYTES: usize = 16 * 1024;
 const MAX_RATCHET_TREE_BYTES: usize = 64 * 1024;
 const MLS_REPLAY_WINDOW_ENTRIES: usize = 16;
+/// Unacknowledged controls at which a participant counts as lagging, once
+/// that backlog has lasted longer than the grace period. See
+/// `MLS_CONTROL_LAG_GRACE` and `MLS_CONTROL_LAG_HARD_LIMIT` in app_state.rs
+/// for the two rules around it.
 const MAX_MLS_UNACKNOWLEDGED_CONTROLS: u64 = 64;
+/// Longest a participant may leave any control unacknowledged.
 const MLS_CONTROL_ACK_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -759,6 +764,35 @@ fn evict_lagging_group_participants(state: &AppState, room_id: Uuid) {
     }
 }
 
+/// Longest a single WebSocket write may take before the peer is treated as
+/// gone.
+///
+/// A write completes once the kernel has taken the frame, so it only waits
+/// when the peer has stopped reading and the socket buffers are full. Left
+/// unbounded, such a write parked the connection's send task for as long as
+/// the peer kept the TCP connection open: the frames queued for it stayed
+/// counted against the room and global broadcast byte budgets, and the ping,
+/// room TTL and connection age checks on that task never ran. A peer that
+/// kept sending but never read could hold that state until the connection
+/// age limit, half an hour by default.
+#[cfg(not(test))]
+const WS_SEND_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(test)]
+const WS_SEND_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Write one frame, giving up after [`WS_SEND_TIMEOUT`]. Returns whether the
+/// frame was handed to the transport; `false` means the caller must drop the
+/// connection.
+async fn send_within_deadline<S>(sender: &mut S, message: WsMessage) -> bool
+where
+    S: futures_util::Sink<WsMessage> + Unpin,
+{
+    matches!(
+        tokio::time::timeout(WS_SEND_TIMEOUT, sender.send(message)).await,
+        Ok(Ok(()))
+    )
+}
+
 fn schedule_connection_departure(state: &AppState, connection_id: Uuid) {
     let Some(detached_room_id) = state.detach_connection(&connection_id) else {
         return;
@@ -1050,7 +1084,7 @@ async fn handle_socket(
     };
 
     let connected_sent = match serde_json::to_string(&connected_msg) {
-        Ok(json) => sender.send(WsMessage::Text(json)).await.is_ok(),
+        Ok(json) => send_within_deadline(&mut sender, WsMessage::Text(json)).await,
         Err(_) => false,
     };
     if !connected_sent {
@@ -1071,10 +1105,11 @@ async fn handle_socket(
         loop {
             for window in stream.replay.chunks(MLS_REPLAY_WINDOW_ENTRIES) {
                 for entry in window {
-                    if sender
-                        .send(WsMessage::Text(entry.json.as_str().to_owned()))
-                        .await
-                        .is_err()
+                    if !send_within_deadline(
+                        &mut sender,
+                        WsMessage::Text(entry.json.as_str().to_owned()),
+                    )
+                    .await
                     {
                         schedule_connection_departure(&state, connection_id);
                         return;
@@ -1155,7 +1190,7 @@ async fn handle_socket(
                             connection_id,
                             "invalid frame while replay ACK was required",
                         );
-                        let _ = sender.send(WsMessage::Close(None)).await;
+                        let _ = send_within_deadline(&mut sender, WsMessage::Close(None)).await;
                         return;
                     }
                     Err(_) => {
@@ -1165,21 +1200,18 @@ async fn handle_socket(
                             connection_id,
                             "replay ACK deadline expired",
                         );
-                        let _ = sender.send(WsMessage::Close(None)).await;
+                        let _ = send_within_deadline(&mut sender, WsMessage::Close(None)).await;
                         return;
                     }
                 }
             }
 
             if stream.replay.is_empty() {
-                let sync_sent = serde_json::to_string(&Message::MlsSync {
+                let sync = serde_json::to_string(&Message::MlsSync {
                     through_seq: stream.through_seq,
                 })
-                .ok()
-                .map(|json| sender.send(WsMessage::Text(json)))
-                .expect("MlsSync serialization cannot fail")
-                .await
-                .is_ok();
+                .expect("MlsSync serialization cannot fail");
+                let sync_sent = send_within_deadline(&mut sender, WsMessage::Text(sync)).await;
                 if !sync_sent {
                     schedule_connection_departure(&state, connection_id);
                     return;
@@ -1204,7 +1236,7 @@ async fn handle_socket(
                         connection_id,
                         "replay cursor became unavailable",
                     );
-                    let _ = sender.send(WsMessage::Close(None)).await;
+                    let _ = send_within_deadline(&mut sender, WsMessage::Close(None)).await;
                     return;
                 }
             }
@@ -1231,7 +1263,7 @@ async fn handle_socket(
                     if !send_state.connection_is_active(&room_id, &connection_id) {
                         break;
                     }
-                    if sender.send(WsMessage::Text(msg)).await.is_err() {
+                    if !send_within_deadline(&mut sender, WsMessage::Text(msg)).await {
                         break;
                     }
                 }
@@ -1243,10 +1275,11 @@ async fn handle_socket(
                             {
                                 break;
                             }
-                            if sender
-                                .send(WsMessage::Text(msg.as_str().to_owned()))
-                                .await
-                                .is_err()
+                            if !send_within_deadline(
+                                &mut sender,
+                                WsMessage::Text(msg.as_str().to_owned()),
+                            )
+                            .await
                             {
                                 break;
                             }
@@ -1259,7 +1292,7 @@ async fn handle_socket(
                         evict_lagging_group_participants(&send_state, room_id);
                     }
                     if !send_state.connection_is_active(&room_id, &connection_id) {
-                        let _ = sender.send(WsMessage::Close(None)).await;
+                        let _ = send_within_deadline(&mut sender, WsMessage::Close(None)).await;
                         break;
                     }
                     // Enforce room TTL at every ping tick (~30s). Without this,
@@ -1274,7 +1307,7 @@ async fn handle_socket(
                         #[cfg(debug_assertions)]
                         tracing::debug!("Room TTL expired on live connection, closing");
                         send_state.remove_room(&room_id);
-                        let _ = sender.send(WsMessage::Close(None)).await;
+                        let _ = send_within_deadline(&mut sender, WsMessage::Close(None)).await;
                         break;
                     }
                     // Hard cap on connection lifetime: even an active client is
@@ -1284,10 +1317,10 @@ async fn handle_socket(
                     if connected_at.elapsed() > max_connection_age {
                         #[cfg(debug_assertions)]
                         tracing::debug!("Connection exceeded max age, closing");
-                        let _ = sender.send(WsMessage::Close(None)).await;
+                        let _ = send_within_deadline(&mut sender, WsMessage::Close(None)).await;
                         break;
                     }
-                    if sender.send(WsMessage::Ping(vec![])).await.is_err() {
+                    if !send_within_deadline(&mut sender, WsMessage::Ping(vec![])).await {
                         break;
                     }
                 }
@@ -2133,12 +2166,18 @@ async fn send_error(mut socket: WebSocket, error: &str) -> Result<(), axum::Erro
         message: error.to_string(),
     };
 
-    if let Ok(json) = serde_json::to_string(&error_msg) {
-        socket.send(WsMessage::Text(json)).await?;
+    // Best effort and bounded: a peer that does not read must not keep the
+    // handler task alive.
+    let farewell = async {
+        if let Ok(json) = serde_json::to_string(&error_msg) {
+            socket.send(WsMessage::Text(json)).await?;
+        }
+        socket.send(WsMessage::Close(None)).await
+    };
+    match tokio::time::timeout(WS_SEND_TIMEOUT, farewell).await {
+        Ok(result) => result,
+        Err(_) => Ok(()),
     }
-
-    socket.send(WsMessage::Close(None)).await?;
-    Ok(())
 }
 
 #[cfg(test)]
@@ -2154,6 +2193,7 @@ mod tests {
     use crate::config::Config;
     use crate::jwt::{WsTokenClaims, sign_token};
     use crate::models::{Room, RoomConfig, RoomType};
+    use crate::state::app_state::{MLS_CONTROL_LAG_GRACE, MLS_CONTROL_LAG_HARD_LIMIT};
     use axum::{Router, routing::get};
     use std::collections::VecDeque;
     use std::net::SocketAddr;
@@ -3223,7 +3263,10 @@ mod tests {
             .open_mls_control_stream(&room_id, stalled, None)
             .expect("open stalled stream");
 
-        for expected in 1..=MAX_MLS_UNACKNOWLEDGED_CONTROLS {
+        // A participant that never acknowledges is evicted on count alone,
+        // without waiting for the grace period, once its backlog reaches the
+        // hard limit. That limit lies below the log capacity.
+        for expected in 1..=MLS_CONTROL_LAG_HARD_LIMIT {
             let seq = state
                 .append_and_broadcast_mls_control(&room_id, |seq| {
                     Some(format!(r#"{{"type":"test","control_seq":{seq}}}"#))
@@ -3252,8 +3295,8 @@ mod tests {
             "a participant that withholds every ACK is removed from the room and pruning quorum"
         );
 
-        // Eviction appends one ordered UserLeft after the 64th test control.
-        let departure_seq = MAX_MLS_UNACKNOWLEDGED_CONTROLS + 1;
+        // Eviction appends one ordered UserLeft after the last test control.
+        let departure_seq = MLS_CONTROL_LAG_HARD_LIMIT + 1;
         assert!(state.acknowledge_mls_control(&room_id, alice, departure_seq));
 
         // Continue well beyond the retained-log count cap. Alice's advancing
@@ -3268,6 +3311,133 @@ mod tests {
             assert_eq!(seq, expected);
             assert!(state.acknowledge_mls_control(&room_id, alice, seq));
         }
+    }
+
+    #[test]
+    fn burst_of_controls_does_not_evict_members_that_acknowledge_within_the_grace_period() {
+        let state = AppState::new(1000, test_config());
+        let room = Room::new(RoomConfig {
+            room_type: RoomType::Group,
+            ttl_minutes: 60,
+            max_participants: 4,
+        });
+        let room_id = room.id;
+        let creator = room
+            .creator_connection_id()
+            .expect("group room has creator identity");
+        state.try_create_room(room).unwrap();
+        let member = Uuid::new_v4();
+        for participant in [creator, member] {
+            assert_eq!(
+                state.add_connection(participant, room_id, false),
+                Some(ConnectionAdmission::New)
+            );
+            state
+                .open_mls_control_stream(&room_id, participant, None)
+                .expect("open control stream");
+            if participant == creator {
+                assert!(state.mark_creator_control_ready(&room_id, creator));
+            }
+        }
+
+        // A burst well past the count threshold lands before anybody could
+        // have acknowledged anything: one link holder with a handful of
+        // sockets can produce it.
+        let burst_at = std::time::Instant::now();
+        let burst = MAX_MLS_UNACKNOWLEDGED_CONTROLS + 40;
+        for _ in 0..burst {
+            state
+                .append_and_broadcast_mls_control_at_for_test(&room_id, burst_at, |seq| {
+                    Some(format!(r#"{{"type":"test","control_seq":{seq}}}"#))
+                })
+                .expect("append burst");
+        }
+        let lagging_at = |at| {
+            let mut lagging = state.lagging_mls_control_participants_at_for_test(
+                &room_id,
+                MAX_MLS_UNACKNOWLEDGED_CONTROLS,
+                MLS_CONTROL_ACK_TIMEOUT,
+                at,
+            );
+            lagging.sort_unstable();
+            lagging
+        };
+        assert!(
+            lagging_at(burst_at).is_empty(),
+            "nobody is stalled the instant a burst lands"
+        );
+        assert!(lagging_at(burst_at + MLS_CONTROL_LAG_GRACE - Duration::from_millis(1)).is_empty());
+
+        // The real eviction path agrees: the room and both members survive.
+        evict_lagging_group_participants(&state, room_id);
+        assert!(state.rooms.contains_key(&room_id));
+        assert_eq!(state.get_participant_count(&room_id), 2);
+
+        // The creator catches up inside the grace period; the member does not.
+        assert!(state.acknowledge_mls_control(&room_id, creator, burst));
+        assert_eq!(
+            lagging_at(burst_at + MLS_CONTROL_LAG_GRACE),
+            vec![member],
+            "a backlog that outlives the grace period is still evicted on count"
+        );
+
+        // A partial acknowledgement that leaves less than the threshold
+        // outstanding is governed by the stall deadline alone.
+        assert!(state.acknowledge_mls_control(&room_id, member, 50));
+        assert!(lagging_at(burst_at + MLS_CONTROL_LAG_GRACE).is_empty());
+        assert_eq!(lagging_at(burst_at + MLS_CONTROL_ACK_TIMEOUT), vec![member]);
+    }
+
+    #[test]
+    fn backlog_at_the_hard_limit_is_evicted_without_a_grace_period() {
+        let state = AppState::new(1000, test_config());
+        let room = Room::new(RoomConfig {
+            room_type: RoomType::Group,
+            ttl_minutes: 60,
+            max_participants: 4,
+        });
+        let room_id = room.id;
+        let creator = room.creator_connection_id().unwrap();
+        state.try_create_room(room).unwrap();
+        assert_eq!(
+            state.add_connection(creator, room_id, false),
+            Some(ConnectionAdmission::New)
+        );
+        state
+            .open_mls_control_stream(&room_id, creator, None)
+            .expect("open control stream");
+
+        let now = std::time::Instant::now();
+        for _ in 1..MLS_CONTROL_LAG_HARD_LIMIT {
+            state
+                .append_and_broadcast_mls_control_at_for_test(&room_id, now, |seq| {
+                    Some(format!(r#"{{"type":"test","control_seq":{seq}}}"#))
+                })
+                .expect("append below the hard limit");
+        }
+        let lagging = |state: &AppState| {
+            state.lagging_mls_control_participants_at_for_test(
+                &room_id,
+                MAX_MLS_UNACKNOWLEDGED_CONTROLS,
+                MLS_CONTROL_ACK_TIMEOUT,
+                now,
+            )
+        };
+        assert!(lagging(&state).is_empty());
+        state
+            .append_and_broadcast_mls_control_at_for_test(&room_id, now, |seq| {
+                Some(format!(r#"{{"type":"test","control_seq":{seq}}}"#))
+            })
+            .expect("append reaching the hard limit");
+        assert_eq!(lagging(&state), vec![creator]);
+
+        // The limit leaves the lifecycle reserve and more untouched, so the
+        // departure of an evicted member can always be recorded.
+        assert!(
+            (MLS_CONTROL_LAG_HARD_LIMIT as usize)
+                < crate::state::app_state::MAX_MLS_CONTROL_LOG_ENTRIES
+                    - crate::state::app_state::MLS_LIFECYCLE_RESERVED_ENTRIES
+        );
     }
 
     #[test]
@@ -4086,10 +4256,10 @@ mod tests {
 
             // The creator reads every control but never acknowledges one. Its
             // own ordered join is control 1; fill the log up to one below the
-            // eviction threshold. Reading keeps the socket inside the small
-            // broadcast ring, so it is evicted for missing ACKs and not for
-            // being a slow consumer.
-            for _ in 2..MAX_MLS_UNACKNOWLEDGED_CONTROLS {
+            // backlog that is evicted at once. Reading keeps the socket
+            // inside the small broadcast ring, so it is evicted for missing
+            // ACKs and not for being a slow consumer.
+            for _ in 2..MLS_CONTROL_LAG_HARD_LIMIT {
                 state
                     .append_and_broadcast_mls_control(&room_id, |seq| {
                         Some(format!(r#"{{"type":"test","control_seq":{seq}}}"#))
@@ -4106,12 +4276,12 @@ mod tests {
                         MLS_CONTROL_ACK_TIMEOUT,
                     )
                     .is_empty(),
-                "63 outstanding controls are still below the eviction threshold"
+                "one control below the hard limit nobody is evicted yet"
             );
 
-            // The 64th control arrives through the relay itself, so the
-            // creator crosses the threshold inside the receive loop, right
-            // after the append.
+            // The next control arrives through the relay itself, so the
+            // creator crosses the limit inside the receive loop, right after
+            // the append.
             let proposal = URL_SAFE_NO_PAD.encode(synthetic_public_message(CONTENT_TYPE_PROPOSAL));
             creator_socket
                 .send(ClientMessage::Text(
@@ -4620,6 +4790,96 @@ mod tests {
             assert_eq!(connected["resumed"], true);
             assert_eq!(connected["user_id"], member.to_string());
             assert_eq!(state.get_participant_count(&room_id), 2);
+        });
+    }
+
+    #[test]
+    fn socket_that_stops_reading_is_disconnected_instead_of_pinning_broadcast_memory() {
+        use tokio_tungstenite::tungstenite::{Message as ClientMessage, client::IntoClientRequest};
+
+        run_relay_scenario(std::time::Duration::from_secs(60), || async {
+            let state = AppState::new(1000, test_config());
+            let room_id = state
+                .try_create_room(Room::new(RoomConfig {
+                    room_type: RoomType::OneToOne,
+                    ttl_minutes: 60,
+                    max_participants: 2,
+                }))
+                .unwrap();
+            let addr = spawn_relay(state.clone()).await;
+            let sender_id = Uuid::new_v4();
+            let stalled_id = Uuid::new_v4();
+            let mut sender_socket =
+                try_open_socket(addr, room_id, &fresh_token(&state, room_id, sender_id))
+                    .await
+                    .expect("sender is admitted");
+            expect_frame(&mut sender_socket, "connected").await;
+
+            // The second peer keeps its TCP connection open but never reads
+            // after the handshake. A small receive buffer makes the relay's
+            // writes back up after a few image frames.
+            let tcp = tokio::net::TcpSocket::new_v4().unwrap();
+            tcp.set_recv_buffer_size(4096).unwrap();
+            let stream = tcp.connect(addr).await.unwrap();
+            let mut request = format!("ws://{addr}/ws/{room_id}")
+                .into_client_request()
+                .unwrap();
+            request
+                .headers_mut()
+                .insert("origin", "https://localhost:3000".parse().unwrap());
+            request.headers_mut().insert(
+                "sec-websocket-protocol",
+                format!(
+                    "pinchat.v1, pinchat.v1.jwt.{}",
+                    fresh_token(&state, room_id, stalled_id)
+                )
+                .parse()
+                .unwrap(),
+            );
+            let (_stalled_socket, _) = tokio_tungstenite::client_async(request, stream)
+                .await
+                .expect("stalled peer is admitted");
+            expect_frame(&mut sender_socket, "userjoined").await;
+            assert!(state.connection_is_active(&room_id, &stalled_id));
+
+            // Stream distinct maximum-size images, paced below the per-sender
+            // traffic budget. The sender drains its own socket, so only the
+            // stalled peer backs up. The relay ends the sender's connection
+            // once the room's broadcast byte budget is exhausted by frames
+            // the stalled peer has not taken.
+            let image_size = state.config.max_image_size;
+            'stream: for index in 0..120 {
+                let mut image = browser_image_envelope(image_size - 3 * index);
+                image["type"] = serde_json::json!("image");
+                if sender_socket
+                    .send(ClientMessage::Text(image.to_string()))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                let pause = tokio::time::sleep(Duration::from_millis(250));
+                tokio::pin!(pause);
+                loop {
+                    tokio::select! {
+                        _ = &mut pause => break,
+                        frame = sender_socket.next() => match frame {
+                            Some(Ok(ClientMessage::Close(_))) | Some(Err(_)) | None => break 'stream,
+                            Some(Ok(_)) => {}
+                        },
+                    }
+                }
+                if !state.connection_is_active(&room_id, &stalled_id) {
+                    break;
+                }
+            }
+
+            // The stalled peer must lose its slot within the send deadline,
+            // not sit on the frames until the idle or age limits fire.
+            wait_until("relay disconnects the peer that stopped reading", || {
+                !state.connection_is_active(&room_id, &stalled_id)
+            })
+            .await;
         });
     }
 }
