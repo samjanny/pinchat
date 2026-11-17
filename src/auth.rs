@@ -32,6 +32,65 @@ pub fn verify_password(password: &str, hashes: &[String]) -> bool {
     false
 }
 
+/// Password verifications that may run at the same time.
+///
+/// One Argon2id verification costs tens of milliseconds of CPU and tens of
+/// MiB of memory per configured hash (46 MiB with the parameters
+/// `hash_password` uses). Unbounded, a burst of login attempts from many
+/// addresses would take that for each of them at once.
+const MAX_CONCURRENT_PASSWORD_CHECKS: usize = 2;
+
+/// How long a login attempt waits for one of those slots before it is
+/// answered as busy.
+const PASSWORD_CHECK_QUEUE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+static PASSWORD_CHECK_SLOTS: tokio::sync::Semaphore =
+    tokio::sync::Semaphore::const_new(MAX_CONCURRENT_PASSWORD_CHECKS);
+
+/// Outcome of [`verify_password_bounded`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PasswordCheck {
+    Match,
+    Mismatch,
+    /// No verification slot became free in time. Nothing was checked.
+    Busy,
+}
+
+/// Verify a password without stalling the server.
+///
+/// `verify_password` is synchronous and slow by design. Called directly from
+/// a request handler it occupies an async worker thread for the whole hash,
+/// and with as many concurrent login attempts as there are workers nothing
+/// else runs: WebSocket relays, pings and room cleanup all wait. Here the
+/// hash runs on the blocking thread pool, and a semaphore bounds how many
+/// run at once.
+pub async fn verify_password_bounded(password: String, hashes: Vec<String>) -> PasswordCheck {
+    verify_password_within(password, hashes, PASSWORD_CHECK_QUEUE_TIMEOUT).await
+}
+
+async fn verify_password_within(
+    password: String,
+    hashes: Vec<String>,
+    queue_timeout: std::time::Duration,
+) -> PasswordCheck {
+    let Ok(Ok(slot)) = tokio::time::timeout(queue_timeout, PASSWORD_CHECK_SLOTS.acquire()).await
+    else {
+        return PasswordCheck::Busy;
+    };
+    // The slot moves into the blocking task. Dropping this future (a client
+    // that disconnects) does not stop a hash that is already running, so the
+    // slot must stay taken until that hash is done.
+    let check = tokio::task::spawn_blocking(move || {
+        let _slot = slot;
+        verify_password(&password, &hashes)
+    });
+    match check.await {
+        Ok(true) => PasswordCheck::Match,
+        Ok(false) => PasswordCheck::Mismatch,
+        Err(_) => PasswordCheck::Busy,
+    }
+}
+
 /// Generates a new random session token (UUID v4)
 pub fn generate_session_token() -> Uuid {
     Uuid::new_v4()
@@ -128,5 +187,103 @@ mod tests {
         assert!(verify_password(password1, &hashes));
         assert!(verify_password(password2, &hashes));
         assert!(!verify_password("password3", &hashes));
+    }
+
+    /// A valid Argon2id hash that is cheap enough for unit tests.
+    fn cheap_hash(password: &str) -> String {
+        let salt = SaltString::generate(&mut OsRng);
+        Argon2::new(
+            argon2::Algorithm::Argon2id,
+            argon2::Version::V0x13,
+            argon2::Params::new(8, 1, 1, None).unwrap(),
+        )
+        .hash_password(password.as_bytes(), &salt)
+        .unwrap()
+        .to_string()
+    }
+
+    #[tokio::test]
+    async fn bounded_check_agrees_with_the_direct_check() {
+        let hashes = vec![cheap_hash("other"), cheap_hash("correct horse")];
+        assert_eq!(
+            verify_password_bounded("correct horse".to_string(), hashes.clone()).await,
+            PasswordCheck::Match
+        );
+        assert_eq!(
+            verify_password_bounded("wrong".to_string(), hashes.clone()).await,
+            PasswordCheck::Mismatch
+        );
+        assert_eq!(
+            verify_password_bounded("correct horse".to_string(), vec![]).await,
+            PasswordCheck::Mismatch
+        );
+        assert_eq!(
+            verify_password_bounded("x".to_string(), vec!["not a hash".to_string()]).await,
+            PasswordCheck::Mismatch
+        );
+    }
+
+    #[tokio::test]
+    async fn password_check_does_not_occupy_the_async_worker() {
+        // Single-threaded runtime: if the hash ran on the worker, the ticker
+        // below could not make progress until it finished.
+        let hash = hash_password("production cost").unwrap();
+        let ticks = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let ticker = {
+            let ticks = ticks.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    ticks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            })
+        };
+
+        let started = std::time::Instant::now();
+        let mut ticks_during_hash = 0;
+        while ticks_during_hash == 0 && started.elapsed() < std::time::Duration::from_secs(60) {
+            let before = ticks.load(std::sync::atomic::Ordering::Relaxed);
+            assert_eq!(
+                verify_password_bounded("production cost".to_string(), vec![hash.clone()]).await,
+                PasswordCheck::Match
+            );
+            ticks_during_hash = ticks.load(std::sync::atomic::Ordering::Relaxed) - before;
+        }
+        ticker.abort();
+        assert!(
+            ticks_during_hash > 0,
+            "other tasks must keep running while a password is being hashed"
+        );
+    }
+
+    #[tokio::test]
+    async fn password_checks_beyond_the_concurrency_bound_wait_and_then_give_up() {
+        // Occupy every slot, as in-flight verifications would.
+        let held = PASSWORD_CHECK_SLOTS
+            .acquire_many(MAX_CONCURRENT_PASSWORD_CHECKS as u32)
+            .await
+            .unwrap();
+        let hashes = vec![cheap_hash("pw")];
+        assert_eq!(
+            verify_password_within(
+                "pw".to_string(),
+                hashes.clone(),
+                std::time::Duration::from_millis(100)
+            )
+            .await,
+            PasswordCheck::Busy,
+            "an attempt that finds no free slot must not be reported as a wrong password"
+        );
+
+        // A waiting attempt proceeds as soon as a slot is released.
+        let waiting = tokio::spawn(verify_password_within(
+            "pw".to_string(),
+            hashes,
+            std::time::Duration::from_secs(30),
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!waiting.is_finished());
+        drop(held);
+        assert_eq!(waiting.await.unwrap(), PasswordCheck::Match);
     }
 }

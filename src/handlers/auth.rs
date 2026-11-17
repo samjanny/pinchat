@@ -8,7 +8,8 @@ use axum_extra::extract::cookie::{Cookie, SameSite};
 use serde::Deserialize;
 
 use crate::auth::{
-    generate_csrf_token, generate_session_token, verify_csrf_token, verify_password,
+    PasswordCheck, generate_csrf_token, generate_session_token, verify_csrf_token,
+    verify_password_bounded,
 };
 use crate::state::AppState;
 
@@ -151,17 +152,9 @@ fn is_safe_redirect_target(url: &str) -> bool {
 pub async fn login_page(
     State(state): State<AppState>,
     Query(query): Query<LoginQuery>,
+    request_headers: HeaderMap,
 ) -> impl IntoResponse {
     let use_secure = should_use_secure_cookies(state.config.force_secure_cookies);
-
-    // Clear any stale session cookie to ensure clean state
-    let clear_session = Cookie::build((SESSION_COOKIE_NAME, ""))
-        .path("/")
-        .same_site(SameSite::Strict)
-        .secure(use_secure)
-        .http_only(true)
-        .max_age(time::Duration::ZERO)
-        .build();
 
     // Sanitize redirect URL to prevent open redirect attacks.
     // Only same-origin relative paths survive; see is_safe_redirect_target.
@@ -171,10 +164,30 @@ pub async fn login_page(
         .unwrap_or_default();
 
     let mut headers = HeaderMap::new();
-    headers.append(
-        header::SET_COOKIE,
-        clear_session.to_string().parse().unwrap(),
-    );
+
+    // Clear a stale session cookie, but only one the browser actually sent.
+    //
+    // The cookie is SameSite=Strict, so a navigation started by another site
+    // arrives here without it even when the user is logged in. Answering
+    // every such request with a clearing Set-Cookie let any page or link log
+    // the user out: the browser accepts the header on a top-level
+    // navigation, and the other tabs then fail their next token request. A
+    // request that carries the cookie and still reaches this handler is one
+    // redirect_if_authenticated did not recognise, which is the stale case
+    // this clearing was meant for.
+    if request_carries_session_cookie(&request_headers) {
+        let clear_session = Cookie::build((SESSION_COOKIE_NAME, ""))
+            .path("/")
+            .same_site(SameSite::Strict)
+            .secure(use_secure)
+            .http_only(true)
+            .max_age(time::Duration::ZERO)
+            .build();
+        headers.append(
+            header::SET_COOKIE,
+            clear_session.to_string().parse().unwrap(),
+        );
+    }
 
     // Redirect to static login page with optional redirect parameter
     let location = if redirect_url.is_empty() {
@@ -288,14 +301,26 @@ pub async fn login_submit(
         }
     }
 
-    // Verify password
-    if !verify_password(&form.password, &state.config.password_hashes) {
-        tracing::warn!("Failed login attempt");
-        return login_error_response(
-            "Invalid password",
-            &state.csrf_secret,
-            state.config.force_secure_cookies,
-        );
+    // Verify password. Argon2id is deliberately expensive in CPU and memory,
+    // so it runs off the async workers and with bounded concurrency; see
+    // verify_password_bounded.
+    match verify_password_bounded(form.password, state.config.password_hashes.clone()).await {
+        PasswordCheck::Match => {}
+        PasswordCheck::Mismatch => {
+            tracing::warn!("Failed login attempt");
+            return login_error_response(
+                "Invalid password",
+                &state.csrf_secret,
+                state.config.force_secure_cookies,
+            );
+        }
+        PasswordCheck::Busy => {
+            return login_error_response(
+                "The server is busy. Please try again in a moment.",
+                &state.csrf_secret,
+                state.config.force_secure_cookies,
+            );
+        }
     }
 
     // Create session
@@ -387,6 +412,17 @@ pub async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Respon
         ],
     )
         .into_response()
+}
+
+/// Whether the request presented a session cookie at all, valid or not.
+fn request_carries_session_cookie(headers: &HeaderMap) -> bool {
+    let prefix = format!("{}=", SESSION_COOKIE_NAME);
+    headers
+        .get_all(header::COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|cookies| cookies.split(';'))
+        .any(|cookie| cookie.trim().starts_with(&prefix))
 }
 
 /// Helper to extract session ID from cookies
@@ -501,5 +537,87 @@ mod tests {
                 "{url} must be a legal header value"
             );
         }
+    }
+
+    use super::{LoginQuery, SESSION_COOKIE_NAME, login_page, request_carries_session_cookie};
+    use crate::config::Config;
+    use crate::state::AppState;
+    use axum::extract::{Query, State};
+    use axum::http::{HeaderMap, StatusCode, header};
+    use axum::response::IntoResponse;
+
+    async fn login_page_response(cookie_header: Option<&str>) -> axum::response::Response {
+        let state = AppState::new(10, Config::for_tests());
+        let mut request_headers = HeaderMap::new();
+        if let Some(cookie) = cookie_header {
+            request_headers.insert(header::COOKIE, cookie.parse().unwrap());
+        }
+        login_page(
+            State(state),
+            Query(LoginQuery { redirect: None }),
+            request_headers,
+        )
+        .await
+        .into_response()
+    }
+
+    #[tokio::test]
+    async fn login_page_does_not_clear_a_session_cookie_it_was_not_sent() {
+        // What a cross-site navigation looks like for a logged-in user: the
+        // SameSite=Strict session cookie is withheld by the browser.
+        for cookie_header in [None, Some("csrf_token=abc; theme=dark")] {
+            let response = login_page_response(cookie_header).await;
+            assert_eq!(response.status(), StatusCode::SEE_OTHER);
+            assert_eq!(
+                response.headers().get(header::LOCATION).unwrap(),
+                "/static/login.html"
+            );
+            assert!(
+                response.headers().get(header::SET_COOKIE).is_none(),
+                "a request without the session cookie must not be answered with one that deletes it"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn login_page_clears_a_stale_session_cookie_that_was_sent() {
+        let stale = format!(
+            "theme=dark; {}=2f8a1b3c-0000-4000-8000-000000000000",
+            SESSION_COOKIE_NAME
+        );
+        let response = login_page_response(Some(&stale)).await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let cleared = response
+            .headers()
+            .get(header::SET_COOKIE)
+            .expect("a stale cookie is cleared")
+            .to_str()
+            .unwrap();
+        assert!(cleared.starts_with(&format!("{}=;", SESSION_COOKIE_NAME)));
+        assert!(cleared.contains("Max-Age=0"));
+        assert!(cleared.contains("SameSite=Strict"));
+        assert!(cleared.contains("HttpOnly"));
+    }
+
+    #[test]
+    fn session_cookie_presence_ignores_other_cookies_and_name_prefixes() {
+        let headers = |value: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::COOKIE, value.parse().unwrap());
+            headers
+        };
+        assert!(request_carries_session_cookie(&headers(
+            "pinchat_session=x"
+        )));
+        assert!(request_carries_session_cookie(&headers(
+            "a=b;  pinchat_session="
+        )));
+        assert!(!request_carries_session_cookie(&headers(
+            "pinchat_session_old=x"
+        )));
+        assert!(!request_carries_session_cookie(&headers(
+            "xpinchat_session=x"
+        )));
+        assert!(!request_carries_session_cookie(&HeaderMap::new()));
     }
 }
