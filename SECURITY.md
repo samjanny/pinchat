@@ -552,6 +552,24 @@ sessionStorage["pinchat_hash:/c/<room_id>"] = "#key=<base64url_key>"
 
 ---
 
+### Removing a Group Member is Not a Ban
+
+In a group room the creator commits an MLS Remove when a member's connection
+is gone and the member does not answer a liveness challenge. The Remove does
+what MLS promises: the removed leaf cannot read the epochs that follow, and
+messages sent with its old keys are rejected.
+
+It does not keep the person out. A group room follows the same rule as every
+other room, the link is the capability to join. Whoever still holds the link
+can come back as a new participant, present a fresh KeyPackage, and is added
+to the next epoch by the creator's client like any other arrival. There is no
+list of excluded identities, and group members carry no identity beyond the
+keys of their current session that such a list could name.
+
+**Mitigation**: treat removal as "this session left", not as "this person is
+excluded". To exclude someone who has the link, end the room and create a new
+one, and share the new link only with the people who should be in it.
+
 ## Attack Surface Analysis
 
 ### Transport Layer
