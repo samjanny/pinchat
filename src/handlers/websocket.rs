@@ -17,7 +17,7 @@ use crate::jwt::{WsResumeTokenClaims, sign_resume_token, verify_token};
 use crate::models::message::MessageHeader;
 use crate::models::{IncomingMessage, Message, RoomType};
 use crate::state::app_state::MlsControlAppendError;
-use crate::state::{AppState, ConnectionAdmission, MlsControlAdmission};
+use crate::state::{AppState, ConnectionAdmission, MlsControlAdmission, ReplayAdmission};
 
 /// Maximum allowed size for ECDH public key payload (8KB)
 /// Typical ECDH payload with P-256: ~500 bytes (65-byte key + encryption overhead + AAD)
@@ -548,14 +548,26 @@ pub async fn ws_handler(
     // between here and the upgrade. That residual race burns a token at most
     // once per genuine tie, instead of on every full-room arrival.
     //
+    // Capacity only applies to an upgrade that needs a new slot. A resume
+    // reclaims the slot its own identity still holds (active or reserved for
+    // the reconnect grace period): it adds no participant, and it cannot
+    // reach another peer's slot because the identity is the one signed into
+    // the token. The token endpoint already mints resume tokens for a full
+    // room on that basis; refusing them here made every reconnect into a
+    // one-to-one room with both peers present fail until the grace period
+    // ran out, and the peer then came back as a new identity with a new
+    // handshake. A resume token whose reservation is gone gets no exemption:
+    // it is treated like any other arrival and add_connection refuses to
+    // turn it into a fresh admission.
+    //
     // The `.map()` keeps the DashMap read guard scoped to this statement.
     // remove_room write-locks the same shard, so holding the guard across the
     // expired branch would self-deadlock the worker (cf. the room_page
     // regression test in handlers/http.rs).
-    let room_state = state
-        .rooms
-        .get(&room_id)
-        .map(|room| (room.is_expired(), room.is_full()));
+    let room_state = state.rooms.get(&room_id).map(|room| {
+        let reclaims_own_slot = claims.resume && room.holds_slot_for(&claims.connection_id);
+        (room.is_expired(), room.is_full() && !reclaims_own_slot)
+    });
     match room_state {
         Some((false, false)) => {}
         Some((true, _)) => {
@@ -1762,22 +1774,14 @@ async fn handle_socket(
                             // must remain retryable after the window instead of
                             // poisoning the replay cache despite never having
                             // been broadcast.
-                            let mut seen_hashes =
-                                state_clone.seen_message_hashes.entry(room_id).or_default();
-                            let room_ttl_minutes = state_clone
-                                .rooms
-                                .get(&room_id)
-                                .map(|r| r.ttl_minutes)
-                                .unwrap_or(60);
-                            let cutoff = now - chrono::Duration::minutes(room_ttl_minutes as i64);
-                            let max_entries = state_clone.config.replay_cache_max_per_room;
-                            if !seen_hashes.insert_if_new(
-                                payload_hash.clone(),
-                                now,
-                                cutoff,
-                                max_entries,
-                            ) {
-                                continue;
+                            //
+                            // The cache lock lives only inside this call. The
+                            // append and the lag eviction below can close the
+                            // room, and room teardown takes the same lock.
+                            match state_clone.record_replay_hash(&room_id, &payload_hash, now) {
+                                ReplayAdmission::New => {}
+                                ReplayAdmission::Duplicate => continue,
+                                ReplayAdmission::RoomGone => break,
                             }
 
                             if wire_format == WIRE_PRIVATE_MESSAGE {
@@ -1797,7 +1801,7 @@ async fn handle_socket(
                                             .broadcast_room_message(&room_id, json)
                                             .is_err()
                                         {
-                                            seen_hashes.remove(&payload_hash);
+                                            state_clone.forget_replay_hash(&room_id, &payload_hash);
                                             tracing::warn!(
                                                 "Room {} broadcast byte budget exhausted",
                                                 room_id
@@ -1806,7 +1810,7 @@ async fn handle_socket(
                                         }
                                     }
                                     Err(error) => {
-                                        seen_hashes.remove(&payload_hash);
+                                        state_clone.forget_replay_hash(&room_id, &payload_hash);
                                         tracing::error!(
                                             "Failed to serialize MLS PrivateMessage: {}",
                                             error
@@ -1871,7 +1875,7 @@ async fn handle_socket(
                                     },
                                 );
                                 if let Err(error) = append_result {
-                                    seen_hashes.remove(&payload_hash);
+                                    state_clone.forget_replay_hash(&room_id, &payload_hash);
                                     // No room identifier in error output
                                     // (docs/design-decisions.md).
                                     tracing::error!(
@@ -2019,27 +2023,20 @@ async fn handle_socket(
                                     continue;
                                 }
 
-                                let room_ttl_minutes = state_clone
-                                    .rooms
-                                    .get(&room_id)
-                                    .map(|r| r.ttl_minutes)
-                                    .unwrap_or(60);
-                                let cutoff =
-                                    now - chrono::Duration::minutes(room_ttl_minutes as i64);
-                                let mut seen_hashes =
-                                    state_clone.seen_message_hashes.entry(room_id).or_default();
-                                if !seen_hashes.insert_if_new(
-                                    payload_hash.clone(),
-                                    now,
-                                    cutoff,
-                                    state_clone.config.replay_cache_max_per_room,
-                                ) {
-                                    // REPLAY DETECTED - Ignore silently (don't broadcast)
-                                    #[cfg(debug_assertions)]
-                                    tracing::debug!(
-                                        "Replay attack detected (duplicate payload hash)"
-                                    );
-                                    continue;
+                                // Same lock discipline as the MLS branch:
+                                // the cache lock is released before anything
+                                // else touches room state.
+                                match state_clone.record_replay_hash(&room_id, &payload_hash, now) {
+                                    ReplayAdmission::New => {}
+                                    ReplayAdmission::Duplicate => {
+                                        // REPLAY DETECTED - Ignore silently (don't broadcast)
+                                        #[cfg(debug_assertions)]
+                                        tracing::debug!(
+                                            "Replay attack detected (duplicate payload hash)"
+                                        );
+                                        continue;
+                                    }
+                                    ReplayAdmission::RoomGone => break,
                                 }
 
                                 // Create the message to broadcast based on type
@@ -2064,7 +2061,7 @@ async fn handle_socket(
                                             .broadcast_room_message(&room_id, json)
                                             .is_err()
                                         {
-                                            seen_hashes.remove(&payload_hash);
+                                            state_clone.forget_replay_hash(&room_id, &payload_hash);
                                             tracing::warn!(
                                                 "Room {} broadcast byte budget exhausted",
                                                 room_id
@@ -2073,7 +2070,7 @@ async fn handle_socket(
                                         }
                                     }
                                     Err(error) => {
-                                        seen_hashes.remove(&payload_hash);
+                                        state_clone.forget_replay_hash(&room_id, &payload_hash);
                                         tracing::error!(
                                             "Failed to serialize relay message: {}",
                                             error
@@ -3822,5 +3819,807 @@ mod tests {
             ),
             "departure of the Welcome target removes the pending correlation"
         );
+    }
+
+    // ---- Real-socket relay scenarios -------------------------------------
+
+    type TestSocket = tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >;
+
+    /// Run an async relay scenario on its own multi-thread runtime and fail
+    /// the test when it does not finish in time.
+    ///
+    /// A worker blocked on a lock cannot be cancelled, and dropping a runtime
+    /// waits for its workers, so under a plain `#[tokio::test]` a relay
+    /// deadlock hangs the whole test binary instead of failing one test. The
+    /// scenario thread is detached: on a missed deadline it is left behind
+    /// and the failure is raised from the calling thread.
+    fn run_relay_scenario<F, Fut>(limit: std::time::Duration, scenario: F)
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()>,
+    {
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .expect("build scenario runtime");
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                runtime.block_on(scenario())
+            }));
+            // Report before the runtime is dropped: the drop never returns
+            // while a worker is stuck.
+            let _ = done_tx.send(outcome);
+        });
+        match done_rx.recv_timeout(limit) {
+            Ok(Ok(())) => {}
+            Ok(Err(panic)) => std::panic::resume_unwind(panic),
+            Err(_) => {
+                panic!("relay scenario did not finish within {limit:?}: a worker is blocked")
+            }
+        }
+    }
+
+    async fn spawn_relay(state: AppState) -> SocketAddr {
+        let app: Router = Router::new()
+            .route("/ws/:room_id", get(ws_handler))
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        addr
+    }
+
+    /// Attempt a WebSocket upgrade with the given one-shot JWT. A refused
+    /// upgrade yields the HTTP status the relay answered with.
+    async fn try_open_socket(
+        addr: SocketAddr,
+        room_id: Uuid,
+        token: &str,
+    ) -> Result<TestSocket, u16> {
+        use tokio_tungstenite::tungstenite::{Error, client::IntoClientRequest};
+
+        let mut request = format!("ws://{addr}/ws/{room_id}")
+            .into_client_request()
+            .unwrap();
+        request
+            .headers_mut()
+            .insert("origin", "https://localhost:3000".parse().unwrap());
+        request.headers_mut().insert(
+            "sec-websocket-protocol",
+            format!("pinchat.v1, pinchat.v1.jwt.{token}")
+                .parse()
+                .unwrap(),
+        );
+        let attempt = tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio_tungstenite::connect_async(request),
+        )
+        .await
+        .expect("relay must answer the upgrade request");
+        match attempt {
+            Ok((socket, _)) => Ok(socket),
+            Err(Error::Http(response)) => Err(response.status().as_u16()),
+            Err(other) => panic!("unexpected upgrade failure: {other:?}"),
+        }
+    }
+
+    /// Next JSON text frame, or `None` once the relay closed the socket.
+    async fn next_frame(socket: &mut TestSocket) -> Option<serde_json::Value> {
+        use tokio_tungstenite::tungstenite::Message as ClientMessage;
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match socket.next().await {
+                    Some(Ok(ClientMessage::Text(text))) => {
+                        return Some(serde_json::from_str(&text).expect("relay sends JSON"));
+                    }
+                    Some(Ok(ClientMessage::Ping(_) | ClientMessage::Pong(_))) => continue,
+                    Some(Ok(ClientMessage::Close(_))) | Some(Err(_)) | None => return None,
+                    Some(Ok(other)) => panic!("unexpected frame: {other:?}"),
+                }
+            }
+        })
+        .await
+        .expect("relay must send a frame or close the socket")
+    }
+
+    async fn expect_frame(socket: &mut TestSocket, expected_type: &str) -> serde_json::Value {
+        let frame = next_frame(socket)
+            .await
+            .unwrap_or_else(|| panic!("socket closed while waiting for `{expected_type}`"));
+        assert_eq!(frame["type"], expected_type, "unexpected frame: {frame}");
+        frame
+    }
+
+    /// Asserts that nothing arrives on the socket for a short quiet period.
+    async fn expect_silence(socket: &mut TestSocket, context: &str) {
+        use tokio_tungstenite::tungstenite::Message as ClientMessage;
+
+        let quiet = tokio::time::timeout(Duration::from_millis(300), async {
+            loop {
+                match socket.next().await {
+                    Some(Ok(ClientMessage::Ping(_) | ClientMessage::Pong(_))) => continue,
+                    other => return other,
+                }
+            }
+        })
+        .await;
+        assert!(quiet.is_err(), "{context}: unexpected frame {quiet:?}");
+    }
+
+    async fn wait_until(context: &str, mut condition: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !condition() {
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for: {context}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// A distinct one-to-one ciphertext envelope per marker. The fixture
+    /// payload is all zeroes, so only its length tells two envelopes apart;
+    /// multiples of three give every marker its own Base64 length.
+    fn one_to_one_text_frame(marker: usize) -> String {
+        let mut frame = browser_image_envelope(marker * 3);
+        frame["type"] = serde_json::json!("message");
+        frame.to_string()
+    }
+
+    fn fresh_token(state: &AppState, room_id: Uuid, connection_id: Uuid) -> String {
+        sign_token(
+            &WsTokenClaims::new_for_connection(
+                room_id,
+                connection_id,
+                30,
+                &state.config.jwt_issuer,
+            ),
+            &state.jwt_secret,
+        )
+        .unwrap()
+    }
+
+    fn resume_token(state: &AppState, room_id: Uuid, connection_id: Uuid) -> String {
+        sign_token(
+            &WsTokenClaims::for_resume(room_id, connection_id, 30, &state.config.jwt_issuer, None),
+            &state.jwt_secret,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn replay_admission_is_scoped_to_the_room_lifetime() {
+        let state = AppState::new(1000, test_config());
+        let room_id = state
+            .try_create_room(Room::new(RoomConfig {
+                room_type: RoomType::OneToOne,
+                ttl_minutes: 60,
+                max_participants: 2,
+            }))
+            .unwrap();
+        let now = Utc::now();
+
+        assert_eq!(
+            state.record_replay_hash(&room_id, "envelope", now),
+            ReplayAdmission::New
+        );
+        assert_eq!(
+            state.record_replay_hash(&room_id, "envelope", now),
+            ReplayAdmission::Duplicate,
+            "a relayed envelope stays suppressed"
+        );
+
+        // A failed relay rolls the identity back so the sender can retry.
+        state.forget_replay_hash(&room_id, "envelope");
+        assert_eq!(
+            state.record_replay_hash(&room_id, "envelope", now),
+            ReplayAdmission::New
+        );
+
+        // Teardown is not blocked by an earlier admission on the same
+        // thread, and a removed room never gets its cache entry back.
+        state.remove_room(&room_id);
+        assert!(!state.seen_message_hashes.contains_key(&room_id));
+        assert_eq!(
+            state.record_replay_hash(&room_id, "late", now),
+            ReplayAdmission::RoomGone
+        );
+        state.forget_replay_hash(&room_id, "late");
+        assert!(
+            !state.seen_message_hashes.contains_key(&room_id),
+            "neither admission nor rollback may re-create the cache of a removed room"
+        );
+    }
+
+    #[test]
+    fn creator_lag_eviction_on_append_closes_the_room_without_blocking_the_relay() {
+        use tokio_tungstenite::tungstenite::Message as ClientMessage;
+
+        run_relay_scenario(std::time::Duration::from_secs(30), || async {
+            let state = AppState::new(1000, test_config());
+            let room = Room::new(RoomConfig {
+                room_type: RoomType::Group,
+                ttl_minutes: 60,
+                max_participants: 4,
+            });
+            let room_id = room.id;
+            let creator = room
+                .creator_connection_id()
+                .expect("group room has creator identity");
+            let generation = room.creator_bootstrap_generation();
+            state.try_create_room(room).unwrap();
+            let other_room = state
+                .try_create_room(Room::new(RoomConfig {
+                    room_type: RoomType::OneToOne,
+                    ttl_minutes: 60,
+                    max_participants: 2,
+                }))
+                .unwrap();
+            let addr = spawn_relay(state.clone()).await;
+
+            let creator_token = sign_token(
+                &WsTokenClaims::for_creator_bootstrap(
+                    room_id,
+                    creator,
+                    30,
+                    &state.config.jwt_issuer,
+                    generation,
+                    false,
+                    None,
+                ),
+                &state.jwt_secret,
+            )
+            .unwrap();
+            let mut creator_socket = try_open_socket(addr, room_id, &creator_token)
+                .await
+                .expect("creator is admitted");
+            expect_frame(&mut creator_socket, "connected").await;
+            expect_frame(&mut creator_socket, "mlssync").await;
+            expect_frame(&mut creator_socket, "userjoined").await;
+
+            // The creator reads every control but never acknowledges one. Its
+            // own ordered join is control 1; fill the log up to one below the
+            // eviction threshold. Reading keeps the socket inside the small
+            // broadcast ring, so it is evicted for missing ACKs and not for
+            // being a slow consumer.
+            for _ in 2..MAX_MLS_UNACKNOWLEDGED_CONTROLS {
+                state
+                    .append_and_broadcast_mls_control(&room_id, |seq| {
+                        Some(format!(r#"{{"type":"test","control_seq":{seq}}}"#))
+                    })
+                    .expect("append below the lag threshold");
+                expect_frame(&mut creator_socket, "test").await;
+            }
+            assert!(state.connection_is_active(&room_id, &creator));
+            assert!(
+                state
+                    .lagging_mls_control_participants(
+                        &room_id,
+                        MAX_MLS_UNACKNOWLEDGED_CONTROLS,
+                        MLS_CONTROL_ACK_TIMEOUT,
+                    )
+                    .is_empty(),
+                "63 outstanding controls are still below the eviction threshold"
+            );
+
+            // The 64th control arrives through the relay itself, so the
+            // creator crosses the threshold inside the receive loop, right
+            // after the append.
+            let proposal = URL_SAFE_NO_PAD.encode(synthetic_public_message(CONTENT_TYPE_PROPOSAL));
+            creator_socket
+                .send(ClientMessage::Text(
+                    serde_json::json!({
+                        "type": "mls",
+                        "wire_format": WIRE_PUBLIC_MESSAGE,
+                        "payload": proposal,
+                    })
+                    .to_string(),
+                ))
+                .await
+                .unwrap();
+
+            wait_until("creator eviction closes the room", || {
+                !state.rooms.contains_key(&room_id)
+            })
+            .await;
+
+            // Every per-room index is cleared. `len()` visits every shard of
+            // the replay cache, so it only returns when none was left locked.
+            let probe = state.clone();
+            let cleared = tokio::time::timeout(
+                Duration::from_secs(5),
+                tokio::task::spawn_blocking(move || {
+                    let _ = probe.seen_message_hashes.len();
+                    !probe.seen_message_hashes.contains_key(&room_id)
+                        && probe
+                            .acknowledged_mls_control_cursor(&room_id, creator)
+                            .is_none()
+                        && !probe.broadcast_channels.contains_key(&room_id)
+                        && !probe.connections.contains_key(&creator)
+                }),
+            )
+            .await
+            .expect("room teardown must not leave the replay cache locked")
+            .unwrap();
+            assert!(cleared, "room teardown must clear every per-room index");
+
+            while next_frame(&mut creator_socket).await.is_some() {}
+
+            // An unrelated room keeps relaying through the same state.
+            let alice = Uuid::new_v4();
+            let bob = Uuid::new_v4();
+            let mut alice_socket =
+                try_open_socket(addr, other_room, &fresh_token(&state, other_room, alice))
+                    .await
+                    .expect("other room admits its first peer");
+            expect_frame(&mut alice_socket, "connected").await;
+            let mut bob_socket =
+                try_open_socket(addr, other_room, &fresh_token(&state, other_room, bob))
+                    .await
+                    .expect("other room admits its second peer");
+            expect_frame(&mut bob_socket, "connected").await;
+            expect_frame(&mut alice_socket, "userjoined").await;
+            alice_socket
+                .send(ClientMessage::Text(one_to_one_text_frame(1)))
+                .await
+                .unwrap();
+            let relayed = expect_frame(&mut bob_socket, "message").await;
+            assert_eq!(relayed["sender_id"], alice.to_string());
+            assert!(
+                state.seen_message_hashes.contains_key(&other_room),
+                "the other room's replay cache recorded the relayed message"
+            );
+        });
+    }
+
+    // ---- One-to-one resume through the real upgrade gate ------------------
+
+    struct LiveRoom {
+        state: AppState,
+        addr: SocketAddr,
+        room_id: Uuid,
+        alice: Uuid,
+        alice_socket: TestSocket,
+        bob: Uuid,
+        bob_socket: TestSocket,
+    }
+
+    /// A one-to-one room with both peers connected, which is a full room.
+    async fn live_one_to_one_room(config: Config) -> LiveRoom {
+        let state = AppState::new(1000, config);
+        let room_id = state
+            .try_create_room(Room::new(RoomConfig {
+                room_type: RoomType::OneToOne,
+                ttl_minutes: 60,
+                max_participants: 2,
+            }))
+            .unwrap();
+        let addr = spawn_relay(state.clone()).await;
+        let alice = Uuid::new_v4();
+        let bob = Uuid::new_v4();
+        let mut alice_socket = try_open_socket(addr, room_id, &fresh_token(&state, room_id, alice))
+            .await
+            .expect("first peer is admitted");
+        expect_frame(&mut alice_socket, "connected").await;
+        let mut bob_socket = try_open_socket(addr, room_id, &fresh_token(&state, room_id, bob))
+            .await
+            .expect("second peer is admitted");
+        expect_frame(&mut bob_socket, "connected").await;
+        expect_frame(&mut alice_socket, "userjoined").await;
+        assert!(state.rooms.get(&room_id).unwrap().is_full());
+        LiveRoom {
+            state,
+            addr,
+            room_id,
+            alice,
+            alice_socket,
+            bob,
+            bob_socket,
+        }
+    }
+
+    /// Drop a peer's transport and wait until the relay holds its slot only
+    /// as a reconnect grace reservation.
+    async fn drop_transport(state: &AppState, room_id: Uuid, peer: Uuid, socket: TestSocket) {
+        drop(socket);
+        wait_until("relay notices the dropped transport", || {
+            !state.connection_is_active(&room_id, &peer)
+        })
+        .await;
+        assert!(
+            state.rooms.get(&room_id).unwrap().holds_slot_for(&peer),
+            "the slot stays reserved during the grace period"
+        );
+    }
+
+    async fn assert_relays(
+        from: &mut TestSocket,
+        from_id: Uuid,
+        to: &mut TestSocket,
+        marker: usize,
+    ) {
+        use tokio_tungstenite::tungstenite::Message as ClientMessage;
+
+        from.send(ClientMessage::Text(one_to_one_text_frame(marker)))
+            .await
+            .unwrap();
+        let relayed = expect_frame(to, "message").await;
+        assert_eq!(relayed["sender_id"], from_id.to_string());
+        // The relay also echoes a message to its sender.
+        let echoed = expect_frame(from, "message").await;
+        assert_eq!(echoed["sender_id"], from_id.to_string());
+    }
+
+    #[test]
+    fn resume_into_a_full_one_to_one_room_keeps_the_relay_identity() {
+        use tokio_tungstenite::tungstenite::Message as ClientMessage;
+
+        run_relay_scenario(std::time::Duration::from_secs(30), || async {
+            let mut config = test_config();
+            config.ws_reconnect_grace_secs = 1;
+            let LiveRoom {
+                state,
+                addr,
+                room_id,
+                alice,
+                alice_socket,
+                bob,
+                mut bob_socket,
+            } = live_one_to_one_room(config).await;
+
+            drop_transport(&state, room_id, alice, alice_socket).await;
+
+            let mut resumed = try_open_socket(addr, room_id, &resume_token(&state, room_id, alice))
+                .await
+                .expect("a resume into a full room must be admitted");
+            let connected = expect_frame(&mut resumed, "connected").await;
+            assert_eq!(connected["resumed"], true);
+            assert_eq!(connected["user_id"], alice.to_string());
+            assert_eq!(connected["participant_count"], 2);
+
+            // The peer sees no leave/join cycle: that cycle is what makes the
+            // browsers discard the ratchet and ask for a new SAS check.
+            expect_silence(&mut bob_socket, "peer during a stable resume").await;
+
+            // The grace finalizer of the dropped transport fires after one
+            // second. It must find the resumed socket and leave the slot.
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            assert!(state.connection_is_active(&room_id, &alice));
+            assert_eq!(state.get_participant_count(&room_id), 2);
+            expect_silence(&mut bob_socket, "peer after the old grace timer").await;
+
+            assert_relays(&mut resumed, alice, &mut bob_socket, 1).await;
+            assert_relays(&mut bob_socket, bob, &mut resumed, 2).await;
+
+            // The replay cache belongs to the room, not to a socket: an
+            // envelope relayed before stays suppressed after the resume, from
+            // either peer.
+            resumed
+                .send(ClientMessage::Text(one_to_one_text_frame(2)))
+                .await
+                .unwrap();
+            bob_socket
+                .send(ClientMessage::Text(one_to_one_text_frame(1)))
+                .await
+                .unwrap();
+            expect_silence(&mut bob_socket, "replayed envelope").await;
+            expect_silence(&mut resumed, "replayed envelope").await;
+        });
+    }
+
+    #[test]
+    fn reserved_slot_is_not_available_to_other_arrivals() {
+        run_relay_scenario(std::time::Duration::from_secs(30), || async {
+            let LiveRoom {
+                state,
+                addr,
+                room_id,
+                alice,
+                alice_socket,
+                bob,
+                mut bob_socket,
+            } = live_one_to_one_room(test_config()).await;
+            drop_transport(&state, room_id, alice, alice_socket).await;
+
+            // A link holder arriving during the grace period finds a full
+            // room, and keeps its token because the refusal was not its fault.
+            let intruder = Uuid::new_v4();
+            let intruder_claims =
+                WsTokenClaims::new_for_connection(room_id, intruder, 30, &state.config.jwt_issuer);
+            let intruder_jti = intruder_claims.jti;
+            let intruder_token = sign_token(&intruder_claims, &state.jwt_secret).unwrap();
+            assert_eq!(
+                try_open_socket(addr, room_id, &intruder_token).await.err(),
+                Some(404)
+            );
+            assert!(!state.consumed_tokens.contains_key(&intruder_jti));
+
+            // A resume token for an identity that holds no slot gets no
+            // exemption from capacity.
+            assert_eq!(
+                try_open_socket(addr, room_id, &resume_token(&state, room_id, intruder))
+                    .await
+                    .err(),
+                Some(404)
+            );
+
+            // A fresh (non-resume) token naming the reserved identity cannot
+            // reclaim the reservation either.
+            assert_eq!(
+                try_open_socket(addr, room_id, &fresh_token(&state, room_id, alice))
+                    .await
+                    .err(),
+                Some(404)
+            );
+
+            // The other peer was never disturbed and the reservation is
+            // still there for its owner.
+            assert!(state.connection_is_active(&room_id, &bob));
+            assert_eq!(state.get_participant_count(&room_id), 2);
+            expect_silence(&mut bob_socket, "peer while arrivals are refused").await;
+            let mut resumed = try_open_socket(addr, room_id, &resume_token(&state, room_id, alice))
+                .await
+                .expect("the owner still resumes");
+            assert_eq!(
+                expect_frame(&mut resumed, "connected").await["resumed"],
+                true
+            );
+        });
+    }
+
+    #[test]
+    fn resume_tokens_are_bound_to_room_expiry_and_single_use() {
+        run_relay_scenario(std::time::Duration::from_secs(30), || async {
+            let LiveRoom {
+                state,
+                addr,
+                room_id,
+                alice,
+                alice_socket,
+                bob: _bob,
+                bob_socket: _bob_socket,
+            } = live_one_to_one_room(test_config()).await;
+            let other_room = state
+                .try_create_room(Room::new(RoomConfig {
+                    room_type: RoomType::OneToOne,
+                    ttl_minutes: 60,
+                    max_participants: 2,
+                }))
+                .unwrap();
+            drop_transport(&state, room_id, alice, alice_socket).await;
+
+            // Minted for another room: the signed room does not match the path.
+            assert_eq!(
+                try_open_socket(addr, room_id, &resume_token(&state, other_room, alice))
+                    .await
+                    .err(),
+                Some(403)
+            );
+            // And it opens nothing in that other room, where the identity
+            // holds no slot: admission refuses to turn a resume into a join.
+            let mut stray =
+                try_open_socket(addr, other_room, &resume_token(&state, other_room, alice))
+                    .await
+                    .expect("upgrade completes, admission decides");
+            expect_frame(&mut stray, "error").await;
+            assert!(next_frame(&mut stray).await.is_none());
+            assert_eq!(state.get_participant_count(&other_room), 0);
+
+            // Expired.
+            let mut expired =
+                WsTokenClaims::for_resume(room_id, alice, 30, &state.config.jwt_issuer, None);
+            expired.exp = 1;
+            assert_eq!(
+                try_open_socket(
+                    addr,
+                    room_id,
+                    &sign_token(&expired, &state.jwt_secret).unwrap()
+                )
+                .await
+                .err(),
+                Some(401)
+            );
+
+            // Signed with another key.
+            let forged = sign_token(
+                &WsTokenClaims::for_resume(room_id, alice, 30, &state.config.jwt_issuer, None),
+                &[7u8; 32],
+            )
+            .unwrap();
+            assert_eq!(
+                try_open_socket(addr, room_id, &forged).await.err(),
+                Some(401)
+            );
+
+            // The long-lived resume credential is not an upgrade token: it
+            // carries another audience and must go through the token endpoint.
+            let credential = sign_resume_token(
+                &WsResumeTokenClaims::new(room_id, alice, 600, &state.config.jwt_issuer),
+                &state.jwt_secret,
+            )
+            .unwrap();
+            assert_eq!(
+                try_open_socket(addr, room_id, &credential).await.err(),
+                Some(401)
+            );
+
+            // None of the refusals above disturbed the reservation. A valid
+            // token works once.
+            let token = resume_token(&state, room_id, alice);
+            let mut resumed = try_open_socket(addr, room_id, &token)
+                .await
+                .expect("valid resume");
+            assert_eq!(
+                expect_frame(&mut resumed, "connected").await["resumed"],
+                true
+            );
+
+            drop_transport(&state, room_id, alice, resumed).await;
+            assert_eq!(
+                try_open_socket(addr, room_id, &token).await.err(),
+                Some(403),
+                "a spent upgrade token must not resume a second time"
+            );
+            let mut again = try_open_socket(addr, room_id, &resume_token(&state, room_id, alice))
+                .await
+                .expect("a new token resumes again");
+            assert_eq!(expect_frame(&mut again, "connected").await["resumed"], true);
+        });
+    }
+
+    #[test]
+    fn concurrent_resumes_admit_exactly_one_socket() {
+        run_relay_scenario(std::time::Duration::from_secs(30), || async {
+            let LiveRoom {
+                state,
+                addr,
+                room_id,
+                alice,
+                alice_socket,
+                bob,
+                mut bob_socket,
+            } = live_one_to_one_room(test_config()).await;
+            drop_transport(&state, room_id, alice, alice_socket).await;
+
+            let first_token = resume_token(&state, room_id, alice);
+            let second_token = resume_token(&state, room_id, alice);
+            let (first, second) = tokio::join!(
+                try_open_socket(addr, room_id, &first_token),
+                try_open_socket(addr, room_id, &second_token),
+            );
+            let mut first = first.expect("both upgrades pass the gate");
+            let mut second = second.expect("both upgrades pass the gate");
+            let first_frame = next_frame(&mut first).await.expect("first frame");
+            let second_frame = next_frame(&mut second).await.expect("first frame");
+            let mut kinds = [
+                first_frame["type"].as_str().unwrap().to_owned(),
+                second_frame["type"].as_str().unwrap().to_owned(),
+            ];
+            kinds.sort();
+            assert_eq!(
+                kinds,
+                ["connected", "error"],
+                "exactly one socket may own a relay identity"
+            );
+            let (mut winner, mut loser) = if first_frame["type"] == "connected" {
+                (first, second)
+            } else {
+                (second, first)
+            };
+            assert!(
+                next_frame(&mut loser).await.is_none(),
+                "the loser is closed"
+            );
+
+            assert_eq!(state.get_participant_count(&room_id), 2);
+            assert!(state.connection_is_active(&room_id, &bob));
+            expect_silence(&mut bob_socket, "peer during concurrent resumes").await;
+            assert_relays(&mut winner, alice, &mut bob_socket, 1).await;
+
+            // A further resume while the identity is active is refused and
+            // leaves the live socket in place.
+            let mut late = try_open_socket(addr, room_id, &resume_token(&state, room_id, alice))
+                .await
+                .expect("upgrade completes, admission decides");
+            expect_frame(&mut late, "error").await;
+            assert!(next_frame(&mut late).await.is_none());
+            assert!(state.connection_is_active(&room_id, &alice));
+            assert_relays(&mut bob_socket, bob, &mut winner, 2).await;
+        });
+    }
+
+    #[test]
+    fn resume_after_the_grace_period_is_not_admitted_as_a_new_peer() {
+        run_relay_scenario(std::time::Duration::from_secs(30), || async {
+            let mut config = test_config();
+            config.ws_reconnect_grace_secs = 1;
+            let LiveRoom {
+                state,
+                addr,
+                room_id,
+                alice,
+                alice_socket,
+                bob,
+                mut bob_socket,
+            } = live_one_to_one_room(config).await;
+            let token = resume_token(&state, room_id, alice);
+            drop_transport(&state, room_id, alice, alice_socket).await;
+
+            let left = expect_frame(&mut bob_socket, "userleft").await;
+            assert_eq!(left["user_id"], alice.to_string());
+            assert!(!state.rooms.get(&room_id).unwrap().holds_slot_for(&alice));
+
+            // The slot is free again, so the upgrade itself is not refused,
+            // but a resume is never converted into a fresh admission.
+            let mut stale = try_open_socket(addr, room_id, &token)
+                .await
+                .expect("upgrade completes, admission decides");
+            expect_frame(&mut stale, "error").await;
+            assert!(next_frame(&mut stale).await.is_none());
+            assert_eq!(state.get_participant_count(&room_id), 1);
+            assert!(state.connection_is_active(&room_id, &bob));
+            expect_silence(&mut bob_socket, "peer after a refused late resume").await;
+        });
+    }
+
+    #[test]
+    fn resume_into_a_full_group_room_passes_the_capacity_gate() {
+        run_relay_scenario(std::time::Duration::from_secs(30), || async {
+            let state = AppState::new(1000, test_config());
+            let room = Room::new(RoomConfig {
+                room_type: RoomType::Group,
+                ttl_minutes: 60,
+                max_participants: 2,
+            });
+            let room_id = room.id;
+            let creator = room.creator_connection_id().unwrap();
+            state.try_create_room(room).unwrap();
+            let member = Uuid::new_v4();
+            assert_eq!(
+                state.add_connection(creator, room_id, false),
+                Some(ConnectionAdmission::New)
+            );
+            let _creator_stream = state
+                .open_mls_control_stream(&room_id, creator, None)
+                .expect("open creator stream");
+            assert!(state.mark_creator_control_ready(&room_id, creator));
+            assert_eq!(
+                state.add_connection(member, room_id, false),
+                Some(ConnectionAdmission::New)
+            );
+            let _member_stream = state
+                .open_mls_control_stream(&room_id, member, None)
+                .expect("open member stream");
+            assert!(state.rooms.get(&room_id).unwrap().is_full());
+            assert_eq!(state.detach_connection(&member), Some(room_id));
+
+            let addr = spawn_relay(state.clone()).await;
+            let outsider = Uuid::new_v4();
+            assert_eq!(
+                try_open_socket(addr, room_id, &fresh_token(&state, room_id, outsider))
+                    .await
+                    .err(),
+                Some(404)
+            );
+            let token = sign_token(
+                &WsTokenClaims::for_resume(room_id, member, 30, &state.config.jwt_issuer, Some(0)),
+                &state.jwt_secret,
+            )
+            .unwrap();
+            let mut resumed = try_open_socket(addr, room_id, &token)
+                .await
+                .expect("a group member resumes into a full room");
+            let connected = expect_frame(&mut resumed, "connected").await;
+            assert_eq!(connected["resumed"], true);
+            assert_eq!(connected["user_id"], member.to_string());
+            assert_eq!(state.get_participant_count(&room_id), 2);
+        });
     }
 }

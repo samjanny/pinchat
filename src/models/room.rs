@@ -266,6 +266,17 @@ impl Room {
         self.participant_ids.len() >= self.max_participants
     }
 
+    /// Whether this relay identity still owns a slot in the room, either
+    /// through an active socket or through a reconnect grace reservation.
+    ///
+    /// A resume upgrade for such an identity reclaims that slot and takes no
+    /// new one, so room capacity does not apply to it. Without this
+    /// distinction a one-to-one room with both peers present, which is
+    /// always full, could never be resumed into.
+    pub fn holds_slot_for(&self, connection_id: &Uuid) -> bool {
+        self.participant_ids.contains(connection_id)
+    }
+
     /// Checks whether a fresh ordinary participant can be admitted without
     /// consuming the stable group creator's reserved slot.
     ///

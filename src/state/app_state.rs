@@ -70,6 +70,38 @@ mod resource_bound_tests {
     }
 
     #[test]
+    fn replay_cache_rollback_removes_an_entry_that_is_no_longer_the_tail() {
+        // The relay releases the cache lock between the insert and a
+        // rollback, so other envelopes can be recorded in between.
+        let mut cache = ReplayCache::default();
+        let now = Utc::now();
+        let cutoff = now - Duration::minutes(1);
+        assert!(cache.insert_if_new("failed".into(), now, cutoff, 3));
+        assert!(cache.insert_if_new("later".into(), now, cutoff, 3));
+
+        cache.remove("failed");
+        assert!(!cache.contains("failed") && cache.contains("later"));
+        assert_eq!(
+            cache.queued_len(),
+            cache.len(),
+            "a rolled back insert must not leave a stale queue entry behind"
+        );
+
+        // The retry is admitted and takes its place at the tail, so FIFO
+        // eviction still removes the genuinely oldest identity first.
+        assert!(cache.insert_if_new("failed".into(), now, cutoff, 3));
+        assert!(cache.insert_if_new("third".into(), now, cutoff, 3));
+        assert!(cache.insert_if_new("fourth".into(), now, cutoff, 3));
+        assert!(!cache.contains("later"));
+        assert!(cache.contains("failed") && cache.contains("third") && cache.contains("fourth"));
+        assert_eq!(cache.queued_len(), cache.len());
+
+        // Rolling back an identity that was never recorded is a no-op.
+        cache.remove("unknown");
+        assert_eq!(cache.len(), 3);
+    }
+
+    #[test]
     fn mls_control_bytes_follow_the_final_shared_clone() {
         let retained_bytes = 7;
         let global_bytes = Arc::new(AtomicUsize::new(retained_bytes));
@@ -154,6 +186,17 @@ pub enum BroadcastError {
     GlobalByteCapacity,
 }
 
+/// Outcome of recording a relay replay identity for a room.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplayAdmission {
+    /// First sighting: the envelope may be relayed.
+    New,
+    /// Already recorded: the envelope is a replay and is dropped silently.
+    Duplicate,
+    /// The room was removed; nothing was recorded.
+    RoomGone,
+}
+
 #[derive(Debug, Default)]
 pub struct ReplayCache {
     by_hash: HashMap<String, DateTime<Utc>>,
@@ -193,19 +236,21 @@ impl ReplayCache {
         true
     }
 
+    /// Roll back an insert whose envelope was never relayed.
+    ///
+    /// The cache lock is not held between the insert and this rollback, so
+    /// other envelopes for the room may have been recorded in between. The
+    /// entry is still at or near the tail, hence the scan from the back.
     pub fn remove(&mut self, hash: &str) {
-        if self.by_hash.remove(hash).is_some()
-            && self
-                .insertion_order
-                .back()
-                .map(|(queued_hash, _)| queued_hash == hash)
-                .unwrap_or(false)
+        let Some(inserted_at) = self.by_hash.remove(hash) else {
+            return;
+        };
+        if let Some(index) = self
+            .insertion_order
+            .iter()
+            .rposition(|(queued_hash, timestamp)| queued_hash == hash && *timestamp == inserted_at)
         {
-            // Rollback is called immediately after a failed broadcast while
-            // the cache guard is still held, so the inserted entry is the
-            // queue tail. Removing it avoids leaving a stale timestamp that
-            // could later collide with an identical retry timestamp.
-            self.insertion_order.pop_back();
+            self.insertion_order.remove(index);
         }
     }
 
@@ -226,6 +271,11 @@ impl ReplayCache {
     #[cfg(test)]
     fn contains(&self, hash: &str) -> bool {
         self.by_hash.contains_key(hash)
+    }
+
+    #[cfg(test)]
+    fn queued_len(&self) -> usize {
+        self.insertion_order.len()
     }
 }
 
@@ -614,6 +664,62 @@ impl AppState {
 
         Ok(room_id)
         // Lock released automatically here
+    }
+
+    /// Record the replay identity of an envelope about to be relayed.
+    ///
+    /// Lock discipline: the replay-cache shard is locked only inside this
+    /// call and never while another map is touched or any other state method
+    /// runs. `remove_room` write-locks the same shard, so a caller that kept
+    /// the cache entry locked across room teardown (a lag eviction of the
+    /// group creator, a failed lifecycle append) blocked its worker thread
+    /// for good, together with every room hashing to that shard.
+    ///
+    /// Releasing the lock before the broadcast does not weaken replay
+    /// suppression. Two connections can only race the same identity when one
+    /// of them is replaying an envelope the relay already delivered; the
+    /// loser is dropped as a duplicate either way.
+    pub fn record_replay_hash(
+        &self,
+        room_id: &Uuid,
+        hash: &str,
+        now: DateTime<Utc>,
+    ) -> ReplayAdmission {
+        let Some(ttl_minutes) = self.rooms.get(room_id).map(|room| room.ttl_minutes) else {
+            return ReplayAdmission::RoomGone;
+        };
+        let cutoff = now - chrono::Duration::minutes(i64::from(ttl_minutes));
+        let inserted = self
+            .seen_message_hashes
+            .entry(*room_id)
+            .or_default()
+            .insert_if_new(
+                hash.to_owned(),
+                now,
+                cutoff,
+                self.config.replay_cache_max_per_room,
+            );
+        // remove_room deletes the room entry before its replay cache. If the
+        // room vanished after the TTL read, the insert above may have
+        // re-created a cache that teardown can no longer see; drop it here so
+        // a removed room never keeps an orphan entry.
+        if !self.rooms.contains_key(room_id) {
+            self.seen_message_hashes.remove(room_id);
+            return ReplayAdmission::RoomGone;
+        }
+        if inserted {
+            ReplayAdmission::New
+        } else {
+            ReplayAdmission::Duplicate
+        }
+    }
+
+    /// Roll back `record_replay_hash` for an envelope that was not relayed,
+    /// so the sender can retry it. Never creates a cache entry.
+    pub fn forget_replay_hash(&self, room_id: &Uuid, hash: &str) {
+        if let Some(mut cache) = self.seen_message_hashes.get_mut(room_id) {
+            cache.remove(hash);
+        }
     }
 
     /// Removes a room and all its connections
