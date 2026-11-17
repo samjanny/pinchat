@@ -2,7 +2,7 @@ name: SRI consistency
 
 on:
   push:
-    branches: [main, experimental-groups-custom]
+    branches: [main]
     paths:
       - 'static/**'
       - 'hashes.json.signed'

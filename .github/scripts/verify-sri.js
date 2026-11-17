@@ -173,7 +173,9 @@ try {
 
   // The preventive CSP is another release artifact derived from the same
   // signed hashes. Reject stale or hand-edited browser rulesets.
-  const { buildRules } = require('../../extensions/generate-csp-rules');
+  const {
+    buildRules, PAGES, CATCH_ALL_REGEX, pageRegex,
+  } = require('../../extensions/generate-csp-rules');
   const expectedRules = buildRules(signed);
 
   // Coverage gate. Comparing a ruleset against buildRules() only proves it is
@@ -189,15 +191,42 @@ try {
   const sriFromHex = (hex) => `sha256-${Buffer.from(hex, 'hex').toString('base64')}`;
   const signedByPath = new Map(signed.data.files.map((f) => [f.path, f.hash]));
 
+  // Rules are looked up by the exact filter the generator emits for each
+  // page. An earlier version recovered the page path from the filter by
+  // deleting a fixed prefix and suffix; when the suffix changed, no path
+  // ended in ".html" any more, every rule was skipped as "the catch-all", and
+  // the gate printed success without having compared a single hash. Pages
+  // checked are therefore counted, and a rule this script cannot attribute is
+  // an error instead of being skipped.
   function checkRuleCoverage(browser, rules) {
     let bad = 0;
-    for (const rule of rules) {
-      const filter = rule.condition.regexFilter;
-      const pagePath = filter
-        .replace('^https://(www\\.)?pinchat\\.io', '')
-        .replace('(?:\\?.*)?$', '')
-        .replace(/\\/g, '');
-      if (!pagePath.endsWith('.html')) continue; // catch-all rule, nothing to cover
+    let pagesChecked = 0;
+    const pageByFilter = new Map(PAGES.map((pagePath) => [pageRegex(pagePath), pagePath]));
+    const filters = rules.map((rule) => rule.condition.regexFilter);
+
+    const catchAll = rules.filter((rule) => rule.condition.regexFilter === CATCH_ALL_REGEX);
+    if (catchAll.length !== 1) {
+      console.error(`CSP COVERAGE: ${browser} must have exactly one catch-all rule, found ${catchAll.length}`);
+      bad++;
+    } else if (!catchAll[0].action.responseHeaders[0].value.startsWith("script-src 'none';")) {
+      console.error(`CSP COVERAGE: ${browser}: the catch-all rule must deny every script`);
+      bad++;
+    }
+
+    for (const filter of filters) {
+      if (filter !== CATCH_ALL_REGEX && !pageByFilter.has(filter)) {
+        console.error(`CSP COVERAGE: ${browser} has a rule this check cannot attribute to a page: ${filter}`);
+        bad++;
+      }
+    }
+
+    for (const [filter, pagePath] of pageByFilter) {
+      const rule = rules.find((candidate) => candidate.condition.regexFilter === filter);
+      if (!rule) {
+        console.error(`CSP COVERAGE: ${browser} has no rule for ${pagePath}`);
+        bad++;
+        continue;
+      }
       const pageFile = '.' + pagePath;
       if (!fs.existsSync(pageFile)) {
         console.error(`CSP COVERAGE: ${browser} has a rule for ${pagePath}, which does not exist`);
@@ -207,6 +236,11 @@ try {
       const policy = rule.action.responseHeaders[0].value.split(';')[0];
       const html = fs.readFileSync(pageFile, 'utf8');
       const loaded = [...html.matchAll(/<script\b[^>]*\ssrc="([^"]+)"/g)].map((m) => m[1]);
+      if (loaded.length === 0) {
+        console.error(`CSP COVERAGE: ${browser}: found no script tag in ${pagePath}`);
+        bad++;
+        continue;
+      }
       for (const src of loaded) {
         const hex = signedByPath.get(src);
         if (!hex) {
@@ -219,8 +253,13 @@ try {
           bad++;
         }
       }
+      pagesChecked++;
     }
-    return bad;
+    if (pagesChecked !== PAGES.length && bad === 0) {
+      console.error(`CSP COVERAGE: ${browser}: checked ${pagesChecked} of ${PAGES.length} pages`);
+      bad++;
+    }
+    return { bad, pagesChecked };
   }
 
   for (const browser of ['chrome', 'firefox']) {
@@ -232,11 +271,13 @@ try {
     } else {
       console.log(`Preventive CSP: ${browser} rules match signed manifest`);
     }
-    const coverageBad = checkRuleCoverage(browser, actualRules);
-    if (coverageBad === 0) {
-      console.log(`Preventive CSP: ${browser} rules cover every script tag on every page`);
+    const coverage = checkRuleCoverage(browser, actualRules);
+    if (coverage.bad === 0) {
+      console.log(
+        `Preventive CSP: ${browser} rules cover every script tag on all ${coverage.pagesChecked} pages`,
+      );
     } else {
-      totalBad += coverageBad;
+      totalBad += coverage.bad;
     }
   }
 } catch (error) {
