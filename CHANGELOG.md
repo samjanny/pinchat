@@ -4,6 +4,110 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Dates are the repository-local commit dates; entries are curated for user-visible impact
 rather than being a 1:1 mirror of `git log`.
 
+## [Unreleased] - server changes on main, extension 1.4.0
+
+The site's static files are unchanged: the manifest stays at sequence 54 and
+the extension keeps its pin on v0.8.6. The server changes below are not
+tagged or deployed yet. Extension 1.4.0 can be installed against the
+deployed v0.8.6.
+
+### Changed - the extension reports one state per page, and says what it is based on
+
+The verifier kept a single state for the whole browser: the result of one
+tab coloured every badge, and with no site tab open the state became
+"verified" on the manifest signature alone. Each tab now has a record for
+the document it shows, and the state is one of verified, partially verified,
+failed, unverifiable or checking, defined in one file (`verdict.js`) with
+every finding and its class. What another extension adds to a page is listed
+and never changes the state, so a password manager no longer raises a
+tampering warning. `extensions/README.md` describes every state and has a
+per-browser table of attacks.
+
+### Added - Firefox checks the page itself before it is parsed
+
+The page HTML used to be checked through a second request, which a server
+can answer differently from the navigation. In Firefox the background script
+now holds the body of every document navigation on the site, compares its
+hash with the signed one, and releases those bytes or a block page that
+contains nothing the server sent. "Verified" is reachable only through this
+check. The update asks for the `webRequest` permissions it needs. What is
+released is always delivered as HTML in UTF-8, and an answer with an error
+status (a room that no longer exists, a rate limit, a gateway error) is
+reported as an error answer, not as a mismatch.
+
+Chromium gives a Manifest V3 extension no way to hold a response body. There
+the best state is "partially verified": only signed scripts can run, the
+page itself is not attested. The README states what that leaves open,
+including that markup interpreted by the client-side framework can move
+application data to the server without any script.
+
+### Added - redirects that would carry an invite key off the site are refused
+
+An invite link carries its key in the URL fragment, and browsers carry the
+fragment across HTTP redirects, to another origin too. With the extension
+installed, a document navigation on the site whose address carries a
+fragment may only be redirected to the site. One without a fragment may also
+be redirected to the project's release page or to the two extension stores,
+which is where the "Add to Chrome" and "Add to Firefox" buttons lead. This
+raises the minimum Chromium version to 128.
+
+### Fixed - other ports of the host, stylesheet links, service workers
+
+`https://pinchat.io:<port>` is another origin that the packaged policy did
+not cover while the extension still treated it as the site; such a page can
+now run no script and shows a warning. A stylesheet linked with
+`rel="stylesheet nofollow"` was never looked at. A service worker registered
+while the extension was absent answered navigations without the packaged
+policy; such a document is now stopped, the worker removed and the page
+reloaded. `Link` and `Refresh` response headers are removed from documents.
+
+### Fixed - a relay worker could freeze, and a 1:1 reconnect could not resume
+
+The replay cache entry of a group room stayed locked across room teardown. A
+creator with 63 unacknowledged controls froze the worker on the next one,
+along with every room on the same shard, until the process was restarted.
+Separately, the upgrade gate answered 404 for any full room before looking at
+the resume claim, and a one-to-one room with both peers present is always
+full: no reconnect there could resume, so the peer came back as a new
+identity with a new handshake and a new SAS check.
+
+### Fixed - rate limits refill as documented and stop at the right callers
+
+"100 requests per 10 minutes" behaved as 100 requests and then one every 10
+minutes, so a client that spent its burst once stayed locked out for hours.
+Quotas now refill the whole burst evenly over the window. Room and token
+requests are counted only after the session check, and WebSocket upgrades
+only when they carry a valid token, so someone without the site password
+cannot use up the budget of the users it shares an address with. Hashed
+addresses are deleted once their bucket is full again; windows that would
+keep one longer than the 15 minutes of the privacy policy are shortened at
+startup with a warning, and `LOGIN_PERIOD_SECS` defaults to 720 for that
+reason.
+
+Every `X-Forwarded-For` line is read, IPv4-mapped addresses are treated as
+IPv4, and a `TRUSTED_PROXIES` entry that is neither an address nor a CIDR
+range is refused at startup instead of silently matching nothing. Check the
+value with a dry run before deploying.
+
+### Fixed - logins could starve the relay, and following a link logged users out
+
+Password verification ran Argon2id on the async workers; it now runs on the
+blocking pool behind a two-slot semaphore. `GET /login` deleted the session
+cookie on every request, so a link to the site from elsewhere logged the
+user out; the cookie is now cleared only when the request carried one.
+
+### Fixed - a peer that stopped reading held relay state, and bursts evicted honest members
+
+Every WebSocket write has a 30 second deadline. The rule that evicts a group
+member with 64 unacknowledged controls now applies only to a backlog older
+than five seconds; 192 is still evicted at once.
+
+### Changed - dependencies and CI
+
+rustls 0.23.46 and rustls-webpki 0.103.17 clear the advisories that kept the
+weekly audit job red. The CSP coverage check in CI had been skipping every
+rule and compares hashes again.
+
 ## [2026-09-11] - v0.8.6
 
 ### Fixed - the gap between the two warning paragraphs never rendered
