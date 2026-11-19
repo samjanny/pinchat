@@ -139,6 +139,15 @@ pub enum ConnectionAdmission {
 const BROADCAST_CHANNEL_ENTRIES: usize = 8;
 const MAX_BROADCAST_ROOM_BYTES: usize = 4 * 1024 * 1024;
 const MAX_BROADCAST_GLOBAL_BYTES: usize = 64 * 1024 * 1024;
+/// What the clients behind one address may hold of the global broadcast
+/// budget at a time. Frames stay counted until every receiver has taken
+/// them, so a sender paired with receivers that do not read keeps its bytes
+/// in the budget for as long as the write deadline allows. With the per-room
+/// limit alone, sixteen such rooms opened from one address filled the global
+/// budget and no other room could relay. A quarter leaves an address room
+/// for several full-size images in flight at once and takes at least four
+/// addresses to fill the budget.
+pub(crate) const MAX_BROADCAST_CLIENT_BYTES: usize = MAX_BROADCAST_GLOBAL_BYTES / 4;
 pub(crate) const MAX_MLS_CONTROL_LOG_ENTRIES: usize = 256;
 const MAX_MLS_CONTROL_LOG_BYTES: usize = 2 * 1024 * 1024;
 const MAX_MLS_CONTROL_LOG_GLOBAL_BYTES: usize = 64 * 1024 * 1024;
@@ -173,6 +182,9 @@ struct BroadcastPayloadInner {
     json: String,
     retained_bytes: usize,
     room_bytes: Arc<AtomicUsize>,
+    /// The counter of the address the frame came from. `None` for frames the
+    /// relay produces itself.
+    client_bytes: Option<Arc<AtomicUsize>>,
     global_bytes: Arc<AtomicUsize>,
 }
 
@@ -180,8 +192,49 @@ impl Drop for BroadcastPayloadInner {
     fn drop(&mut self) {
         self.room_bytes
             .fetch_sub(self.retained_bytes, Ordering::AcqRel);
+        if let Some(client_bytes) = &self.client_bytes {
+            client_bytes.fetch_sub(self.retained_bytes, Ordering::AcqRel);
+        }
         self.global_bytes
             .fetch_sub(self.retained_bytes, Ordering::AcqRel);
+    }
+}
+
+/// Broadcast bytes in flight for the clients behind one address.
+#[derive(Debug)]
+struct ClientBroadcastShare {
+    bytes: Arc<AtomicUsize>,
+    connections: usize,
+}
+
+/// Held by a WebSocket connection for as long as it lives. Frames the
+/// connection sends into a room are counted against the share of its
+/// address.
+///
+/// The map behind it is keyed by the same keyed hash of the address that
+/// the request quotas use. An entry exists while a connection from that
+/// address is open or one of its frames is still in flight, and no longer:
+/// dropping the last lease removes it at once when nothing is in flight,
+/// and `sweep_client_broadcast_shares` removes the rest. A frame in flight
+/// keeps the counter alive, not the key.
+#[derive(Debug)]
+pub struct ClientBroadcastLease {
+    key: String,
+    bytes: Arc<AtomicUsize>,
+    shares: Arc<DashMap<String, ClientBroadcastShare>>,
+}
+
+impl Drop for ClientBroadcastLease {
+    fn drop(&mut self) {
+        if let Some(mut share) = self.shares.get_mut(&self.key) {
+            share.connections = share.connections.saturating_sub(1);
+        }
+        // The entry outlives its last connection only while frames are in
+        // flight: a client must not get a fresh share by reconnecting while
+        // its earlier frames are still held by receivers that do not read.
+        self.shares.remove_if(&self.key, |_, share| {
+            share.connections == 0 && share.bytes.load(Ordering::Acquire) == 0
+        });
     }
 }
 
@@ -201,6 +254,7 @@ impl BroadcastPayload {
 pub enum BroadcastError {
     MissingRoom,
     RoomByteCapacity,
+    ClientByteCapacity,
     GlobalByteCapacity,
 }
 
@@ -443,6 +497,7 @@ pub struct AppState {
     /// Uses tokio::sync::broadcast to distribute messages
     pub broadcast_channels: Arc<DashMap<Uuid, tokio::sync::broadcast::Sender<BroadcastPayload>>>,
     broadcast_room_bytes: Arc<DashMap<Uuid, Arc<AtomicUsize>>>,
+    broadcast_client_shares: Arc<DashMap<String, ClientBroadcastShare>>,
     broadcast_global_bytes: Arc<AtomicUsize>,
 
     /// Ordered, bounded replay log for MLS group-control envelopes
@@ -558,6 +613,7 @@ impl AppState {
             connections: Arc::new(DashMap::new()),
             broadcast_channels: Arc::new(DashMap::new()),
             broadcast_room_bytes: Arc::new(DashMap::new()),
+            broadcast_client_shares: Arc::new(DashMap::new()),
             broadcast_global_bytes: Arc::new(AtomicUsize::new(0)),
             mls_control_logs: Arc::new(DashMap::new()),
             mls_control_global_bytes: Arc::new(AtomicUsize::new(0)),
@@ -1027,10 +1083,42 @@ impl AppState {
             .is_ok()
     }
 
+    /// Register a connection from the address behind `client_key` (its
+    /// keyed hash) for the per-address share of the broadcast budget.
+    pub fn lease_client_broadcast_share(&self, client_key: &str) -> ClientBroadcastLease {
+        let mut share = self
+            .broadcast_client_shares
+            .entry(client_key.to_string())
+            .or_insert_with(|| ClientBroadcastShare {
+                bytes: Arc::new(AtomicUsize::new(0)),
+                connections: 0,
+            });
+        share.connections += 1;
+        ClientBroadcastLease {
+            key: client_key.to_string(),
+            bytes: share.bytes.clone(),
+            shares: self.broadcast_client_shares.clone(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn client_broadcast_share_count(&self) -> usize {
+        self.broadcast_client_shares.len()
+    }
+
+    /// Delete the entries that outlived their last connection because frames
+    /// were still in flight at the time. Returns how many addresses remain.
+    pub fn sweep_client_broadcast_shares(&self) -> usize {
+        self.broadcast_client_shares
+            .retain(|_, share| share.connections > 0 || share.bytes.load(Ordering::Acquire) > 0);
+        self.broadcast_client_shares.len()
+    }
+
     fn tracked_broadcast_payload(
         &self,
         room_id: &Uuid,
         json: String,
+        sender: Option<&ClientBroadcastLease>,
     ) -> Result<BroadcastPayload, BroadcastError> {
         let room_bytes = self
             .broadcast_room_bytes
@@ -1045,35 +1133,62 @@ impl AppState {
         ) {
             return Err(BroadcastError::RoomByteCapacity);
         }
+        let client_bytes = sender.map(|lease| lease.bytes.clone());
+        if let Some(client_bytes) = &client_bytes
+            && !Self::reserve_bytes(
+                client_bytes.as_ref(),
+                retained_bytes,
+                MAX_BROADCAST_CLIENT_BYTES,
+            )
+        {
+            room_bytes.fetch_sub(retained_bytes, Ordering::AcqRel);
+            return Err(BroadcastError::ClientByteCapacity);
+        }
         if !Self::reserve_bytes(
             self.broadcast_global_bytes.as_ref(),
             retained_bytes,
             MAX_BROADCAST_GLOBAL_BYTES,
         ) {
             room_bytes.fetch_sub(retained_bytes, Ordering::AcqRel);
+            if let Some(client_bytes) = &client_bytes {
+                client_bytes.fetch_sub(retained_bytes, Ordering::AcqRel);
+            }
             return Err(BroadcastError::GlobalByteCapacity);
         }
         Ok(BroadcastPayload(Arc::new(BroadcastPayloadInner {
             json,
             retained_bytes,
             room_bytes,
+            client_bytes,
             global_bytes: self.broadcast_global_bytes.clone(),
         })))
     }
 
-    /// Broadcast one ephemeral room frame under both per-room and global byte
-    /// budgets. The returned value is the number of active receivers.
+    /// Broadcast one ephemeral room frame that the relay produced itself,
+    /// under the per-room and global byte budgets. The returned value is the
+    /// number of active receivers.
     pub fn broadcast_room_message(
         &self,
         room_id: &Uuid,
         json: String,
+    ) -> Result<usize, BroadcastError> {
+        self.broadcast_room_message_from(room_id, json, None)
+    }
+
+    /// Broadcast one ephemeral room frame that a client sent. With a lease,
+    /// the frame also counts against the share of the sender's address.
+    pub fn broadcast_room_message_from(
+        &self,
+        room_id: &Uuid,
+        json: String,
+        sender: Option<&ClientBroadcastLease>,
     ) -> Result<usize, BroadcastError> {
         let tx = self
             .broadcast_channels
             .get(room_id)
             .map(|entry| entry.value().clone())
             .ok_or(BroadcastError::MissingRoom)?;
-        let payload = self.tracked_broadcast_payload(room_id, json)?;
+        let payload = self.tracked_broadcast_payload(room_id, json, sender)?;
         Ok(tx.send(payload).unwrap_or(0))
     }
 
@@ -1271,6 +1386,7 @@ impl AppState {
             Instant::now(),
             false,
             MlsControlAdmission::Ordinary,
+            None,
             serialize,
         )
     }
@@ -1291,14 +1407,31 @@ impl AppState {
             Instant::now(),
             true,
             MlsControlAdmission::Ordinary,
+            None,
             serialize,
         )
     }
 
+    #[cfg(test)]
     pub fn append_and_broadcast_mls_envelope<F>(
         &self,
         room_id: &Uuid,
         admission: MlsControlAdmission,
+        serialize: F,
+    ) -> Result<u64, MlsControlAppendError>
+    where
+        F: FnOnce(u64) -> Option<String>,
+    {
+        self.append_and_broadcast_mls_envelope_from(room_id, admission, None, serialize)
+    }
+
+    /// Append an MLS envelope that a client sent. With a lease, its live
+    /// broadcast also counts against the share of the sender's address.
+    pub fn append_and_broadcast_mls_envelope_from<F>(
+        &self,
+        room_id: &Uuid,
+        admission: MlsControlAdmission,
+        sender: Option<&ClientBroadcastLease>,
         serialize: F,
     ) -> Result<u64, MlsControlAppendError>
     where
@@ -1309,6 +1442,7 @@ impl AppState {
             Instant::now(),
             false,
             admission,
+            sender,
             serialize,
         )
     }
@@ -1319,6 +1453,7 @@ impl AppState {
         appended_at: Instant,
         lifecycle: bool,
         admission: MlsControlAdmission,
+        sender: Option<&ClientBroadcastLease>,
         serialize: F,
     ) -> Result<u64, MlsControlAppendError>
     where
@@ -1430,7 +1565,7 @@ impl AppState {
             return Err(MlsControlAppendError::CapacityExceeded);
         }
         let broadcast_payload = self
-            .tracked_broadcast_payload(room_id, json.clone())
+            .tracked_broadcast_payload(room_id, json.clone(), sender)
             .map_err(|_| MlsControlAppendError::BroadcastCapacity)?;
         if !Self::reserve_bytes(
             self.mls_control_global_bytes.as_ref(),
@@ -1666,6 +1801,7 @@ impl AppState {
             appended_at,
             false,
             MlsControlAdmission::Ordinary,
+            None,
             serialize,
         )
     }

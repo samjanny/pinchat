@@ -604,7 +604,7 @@ one, and share the new link only with the people who should be in it.
 |-----------|------------|---------------|------------|
 | Memory | Data persistence | Memory dumps | No keys stored, auto-cleanup |
 | Logs | User privacy | Log analysis | PRIVACY_MODE=strict (zero logs) |
-| IP Addresses | User tracking | IP logging | HMAC-hashed IPs in rate limiter |
+| IP Addresses | User tracking | IP logging | HMAC-hashed IPs in the rate limiter and, while a connection is open, in the relay's per-address share of the broadcast budget; memory only |
 
 ---
 

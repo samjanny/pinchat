@@ -102,6 +102,24 @@ Every WebSocket write has a 30 second deadline. The rule that evicts a group
 member with 64 unacknowledged controls now applies only to a backlog older
 than five seconds; 192 is still evicted at once.
 
+### Changed - one address can no longer fill the relay's broadcast budget
+
+A frame sent into a room stays counted against the room (4 MiB) and against
+the whole relay (64 MiB) until every receiver has taken it. A sender paired
+with receivers that do not read keeps its frames counted for as long as the
+write deadline allows, and sixteen such rooms opened from one address filled
+the global budget: no other room could relay until they were evicted, and
+they could come straight back. The clients behind one address may now hold a
+quarter of the global budget at a time, messages, images and MLS envelopes
+together. Reconnecting does not give an address a fresh share while its
+earlier frames are still in flight.
+
+For this the relay keeps the keyed hash of the address next to each open
+connection, in memory, and deletes it when the last connection from that
+address closes, or within one cleanup interval if frames were still in
+flight then. The address in the clear was already held for the life of the
+connection.
+
 ### Changed - dependencies and CI
 
 rustls 0.23.46 and rustls-webpki 0.103.17 clear the advisories that kept the

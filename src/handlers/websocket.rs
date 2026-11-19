@@ -1,6 +1,6 @@
 use axum::{
     extract::{
-        Path, State, WebSocketUpgrade,
+        ConnectInfo, Path, State, WebSocketUpgrade,
         ws::{Message as WsMessage, WebSocket},
     },
     http::{HeaderMap, StatusCode, header, header::SEC_WEBSOCKET_PROTOCOL},
@@ -10,14 +10,20 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
 use sha2::{Digest, Sha256};
+use std::net::SocketAddr;
+use std::sync::Arc;
 use tokio::time::{Duration, Instant, interval};
 use uuid::Uuid;
+
+use crate::ip_hash::{extract_client_ip_with_proxy, hash_ip};
 
 use crate::jwt::{WsResumeTokenClaims, WsTokenClaims, sign_resume_token, verify_token};
 use crate::models::message::MessageHeader;
 use crate::models::{IncomingMessage, Message, RoomType};
 use crate::state::app_state::MlsControlAppendError;
-use crate::state::{AppState, ConnectionAdmission, MlsControlAdmission, ReplayAdmission};
+use crate::state::{
+    AppState, ClientBroadcastLease, ConnectionAdmission, MlsControlAdmission, ReplayAdmission,
+};
 
 /// Maximum allowed size for ECDH public key payload (8KB)
 /// Typical ECDH payload with P-256: ~500 bytes (65-byte key + encryption overhead + AAD)
@@ -571,6 +577,7 @@ pub async fn ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
     Path(room_id): Path<Uuid>,
+    connect_info: Option<ConnectInfo<SocketAddr>>,
     headers: HeaderMap,
 ) -> Response {
     let claims = match check_upgrade_request(&state, &room_id, &headers) {
@@ -681,6 +688,18 @@ pub async fn ws_handler(
     let creator_bootstrap_generation = claims.creator_bootstrap_generation;
     let ws_size = max_ws_size(state.config.max_image_size);
 
+    // What this connection sends into the room counts against the share of
+    // the broadcast budget of the address it comes from, identified by the
+    // same keyed hash the request quotas use. The lease lives as long as
+    // the connection. The server is always run with connection info; only
+    // a router assembled without it (tests) has none, and then no share
+    // applies.
+    let client_share = connect_info.map(|connect_info| {
+        let client_ip =
+            extract_client_ip_with_proxy(&connect_info, &headers, &state.config.trusted_proxies);
+        Arc::new(state.lease_client_broadcast_share(&hash_ip(&client_ip, &state.ip_hash_secret)))
+    });
+
     // Echo only the base subprotocol back (do NOT echo the jwt.* companion -
     // the RFC requires the response subprotocol to be one the client offered,
     // but we pick the non-secret one so the 101 response carries no token).
@@ -696,6 +715,7 @@ pub async fn ws_handler(
                 resume_requested,
                 mls_control_cursor,
                 creator_bootstrap_generation,
+                client_share,
             )
         })
 }
@@ -915,6 +935,9 @@ fn schedule_connection_departure(state: &AppState, connection_id: Uuid) {
 /// * `state` - Application state
 /// * `room_id` - Room ID (already validated by ws_handler)
 /// * `connection_id` - Pre-allocated connection ID from JWT token (ensures uniqueness)
+// One value per fact established by the upgrade; they are only ever passed
+// together here.
+#[allow(clippy::too_many_arguments)]
 async fn handle_socket(
     socket: WebSocket,
     state: AppState,
@@ -923,6 +946,7 @@ async fn handle_socket(
     resume_requested: bool,
     mls_control_cursor: Option<u64>,
     creator_bootstrap_generation: Option<u64>,
+    client_share: Option<Arc<ClientBroadcastLease>>,
 ) {
     // Verify that the room exists AND is not expired.
     // Without the is_expired() gate, a room past its hard TTL can still accept
@@ -1390,6 +1414,7 @@ async fn handle_socket(
     const IDLE_TIMEOUT: Duration = Duration::from_secs(90);
     let state_clone = state.clone();
     let recv_direct_tx = direct_tx.clone();
+    let recv_client_share = client_share.clone();
     let mut recv_task = tokio::spawn(async move {
         while let Ok(Some(Ok(msg))) = tokio::time::timeout(IDLE_TIMEOUT, receiver.next()).await {
             if !state_clone.connection_is_active(&room_id, &connection_id) {
@@ -1602,7 +1627,11 @@ async fn handle_socket(
                                             "ECDH message serialized, attempting broadcast..."
                                         );
 
-                                        match state_clone.broadcast_room_message(&room_id, json) {
+                                        match state_clone.broadcast_room_message_from(
+                                            &room_id,
+                                            json,
+                                            recv_client_share.as_deref(),
+                                        ) {
                                             Ok(receiver_count) => {
                                                 tracing::info!(
                                                     "✅ ECDH public key broadcasted to {} receivers in room={}",
@@ -1886,7 +1915,11 @@ async fn handle_socket(
                                 match serde_json::to_string(&broadcast_msg) {
                                     Ok(json) => {
                                         if state_clone
-                                            .broadcast_room_message(&room_id, json)
+                                            .broadcast_room_message_from(
+                                                &room_id,
+                                                json,
+                                                recv_client_share.as_deref(),
+                                            )
                                             .is_err()
                                         {
                                             state_clone.forget_replay_hash(&room_id, &payload_hash);
@@ -1945,23 +1978,25 @@ async fn handle_socket(
                                     _ => MlsControlAdmission::Ordinary,
                                 };
                                 let submitted_commit_ref = commit_ref.clone();
-                                let append_result = state_clone.append_and_broadcast_mls_envelope(
-                                    &room_id,
-                                    admission,
-                                    |control_seq| {
-                                        serde_json::to_string(&Message::Mls {
-                                            payload,
-                                            wire_format,
-                                            ratchet_tree,
-                                            key_package_ref,
-                                            commit_ref,
-                                            bootstrap_proof,
-                                            control_seq: Some(control_seq),
-                                            sender_id: connection_id,
-                                        })
-                                        .ok()
-                                    },
-                                );
+                                let append_result = state_clone
+                                    .append_and_broadcast_mls_envelope_from(
+                                        &room_id,
+                                        admission,
+                                        recv_client_share.as_deref(),
+                                        |control_seq| {
+                                            serde_json::to_string(&Message::Mls {
+                                                payload,
+                                                wire_format,
+                                                ratchet_tree,
+                                                key_package_ref,
+                                                commit_ref,
+                                                bootstrap_proof,
+                                                control_seq: Some(control_seq),
+                                                sender_id: connection_id,
+                                            })
+                                            .ok()
+                                        },
+                                    );
                                 if let Err(error) = append_result {
                                     state_clone.forget_replay_hash(&room_id, &payload_hash);
                                     // No room identifier in error output
@@ -2146,7 +2181,11 @@ async fn handle_socket(
                                 match serde_json::to_string(&broadcast_msg) {
                                     Ok(json) => {
                                         if state_clone
-                                            .broadcast_room_message(&room_id, json)
+                                            .broadcast_room_message_from(
+                                                &room_id,
+                                                json,
+                                                recv_client_share.as_deref(),
+                                            )
                                             .is_err()
                                         {
                                             state_clone.forget_replay_hash(&room_id, &payload_hash);
@@ -3624,6 +3663,186 @@ mod tests {
             "per-room retained broadcast bytes are capped independently of count"
         );
         state.remove_room(&room_id);
+    }
+
+    #[test]
+    fn one_address_cannot_fill_the_global_broadcast_budget() {
+        use crate::state::app_state::{BroadcastError, MAX_BROADCAST_CLIENT_BYTES};
+
+        const MIB: usize = 1024 * 1024;
+        let state = AppState::new(1000, test_config());
+        // Rooms with a receiver that never reads, so every frame sent into
+        // them stays counted.
+        let mut rooms = Vec::new();
+        let mut receivers = Vec::new();
+        for _ in 0..7 {
+            let room_id = state
+                .try_create_room(Room::new(RoomConfig {
+                    room_type: RoomType::OneToOne,
+                    ttl_minutes: 5,
+                    max_participants: 2,
+                }))
+                .unwrap();
+            receivers.push(
+                state
+                    .broadcast_channels
+                    .get(&room_id)
+                    .expect("room broadcast sender")
+                    .subscribe(),
+            );
+            rooms.push(room_id);
+        }
+        let megabyte = || "x".repeat(MIB);
+
+        // Four full rooms are the whole share of one address.
+        assert_eq!(MAX_BROADCAST_CLIENT_BYTES, 16 * MIB);
+        let first = state.lease_client_broadcast_share("address-a");
+        for room_id in &rooms[..4] {
+            for _ in 0..4 {
+                assert!(
+                    state
+                        .broadcast_room_message_from(room_id, megabyte(), Some(&first))
+                        .is_ok()
+                );
+            }
+        }
+        assert_eq!(
+            state.broadcast_room_message_from(&rooms[4], megabyte(), Some(&first)),
+            Err(BroadcastError::ClientByteCapacity),
+            "an empty room does not help an address that is at its share"
+        );
+
+        // A second connection from the same address draws on the same share.
+        let second = state.lease_client_broadcast_share("address-a");
+        assert_eq!(
+            state.broadcast_room_message_from(&rooms[4], megabyte(), Some(&second)),
+            Err(BroadcastError::ClientByteCapacity)
+        );
+
+        // Another address is not affected, and the refused frames left
+        // nothing counted against the room they were meant for.
+        let other = state.lease_client_broadcast_share("address-b");
+        for _ in 0..4 {
+            assert!(
+                state
+                    .broadcast_room_message_from(&rooms[4], megabyte(), Some(&other))
+                    .is_ok()
+            );
+        }
+        // Frames the relay produces itself are charged to no address.
+        assert!(state.broadcast_room_message(&rooms[5], megabyte()).is_ok());
+
+        // Closing every connection does not hand the address a fresh share
+        // while its frames are still held by receivers that do not read.
+        drop(first);
+        drop(second);
+        assert_eq!(state.sweep_client_broadcast_shares(), 2);
+        let reconnected = state.lease_client_broadcast_share("address-a");
+        assert_eq!(
+            state.broadcast_room_message_from(&rooms[6], megabyte(), Some(&reconnected)),
+            Err(BroadcastError::ClientByteCapacity)
+        );
+
+        // Once the frames are gone the share is available again. A frame is
+        // gone when the room is and no receiver holds it any more.
+        for room_id in &rooms[..4] {
+            state.remove_room(room_id);
+        }
+        receivers.drain(..4);
+        assert!(
+            state
+                .broadcast_room_message_from(&rooms[6], megabyte(), Some(&reconnected))
+                .is_ok()
+        );
+
+        // The address is kept only while a connection or a frame needs it.
+        drop(reconnected);
+        drop(other);
+        assert_eq!(
+            state.client_broadcast_share_count(),
+            2,
+            "both addresses still have frames in flight"
+        );
+        for room_id in &rooms[4..] {
+            state.remove_room(room_id);
+        }
+        drop(receivers);
+        assert_eq!(state.sweep_client_broadcast_shares(), 0);
+
+        // With nothing in flight the entry goes with the last connection.
+        let idle = state.lease_client_broadcast_share("address-c");
+        let idle_too = state.lease_client_broadcast_share("address-c");
+        assert_eq!(state.client_broadcast_share_count(), 1);
+        drop(idle);
+        assert_eq!(state.client_broadcast_share_count(), 1);
+        drop(idle_too);
+        assert_eq!(state.client_broadcast_share_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_connection_holds_the_share_of_its_address_until_it_closes() {
+        use std::net::SocketAddr;
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+        let state = AppState::new(1, test_config());
+        let room_id = state
+            .try_create_room(Room::new(RoomConfig {
+                room_type: RoomType::OneToOne,
+                ttl_minutes: 5,
+                max_participants: 2,
+            }))
+            .unwrap();
+        let token = sign_token(
+            &WsTokenClaims::new(room_id, 30, &state.config.jwt_issuer),
+            &state.jwt_secret,
+        )
+        .unwrap();
+        let app = Router::new()
+            .route("/ws/:room_id", get(ws_handler))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+        let mut request = format!("ws://{addr}/ws/{room_id}")
+            .into_client_request()
+            .unwrap();
+        request
+            .headers_mut()
+            .insert("origin", "https://localhost:3000".parse().unwrap());
+        request.headers_mut().insert(
+            "sec-websocket-protocol",
+            format!("pinchat.v1, pinchat.v1.jwt.{token}")
+                .parse()
+                .unwrap(),
+        );
+
+        assert_eq!(state.client_broadcast_share_count(), 0);
+        let (socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+        assert_eq!(
+            state.client_broadcast_share_count(),
+            1,
+            "the upgrade registers the address of the connection"
+        );
+
+        drop(socket);
+        let gone = tokio::time::timeout(Duration::from_secs(5), async {
+            while state.client_broadcast_share_count() != 0 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(
+            gone.is_ok(),
+            "the address must not be kept once the connection is closed"
+        );
+        server.abort();
     }
 
     #[test]

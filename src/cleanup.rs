@@ -38,6 +38,9 @@ async fn cleanup_expired_rooms(state: &AppState) {
         state.remove_room(&room_id);
     }
 
+    // Addresses whose last connection closed while frames were in flight.
+    state.sweep_client_broadcast_shares();
+
     // Emit cleanup statistics in debug builds to aid observability during development
     #[cfg(debug_assertions)]
     if state.total_rooms() > 0 {
