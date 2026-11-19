@@ -245,7 +245,7 @@ hosting-provider logs.
 | `CORS_ALLOWED_ORIGINS` | `https://localhost:3000` | Comma-separated origins for CORS and the WebSocket Origin check. Required in production: must include your public origin or the WebSocket upgrade fails with 403 |
 | `MAX_TOTAL_ROOMS` | `1000` | Maximum concurrent rooms |
 | `CSP_WS_HOST` | `'self'` | Extra WebSocket origins allowed by the CSP |
-| `WS_CONN_BURST_SIZE` | `30` | WebSocket connections per window, per client address. Also the burst a client may spend at once |
+| `WS_CONN_BURST_SIZE` | `30` | WebSocket connections per window, per client address, counted only for upgrades that carry a valid token. Also the burst a client may spend at once |
 | `WS_CONN_PERIOD_SECS` | `60` | Window over which the WebSocket connection budget refills evenly |
 | `ROOM_TOKEN_BURST_SIZE` | `100` | Room and token requests per window, per client address, counted after the session check |
 | `ROOM_TOKEN_PERIOD_SECS` | `600` | Window over which the room and token budget refills evenly |

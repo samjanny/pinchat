@@ -23,10 +23,13 @@
 //! is free to mint, so a per-session bucket would hand an abuser a fresh
 //! budget on every login. The consequence is that users behind one NAT, VPN
 //! or Tor exit share one budget. To keep that from being exploitable without
-//! credentials, the API quotas run *behind* the session check (see
-//! `main.rs`): a request without a valid session is refused before it can
-//! spend the budget of the people it shares an address with. The login
-//! endpoint cannot be protected that way, it is the authentication step.
+//! credentials, the API quotas run *behind* the session check and the
+//! connection quota *behind* the check of the WebSocket token (see
+//! `main.rs`): a request without a valid session, or an upgrade without a
+//! valid token for the room, is refused before it can spend the budget of
+//! the people it shares an address with. What is refused there costs one
+//! lookup or one signature check and keeps no state. The login endpoint
+//! cannot be protected that way, it is the authentication step.
 //!
 //! # Retention
 //!

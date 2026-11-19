@@ -38,7 +38,7 @@ use crate::cleanup::start_cleanup_task;
 use crate::config::Config;
 use crate::handlers::{
     create_room, generate_ws_token, get_csrf_token, homepage, login_page, login_submit, logout,
-    room_page, ws_handler,
+    require_ws_token, room_page, ws_handler,
 };
 use crate::rate_limit::{Quota, RetentionSweeper, ip_quota_layer};
 use crate::state::AppState;
@@ -145,6 +145,30 @@ async fn add_security_headers(req: axum::extract::Request, next: Next) -> Respon
 /// The token endpoint is POST (not GET) so the request cannot be forged as a
 /// top-level navigation; CSRF double-submit gating is applied inside the
 /// handlers.
+/// The WebSocket endpoint.
+///
+/// It is authenticated by a single-use JWT sent in the Sec-WebSocket-Protocol
+/// header instead of the session cookie; the token comes from /api/ws-token,
+/// which requires a session. As above, the check is the outer layer and the
+/// quota the inner one: an upgrade without a valid token for the room is
+/// refused before it reaches the bucket, so only requests that could be
+/// accepted count against the address they come from.
+fn limited_websocket_routes(
+    app_state: &AppState,
+    quota: Quota,
+    sweeper: &mut RetentionSweeper,
+) -> Router {
+    let quota_layer = ip_quota_layer!(app_state, quota, sweeper);
+    Router::new()
+        .route("/ws/:room_id", get(ws_handler))
+        .layer(quota_layer)
+        .layer(middleware::from_fn_with_state(
+            app_state.clone(),
+            require_ws_token,
+        ))
+        .with_state(app_state.clone())
+}
+
 fn limited_api_routes(
     app_state: &AppState,
     quota: Quota,
@@ -448,29 +472,21 @@ async fn main() {
 
     // WebSocket upgrades. Restrictive (configurable) to prevent connection
     // flooding abuse.
-    let ws_rate_limiter = ServiceBuilder::new().layer(ip_quota_layer!(
-        app_state,
+    let rate_limited_websocket = limited_websocket_routes(
+        &app_state,
         quota(
             "WS_CONN_PERIOD_SECS",
             config.ws_conn_burst_size,
-            config.ws_conn_period_secs
+            config.ws_conn_period_secs,
         ),
-        rate_limit_sweeper
-    ));
+        &mut rate_limit_sweeper,
+    );
 
     rate_limit_sweeper.spawn(rate_limit::SWEEP_INTERVAL);
     tracing::info!(
         "Rate limit retention sweep started ({}s interval)",
         rate_limit::SWEEP_INTERVAL.as_secs()
     );
-
-    // Note: the WebSocket endpoint is authenticated by a single-use JWT sent
-    // in the Sec-WebSocket-Protocol header instead of the session cookie.
-    // The token is obtained from /api/ws-token, which requires a session.
-    let rate_limited_websocket = Router::new()
-        .route("/ws/:room_id", get(ws_handler))
-        .layer(ws_rate_limiter)
-        .with_state(app_state);
 
     // Merge routers
     app = app.merge(rate_limited_api);
@@ -663,6 +679,83 @@ mod tests {
             post_api(&app, "/api/rooms", None).await,
             StatusCode::UNAUTHORIZED
         );
+    }
+
+    async fn upgrade(app: &Router, room_id: Uuid, token: Option<&str>) -> StatusCode {
+        let protocol = match token {
+            Some(token) => format!("pinchat.v1, pinchat.v1.jwt.{token}"),
+            None => "pinchat.v1".to_string(),
+        };
+        let mut request = Request::builder()
+            .uri(format!("/ws/{room_id}"))
+            .header(header::ORIGIN, "https://localhost:3000")
+            .header(header::CONNECTION, "upgrade")
+            .header(header::UPGRADE, "websocket")
+            .header("sec-websocket-version", "13")
+            .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+            .header("sec-websocket-protocol", protocol)
+            .body(Body::empty())
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from((CLIENT, 40000))));
+        app.clone().oneshot(request).await.unwrap().status()
+    }
+
+    #[tokio::test]
+    async fn upgrades_without_a_valid_token_cannot_spend_the_connection_quota() {
+        use crate::jwt::{WsTokenClaims, sign_token};
+
+        let state = AppState::new(10, Config::for_tests());
+        let mut sweeper = RetentionSweeper::default();
+        let (quota, _) = Quota::new(2, 600);
+        let app = limited_websocket_routes(&state, quota, &mut sweeper);
+
+        let room_id = Uuid::new_v4();
+        let other_room = Uuid::new_v4();
+        let claims = WsTokenClaims::new(room_id, 30, &state.config.jwt_issuer);
+        let token = sign_token(&claims, &state.jwt_secret).unwrap();
+        let forged = sign_token(&claims, &[7u8; 32]).unwrap();
+
+        // Far more than the burst, from the address the user will come from.
+        for _ in 0..10 {
+            assert_eq!(upgrade(&app, room_id, None).await, StatusCode::UNAUTHORIZED);
+            assert_eq!(
+                upgrade(&app, room_id, Some("not-a-token")).await,
+                StatusCode::UNAUTHORIZED
+            );
+            assert_eq!(
+                upgrade(&app, room_id, Some(&forged)).await,
+                StatusCode::UNAUTHORIZED,
+                "a token signed with another key is not a token"
+            );
+            assert_eq!(
+                upgrade(&app, other_room, Some(&token)).await,
+                StatusCode::FORBIDDEN,
+                "a token for another room is not a token for this one"
+            );
+        }
+        assert_eq!(
+            sweeper.sweep_all(),
+            0,
+            "refused upgrades must not even create a bucket"
+        );
+
+        // The user behind the same address still has the whole budget. A
+        // request made without a real connection cannot be upgraded, so the
+        // handler refuses these, but not as unauthenticated or rate limited.
+        for _ in 0..2 {
+            let status = upgrade(&app, room_id, Some(&token)).await;
+            assert_ne!(status, StatusCode::UNAUTHORIZED);
+            assert_ne!(status, StatusCode::TOO_MANY_REQUESTS);
+        }
+        assert_eq!(
+            upgrade(&app, room_id, Some(&token)).await,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        // An exhausted bucket still refuses a token-less upgrade as
+        // unauthenticated, without telling it anything about the quota.
+        assert_eq!(upgrade(&app, room_id, None).await, StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]

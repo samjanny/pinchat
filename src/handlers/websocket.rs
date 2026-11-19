@@ -13,7 +13,7 @@ use sha2::{Digest, Sha256};
 use tokio::time::{Duration, Instant, interval};
 use uuid::Uuid;
 
-use crate::jwt::{WsResumeTokenClaims, sign_resume_token, verify_token};
+use crate::jwt::{WsResumeTokenClaims, WsTokenClaims, sign_resume_token, verify_token};
 use crate::models::message::MessageHeader;
 use crate::models::{IncomingMessage, Message, RoomType};
 use crate::state::app_state::MlsControlAppendError;
@@ -408,26 +408,18 @@ fn valid_mls_correlation_ref(value: &str) -> bool {
         )
 }
 
-/// Handler for upgrading the WebSocket connection (protocol v1).
+/// The rejections of an upgrade that depend on nothing but the request and
+/// the configuration: subprotocol, Origin, token signature, and the room the
+/// token was issued for.
 ///
-/// JWT is carried in the `Sec-WebSocket-Protocol` header rather than a query
-/// string, so it never appears in access logs, proxy logs, or Referer headers.
-/// The client offers two subprotocols in a comma-separated list:
-///   - `pinchat.v1`                (the wire-protocol version; echoed in the 101 response)
-///   - `pinchat.v1.jwt.<token>`    (base64url-encoded single-use JWT)
-///
-/// Both MUST be present. The server echoes only `pinchat.v1` back so the
-/// token never appears in the upgrade response.
-///
-/// # Security
-/// - Requires explicit `pinchat.v1` subprotocol (gate against v0 clients)
-/// - Validates JWT signature + expiration (30s) + room_id claim + single-use jti
-pub async fn ws_handler(
-    ws: WebSocketUpgrade,
-    State(state): State<AppState>,
-    Path(room_id): Path<Uuid>,
-    headers: HeaderMap,
-) -> Response {
+/// None of them consumes the token (see C-07 below), so they can run twice
+/// for one request: in `require_ws_token`, ahead of the connection quota,
+/// and again in the handler, which does not rely on the layer being there.
+fn check_upgrade_request(
+    state: &AppState,
+    room_id: &Uuid,
+    headers: &HeaderMap,
+) -> Result<WsTokenClaims, Box<Response>> {
     // Read Sec-WebSocket-Protocol; absence = client did not perform a v1 handshake.
     let sec_proto = match headers
         .get(SEC_WEBSOCKET_PROTOCOL)
@@ -435,7 +427,9 @@ pub async fn ws_handler(
     {
         Some(s) => s,
         None => {
-            return (StatusCode::UNAUTHORIZED, "Missing Sec-WebSocket-Protocol").into_response();
+            return Err(Box::new(
+                (StatusCode::UNAUTHORIZED, "Missing Sec-WebSocket-Protocol").into_response(),
+            ));
         }
     };
 
@@ -444,7 +438,9 @@ pub async fn ws_handler(
     // Gate: client MUST offer the base `pinchat.v1` subprotocol.
     if !offered.contains(&"pinchat.v1") {
         tracing::warn!("WebSocket upgrade rejected: base pinchat.v1 subprotocol missing");
-        return (StatusCode::UPGRADE_REQUIRED, "Protocol pinchat.v1 required").into_response();
+        return Err(Box::new(
+            (StatusCode::UPGRADE_REQUIRED, "Protocol pinchat.v1 required").into_response(),
+        ));
     }
 
     // Extract JWT from the `pinchat.v1.jwt.<token>` companion subprotocol.
@@ -455,7 +451,9 @@ pub async fn ws_handler(
         Some(t) => t,
         None => {
             tracing::warn!("WebSocket upgrade rejected: JWT subprotocol missing");
-            return (StatusCode::UNAUTHORIZED, "Missing JWT in subprotocol").into_response();
+            return Err(Box::new(
+                (StatusCode::UNAUTHORIZED, "Missing JWT in subprotocol").into_response(),
+            ));
         }
     };
 
@@ -488,12 +486,16 @@ pub async fn ws_handler(
                     "WebSocket upgrade rejected: Origin '{}' not in allowlist",
                     origin_str
                 );
-                return (StatusCode::FORBIDDEN, "Origin not allowed").into_response();
+                return Err(Box::new(
+                    (StatusCode::FORBIDDEN, "Origin not allowed").into_response(),
+                ));
             }
         }
         None if !dev_mode => {
             tracing::warn!("WebSocket upgrade rejected: Origin header missing (production)");
-            return (StatusCode::FORBIDDEN, "Origin header required").into_response();
+            return Err(Box::new(
+                (StatusCode::FORBIDDEN, "Origin header required").into_response(),
+            ));
         }
         None => {
             // dev mode: tolerate missing Origin for raw-socket test clients
@@ -509,19 +511,72 @@ pub async fn ws_handler(
         Ok(claims) => claims,
         Err(e) => {
             tracing::warn!("Invalid JWT token for WebSocket: {}", e);
-            return (StatusCode::UNAUTHORIZED, "Invalid or expired token").into_response();
+            return Err(Box::new(
+                (StatusCode::UNAUTHORIZED, "Invalid or expired token").into_response(),
+            ));
         }
     };
 
     // Verify room_id matches token claim (prevent token reuse for different rooms)
-    if claims.room_id != room_id {
+    if claims.room_id != *room_id {
         tracing::warn!(
             "JWT room_id mismatch: token={}, path={}",
             claims.room_id,
             room_id
         );
-        return (StatusCode::FORBIDDEN, "Token not valid for this room").into_response();
+        return Err(Box::new(
+            (StatusCode::FORBIDDEN, "Token not valid for this room").into_response(),
+        ));
     }
+
+    Ok(claims)
+}
+
+/// Refuses an upgrade that carries no valid token for the room before it
+/// reaches the connection quota.
+///
+/// The quota is keyed by client address. With the quota in front, anyone
+/// sharing an address with a user (an office NAT, a VPN, a Tor exit) could
+/// spend that user's connections with requests that were never going to be
+/// accepted, without holding a token or knowing the site password. A token
+/// is only issued by /api/ws-token, behind the session check and its own
+/// quota.
+pub async fn require_ws_token(
+    State(state): State<AppState>,
+    Path(room_id): Path<Uuid>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if let Err(rejection) = check_upgrade_request(&state, &room_id, request.headers()) {
+        return *rejection;
+    }
+    next.run(request).await
+}
+
+/// Handler for upgrading the WebSocket connection (protocol v1).
+///
+/// JWT is carried in the `Sec-WebSocket-Protocol` header rather than a query
+/// string, so it never appears in access logs, proxy logs, or Referer headers.
+/// The client offers two subprotocols in a comma-separated list:
+///   - `pinchat.v1`                (the wire-protocol version; echoed in the 101 response)
+///   - `pinchat.v1.jwt.<token>`    (base64url-encoded single-use JWT)
+///
+/// Both MUST be present. The server echoes only `pinchat.v1` back so the
+/// token never appears in the upgrade response.
+///
+/// # Security
+/// - Requires explicit `pinchat.v1` subprotocol (gate against v0 clients)
+/// - Validates JWT signature + expiration (30s) + room_id claim + single-use jti
+pub async fn ws_handler(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+    Path(room_id): Path<Uuid>,
+    headers: HeaderMap,
+) -> Response {
+    let claims = match check_upgrade_request(&state, &room_id, &headers) {
+        Ok(claims) => claims,
+        Err(rejection) => return *rejection,
+    };
     if let Some(generation) = claims.creator_bootstrap_generation
         && !state.creator_bootstrap_claim_is_live(&room_id, claims.connection_id, generation)
     {
