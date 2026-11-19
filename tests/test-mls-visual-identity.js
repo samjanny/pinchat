@@ -126,8 +126,9 @@ async function main() {
     'group counts and own label use authenticated roster state');
     assert(nicknameInputs.length === 0,
         'installing MLS roster never calls relay nickname generator');
+    // The page markup lives in a signed template script, not in chat.html.
     const chatHtml = fs.readFileSync(
-        path.join(__dirname, '..', 'static', 'chat.html'), 'utf8',
+        path.join(__dirname, '..', 'static', 'js', 'templates', 'chat.js'), 'utf8',
     );
     assert(chatHtml.includes(':key="p.fingerprint"')
         && chatHtml.includes(':title="p.identityTitle"')

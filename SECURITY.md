@@ -734,12 +734,17 @@ describes every state and what each may be based on.
 **What This Does NOT Protect Against**:
 - **Altered HTML in Chromium.** Manifest V3 gives an extension no access to
   the body of a navigation response, and a second download proves nothing.
-  Markup that the signed client-side framework interprets can be added by
-  the server without any script: reproduced against the real client, a
-  single element with a binding attribute sends a value held by the
-  application to the server as part of an image URL. Decrypted messages are
-  within reach of the same mechanism. The state shown is "partially
-  verified", never "verified"
+  The state shown is "partially verified", never "verified". What a server
+  can do with markup alone is limited by the client, not by the extension:
+  the pages that run the application carry no application markup, the
+  client-side framework reads directives only from signed templates (it is
+  given a directive prefix that served markup cannot name), and whatever
+  else arrived in the page body is removed before the framework starts. Up
+  to v0.8.6 a single served element with a binding attribute made the
+  signed framework send a value held by the application to the server.
+  What remains: served markup is displayed until the page has been parsed,
+  and a page served without the framework runs no application but can show
+  anything, a form that asks for something included
 - Unsigned same-origin stylesheets in Chromium: detected, shown as a
   failure, not blocked
 - Anything at all when the extension is not installed, is disabled, or has

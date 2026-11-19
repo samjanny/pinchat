@@ -17,6 +17,17 @@
  * (Firefox). The same goes for the host of the release page, which the
  * site's extension links redirect to.
  *
+ * A working tree whose static files differ from the pinned release cannot be
+ * tested against that release's manifest. For that, sign the tree with a
+ * throwaway key, build a copy of the extension that trusts it, and name the
+ * manifest in VERIFIER_TEST_MANIFEST: the release host is then answered
+ * locally with that file and never contacted.
+ *
+ *   openssl ecparam -name prime256v1 -genkey -noout -out test-key.pem
+ *   node extensions/generate-hashes.js --private-key test-key.pem   (in a copy of the tree)
+ *   replace PINCHAT_PUBLIC_KEY in the copy's extensions/<browser>/background.js
+ *   VERIFIER_TEST_MANIFEST=<copy>/hashes.json.signed node <copy>/tests/extension-browser/run.js
+ *
  * Usage:
  *   node tests/extension-browser/run.js [options] [case-id ...]
  *     --browser chromium|firefox   run one browser only (default: both)
@@ -41,6 +52,9 @@ const { startProxy } = require('./lib/proxy');
 // Overridable so that two runs can share a machine.
 const HTTPS_PORT = Number(process.env.VERIFIER_TEST_HTTPS_PORT || 8443);
 const CONTROL_PORT = Number(process.env.VERIFIER_TEST_CONTROL_PORT || 8442);
+// A manifest that replaces the one of the pinned release; see above.
+const TEST_MANIFEST = process.env.VERIFIER_TEST_MANIFEST
+    ? path.resolve(process.env.VERIFIER_TEST_MANIFEST) : null;
 const SITE = 'https://pinchat.io';
 const ROOM = '00000000-0000-4000-8000-000000000000';
 // What an invite link carries after the "#". The value is a made-up key.
@@ -80,12 +94,16 @@ const PROBE = `() => {
         title: document.title,
         contentType: document.contentType,
         text: document.body ? document.body.textContent.trim().slice(0, 200) : '',
-        appLoaded: document.title.includes('PinChat') && !!document.querySelector('[x-data]'),
+        appLoaded: document.title.includes('PinChat') && !!document.querySelector('.chat-container, .home-container'),
         attacker: root ? root.getAttribute('data-attacker') : null,
         marker: text('marker'),
         leak: text('leak'),
         swStatus: text('sw-status'),
-        serverAdded: !!document.getElementById('server-added'),
+        serverAdded: !!document.getElementById('server-added') || !!document.querySelector('form[action="/collect"]'),
+        boundByServer: [
+            ...Array.from(document.querySelectorAll('#server-added'), (el) => el.getAttribute('src')),
+            document.body ? document.body.getAttribute('background') : null,
+        ].filter(Boolean),
         overlay: overlay ? (overlay.getAttribute('data-kind') || 'present') : null,
         blockPage: text('verifier-block-reason'),
         evilCss: !!style && style.outlineStyle === 'solid' && style.outlineColor === 'rgb(255, 0, 0)',
@@ -108,10 +126,12 @@ async function withServer(work, body) {
         'req', '-x509', '-newkey', 'rsa:2048', '-nodes',
         '-keyout', path.join(work, 'key.pem'), '-out', path.join(work, 'cert.pem'),
         '-days', '1', '-subj', '/CN=pinchat.io',
-        '-addext', 'subjectAltName=DNS:pinchat.io,DNS:www.pinchat.io,DNS:attacker.test,DNS:github.com',
+        '-addext', 'subjectAltName=DNS:pinchat.io,DNS:www.pinchat.io,DNS:attacker.test,DNS:github.com,'
+            + 'DNS:raw.githubusercontent.com',
     ], { stdio: 'ignore' });
     const server = spawn(process.execPath, [
         path.join(__dirname, 'hostile-server.js'), work, String(HTTPS_PORT), String(CONTROL_PORT),
+        ...(TEST_MANIFEST ? [TEST_MANIFEST] : []),
     ], { stdio: 'ignore' });
     try {
         for (let i = 0; i < 50; i += 1) {
@@ -141,6 +161,7 @@ function makeContext(browserName, work) {
     async function launch({
         verifier = true, passwordManager = false, releaseHost = true, profileDir = null,
     } = {}) {
+        if (TEST_MANIFEST) await control(`/manifest?serve=${releaseHost ? 1 : 0}`);
         const extensions = [];
         if (verifier) extensions.push(verifierDir);
         if (passwordManager) extensions.push(path.join(__dirname, 'pm-sim'));
@@ -149,15 +170,16 @@ function makeContext(browserName, work) {
             const hosts = ['pinchat.io', 'www.pinchat.io', 'attacker.test', 'github.com'];
             // No release host: point it at the local server, which has no
             // manifest to offer.
-            if (!releaseHost) hosts.push('raw.githubusercontent.com');
+            if (!releaseHost || TEST_MANIFEST) hosts.push('raw.githubusercontent.com');
             browser = await launchChromium({
                 extensions, workDir: work, httpsPort: HTTPS_PORT, hosts, profileDir,
             });
         } else {
             proxy = await startProxy({
-                localHosts: ['pinchat.io', 'www.pinchat.io', 'attacker.test', 'github.com'],
+                localHosts: ['pinchat.io', 'www.pinchat.io', 'attacker.test', 'github.com',
+                    ...(TEST_MANIFEST && releaseHost ? ['raw.githubusercontent.com'] : [])],
                 localPort: HTTPS_PORT,
-                passthroughHosts: releaseHost ? ['raw.githubusercontent.com'] : [],
+                passthroughHosts: releaseHost && !TEST_MANIFEST ? ['raw.githubusercontent.com'] : [],
             });
             browser = await launchFirefox({ extensions, proxyPort: proxy.port });
         }
@@ -285,6 +307,7 @@ const cases = require('./cases');
                     const context = makeContext(browserName, work);
                     try {
                         await control('/mode?set=clean');
+                        await control('/manifest?serve=1');
                         await testCase.run({
                             ...context,
                             control,

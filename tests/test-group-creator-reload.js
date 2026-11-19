@@ -150,8 +150,9 @@ async function main() {
     assert(chatStore.mlsGroupEnded === false, 'joiner with pins is not a reload');
 
     // Case 4: the page shows the state and the trust notice honestly.
+    // The page markup lives in a signed template script, not in chat.html.
     const chatHtml = fs.readFileSync(
-        path.join(__dirname, '..', 'static', 'chat.html'), 'utf8',
+        path.join(__dirname, '..', 'static', 'js', 'templates', 'chat.js'), 'utf8',
     );
     assert(chatHtml.includes('x-show="mlsGroupEnded"')
         && chatHtml.includes('Group ended'),

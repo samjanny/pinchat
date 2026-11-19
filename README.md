@@ -153,7 +153,11 @@ TLS-terminating reverse proxy, application state in memory, rate limiting via
 tower-governor with HMAC-hashed IPs, proof-of-work anti-spam.
 
 **Frontend.** Vanilla JavaScript with Alpine.js (CSP build), WebCrypto,
-responsive CSS. No build step.
+responsive CSS. No build step. The application markup lives in signed
+scripts (`static/js/templates/`), not in the HTML pages, and the framework
+only reads directives from those: see the guard at the end of
+`static/js/alpine-csp.min.js`. Images are stripped of their metadata before
+they are sent (`static/js/image-metadata.js`).
 
 ## Quick start
 

@@ -48,7 +48,7 @@ async function createChatPair() {
         };
         context.window = context;
         vm.createContext(context);
-        for (const file of ['nicknames.js', 'crypto.js', 'identity.js', 'double-ratchet.js', 'ecdh.js', 'app.js']) {
+        for (const file of ['nicknames.js', 'crypto.js', 'identity.js', 'double-ratchet.js', 'ecdh.js', 'image-metadata.js', 'app.js']) {
             vm.runInContext(fs.readFileSync(path.join(__dirname, '../../static/js', file), 'utf8'), context, { filename: file });
         }
         init();
