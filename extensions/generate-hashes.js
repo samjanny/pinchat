@@ -37,6 +37,7 @@ const JS_CSS_FILES = [
   '/static/js/emoji.js',
   '/static/js/homepage.js',
   '/static/js/identity.js',
+  '/static/js/image-metadata.js',
   '/static/js/legal.js',
   '/static/js/login.js',
   '/static/js/login-stash.js',
@@ -45,6 +46,10 @@ const JS_CSS_FILES = [
   '/static/js/theme.js',
   '/static/js/websocket.js',
   '/static/js/debug.js',
+
+  // Page markup, mounted by the guard at the end of alpine-csp.min.js
+  '/static/js/templates/chat.js',
+  '/static/js/templates/index.js',
 
   // MLS / TreeKEM bundle (RFC 9420, ciphersuite 0x0002)
   // Listed in load order for readability - hashing itself is order-insensitive.

@@ -1,0 +1,257 @@
+/**
+ * Markup of the home page.
+ *
+ * It lives in a signed script instead of index.html so that it is covered by
+ * the script policy like the rest of the client, and reaches the document
+ * only through PinChatUI.mount (see the guard at the end of
+ * alpine-csp.min.js). The page itself carries no application markup, and
+ * directives in markup that arrives with the page are not evaluated.
+ *
+ * Written with the engine's usual directive names; mount rewrites them. The
+ * string is a raw template literal, so a backtick is written as &#96; and
+ * the sequence "${" must not occur.
+ */
+window.PinChatUI.mount(String.raw`
+    <div class="container home-container" x-data>
+
+        <nav class="topbar">
+            <div class="brand">
+                <div class="brand-mark">P</div>
+                <span>PinChat</span>
+            </div>
+            <div class="spacer"></div>
+            <a class="topbar-link" href="#features">Features</a>
+            <a class="topbar-link" href="#extension">Extension</a>
+            <a class="topbar-link" href="#important">Security</a>
+            <a class="topbar-link muted" href="https://github.com/samjanny/pinchat" target="_blank" rel="noopener noreferrer">GitHub&nbsp;↗</a>
+        </nav>
+
+        <main class="hero">
+
+            <div class="hero-eyebrow">
+                <span class="dot"></span>
+                <span>Protocol v1 · Zero persistence · End-to-end encrypted</span>
+            </div>
+
+            <h1 class="hero-title">
+                Ephemeral chats,<br>
+                <span class="hero-title-accent">authenticated end-to-end.</span>
+            </h1>
+            <p class="hero-lede">No accounts, no stored messages, no server access to your conversations. Generate a room, share the link out-of-band, and the Double Ratchet takes care of the rest.</p>
+
+            <div class="hero-chips">
+                <span class="hero-chip"><svg class="icon" aria-hidden="true"><use href="#i-lock"/></svg>AES-GCM 256</span>
+                <span class="hero-chip"><svg class="icon" aria-hidden="true"><use href="#i-refresh"/></svg>PFS · PCS</span>
+                <span class="hero-chip"><svg class="icon" aria-hidden="true"><use href="#i-shield"/></svg>ECDSA-signed DH</span>
+                <span class="hero-chip"><svg class="icon" aria-hidden="true"><use href="#i-timer"/></svg>Auto-expire rooms</span>
+                <span class="hero-chip"><svg class="icon" aria-hidden="true"><use href="#i-eye-off"/></svg>No accounts</span>
+            </div>
+
+            <div class="hero-grid">
+
+                <!-- ==== CREATE ROOM CARD ==== -->
+                <div class="card create-room-card">
+                    <h2>Create a new room</h2>
+                    <p class="card-sub">Room metadata lives only in the server's RAM and is wiped when the TTL elapses.</p>
+
+                    <form @submit.prevent="$store.homepage.createRoom()">
+                        <!-- Room type -->
+                        <div class="form-group">
+                            <label>Room type</label>
+                            <div class="radio-group segmented" role="radiogroup" aria-label="Room type">
+                                <label class="radio-label">
+                                    <input type="radio" name="roomType" value="onetoone" x-model="$store.homepage.roomType">
+                                    <span>1 : 1 <em class="tag">recommended</em></span>
+                                </label>
+                                <label class="radio-label">
+                                    <input type="radio" name="roomType" value="group" x-model="$store.homepage.roomType">
+                                    <span>Group <em class="tag">up to 20</em></span>
+                                </label>
+                            </div>
+                            <small x-show="$store.homepage.roomType === 'onetoone'">Two participants. The security code check gates the first message.</small>
+                            <small x-show="$store.homepage.roomType === 'group'">Anyone with the link can join; members are told apart by key fingerprint, not by a security code. The creator's tab must stay open for the life of the group.</small>
+                        </div>
+
+                        <!-- Members (group rooms only) -->
+                        <div class="form-group" x-show="$store.homepage.roomType === 'group'">
+                            <label for="members">Members</label>
+                            <div class="slider-row">
+                                <input type="range" id="members" class="slider" min="2" max="20" step="1" x-model.number="$store.homepage.maxParticipants">
+                                <div class="slider-val">
+                                    <span x-text="$store.homepage.maxParticipants">10</span><small>people</small>
+                                </div>
+                            </div>
+                            <small>Including you. The server refuses joins beyond this number.</small>
+                        </div>
+
+                        <!-- TTL slider -->
+                        <div class="form-group">
+                            <label for="ttl">Session lifetime</label>
+                            <div class="slider-row">
+                                <input type="range" id="ttl" class="slider" min="5" max="1440" step="5" x-model.number="$store.homepage.ttlMinutes">
+                                <div class="slider-val">
+                                    <span x-text="$store.homepage.ttlMinutes < 60 ? $store.homepage.ttlMinutes : Math.floor($store.homepage.ttlMinutes/60)">30</span><small x-text="$store.homepage.ttlMinutes < 60 ? 'min' : ($store.homepage.ttlMinutes % 60 === 0 ? (Math.floor($store.homepage.ttlMinutes/60) === 1 ? 'hour' : 'hours') : 'h')">min</small><span x-show="$store.homepage.ttlMinutes >= 60 && $store.homepage.ttlMinutes % 60 !== 0">&nbsp;<span x-text="$store.homepage.ttlMinutes % 60"></span><small>min</small></span>
+                                </div>
+                            </div>
+                            <small>Between 5 minutes and 24 hours. The server removes the room from memory at expiry.</small>
+                        </div>
+
+                        <!-- Submit -->
+                        <button type="submit" class="btn btn-primary" :disabled="$store.homepage.loading">
+                            <span x-show="!$store.homepage.loading">Create room</span>
+                            <span x-show="$store.homepage.loading" x-text="$store.homepage.loadingMessage">Creating...</span>
+                        </button>
+
+                        <!-- Feedback -->
+                        <div x-show="$store.homepage.powProgress" class="info-message" x-text="$store.homepage.powProgress"></div>
+                        <div x-show="$store.homepage.error" class="error-message" x-text="$store.homepage.error"></div>
+                    </form>
+                </div>
+
+                <!-- ==== SIDE INFO STACK ==== -->
+                <aside class="info-stack" id="security">
+                    <div class="info-card">
+                        <h3>How the link works</h3>
+                        <p>Your room URL looks like <code>/c/&lt;id&gt;#key=&lt;b64&gt;</code>. The fragment after <code>#</code> stays on the client - RFC 3986 - so the server never sees the symmetric key.</p>
+                    </div>
+                    <div class="info-card">
+                        <h3>What the server sees</h3>
+                        <p>A room ID, a TTL, and opaque encrypted payloads. No message content, no metadata, no persistent identifier tying sessions together.</p>
+                    </div>
+                    <div class="info-card">
+                        <h3>No retention, by design</h3>
+                        <p>Nothing records who connected, when, or with whom, beyond the live state a running room needs. Logging or per-user accounts will not be added to make the service public - if that were ever required, this deployment would stay private instead.</p>
+                    </div>
+                    <div class="info-card">
+                        <h3>Identity verification</h3>
+                        <p>Before any message goes through, you'll see a <strong>Short Authentication String</strong> - 16 emoji derived from both parties' identity keys and from the live handshake keys of that session. Confirm it out-of-band to rule out MITM.</p>
+                    </div>
+                </aside>
+
+            </div>
+
+            <!-- ==== FEATURES ==== -->
+            <section id="features" class="feature-grid">
+                <div class="feature">
+                    <div class="feature-icon"><svg class="icon" aria-hidden="true"><use href="#i-lock"/></svg></div>
+                    <div class="feature-title">End-to-End Encryption</div>
+                    <div class="feature-desc">Only you and your contacts can read the messages. The server only relays ciphertext.</div>
+                </div>
+                <div class="feature">
+                    <div class="feature-icon"><svg class="icon" aria-hidden="true"><use href="#i-eye-off"/></svg></div>
+                    <div class="feature-title">No accounts</div>
+                    <div class="feature-desc">No registration, no personal data, no persistent identifier across sessions.</div>
+                </div>
+                <div class="feature">
+                    <div class="feature-icon"><svg class="icon" aria-hidden="true"><use href="#i-cloud-off"/></svg></div>
+                    <div class="feature-title">No persistence</div>
+                    <div class="feature-desc">Messages are never stored on disk. Server keeps only in-RAM state until the room TTL.</div>
+                </div>
+                <div class="feature">
+                    <div class="feature-icon"><svg class="icon" aria-hidden="true"><use href="#i-timer"/></svg></div>
+                    <div class="feature-title">Auto-destruction</div>
+                    <div class="feature-desc">Rooms delete themselves at expiration. Short or long - you decide up front.</div>
+                </div>
+                <div class="feature">
+                    <div class="feature-icon"><svg class="icon" aria-hidden="true"><use href="#i-code"/></svg></div>
+                    <div class="feature-title">Open Source</div>
+                    <div class="feature-desc">Code is publicly auditable on <a href="https://github.com/samjanny/pinchat" target="_blank" rel="noopener noreferrer">GitHub</a>. Reproducible Docker builds.</div>
+                </div>
+            </section>
+
+            <!-- ==== BROWSER EXTENSION ==== -->
+            <section id="extension" class="extension-card">
+                <div class="extension-text">
+                    <h3><svg class="icon" aria-hidden="true"><use href="#i-shield"/></svg>Verify what your browser runs</h3>
+                    <p>The server that relays your encrypted messages is the same server that delivers the code doing the encrypting. If it were compromised, it could serve modified code and you would have no ordinary way to notice.</p>
+                    <p>The <strong>PinChat Integrity Verifier</strong> is the independent check: it lets pinchat.io run only the scripts published in a release manifest signed with an offline key, and warns you if anything served differs from that release. Free, open source, no data collected, active only on pinchat.io.</p>
+                </div>
+                <div class="extension-actions">
+                    <a class="btn btn-primary" href="/ext/chrome" target="_blank" rel="noopener noreferrer">Add to Chrome</a>
+                    <a class="btn btn-secondary" href="/ext/firefox" target="_blank" rel="noopener noreferrer">Add to Firefox</a>
+                    <a class="extension-source" href="https://github.com/samjanny/pinchat/tree/main/extensions" target="_blank" rel="noopener noreferrer">Source and packages on GitHub</a>
+                </div>
+            </section>
+
+            <!-- ==== IMPORTANT NOTES / DISCLAIMER ==== -->
+            <section class="disclaimer-stack" id="important">
+                <div class="info-box warning">
+                    <h3><svg class="icon" aria-hidden="true"><use href="#i-alert"/></svg>Important notes</h3>
+                    <ul>
+                        <li>Do not share the room link on public channels.</li>
+                        <li>The encryption key is contained in the link (after the <code>#</code> symbol).</li>
+                        <li>If you lose the link, you can no longer access the chat.</li>
+                        <li>Messages cannot be recovered after the room expires.</li>
+                    </ul>
+                </div>
+
+                <div class="info-box warning">
+                    <h3><svg class="icon" aria-hidden="true"><use href="#i-alert"/></svg>Experimental software - use at your own risk</h3>
+                    <p>PinChat is an experimental prototype provided strictly for educational and research purposes. It is <strong>NOT designed, intended, or warranted</strong> for production use, the protection of real-world sensitive, personal, financial, or confidential data, or safety-critical, life-critical, or mission-critical communications.</p>
+                    <p>Although it uses modern cryptographic techniques, it has <strong>not undergone a formal security review or audit</strong>, and may contain serious vulnerabilities. You can audit the code yourself on <a href="https://github.com/samjanny/pinchat" target="_blank" rel="noopener noreferrer">GitHub</a>.</p>
+                </div>
+            </section>
+
+        </main>
+
+        <footer>
+            <p>PinChat · Privacy-first ephemeral chat</p>
+            <p class="footer-links">
+                <a href="/static/terms.html">Terms of Service</a>
+                <span class="footer-sep" aria-hidden="true">·</span>
+                <a href="/static/privacy.html">Privacy Policy</a>
+                <span class="footer-sep" aria-hidden="true">·</span>
+                <a href="https://github.com/samjanny/pinchat" target="_blank" rel="noopener noreferrer">Source on GitHub</a>
+            </p>
+        </footer>
+    </div>
+
+    <!-- Lucide icon sprite (ISC license, https://lucide.dev) -->
+    <svg xmlns="http://www.w3.org/2000/svg" class="hidden" aria-hidden="true">
+        <symbol id="i-lock" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <rect width="18" height="11" x="3" y="11" rx="2" ry="2"/>
+            <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
+        </symbol>
+        <symbol id="i-refresh" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/>
+            <path d="M21 3v5h-5"/>
+            <path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/>
+            <path d="M8 16H3v5"/>
+        </symbol>
+        <symbol id="i-shield" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/>
+            <path d="m9 12 2 2 4-4"/>
+        </symbol>
+        <symbol id="i-timer" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <line x1="10" x2="14" y1="2" y2="2"/>
+            <line x1="12" x2="15" y1="14" y2="11"/>
+            <circle cx="12" cy="14" r="8"/>
+        </symbol>
+        <symbol id="i-eye-off" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M9.88 9.88a3 3 0 1 0 4.24 4.24"/>
+            <path d="M10.73 5.08A10.43 10.43 0 0 1 12 5c7 0 10 7 10 7a13.16 13.16 0 0 1-1.67 2.68"/>
+            <path d="M6.61 6.61A13.526 13.526 0 0 0 2 12s3 7 10 7a9.74 9.74 0 0 0 5.39-1.61"/>
+            <line x1="2" x2="22" y1="2" y2="22"/>
+        </symbol>
+        <symbol id="i-cloud-off" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="m2 2 20 20"/>
+            <path d="M5.782 5.782A7 7 0 0 0 9 19h8.5a4.5 4.5 0 0 0 1.307-.193"/>
+            <path d="M21.532 16.5A4.5 4.5 0 0 0 17.5 10h-1.79A7.008 7.008 0 0 0 10 5.07"/>
+        </symbol>
+        <symbol id="i-code" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="m16 18 6-6-6-6"/>
+            <path d="m8 6-6 6 6 6"/>
+        </symbol>
+        <symbol id="i-alert" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3Z"/>
+            <path d="M12 9v4"/>
+            <path d="M12 17h.01"/>
+        </symbol>
+    </svg>
+
+    <!-- Cookie notice (informational, dismissible - see static/js/cookie-notice.js) -->
+    <div id="cookie-notice" class="cookie-notice hidden" role="region" aria-label="Cookie notice">
+        <span class="cookie-notice-text">This site uses only strictly necessary cookies (session, CSRF, and a short-lived proof-of-work cookie). No tracking, no analytics. <a href="/static/privacy.html">Privacy</a></span>
+        <button type="button" class="cookie-notice-ok">OK</button>
+    </div>
+`);

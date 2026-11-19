@@ -12,6 +12,11 @@ const MAX_IMAGE_DIMENSION = 8192;
 const MAX_IMAGE_PIXELS = 8 * 1024 * 1024;
 const MAX_PENDING_IMAGE_DECODES = 2;
 const MAX_PENDING_IMAGE_DECODE_BYTES = 4 * 1024 * 1024;
+// The range the relay itself accepts for MAX_IMAGE_SIZE. The value a relay
+// announces is used inside this range and not beyond it: it is also the
+// largest decrypted image this client will take from a peer.
+const MIN_ROOM_IMAGE_BYTES = 1024;
+const MAX_ROOM_IMAGE_BYTES = 2 * 1024 * 1024;
 window.ROOM_CONFIG = {
     roomId: urlParams.get('room')
     // roomType, ttlMinutes, maxParticipants will be set by server via WebSocket
@@ -452,9 +457,12 @@ document.addEventListener('alpine:init', () => {
                         debugLog('[SECURITY] Using validated max_participants from server:', message.max_participants);
                         this.maxParticipants = message.max_participants;
                     }
-                    if (message.max_image_size) {
-                        debugLog('[CONFIG] Max image size from server:', this.formatFileSize(message.max_image_size));
-                        this.maxImageSize = message.max_image_size;
+                    if (Number.isSafeInteger(message.max_image_size) && message.max_image_size > 0) {
+                        this.maxImageSize = Math.min(
+                            MAX_ROOM_IMAGE_BYTES,
+                            Math.max(MIN_ROOM_IMAGE_BYTES, message.max_image_size),
+                        );
+                        debugLog('[CONFIG] Max image size from server:', this.formatFileSize(this.maxImageSize));
                     }
 
                     // A resumed 1:1 socket keeps its ratchet and SAS decision.
@@ -1377,15 +1385,32 @@ document.addEventListener('alpine:init', () => {
             }
 
             try {
-                const dimensions = await this._validateImageBlob(file);
-                // Read file as ArrayBuffer for encryption
-                const arrayBuffer = await file.arrayBuffer();
+                // What is sent is the picture, not what the file says about
+                // it: position, time, device and comments are removed here
+                // (see image-metadata.js). A file that cannot be cleaned is
+                // not sent at all.
+                let cleaned;
+                try {
+                    cleaned = stripImageMetadata(new Uint8Array(await file.arrayBuffer()));
+                } catch (error) {
+                    if (!(error instanceof ImageMetadataError)) throw error;
+                    console.error('Image metadata could not be removed:', error.message);
+                    this.error = '⚠️ This image could not be prepared for sending. '
+                        + 'Save it again as PNG or JPEG and retry.';
+                    event.target.value = '';
+                    return;
+                }
+                // The preview shows, and the size check counts, the bytes
+                // that will be sent.
+                const outgoing = new Blob([cleaned.bytes], { type: cleaned.mimeType });
+                const dimensions = await this._validateImageBlob(outgoing);
+                const arrayBuffer = cleaned.bytes.buffer;
 
                 // Build a blob URL for the preview. This replaces the previous
                 // FileReader/data URL approach: data: URIs are blocked by our
                 // strict CSP (img-src 'self' blob:), while blob: URLs are
                 // allowed and avoid the base64 round-trip in memory.
-                const previewUrl = URL.createObjectURL(file);
+                const previewUrl = URL.createObjectURL(outgoing);
 
                 if (this.pendingImage?.previewUrl) {
                     try {
@@ -1395,8 +1420,8 @@ document.addEventListener('alpine:init', () => {
                 this.pendingImage = {
                     previewUrl,           // blob: URL (CSP-compatible)
                     name: file.name,
-                    size: file.size,
-                    mimeType: file.type,
+                    size: cleaned.bytes.byteLength,
+                    mimeType: cleaned.mimeType,
                     arrayBuffer: arrayBuffer,
                     pixelCount: dimensions.width * dimensions.height,
                 };

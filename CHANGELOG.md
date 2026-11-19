@@ -4,12 +4,58 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Dates are the repository-local commit dates; entries are curated for user-visible impact
 rather than being a 1:1 mirror of `git log`.
 
-## [Unreleased] - server changes on main, extension 1.4.0
+## [2026-11-19] - v0.9.0
 
-The site's static files are unchanged: the manifest stays at sequence 54 and
-the extension keeps its pin on v0.8.6. The server changes below are not
-tagged or deployed yet. Extension 1.4.0 can be installed against the
-deployed v0.8.6.
+The manifest is at sequence 55 and both extensions move to 1.5.0 with their
+pin on v0.9.0 and their floor raised to 55. An installed build that pins an
+earlier release reports a mismatch on the chat page and the home page until
+it is replaced. Extension 1.4.0 was packaged against v0.8.6 and never
+published; 1.5.0 carries everything listed for it below.
+
+Upgrade notes for operators: a `TRUSTED_PROXIES` entry that is neither an
+address nor a CIDR range now stops the server at startup, and a rate limit
+window that would keep a hashed address longer than 15 minutes is shortened
+with a warning (`LOGIN_PERIOD_SECS` to 725 for the default burst of 5).
+Check the configuration with a dry run before deploying.
+
+### Changed - markup that arrives with a page can no longer drive the client
+
+In Chromium no extension can check the HTML of a page before it is parsed.
+The client's framework read directives from that HTML, so a server could add
+one element with a binding attribute, and no script, and have the signed
+framework put a value held by the application (decrypted messages included)
+into the URL of a request. Reproduced against v0.8.6 with five different
+placements of such an element; all five moved application state.
+
+The chat page and the home page now carry no application markup. It lives in
+signed scripts under `static/js/templates/`. The framework file carries a
+guard after the vendored build: it gives the framework a directive prefix
+drawn at random on every load and known only to that script, mounts the
+signed templates under that prefix, starts the framework once the document
+has been parsed, and removes everything in the page body that was not
+mounted. With the same five placements nothing is evaluated, whatever order
+or attributes the script elements arrive with. What markup can do without
+the framework is unchanged and described in `extensions/README.md`.
+
+### Added - images are sent without their metadata
+
+A photo carries where and when it was taken, the device, sometimes a
+thumbnail of the uncropped original. End-to-end encryption hid that from the
+server and delivered it to the recipient intact. Images are now cleaned
+before they are previewed or encrypted: Exif, XMP, IPTC, comments, text
+chunks and anything that follows the end of the image are removed from JPEG,
+PNG, GIF and WebP files. The picture itself is copied byte for byte, so
+quality and animation do not change; colour profiles are kept, and so is the
+orientation, which is written into a new block that holds nothing else. A
+file whose structure cannot be followed to the end of the image is not sent.
+The type put on the wire is the one the content has, not the one the file
+name claims.
+
+### Fixed - a relay could raise the image size limit without bound
+
+The client took the image size limit from the relay as announced. That limit
+is also the largest decrypted image it accepts from a peer. It is now used
+only inside the range a relay may configure, 1 KiB to 2 MiB.
 
 ### Changed - the extension reports one state per page, and says what it is based on
 

@@ -1,8 +1,8 @@
 {
   "data": {
     "version": "1.2.0",
-    "sequence": 54,
-    "generated": "2026-09-11T12:37:46.434Z",
+    "sequence": 55,
+    "generated": "2026-11-19T13:22:22.683Z",
     "site": "https://pinchat.io",
     "files": [
       {
@@ -11,11 +11,11 @@
       },
       {
         "path": "/static/js/alpine-csp.min.js",
-        "hash": "e7c863da5896692f5d478e10dae089e6164fed1c5c1b6a1f7cbbf7a9b093f055"
+        "hash": "590a313830bee1a8e0faba723c735b7b718c547e253219614449694692812529"
       },
       {
         "path": "/static/js/app.js",
-        "hash": "08865d0246cb8c97c19611d95f2db4e6495fc72c09c87c5f7fe821032f6b0993"
+        "hash": "5433c879f9279260deaf3845fb825510dc7578691ae44ea8a4c9f14153c3d5a1"
       },
       {
         "path": "/static/js/cookie-notice.js",
@@ -44,6 +44,10 @@
       {
         "path": "/static/js/identity.js",
         "hash": "a461ec3cfda280b01539e6ec21b6ce4ebc50814b060b3f1e8f3534c900635221"
+      },
+      {
+        "path": "/static/js/image-metadata.js",
+        "hash": "3f28de9c03c323feb703ce04d72e090af7f1bd3494b65ee39801c7b087aec495"
       },
       {
         "path": "/static/js/legal.js",
@@ -76,6 +80,14 @@
       {
         "path": "/static/js/debug.js",
         "hash": "9d8df390554a17bc7a2956d6ab59b0707ab863f83c3b5d223a62c015f883b09f"
+      },
+      {
+        "path": "/static/js/templates/chat.js",
+        "hash": "cdab0e29c7b15a7e98b7dc9703195de672ae8f1a3f7d81059536bb98d31ccbe2"
+      },
+      {
+        "path": "/static/js/templates/index.js",
+        "hash": "1f7490b7f4d4d7d0c570ba27b91065a38dee07eaf2cc91aeb34db3513ff93c67"
       },
       {
         "path": "/static/js/mls/codec.js",
@@ -187,7 +199,7 @@
       },
       {
         "path": "/static/index.html",
-        "hash": "fbd75f17011ae6f45c454956d84ad7a7edb393312fdc5eaf142d05fa07b01ada"
+        "hash": "90eeb28997a06badafc90059caae392027e7f13c8803eb677250601ebd292903"
       },
       {
         "path": "/static/login.html",
@@ -195,7 +207,7 @@
       },
       {
         "path": "/static/chat.html",
-        "hash": "c2d6ba4be9a4940f937c38cbdfda47ebc31718d85006633b843a11228cbac2cd"
+        "hash": "5474db93f7f3cb3b0accfbf8baa692f48ca5e9eaec7af55d7f7a01cbb2fb1d1a"
       },
       {
         "path": "/static/terms.html",
@@ -211,5 +223,5 @@
       }
     ]
   },
-  "signature": "MEYCIQCWvmevklTJeHFlIbHtzQFOBSjq05cObjZKwb78yWfhNQIhALBqap/7mswrgDom3BDJ0XlOJzpeY5lIB5xOqSfcO381"
+  "signature": "MEYCIQDrHJmnB3waz39UAizj4M2hESLw+DMsbUYUM4zVkfNoXgIhALLlhsOyTZylLAIrBlSbAL70sACsIens00PdTpsWQLR6"
 }

@@ -121,29 +121,53 @@ module.exports = [
             ]);
         },
     },
-    {
-        id: 'markup-directives',
-        title: 'markup with framework directives, and no script, added to the navigation only',
+    ...[
+        ['markup-directives', 'directives',
+            'markup with framework directives, and no script, added to the navigation only', true],
+        ['markup-directives-first', 'directives-first',
+            'the same directives placed before every script of the page', true],
+        ['markup-directives-on-body', 'directives-on-body',
+            'directives on the body element itself', true],
+        ['markup-directives-around', 'directives-around',
+            'a served element with directives wrapped around the whole page', true],
+        ['markup-directives-engine-last', 'directives-engine-last',
+            'directives in place, and the framework loaded last and deferred', false],
+    ].map(([id, poc, title, applicationLoads]) => ({
+        id,
+        title,
         async run(t) {
             const browser = await t.launch();
-            const visit = await t.visit(browser, `${t.urls.CHAT}&poc=directives`, 6000);
+            const visit = await t.visit(browser, `${t.urls.CHAT}&poc=${poc}`, 6000);
             const state = await t.verifierState(browser, t.urls.CHAT);
             const firefox = t.browserName === 'firefox';
-            // The signed framework evaluates the added binding and the page
-            // requests an image whose URL is a value from the application.
+            // A framework that read directives from the served markup would
+            // evaluate the added binding, and the page would request an image
+            // whose URL is a value from the application. The client gives
+            // its framework a directive prefix that served markup cannot
+            // name, so the binding stays an ordinary attribute.
             const carried = visit.log.filter((entry) => entry.dest === 'image'
                 && /challenge|connect|comput/i.test(decodeURIComponent(entry.path + entry.query)));
+            const bound = visit.page.boundByServer || [];
             t.report(summary(visit, t, {
                 'application state sent in a request': carried.length
                     ? decodeURIComponent(carried[0].path) : 'no',
+                'application state bound into served markup': bound.length ? JSON.stringify(bound) : 'no',
                 'verifier state': stateLabel(state),
             }), [
                 ['the state is not verified', 'must', !state || state.integrity !== 'verified'],
-                ['markup alone could not route application state into a request',
-                    firefox ? 'must' : 'limit', carried.length === 0],
+                ['markup alone could not route application state into a request', 'must',
+                    carried.length === 0 && bound.length === 0],
+                ['the added markup is gone once the page has loaded', 'must', !visit.page.serverAdded],
+                firefox
+                    ? ['the altered document was replaced by the block page', 'must', !!visit.page.blockPage]
+                    // A page that loads the framework after everything else
+                    // gets no application: its template had nothing to
+                    // mount it. That is the server's loss, not a leak.
+                    : [applicationLoads ? 'the application still loads' : 'the application does not load at all',
+                        'must', visit.page.appLoaded === applicationLoads],
             ]);
         },
-    },
+    })),
     ...REDIRECT_CODES.map((code) => ({
         id: `redirect-${code}`,
         title: `invite link answered with a ${code} to another origin`,

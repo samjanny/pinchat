@@ -16,7 +16,12 @@
  * fetch looks like, gets the signed bytes. That is the split serving a
  * compromised server would use.
  *
- * Usage: hostile-server.js <cert-dir> [https-port] [control-port]
+ * Usage: hostile-server.js <cert-dir> [https-port] [control-port] [manifest]
+ *
+ * With a manifest file, the server also stands in for the release host and
+ * answers every request for hashes.json.signed with that file. The runner
+ * uses this to test a working tree that the project key has not signed yet,
+ * against a manifest signed with a throwaway key (see run.js).
  */
 
 'use strict';
@@ -26,7 +31,7 @@ const http = require('http');
 const https = require('https');
 const path = require('path');
 
-const [certDir, httpsPortArg, controlPortArg] = process.argv.slice(2);
+const [certDir, httpsPortArg, controlPortArg, manifestFile] = process.argv.slice(2);
 const HTTPS_PORT = Number(httpsPortArg || 8443);
 const CONTROL_PORT = Number(controlPortArg || 8442);
 const staticDir = path.join(__dirname, '..', '..', 'static');
@@ -36,6 +41,8 @@ const ATTACKER_HOST = 'attacker.test';
 // /ext/firefox. Not controlled by the server operator.
 const RELEASE_HOST = 'github.com';
 const RELEASE_PAGE = `https://${RELEASE_HOST}/samjanny/pinchat/releases/latest`;
+// Where the extension fetches the signed manifest of its pinned release.
+const MANIFEST_HOST = 'raw.githubusercontent.com';
 
 const TYPES = {
     '.html': 'text/html; charset=utf-8',
@@ -60,7 +67,7 @@ const TYPES = {
  *   gateway-error            answer navigations to the chat page the way a
  *                            reverse proxy does while the server restarts
  */
-const state = { mode: 'clean', log: [] };
+const state = { mode: 'clean', log: [], serveManifest: true };
 
 const REDIRECTS = {
     internal: (uuid) => `/static/chat.html?room=${uuid}`,
@@ -92,8 +99,40 @@ function injection(poc) {
         // No script at all: markup that the signed client-side framework
         // will interpret. It binds a piece of application state to the URL
         // of an image, which the policy lets the page load from the site.
-        return '<div x-data><img id="server-added" alt="" :src="$store.chatRoom.connectingMessage"></div>';
+        return DIRECTIVES;
     case 'handler': return HANDLER;
+    default: return null;
+    }
+}
+
+const DIRECTIVES = '<div x-data><img id="server-added" alt="" :src="$store.chatRoom.connectingMessage"></div>';
+
+/**
+ * Other ways of serving the same directives, each a way a framework that
+ * read served markup could be reached. Returns the altered page, or null
+ * when `poc` names none of them.
+ */
+function rearranged(html, poc) {
+    switch (poc) {
+    case 'directives-first':
+        // Before every script of the page instead of after them.
+        return html.replace(/(<body[^>]*>)/, `$1${DIRECTIVES}`);
+    case 'directives-on-body':
+        // On the body element itself. Its legacy "background" attribute
+        // loads an image, so a binding on it would make a request.
+        return html.replace(/<body([^>]*)>/, '<body$1 x-data :background="$store.chatRoom.connectingMessage">');
+    case 'directives-around':
+        // Around everything the page brings, application scripts included.
+        return html.replace(/(<body[^>]*>)/, `$1<form action="/collect" x-data="$store.chatRoom">${DIRECTIVES}`)
+            .replace('</body>', '</form></body>');
+    case 'directives-engine-last': {
+        // The framework loaded last and deferred, with the markup in
+        // place before it runs.
+        const tag = /\n\s*<script src="\/static\/js\/alpine-csp\.min\.js"[^>]*><\/script>/.exec(html);
+        if (!tag) return null;
+        return html.replace(tag[0], '')
+            .replace('</body>', `${DIRECTIVES}${tag[0].replace('></script>', ' defer></script>')}\n</body>`);
+    }
     default: return null;
     }
 }
@@ -237,6 +276,8 @@ function handleSite(req, res, url) {
     if (extra && isDocument && (navigation || everyRequest)) {
         body = Buffer.from(body.toString('utf8').replace('</body>', `${extra}</body>`));
     }
+    const moved = isDocument && navigation ? rearranged(body.toString('utf8'), url.searchParams.get('poc')) : null;
+    if (moved) body = Buffer.from(moved);
     if (isDocument && navigation && state.mode === 'link-header') {
         headers.link = '</static/css/evil.css>; rel=stylesheet';
     }
@@ -254,6 +295,13 @@ https.createServer({
     const hostname = (req.headers.host || '').replace(/:\d+$/, '');
     if (hostname === ATTACKER_HOST) return handleAttacker(req, res, url);
     if (hostname === RELEASE_HOST) return handleRelease(req, res, url);
+    if (hostname === MANIFEST_HOST) {
+        if (manifestFile && state.serveManifest && url.pathname.endsWith('/hashes.json.signed')) {
+            return send(res, 200, { 'content-type': 'text/plain; charset=utf-8', 'access-control-allow-origin': '*' },
+                fs.readFileSync(manifestFile));
+        }
+        return send(res, 404, {}, '');
+    }
     return handleSite(req, res, url);
 }).listen(HTTPS_PORT, '127.0.0.1');
 
@@ -262,6 +310,11 @@ http.createServer((req, res) => {
     if (url.pathname === '/mode') {
         state.mode = url.searchParams.get('set') || 'clean';
         return send(res, 200, {}, state.mode);
+    }
+    if (url.pathname === '/manifest') {
+        // Lets a case take the release host away while a test manifest is in use.
+        state.serveManifest = url.searchParams.get('serve') !== '0';
+        return send(res, 200, {}, String(state.serveManifest));
     }
     if (url.pathname === '/reset') {
         state.log = [];

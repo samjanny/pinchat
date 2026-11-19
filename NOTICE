@@ -57,6 +57,11 @@ The CSP-safe build of Alpine.js is vendored at
 static/js/alpine-csp.min.js and used to drive client-side reactivity
 without `unsafe-eval`. Distributed under the MIT License.
 
+The vendored build (version 3.15.0) is the first 60017 bytes of that file,
+unmodified. PinChat's own code follows it in the same file, after the
+comment that begins "PinChat markup guard"; it is not part of Alpine.js and
+is covered by this project's licence.
+
 MIT License
 
 Copyright (c) 2019-present Caleb Porzio and contributors

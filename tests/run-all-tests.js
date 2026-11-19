@@ -39,6 +39,21 @@ const TEST_SUITES = {
         file: 'test-verifier-verdict.js',
         description: 'What each verifier state may be based on; redirect guard; per-browser rules'
     },
+    'inert-markup': {
+        name: 'Served markup cannot drive the client',
+        file: 'test-inert-markup.js',
+        description: 'Engine guard (secret directive prefix, controlled start), pages without markup, signed templates'
+    },
+    'image-metadata': {
+        name: 'Outgoing image metadata',
+        file: 'test-image-metadata.js',
+        description: 'JPEG, PNG, GIF and WebP lose position, device, text and trailing data and keep their picture'
+    },
+    'chat-image-limits': {
+        name: 'Chat image handling',
+        file: 'test-chat-image-limits.js',
+        description: 'The relay cannot raise the image limit; a selected image is cleaned before it is previewed or sent'
+    },
     'websocket-resume': {
         name: 'WebSocket stable-identity resume',
         file: 'test-websocket-resume.js',

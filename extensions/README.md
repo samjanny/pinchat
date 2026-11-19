@@ -78,7 +78,7 @@ git push
 
 The extensions fetch the manifest from the immutable release tag configured by
 `GITHUB_TAG` in both background scripts. For the current security release this is:
-`https://raw.githubusercontent.com/samjanny/pinchat/v0.8.4/hashes.json.signed`.
+`https://raw.githubusercontent.com/samjanny/pinchat/v0.9.0/hashes.json.signed`.
 
 On every extension release, both background scripts move to the new tag,
 `MIN_KNOWN_SEQUENCE` rises to the signed manifest sequence, both extension
@@ -395,7 +395,7 @@ The integrity approach provides multiple layers of protection:
 | Server serves malicious JS | Blocked before execution by the hash-only policy | Same |
 | Server adds an inline script or handler to the HTML | Not run. Shown as a notice | Page replaced by the block page |
 | Server serves different HTML to the navigation than to any other request | **Not detected.** State stays "partially verified" | Page replaced by the block page |
-| Server adds markup with framework directives and no script | **Not prevented**: the signed framework evaluates it (see below) | Page replaced by the block page |
+| Server adds markup with framework directives and no script | Not evaluated: the client's framework does not read directives from served markup (see below). The markup is removed once the page has loaded | Page replaced by the block page |
 | Server links an unsigned same-origin stylesheet | Loaded; state "failed" | Page replaced by the block page |
 | Server sends `Link: rel=stylesheet` | Header removed | Header removed |
 | Server redirects an invite link to another origin | Navigation blocked | Navigation blocked |
@@ -418,19 +418,39 @@ the server can answer it differently. In Chromium the script policy is the
 only thing that binds what the page does to the signed release, and it binds
 scripts, not markup.
 
-That gap is not theoretical. The client uses a framework that reads
-directives from markup. Reproduced against the real client: one element with
-a binding attribute and no script, added to the navigation response only,
-makes the signed framework put a value from the application into the URL of
-an image, which the page then requests from the server. The same mechanism
-reaches anything the application holds, decrypted messages included. The
-state shown in that situation is "partially verified", which is accurate, and
-it is not a verified state.
+That gap was not theoretical. The client uses a framework that reads
+directives from markup. Up to and including v0.8.6, one element with a
+binding attribute and no script, added to the navigation response only, made
+the signed framework put a value from the application into the URL of an
+image, which the page then requested from the server. The same mechanism
+reached anything the application holds, decrypted messages included.
 
-Closing it needs a change in the client, not in the extension: pages reduced
-to a fixed shell whose single signed bootstrap script discards whatever
-markup arrived and builds the document from signed templates. Until then,
-use Firefox when the server must not be trusted with the page.
+The client closes that path itself, since no extension can in Chromium:
+
+- The two pages that run the application carry no application markup. It
+  lives in signed scripts under `static/js/templates/`, so it is covered by
+  the script policy like the rest of the client.
+- The framework file carries a guard after the vendored build, in the same
+  file, so that the framework cannot be loaded without it. The guard gives
+  the framework a directive prefix drawn at random on every page load and
+  known only inside that script. Markup that arrives with the page cannot
+  name it, and its `x-`, `:` and `@` attributes are ordinary attributes
+  that nothing evaluates. The signed templates are rewritten to the prefix
+  when they are mounted.
+- The framework starts once the document has been parsed. Before that,
+  everything in the body that was not mounted and is not a script is
+  removed.
+
+This holds in whatever order, and with whatever attributes, a server arranges
+the script elements of the page: it can leave the application out, it cannot
+address the application's state.
+
+What is left in Chromium is what markup can do without the framework. It is
+shown until the document has been parsed. A page served without the
+framework file runs no application but can show anything, a form that asks
+for something included, under the site's address and a "partially verified"
+state. An unsigned stylesheet from the site is detected and reported, not
+blocked. Use Firefox when the server must not be trusted with the page.
 
 #### Without the extension
 
