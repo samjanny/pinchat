@@ -259,6 +259,57 @@ module.exports = [
         },
     },
     {
+        id: 'room-not-found',
+        title: 'a link to a room that no longer exists, answered with a plain-text 404',
+        async run(t) {
+            await t.control('/mode?set=room-gone');
+            const browser = await t.launch();
+            const visit = await t.visit(browser, t.urls.INVITE, 4000);
+            const firefox = t.browserName === 'firefox';
+            t.report(summary(visit, t, {
+                'document type': visit.page.contentType,
+                'text shown': visit.page.text,
+            }), firefox ? [
+                ['what the server sent is not shown', 'must', !/Room not found/.test(visit.page.text || '')],
+                ['the replacement is rendered as a page, not as its source', 'must',
+                    visit.page.contentType === 'text/html' && !!visit.page.blockPage
+                    && !(visit.page.text || '').includes('<')],
+                ['it says that the server answered with an error, and which', 'must',
+                    /error/i.test(visit.page.blockPage || '') && /404/.test(visit.page.text || '')],
+                ['it does not call the answer tampering', 'must',
+                    !/does not match|tried to redirect/i.test(visit.page.text || '')
+                    && visit.page.overlay !== 'failed'],
+            ] : [
+                ['the server answer is shown as it is', 'must', /Room not found/.test(visit.page.text || '')],
+                ['no warning is shown', 'must', !visit.page.overlay && !visit.page.blockPage],
+            ]);
+        },
+    },
+    {
+        id: 'gateway-error',
+        title: 'the address of a signed page answered with a gateway error',
+        async run(t) {
+            await t.control('/mode?set=gateway-error');
+            const browser = await t.launch();
+            const visit = await t.visit(browser, t.urls.CHAT, 4000);
+            const state = await t.verifierState(browser, t.urls.CHAT);
+            const firefox = t.browserName === 'firefox';
+            t.report(summary(visit, t, {
+                'text shown': visit.page.text,
+                'verifier state': stateLabel(state),
+            }), firefox ? [
+                ['what the server sent is not shown', 'must', !/Bad Gateway/.test(visit.page.text || '')],
+                ['it is reported as an error answer, with its status', 'must',
+                    /error/i.test(visit.page.blockPage || '') && /502/.test(visit.page.text || '')],
+                ['the state is unverifiable: an error answer is not a mismatch', 'must',
+                    !!state && state.integrity === 'unverifiable'
+                    && state.reasons.some((entry) => entry.code === 'error-response')],
+            ] : [
+                ['the state is not verified', 'must', !state || state.integrity !== 'verified'],
+            ]);
+        },
+    },
+    {
         id: 'service-worker',
         title: 'service worker registered before the extension answers the navigation',
         async run(t) {

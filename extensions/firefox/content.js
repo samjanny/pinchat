@@ -483,10 +483,14 @@ function applyVerdict(verdict) {
         return;
     }
     if (verdict.integrity === V.INTEGRITY.UNVERIFIABLE && verdict.canAttest) {
+        const serverError = reasons.some((entry) => entry.code === 'error-response');
         showOverlay({
             kind: 'unverifiable',
-            title: 'This page could not be verified',
-            lead: 'Nothing was found wrong, but the page was not checked. Reload it.',
+            title: serverError ? 'The server answered with an error' : 'This page could not be verified',
+            lead: serverError
+                ? 'What the server sent is not a PinChat page and is not shown. '
+                    + 'If this was a link to a room, the room may no longer exist.'
+                : 'Nothing was found wrong, but the page was not checked. Reload it.',
             items: reasons,
         });
         return;

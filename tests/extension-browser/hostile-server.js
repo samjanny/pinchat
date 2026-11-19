@@ -55,6 +55,10 @@ const TYPES = {
  *   link-header              add a Link: rel=stylesheet header to documents
  *   cacheable                make the (possibly altered) chat.html cacheable
  *   sw-install               serve a page that registers /sw.js
+ *   room-gone                answer /c/<uuid> the way the real server does
+ *                            for a room that no longer exists
+ *   gateway-error            answer navigations to the chat page the way a
+ *                            reverse proxy does while the server restarts
  */
 const state = { mode: 'clean', log: [] };
 
@@ -176,6 +180,9 @@ function handleSite(req, res, url) {
     record(req, url);
 
     const room = /^\/c\/([0-9a-f-]{36})$/.exec(url.pathname);
+    if (room && state.mode === 'room-gone') {
+        return send(res, 404, { 'content-type': 'text/plain; charset=utf-8' }, 'Room not found');
+    }
     if (room) {
         const [, kind, code, target] = /^(redirect):(\d+):(.+)$/.exec(state.mode) || [];
         if (kind && REDIRECTS[target]) {
@@ -207,6 +214,10 @@ function handleSite(req, res, url) {
         return send(res, 200, { 'content-type': 'text/css' }, 'html { outline: 9px solid rgb(255, 0, 0); }');
     }
     if (!url.pathname.startsWith('/static/')) return send(res, 404, {}, '');
+    if (state.mode === 'gateway-error' && navigation && url.pathname === '/static/chat.html') {
+        return send(res, 502, { 'content-type': 'text/html' },
+            '<html><head><title>502 Bad Gateway</title></head><body><h1>502 Bad Gateway</h1></body></html>');
+    }
 
     const file = path.join(staticDir, path.normalize(url.pathname.slice('/static/'.length)));
     if (!file.startsWith(staticDir + path.sep) || !fs.existsSync(file) || fs.statSync(file).isDirectory()) {

@@ -395,6 +395,25 @@ test('the Chromium redirect rules allow only what the same check allows', () => 
     }
 });
 
+test('an error answer from the server is unverifiable, never a mismatch', () => {
+    assert.strictEqual(V.FINDINGS['error-response'][0], V.CLASS.LIMIT);
+    const record = {
+        manifest: 'valid',
+        official: true,
+        topLevel: true,
+        checksDone: true,
+        policyInForce: true,
+        workerControlled: false,
+        canAttest: true,
+        attested: false,
+        findings: [V.finding('error-response', 'HTTP status 404')],
+    };
+    assert.strictEqual(V.decide(record).integrity, V.INTEGRITY.UNVERIFIABLE);
+    // A confirmed finding next to it still fails the document.
+    record.findings.push(V.finding('unsigned-stylesheet'));
+    assert.strictEqual(V.decide(record).integrity, V.INTEGRITY.FAILED);
+});
+
 test('document hashes come from the signed manifest only', () => {
     const signed = JSON.parse(fs.readFileSync(path.join(root, 'hashes.json.signed'), 'utf8'));
     const documents = V.documentHashes(signed.data);

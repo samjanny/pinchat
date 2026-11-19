@@ -722,14 +722,34 @@ const inflight = new Map();
 function blockPageBytes(code, detail) {
     const entry = V.FINDINGS[code] || V.FINDINGS['document-not-attested'];
     const escape = (text) => String(text).replace(/[&<>"]/g, (c) => `&#${c.charCodeAt(0)};`);
+    // An error answer is not a page that was stopped: say what it is.
+    const heading = code === 'error-response'
+        ? 'The server answered with an error'
+        : 'Page blocked by the PinChat Integrity Verifier';
     const html = '<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">'
-        + '<title>Blocked by the PinChat Integrity Verifier</title></head><body>'
-        + '<h1>Page blocked by the PinChat Integrity Verifier</h1>'
+        + `<title>${escape(heading)}</title></head><body>`
+        + `<h1>${escape(heading)}</h1>`
         + `<p id="verifier-block-reason">${escape(entry[1])}</p>`
         + (detail ? `<p>${escape(detail)}</p>` : '')
-        + '<p>Nothing the server sent for this address is shown.</p>'
+        + '<p>Shown by the PinChat Integrity Verifier. Nothing the server sent for this address is shown.</p>'
         + '</body></html>';
     return new TextEncoder().encode(html);
+}
+
+/**
+ * Headers for a response whose body the filter is going to release.
+ *
+ * What is released is the signed page or the block page, never anything
+ * else, and both are HTML in UTF-8. The server's own description of the body
+ * is therefore replaced. Left alone, a block page standing in for a
+ * plain-text error was displayed as its source, and the signed bytes could
+ * be given another character encoding or be sent as a download.
+ */
+function asHtmlDocument(headers) {
+    const kept = (headers || []).filter((header) => !['content-type', 'content-disposition']
+        .includes(header.name.toLowerCase()));
+    kept.push({ name: 'Content-Type', value: 'text/html; charset=utf-8' });
+    return kept;
 }
 
 function toHex(buffer) {
@@ -821,7 +841,7 @@ function onDocumentHeaders(details) {
             return { cancel: true };
         }
         track.status = details.statusCode;
-        return {};
+        return { responseHeaders: asHtmlDocument(details.responseHeaders) };
     } catch (error) {
         console.error('[PinChat Verify] Header check failed:', error);
         showBlockedPage(details, 'document-not-attested');
@@ -860,10 +880,16 @@ async function finishDocument(track) {
                 offset += chunk.byteLength;
             }
             const expected = V.documentHashes(verificationState.manifest).get(new URL(track.url).pathname);
-            if (!expected) {
-                outcome = { verified: false, code: 'unlisted-document', detail: `HTTP status ${track.status}` };
-            } else if (toHex(await crypto.subtle.digest('SHA-256', body)) === expected) {
+            if (expected && toHex(await crypto.subtle.digest('SHA-256', body)) === expected) {
                 outcome = { verified: true, code: null, detail: '' };
+            } else if (track.status >= 400) {
+                // The server says itself that this is not the page: a room
+                // that no longer exists, a rate limit, a gateway error
+                // during a restart. It is withheld like anything else that
+                // is not the signed page, but it is not a mismatch.
+                outcome = { verified: false, code: 'error-response', detail: `HTTP status ${track.status}` };
+            } else if (!expected) {
+                outcome = { verified: false, code: 'unlisted-document', detail: `HTTP status ${track.status}` };
             } else {
                 outcome = { verified: false, code: 'document-hash-mismatch', detail: '' };
             }

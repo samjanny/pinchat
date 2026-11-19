@@ -109,6 +109,8 @@
             'The server answered with a page that is not part of the signed release.'],
         'document-too-large': [CLASS.LIMIT,
             'The page was larger than any signed page and was not read.'],
+        'error-response': [CLASS.LIMIT,
+            'The server answered with an error instead of a page. What it sent is not shown.'],
         // ---- environment --------------------------------------------------
         'inline-script-element': [CLASS.ENVIRONMENT,
             'An inline script element was added to the page. The policy does not run inline scripts.'],

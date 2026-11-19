@@ -78,6 +78,8 @@ const PROBE = `() => {
         url: location.href,
         fragment: location.hash,
         title: document.title,
+        contentType: document.contentType,
+        text: document.body ? document.body.textContent.trim().slice(0, 200) : '',
         appLoaded: document.title.includes('PinChat') && !!document.querySelector('[x-data]'),
         attacker: root ? root.getAttribute('data-attacker') : null,
         marker: text('marker'),

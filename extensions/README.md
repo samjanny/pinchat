@@ -266,7 +266,12 @@ scripts.
    the signed hash for that address, and only then released to the parser,
    byte for byte. Anything else is replaced by a block page that contains
    nothing the server sent. If the filter cannot attach to a response, the
-   response is cancelled.
+   response is cancelled. What is released is always delivered as HTML in
+   UTF-8, whatever type, character encoding or disposition the server
+   declared. An answer with an error status that is not a signed page (a
+   room that no longer exists, a rate limit, a gateway error) is withheld
+   in the same way but reported as an error answer and as "unverifiable",
+   not as a mismatch.
 5. **DOM inspection** (both). Script, stylesheet, base, frame and form
    elements are compared with the manifest, as described above.
 6. **File re-download** (both). Every file of the manifest is downloaded
