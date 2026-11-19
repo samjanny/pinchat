@@ -204,6 +204,61 @@ module.exports = [
         },
     },
     {
+        id: 'extension-link',
+        title: 'the site\'s own extension link, redirected to the release page',
+        async run(t) {
+            const browser = await t.launch();
+            const visit = await t.visit(browser, `${t.urls.SITE}/ext/chrome`, 3000);
+            const seen = t.digest(visit.log);
+            t.report(summary(visit, t, { 'requests to the release page': seen.releasePageRequests }), [
+                ['the redirect is followed', 'must',
+                    seen.releasePageRequests === 1 && visit.page.marker === 'RELEASE-PAGE-STAND-IN'],
+                ['no warning is shown', 'must', !visit.page.overlay && !visit.page.blockPage],
+                ['nothing reaches the attacker origin', 'must', seen.attackerRequests === 0],
+            ]);
+        },
+    },
+    ...['release', 'via-ext-link'].map((kind) => ({
+        id: `redirect-${kind}`,
+        title: kind === 'release'
+            ? 'invite link redirected to the release page, an allowed target for a link without a key'
+            : 'invite link redirected to the site\'s extension link, which redirects off the site',
+        async run(t) {
+            await t.control(`/mode?set=redirect:302:${kind}`);
+            const browser = await t.launch();
+            const visit = await t.visit(browser, t.urls.INVITE, 3000);
+            const seen = t.digest(visit.log);
+            t.report(summary(visit, t, { 'requests to the release page': seen.releasePageRequests }), [
+                ['the release page received no request', 'must', seen.releasePageRequests === 0],
+                ['no document outside the site saw the fragment', 'must',
+                    !(visit.page.leak || '').includes('TESTSECRET')
+                    && visit.page.marker !== 'RELEASE-PAGE-STAND-IN'],
+            ]);
+        },
+    })),
+    {
+        id: 'address-rewrite',
+        title: 'a page that rewrites its own address without loading another document',
+        async run(t) {
+            const browser = await t.launch();
+            const page = `${t.urls.SITE}/static/login.html`;
+            // The login page shows the error and then drops the parameter
+            // from its address with history.replaceState.
+            const visit = await t.visit(browser, `${page}?error=Invalid%20password`, 5000);
+            const state = await t.verifierState(browser, page);
+            const firefox = t.browserName === 'firefox';
+            t.report(summary(visit, t, {
+                'verifier state': stateLabel(state),
+                'address in the record': state ? state.url : '(none)',
+            }), [
+                ['the page did rewrite its address', 'must', visit.page.url === page],
+                ['the document keeps its state', 'must',
+                    !!state && state.integrity === (firefox ? 'verified' : 'partial')],
+                ['the record follows the new address', 'must', !!state && state.url === page],
+            ]);
+        },
+    },
+    {
         id: 'service-worker',
         title: 'service worker registered before the extension answers the navigation',
         async run(t) {

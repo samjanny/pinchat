@@ -218,7 +218,9 @@ try {
     // the same rule in its background script, so its ruleset must not carry
     // a rule it would reject.
     const redirectRules = rules.filter((rule) => rule.action.type === 'block');
-    const expectedRedirectRules = browser === 'chrome' ? 1 : 0;
+    // Two in Chromium: one for every navigation, one that is stricter for a
+    // navigation whose address carries a fragment.
+    const expectedRedirectRules = browser === 'chrome' ? 2 : 0;
     if (redirectRules.length !== expectedRedirectRules
       || redirectRules.some((rule) => !rule.condition.responseHeaders
         || rule.condition.responseHeaders[0].header !== 'location')) {

@@ -248,12 +248,19 @@ scripts.
    worker never receives the extension's header rules. If either check
    fails, the document is stopped and marked failed. Service workers
    registered for the site are removed; the site uses none.
-3. **Redirect guard** (both). A document navigation on the site may only be
-   redirected to the site itself. An invite link carries its key after the
-   `#`, and browsers carry that fragment across redirects, to another origin
-   too. Chromium enforces this with a rule on the `Location` response header
-   (which is why the minimum version is 128); Firefox enforces it in the
-   background script.
+3. **Redirect guard** (both). An invite link carries its key after the `#`,
+   and browsers carry that fragment across redirects, to another origin too.
+   A document navigation on the site whose address carries a fragment may
+   therefore only be redirected to the site itself. One without a fragment
+   has nothing to hand over, and may also be redirected to the three places
+   the site's own links lead to: the project's release page and the two
+   extension stores (the "Add to Chrome" and "Add to Firefox" buttons go
+   through `/ext/chrome` and `/ext/firefox`, which the reverse proxy
+   redirects). The list is `EXTERNAL_REDIRECT_TARGETS` in `verdict.js`; none
+   of the three is an origin the server operator controls. Every other
+   redirect off the site is refused, fragment or not. Chromium enforces this
+   with rules on the `Location` response header (which is why the minimum
+   version is 128); Firefox enforces it in the background script.
 4. **Page bytes** (Firefox). `webRequest.filterResponseData` holds the body
    of every document navigation on the site. It is hashed and compared with
    the signed hash for that address, and only then released to the parser,
@@ -387,6 +394,7 @@ The integrity approach provides multiple layers of protection:
 | Server links an unsigned same-origin stylesheet | Loaded; state "failed" | Page replaced by the block page |
 | Server sends `Link: rel=stylesheet` | Header removed | Header removed |
 | Server redirects an invite link to another origin | Navigation blocked | Navigation blocked |
+| Server redirects an invite link to the release page or a store, directly or through `/ext/chrome` | Navigation blocked: the address carries a fragment | Same |
 | Server redirects to another port or scheme of the host | Blocked, as above | Blocked, as above |
 | Service worker registered before the extension answers the navigation | Document stopped, worker removed, page reloaded | Same |
 | Manifest host unreachable, nothing stored | "Unverifiable"; script policy still in force | Navigation replaced by the block page |
@@ -489,7 +497,7 @@ extensions/
 ├── hashes.json.example    # Example hash file format
 ├── chrome/                # Chromium build
 │   ├── manifest.json      # Extension manifest (MV3)
-│   ├── rules.json         # Script policy, header removals, redirect rule
+│   ├── rules.json         # Script policy, header removals, redirect rules
 │   ├── verdict.js         # What each state means (pure logic, unit tested)
 │   ├── background.js      # Manifest validation, per-tab state, response check
 │   ├── content.js         # Probes, DOM inspection, overlay
@@ -502,7 +510,7 @@ extensions/
 │   └── icons/             # Extension icons
 └── firefox/               # Firefox build: same sources, own manifest and rules
     ├── manifest.json      # Adds the webRequest permissions for the response check
-    ├── rules.json         # No redirect rule: enforced in background.js instead
+    ├── rules.json         # No redirect rules: enforced in background.js instead
     └── ...                # verdict.js, background.js, content.js, popup.*,
                            # blocked.* and warning.css are identical to chrome/
 ```

@@ -799,7 +799,8 @@ function onDocumentHeaders(details) {
         const location = (details.responseHeaders || [])
             .find((header) => header.name.toLowerCase() === 'location');
         if (details.statusCode >= 300 && details.statusCode < 400 && location) {
-            if (!V.isAllowedRedirect(details.url, location.value || '', OFFICIAL_ORIGINS)) {
+            if (!V.isAllowedRedirect(details.url, location.value || '', OFFICIAL_ORIGINS,
+                V.EXTERNAL_REDIRECT_TARGETS)) {
                 console.error('[PinChat Verify] Refused a redirect that leaves the site');
                 inflight.delete(details.requestId);
                 showBlockedPage(details, 'redirect-off-site');
@@ -1063,17 +1064,45 @@ ext.tabs.onRemoved.addListener((tabId) => {
     restoreSessionState().then(() => forgetTab(tabId));
 });
 
+/**
+ * Whether the document a record describes is still the one shown in its tab.
+ * Its content script answers with the token it announced itself with; a new
+ * document has another token, and a tab with no content script does not
+ * answer at all.
+ */
+async function documentStillShown(tabId, token) {
+    try {
+        const reply = await ext.tabs.sendMessage(tabId, { type: 'IDENTIFY' }, { frameId: 0 });
+        return !!reply && reply.token === token;
+    } catch {
+        return false;
+    }
+}
+
 ext.tabs.onUpdated.addListener((tabId, changeInfo) => {
     if (!changeInfo.url) return;
-    restoreSessionState().then(() => {
-        // The tab moved to another address: the record describes a document
-        // that is no longer there. The new one announces itself.
+    restoreSessionState().then(async () => {
         const record = documents.get(tabId);
-        if (record && record.url !== V.documentUrl(changeInfo.url)) {
-            documents.delete(tabId);
+        const url = V.documentUrl(changeInfo.url);
+        if (!record || record.url === url) return;
+
+        // The address of the tab changed. Usually another document is
+        // loading, and it will announce itself. But a page can also rewrite
+        // its own address without loading anything (the login page drops
+        // its error parameter that way): the document is then the same one,
+        // and what was established about it still describes it.
+        const sameDocument = isPinChatUrl(url) && await documentStillShown(tabId, record.token);
+        if (documents.get(tabId) !== record) return; // replaced while waiting
+        if (sameDocument) {
+            record.url = url;
             persistSessionState();
-            setBadge(tabId, null);
+            setBadge(tabId, record);
+            return;
         }
+        // The record describes a document that is no longer there.
+        documents.delete(tabId);
+        persistSessionState();
+        setBadge(tabId, null);
     });
 });
 

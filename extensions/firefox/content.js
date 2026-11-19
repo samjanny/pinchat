@@ -692,8 +692,14 @@ async function start({ restored = false } = {}) {
     }
 }
 
-ext.runtime.onMessage.addListener((message) => {
+ext.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (!ON_OFFICIAL_ORIGIN || !IS_TOP_LEVEL || !message) return;
+    if (message.type === 'IDENTIFY') {
+        // The background script asks which document this is, to tell a page
+        // that rewrote its own address from a new document at that address.
+        sendResponse({ token: DOCUMENT_TOKEN });
+        return;
+    }
     if (message.type === 'VERDICT' && message.token === DOCUMENT_TOKEN) {
         applyVerdict(message.verdict);
     }

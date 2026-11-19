@@ -14,7 +14,8 @@
  * the static/ files in the working tree must be the ones of that release.
  * Nothing is sent to the real site: its host name is remapped to 127.0.0.1
  * (Chromium) or tunnelled there by a proxy that refuses everything else
- * (Firefox).
+ * (Firefox). The same goes for the host of the release page, which the
+ * site's extension links redirect to.
  *
  * Usage:
  *   node tests/extension-browser/run.js [options] [case-id ...]
@@ -105,7 +106,7 @@ async function withServer(work, body) {
         'req', '-x509', '-newkey', 'rsa:2048', '-nodes',
         '-keyout', path.join(work, 'key.pem'), '-out', path.join(work, 'cert.pem'),
         '-days', '1', '-subj', '/CN=pinchat.io',
-        '-addext', 'subjectAltName=DNS:pinchat.io,DNS:www.pinchat.io,DNS:attacker.test',
+        '-addext', 'subjectAltName=DNS:pinchat.io,DNS:www.pinchat.io,DNS:attacker.test,DNS:github.com',
     ], { stdio: 'ignore' });
     const server = spawn(process.execPath, [
         path.join(__dirname, 'hostile-server.js'), work, String(HTTPS_PORT), String(CONTROL_PORT),
@@ -143,7 +144,7 @@ function makeContext(browserName, work) {
         if (passwordManager) extensions.push(path.join(__dirname, 'pm-sim'));
         let browser;
         if (browserName === 'chromium') {
-            const hosts = ['pinchat.io', 'www.pinchat.io', 'attacker.test'];
+            const hosts = ['pinchat.io', 'www.pinchat.io', 'attacker.test', 'github.com'];
             // No release host: point it at the local server, which has no
             // manifest to offer.
             if (!releaseHost) hosts.push('raw.githubusercontent.com');
@@ -152,7 +153,7 @@ function makeContext(browserName, work) {
             });
         } else {
             proxy = await startProxy({
-                localHosts: ['pinchat.io', 'www.pinchat.io', 'attacker.test'],
+                localHosts: ['pinchat.io', 'www.pinchat.io', 'attacker.test', 'github.com'],
                 localPort: HTTPS_PORT,
                 passthroughHosts: releaseHost ? ['raw.githubusercontent.com'] : [],
             });
@@ -243,6 +244,7 @@ function digest(log) {
     const leak = log.find((entry) => entry.note.startsWith('leak '));
     return {
         attackerRequests: log.filter((entry) => entry.host.startsWith('attacker.test')).length,
+        releasePageRequests: log.filter((entry) => entry.note === 'release page').length,
         leakedFragment: leak ? leak.note.slice(5) : null,
         verifierFetches: log.filter((entry) => entry.mode === 'cors' && entry.dest === 'empty'
             && !entry.host.startsWith('attacker.test') && entry.path.startsWith('/static/')).length,

@@ -3,8 +3,9 @@
  * Hostile stand-in for the origin, for tests/extension-browser/run.js.
  *
  * One HTTPS listener on 127.0.0.1 answers for every host name the browser
- * under test is pointed at: the site itself (on any port), and
- * "attacker.test", an origin the server operator also controls. A plain HTTP
+ * under test is pointed at: the site itself (on any port), "attacker.test",
+ * an origin the server operator also controls, and the host of the release
+ * page, which the site's own extension links redirect to. A plain HTTP
  * control listener, also on 127.0.0.1, lets the test runner switch the
  * server's behaviour and read what it received.
  *
@@ -31,6 +32,10 @@ const CONTROL_PORT = Number(controlPortArg || 8442);
 const staticDir = path.join(__dirname, '..', '..', 'static');
 
 const ATTACKER_HOST = 'attacker.test';
+// Where the reverse proxy of the real site sends /ext/chrome and
+// /ext/firefox. Not controlled by the server operator.
+const RELEASE_HOST = 'github.com';
+const RELEASE_PAGE = `https://${RELEASE_HOST}/samjanny/pinchat/releases/latest`;
 
 const TYPES = {
     '.html': 'text/html; charset=utf-8',
@@ -62,6 +67,10 @@ const REDIRECTS = {
     port: () => 'https://pinchat.io:8444/collect',
     // Two hops that stay on the site, then off it.
     chain: () => '/static/hop1',
+    // The release page, which a navigation without a fragment may reach.
+    release: () => RELEASE_PAGE,
+    // The site's own extension link, which redirects there in turn.
+    'via-ext-link': () => '/ext/chrome',
 };
 
 const HANDLER = '<img src="/static/missing.png" '
@@ -135,6 +144,23 @@ function send(res, status, headers, body) {
     res.end(body);
 }
 
+/** Stand-in for the release page. Shows the fragment it was reached with. */
+const RELEASE_STAND_IN = `<!DOCTYPE html><html><head><title>release</title></head><body>
+<p id="marker">RELEASE-PAGE-STAND-IN</p>
+<p id="leak"></p>
+<script>document.getElementById('leak').textContent = location.hash;</script>
+</body></html>`;
+
+function handleRelease(req, res, url) {
+    if (url.pathname !== new URL(RELEASE_PAGE).pathname) {
+        // The browser asking for an icon, not a visit to the page.
+        record(req, url);
+        return send(res, 404, {}, '');
+    }
+    record(req, url, 'release page');
+    return send(res, 200, { 'content-type': 'text/html; charset=utf-8' }, RELEASE_STAND_IN);
+}
+
 function handleAttacker(req, res, url) {
     if (url.pathname === '/leak') {
         record(req, url, `leak ${url.searchParams.get('fragment')}`);
@@ -156,6 +182,10 @@ function handleSite(req, res, url) {
             return send(res, Number(code), { location: REDIRECTS[target](room[1]) }, '');
         }
         return send(res, 303, { location: REDIRECTS.internal(room[1]) }, '');
+    }
+    if (url.pathname === '/ext/chrome' || url.pathname === '/ext/firefox') {
+        // What the reverse proxy of the real site answers.
+        return send(res, 302, { location: RELEASE_PAGE }, '');
     }
     if (url.pathname === '/static/hop1') return send(res, 302, { location: '/static/hop2' }, '');
     if (url.pathname === '/static/hop2') return send(res, 307, { location: REDIRECTS.cross() }, '');
@@ -212,6 +242,7 @@ https.createServer({
     const url = new URL(req.url, 'https://placeholder');
     const hostname = (req.headers.host || '').replace(/:\d+$/, '');
     if (hostname === ATTACKER_HOST) return handleAttacker(req, res, url);
+    if (hostname === RELEASE_HOST) return handleRelease(req, res, url);
     return handleSite(req, res, url);
 }).listen(HTTPS_PORT, '127.0.0.1');
 

@@ -14,6 +14,8 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 
+const { EXTERNAL_REDIRECT_TARGETS } = require('./chrome/verdict.js');
+
 // Pages that get a per-page, hash-pinned script-src. The script list for
 // each one is READ FROM THE PAGE ITSELF rather than repeated here.
 //
@@ -127,8 +129,10 @@ function documentHeaders(csp) {
  * Location header names a fragment of its own. A server that answers an
  * invite link with a redirect to an origin it controls therefore finds the
  * key in that origin's location.hash, without running any code on the site.
- * Every redirect the site makes stays on the site, so anything else is
- * blocked.
+ * So a navigation whose address carries a fragment may be redirected to
+ * the site and nowhere else (FRAGMENT_REGEX below), and one without a
+ * fragment to the site or to one of EXTERNAL_REDIRECT_TARGETS, the few
+ * places the site's own links lead to through a redirect.
  *
  * These are header-value patterns: "*" matches any run of characters, "?"
  * matches zero or one character, and a backslash makes the next character
@@ -151,6 +155,16 @@ const ALLOWED_REDIRECT_LOCATIONS = [
     '/login',
     '/login\\?*',
 ];
+
+// EXTERNAL_REDIRECT_TARGETS is written for both browsers: complete
+// addresses, or a prefix with one final "*". Anything else in an entry
+// would mean something different as a header-value pattern here than it
+// does to the check in verdict.js.
+for (const target of EXTERNAL_REDIRECT_TARGETS) {
+    if (!/^https:\/\/[a-z0-9.-]+\/[A-Za-z0-9._~\/-]*\*?$/.test(target)) {
+        throw new Error(`External redirect target cannot be used as a header-value pattern: ${target}`);
+    }
+}
 
 function hexToSRI(hex) {
     if (!/^[a-f0-9]{64}$/i.test(hex)) {
@@ -177,6 +191,11 @@ function buildCsp(scriptPaths, hashesByPath) {
 // now accepts a query, a fragment, or both.
 const CATCH_ALL_REGEX = '^https://(www\\.)?pinchat\\.io\\.?(:[0-9]+)?/';
 
+// The same documents, when the address carries a fragment. The browser
+// matches a rule against the whole address, and the fragment an earlier
+// redirect carried over is part of it.
+const FRAGMENT_REGEX = `${CATCH_ALL_REGEX}[^#]*#`;
+
 function pageRegex(pagePath) {
     const escapedPath = pagePath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     return `^https://(www\\.)?pinchat\\.io${escapedPath}(?:[?#].*)?$`;
@@ -184,7 +203,7 @@ function pageRegex(pagePath) {
 
 /**
  * Build the ruleset for one browser. The policy rules are the same for
- * both. The redirect rule exists for Chromium only: it relies on matching a
+ * both. The redirect rules exist for Chromium only: they rely on matching a
  * response header, which Firefox's declarativeNetRequest does not support.
  * The Firefox build enforces the same rule in its background script.
  */
@@ -234,19 +253,25 @@ function buildRules(manifestDocument, browser = 'chrome') {
         });
     }
     if (browser === 'chrome') {
-        rules.push({
+        // Two rules, and a redirect has to pass both. The first holds for
+        // every navigation and does not depend on the fragment at all; the
+        // second takes the external targets away again from a navigation
+        // that carries one.
+        const redirectRule = (regexFilter, allowed) => ({
             id: id++,
             priority: 3,
             action: { type: 'block' },
             condition: {
-                regexFilter: CATCH_ALL_REGEX,
+                regexFilter,
                 resourceTypes: ['main_frame', 'sub_frame'],
                 responseHeaders: [{
                     header: 'location',
-                    excludedValues: ALLOWED_REDIRECT_LOCATIONS
+                    excludedValues: allowed
                 }]
             }
         });
+        rules.push(redirectRule(CATCH_ALL_REGEX, [...ALLOWED_REDIRECT_LOCATIONS, ...EXTERNAL_REDIRECT_TARGETS]));
+        rules.push(redirectRule(FRAGMENT_REGEX, ALLOWED_REDIRECT_LOCATIONS));
     }
     return rules;
 }
@@ -273,6 +298,7 @@ if (require.main === module) {
 module.exports = {
     PAGES,
     CATCH_ALL_REGEX,
+    FRAGMENT_REGEX,
     ALLOWED_REDIRECT_LOCATIONS,
     pageRegex,
     pageScripts,

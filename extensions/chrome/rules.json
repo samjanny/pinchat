@@ -196,6 +196,38 @@
             "/static/*",
             "/c/*",
             "/login",
+            "/login\\?*",
+            "https://github.com/samjanny/pinchat/releases/latest",
+            "https://chromewebstore.google.com/detail/*",
+            "https://addons.mozilla.org/*"
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": 8,
+    "priority": 3,
+    "action": {
+      "type": "block"
+    },
+    "condition": {
+      "regexFilter": "^https://(www\\.)?pinchat\\.io\\.?(:[0-9]+)?/[^#]*#",
+      "resourceTypes": [
+        "main_frame",
+        "sub_frame"
+      ],
+      "responseHeaders": [
+        {
+          "header": "location",
+          "excludedValues": [
+            "https://pinchat.io/*",
+            "https://www.pinchat.io/*",
+            "/",
+            "/\\?*",
+            "/static/*",
+            "/c/*",
+            "/login",
             "/login\\?*"
           ]
         }

@@ -715,8 +715,11 @@ describes every state and what each may be based on.
   the browser refuse any script whose hash is not signed
 - Inline scripts and inline event handlers in altered HTML
 - A redirect of an invite link to another origin, which would hand the key
-  in the URL fragment to that origin: document navigations on the site may
-  only be redirected to the site
+  in the URL fragment to that origin: a document navigation on the site
+  whose address carries a fragment may only be redirected to the site. One
+  without a fragment may also be redirected to the project's release page
+  or to the two extension stores, which is where the site's own extension
+  links lead, and nowhere else
 - A redirect to another port or scheme of the same host
 - A service worker registered before the extension was installed answering
   navigations with content of its own: such a document is stopped, the

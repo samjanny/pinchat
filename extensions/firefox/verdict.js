@@ -300,21 +300,55 @@
      * a fragment across HTTP redirects, to another origin too, unless the
      * Location header names a fragment of its own. A server that answers an
      * invite link with a redirect to an origin it controls therefore
-     * receives the key in that origin's `location.hash`. The site's own
-     * redirects all stay on the site, so nothing else is allowed.
+     * receives the key in that origin's `location.hash`. So a navigation
+     * may be redirected to the site and nowhere else.
      *
      * `location` is resolved against `fromUrl` exactly as a browser does,
      * which settles scheme-relative, backslash and other odd forms.
+     *
+     * The one exception is EXTERNAL_REDIRECT_TARGETS, and only for a
+     * navigation whose address carries no fragment: with nothing after the
+     * "#" there is nothing a redirect could hand over.
      */
-    function isAllowedRedirect(fromUrl, location, officialOrigins) {
+    function isAllowedRedirect(fromUrl, location, officialOrigins, externalTargets = []) {
         let target;
+        let from;
         try {
             target = new URL(location, fromUrl);
+            from = new URL(fromUrl);
         } catch (_) {
             return false;
         }
-        return officialOrigins.includes(target.origin);
+        if (officialOrigins.includes(target.origin)) return true;
+        if (from.hash !== '') return false;
+        return externalTargets.some((pattern) => (pattern.endsWith('*')
+            ? target.href.startsWith(pattern.slice(0, -1))
+            : target.href === pattern));
     }
+
+    /**
+     * The places outside the site that the site itself sends a visitor to
+     * with a redirect: the "Add to Chrome" and "Add to Firefox" buttons of
+     * the home page go through /ext/chrome and /ext/firefox, which the
+     * reverse proxy answers with a redirect to the release page today and
+     * to the store listings once they exist.
+     *
+     * Each entry is either a complete address or a prefix ending in "*",
+     * and every prefix ends after the "/" that closes the host name, so
+     * none can be extended into another authority. The same strings are
+     * packaged as header-value patterns in the Chromium ruleset (see
+     * generate-csp-rules.js), where none of them contains a character that
+     * is special in that syntax apart from the final "*".
+     *
+     * None of these is an origin the server operator controls, which is
+     * what the redirect guard is about. A navigation that carries a
+     * fragment is still never allowed to reach them.
+     */
+    const EXTERNAL_REDIRECT_TARGETS = Object.freeze([
+        'https://github.com/samjanny/pinchat/releases/latest',
+        'https://chromewebstore.google.com/detail/*',
+        'https://addons.mozilla.org/*',
+    ]);
 
     /** URL without its fragment: the identity of a document for bookkeeping. */
     function documentUrl(url) {
@@ -345,6 +379,7 @@
         badge,
         headline,
         isAllowedRedirect,
+        EXTERNAL_REDIRECT_TARGETS,
         documentUrl,
         documentHashes,
     };
