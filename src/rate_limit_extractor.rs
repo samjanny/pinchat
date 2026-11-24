@@ -9,7 +9,7 @@
 //! Supports trusted proxy configuration for X-Forwarded-For when running
 //! behind a load balancer or reverse proxy.
 
-use crate::ip_hash::{extract_client_ip_with_proxy, hash_ip};
+use crate::ip_hash::{extract_client_ip_with_proxy, hash_ip, hash_ipv6_prefix48};
 use crate::state::AppState;
 use axum::extract::ConnectInfo;
 use std::net::SocketAddr;
@@ -64,4 +64,17 @@ impl KeyExtractor for HmacIpKeyExtractor {
 
         Ok(ip_hash)
     }
+}
+
+/// Key of the IPv6 /48 the request comes from, for the second bucket of
+/// each per-address quota (see `ip_quota_layer!`). `None` for IPv4, which
+/// has no such bucket, and for a request without connection info.
+pub fn prefix48_key<T>(req: &axum::http::Request<T>, app_state: &AppState) -> Option<String> {
+    let connect_info = req.extensions().get::<ConnectInfo<SocketAddr>>()?;
+    let ip = extract_client_ip_with_proxy(
+        connect_info,
+        req.headers(),
+        &app_state.config.trusted_proxies,
+    );
+    hash_ipv6_prefix48(&ip, &app_state.ip_hash_secret)
 }
