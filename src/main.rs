@@ -13,6 +13,7 @@ mod rate_limit;
 mod rate_limit_extractor;
 mod session;
 mod state;
+mod ws_transport;
 
 use axum::{
     Router,
@@ -186,8 +187,76 @@ fn limited_api_routes(
         .with_state(app_state.clone())
 }
 
-#[tokio::main]
-async fn main() {
+/// Upper bound of what the kernel may queue for one connection, in each
+/// direction.
+///
+/// Left to itself the kernel grows both buffers of a socket to several
+/// megabytes, and that memory is charged to this process like any other.
+/// Towards a peer that reads slowly it is the send buffer that grows. The
+/// receive buffer grows while the relay reads fast and then holds whatever
+/// the peer goes on sending once the relay stops reading that connection,
+/// which it does on purpose when a message has to wait for memory: without
+/// a bound, the wait would only move the bytes from the relay to the kernel.
+/// A fixed size turns the growth off: a connection costs this much and no
+/// more, and a write to a peer that does not read stops making progress
+/// sooner. The kernel doubles the value it is given, for its own
+/// bookkeeping.
+///
+/// What a connection costs in the kernel is the largest per-connection cost
+/// of the relay, so this decides how many connections fit in its memory
+/// (see `MAX_WS_CONNECTIONS`). Measured with peers that stop reading and
+/// peers that keep sending while the relay waits, 128 KiB came to about
+/// 210 KiB in each direction. Smaller is not free: at 32 KiB a 3.7 MB
+/// message over loopback (a relay on the same host as its proxy, with no
+/// container network in between) took 1.4 to 1.8 seconds instead of 10 to
+/// 30 milliseconds, because the window no longer held one of loopback's
+/// 64 KiB segments and every step waited for a delayed acknowledgement.
+/// Over a container bridge (1500 bytes) 32, 64 and 128 KiB all took 10 to
+/// 30 milliseconds. 64 KiB is the smallest size that is fast on both, and
+/// costs at most 256 KiB a connection.
+const SOCKET_BUFFER: usize = 64 * 1024;
+
+/// Applied to the listening socket, which every accepted socket copies.
+fn bound_socket_buffers<S: std::os::fd::AsFd>(listener: &S) {
+    let socket = socket2::SockRef::from(listener);
+    if socket.set_send_buffer_size(SOCKET_BUFFER).is_err()
+        || socket.set_recv_buffer_size(SOCKET_BUFFER).is_err()
+    {
+        tracing::error!("Could not bound the socket buffers");
+    }
+}
+
+/// Have the allocator hand large blocks straight back to the system.
+///
+/// glibc serves a large allocation with a mapping of its own and unmaps it
+/// when it is freed, but only until the first such block has been freed:
+/// from then on it raises the size above which it does so, up to 32 MiB on
+/// 64-bit systems, and keeps what is freed below that size for later use.
+/// For a relay that means the memory of the largest burst of images it has
+/// ever carried stays with the process. Naming the threshold switches the
+/// adjustment off; the value is the one glibc starts from.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn return_freed_memory_to_the_system() {
+    // SAFETY: mallopt takes plain integers and changes one setting of the
+    // allocator. It runs first thing in `main`, before any other thread.
+    unsafe {
+        libc::mallopt(libc::M_MMAP_THRESHOLD, 128 * 1024);
+    }
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+fn return_freed_memory_to_the_system() {}
+
+fn main() {
+    return_freed_memory_to_the_system();
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("the runtime could not be started")
+        .block_on(run());
+}
+
+async fn run() {
     use std::env;
 
     // Load .env file if present; a missing file is tolerated
@@ -251,9 +320,9 @@ async fn main() {
 
     // Read MAX_TOTAL_ROOMS configuration
     let max_rooms = env::var("MAX_TOTAL_ROOMS")
-        .unwrap_or_else(|_| "1000".to_string())
-        .parse::<usize>()
-        .unwrap_or(1000);
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(config::DEFAULT_MAX_TOTAL_ROOMS);
 
     tracing::info!("Maximum concurrent rooms: {}", max_rooms);
 
@@ -524,7 +593,25 @@ async fn main() {
             }
         };
 
-        if let Err(e) = axum_server::bind_rustls(addr, tls_config)
+        let listener = match std::net::TcpListener::bind(addr)
+            .and_then(|listener| listener.set_nonblocking(true).map(|()| listener))
+        {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::error!("Failed to bind to {}: {}", addr, e);
+                std::process::exit(1);
+            }
+        };
+        bound_socket_buffers(&listener);
+
+        let server = match axum_server::from_tcp_rustls(listener, tls_config) {
+            Ok(server) => server,
+            Err(e) => {
+                tracing::error!("Failed to start the HTTPS listener: {}", e);
+                std::process::exit(1);
+            }
+        };
+        if let Err(e) = server
             .serve(app.into_make_service_with_connect_info::<SocketAddr>())
             .await
         {
@@ -575,6 +662,8 @@ async fn main() {
                 std::process::exit(1);
             }
         };
+
+        bound_socket_buffers(&listener);
 
         if let Err(e) = axum::serve(
             listener,

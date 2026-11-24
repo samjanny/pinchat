@@ -1,0 +1,57 @@
+[package]
+name = "pinchat-ws-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Fuzzing harness for the relay's WebSocket transport (src/ws_transport.rs,
+# compiled in as it is). See README.md next to this file.
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = { version = "0.4", features = ["arbitrary-derive"] }
+axum = "0.7"
+hyper = "1"
+hyper-util = { version = "0.1", features = ["tokio"] }
+sha1 = "0.10"
+base64 = "0.22"
+tokio = { version = "1", features = ["io-util", "sync", "time", "rt", "macros", "net"] }
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "frames"
+path = "fuzz_targets/frames.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "model"
+path = "fuzz_targets/model.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "budget"
+path = "fuzz_targets/budget.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "writer"
+path = "fuzz_targets/writer.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }

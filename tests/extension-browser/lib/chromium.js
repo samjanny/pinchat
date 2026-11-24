@@ -102,6 +102,9 @@ async function launchChromium({ extensions, workDir, httpsPort, hosts, binary, p
                 return { error: result.errorText || null };
             },
             eval: evaluate,
+            // A DevTools protocol command for this tab, for what the
+            // helpers above do not cover (a viewport size, a screenshot).
+            send: (method, params = {}) => send(method, params, sessionId),
             close: () => send('Target.closeTarget', { targetId }),
         };
     }

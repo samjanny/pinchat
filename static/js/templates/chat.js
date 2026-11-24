@@ -48,7 +48,7 @@ window.PinChatUI.mount(String.raw`
                  and never create, rename, or key these entries. -->
             <template x-if="roomType === 'group'">
                 <template x-for="p in groupPeers" :key="p.fingerprint">
-                    <div class="sidebar-item" :title="p.identityTitle">
+                    <div class="sidebar-item sidebar-item-link" :title="p.identityTitle" @click="openFingerprintPanel()">
                         <span class="dot on"></span>
                         <span class="sidebar-item-label" x-text="p.nickname">Peer</span>
                         <span class="sidebar-item-badge" x-show="p.isCreator">creator</span>
@@ -126,6 +126,12 @@ window.PinChatUI.mount(String.raw`
                         <svg class="icon" aria-hidden="true"><use href="#i-user"/></svg><span x-text="ownDisplayName()"></span>
                     </span>
 
+                    <!-- Group rooms: the full key fingerprint of every member.
+                         A tooltip needs a pointer to hover with; this does not. -->
+                    <button type="button" x-show="roomType === 'group' && mlsReady" @click="openFingerprintPanel()" class="badge badge-button" title="Show the full key fingerprint of every member">
+                        <svg class="icon" aria-hidden="true"><use href="#i-users"/></svg>Fingerprints
+                    </button>
+
                     <!-- PFS & PCS Status Badges -->
                     <span x-show="pfsActive || (roomType === 'group' && mlsReady)" class="badge badge-success" title="Perfect Forward Secrecy active - Past messages protected">
                         <svg class="icon" aria-hidden="true"><use href="#i-lock"/></svg>PFS
@@ -148,7 +154,7 @@ window.PinChatUI.mount(String.raw`
 
             <div class="header-actions">
                 <button @click="copyLink" class="btn btn-small" title="Copies the complete invite link. The address bar hides the key on purpose, so a URL copied from there does not work.">
-                    <svg class="icon" aria-hidden="true"><use href="#i-copy"/></svg><span x-text="copied ? 'Copied!' : 'Copy invite link'"></span>
+                    <svg class="icon" aria-hidden="true"><use href="#i-copy"/></svg><span class="label-long" x-text="copied ? 'Copied!' : 'Copy invite link'"></span><span class="label-short" x-text="copied ? 'Copied!' : 'Invite'"></span>
                 </button>
                 <button x-show="canShare" @click="shareLink" class="btn btn-small" title="Share the complete invite link. The browser's own share option would send a link without the key.">
                     <svg class="icon" aria-hidden="true"><use href="#i-copy"/></svg><span>Share</span>
@@ -199,7 +205,7 @@ window.PinChatUI.mount(String.raw`
                         <div x-show="msg.type === 'message'" class="message" :class="msg.isOwn ? 'message-own' : 'message-other'">
                             <div class="message-bubble">
                                 <!-- Show nickname for all messages -->
-                                <div x-show="msg.nickname" class="message-sender" :title="msg.senderTitle">
+                                <div x-show="msg.nickname" class="message-sender" :class="roomType === 'group' ? 'message-sender-link' : ''" :title="msg.senderTitle" @click="openFingerprintPanel()">
                                     <strong x-text="msg.nickname"></strong>
                                 </div>
                                 <p><span x-html="renderMessage(msg.text)"></span><span class="message-time" x-text="formatTimestamp(msg.timestamp)"></span><span x-show="msg.outOfOrder" class="message-late" title="Delivered out of order">late</span></p>
@@ -210,7 +216,7 @@ window.PinChatUI.mount(String.raw`
                         <div x-show="msg.type === 'image'" class="message" :class="msg.isOwn ? 'message-own' : 'message-other'">
                             <div class="message-bubble message-bubble-image">
                                 <!-- Show nickname for all messages -->
-                                <div x-show="msg.nickname" class="message-sender" :title="msg.senderTitle">
+                                <div x-show="msg.nickname" class="message-sender" :class="roomType === 'group' ? 'message-sender-link' : ''" :title="msg.senderTitle" @click="openFingerprintPanel()">
                                     <strong x-text="msg.nickname"></strong>
                                 </div>
                                 <div class="message-image-container">
@@ -269,7 +275,7 @@ window.PinChatUI.mount(String.raw`
                     <span class="unverified-warning-icon"><svg class="icon" aria-hidden="true"><use href="#i-unlock"/></svg></span>
                     <div class="unverified-warning-text">
                         <strong>Identities not verified</strong>
-                        <p>Anyone with this link can join. Members are authenticated by their key fingerprint (hover a name), not by a security code: compare fingerprints over another channel if it matters.</p>
+                        <p>Anyone with this link can join. Members are authenticated by their key fingerprint, not by a security code. Open Fingerprints, or tap a name, to see them in full, and compare them over another channel if it matters.</p>
                     </div>
                 </div>
                 <button @click="dismissGroupTrustNotice()" class="btn btn-verify-now">Got it</button>
@@ -356,7 +362,7 @@ window.PinChatUI.mount(String.raw`
                                     class="emoji-category-btn"
                                     :class="{ 'active': selectedEmojiCategory === cat }"
                                     @click="selectEmojiCategory(cat)"
-                                    x-text="cat.substring(0, 4)">
+                                    x-text="cat">
                                 </button>
                             </template>
                         </div>
@@ -485,6 +491,30 @@ window.PinChatUI.mount(String.raw`
         <div x-show="fullscreenImage" class="fullscreen-image-modal" @click="fullscreenImage = null">
             <button class="fullscreen-close" @click="fullscreenImage = null">×</button>
             <img :src="fullscreenImage" class="fullscreen-image" alt="Full size image" @click.stop>
+        </div>
+
+        <!-- Key fingerprints of a group's members, in full. Built from the
+             validated MLS roster only (see groupFingerprintEntries). -->
+        <div x-show="fingerprintPanelOpen && groupFingerprintEntries().length > 0" class="fingerprint-modal" role="dialog" aria-modal="true" aria-label="Key fingerprints of the members" @click="closeFingerprintPanel()">
+            <div class="fingerprint-panel" @click.stop>
+                <div class="fingerprint-head">
+                    <h2>Key fingerprints</h2>
+                    <button type="button" class="fingerprint-close" @click="closeFingerprintPanel()" aria-label="Close">×</button>
+                </div>
+                <p class="fingerprint-intro">Each member is known to this group by the SHA-256 fingerprint of their signature key. To check who is who, have a member read theirs from their own screen over a channel you trust, and compare all sixteen groups.</p>
+                <ul class="fingerprint-list">
+                    <template x-for="entry in groupFingerprintEntries()" :key="entry.key">
+                        <li class="fingerprint-entry" :class="entry.isSelf ? 'fingerprint-entry-self' : ''">
+                            <span class="fingerprint-role" x-text="entry.role"></span>
+                            <code class="fingerprint-value">
+                                <template x-for="(group, index) in entry.groups" :key="entry.key + '-' + index">
+                                    <span x-text="group"></span>
+                                </template>
+                            </code>
+                        </li>
+                    </template>
+                </ul>
+            </div>
         </div>
 
         </div><!-- /.chat-main -->

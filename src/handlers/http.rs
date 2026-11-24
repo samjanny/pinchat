@@ -76,6 +76,13 @@ pub async fn create_room(
         extract_client_ip_with_proxy(&ConnectInfo(addr), &headers, &state.config.trusted_proxies);
     let ip_hash = hash_ip(&client_ip, &state.ip_hash_secret);
 
+    // A client the WebSocket admission control would turn away is told now,
+    // before it spends its proof of work. Advisory: the upgrade checks again
+    // and takes the slot.
+    if let Err(refused) = state.ws_admission_open(&state.client_address(&client_ip)) {
+        return Err(crate::handlers::websocket::admission_refused(refused, true));
+    }
+
     // Resolve PoW session cookie to disambiguate clients behind shared NAT.
     // A missing/invalid cookie yields a fresh UUID + a Set-Cookie header to
     // attach on whichever 428 this request emits.
@@ -411,6 +418,8 @@ mod tests {
             port: 0,
             ws_conn_burst_size: 100,
             ws_conn_period_secs: 60,
+            max_ws_connections: crate::config::DEFAULT_MAX_WS_CONNECTIONS,
+            max_ws_connections_per_address: crate::config::DEFAULT_MAX_WS_CONNECTIONS_PER_ADDRESS,
             room_token_burst_size: 100,
             room_token_period_secs: 600,
             msg_rate_limit: 30,

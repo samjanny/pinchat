@@ -570,6 +570,116 @@ keys of their current session that such a list could name.
 excluded". To exclude someone who has the link, end the room and create a new
 one, and share the new link only with the people who should be in it.
 
+### Relay Memory: Admission, Budgets and What Is Left
+
+The relay admits a bounded number of WebSocket connections, and what it holds
+for messages in transit does not depend on how many connections there are or
+on what they have carried before:
+
+| What | Bound |
+|------|-------|
+| WebSocket connections | `MAX_WS_CONNECTIONS` (400) in all, `MAX_WS_CONNECTIONS_PER_ADDRESS` (50) for one client address, four times that for one IPv6 /48. A connection holds its slot from the moment its upgrade is accepted to the end of its closing handshake. An upgrade beyond a limit is refused before anything is allocated for it, with 503 (relay) or 429 (address) and `Retry-After`, and its single-use token is not spent; the token and room endpoints give the same answer before the proof of work |
+| Messages being received, from 64 KiB | 32 MiB in all, 8 MiB for the connections of one client address. A connection that finds no room stops reading its socket until there is some |
+| Messages being received, above 4 KiB and below 64 KiB | 8 MiB in all, 2 MiB for one client address, apart from the large ones so that pictures cannot starve them |
+| Messages being received, up to 4 KiB | 4 KiB a connection, besides its 4 KiB read buffer |
+| A message that is never finished | 90 seconds from its first frame; control frames sent in between do not extend it. Its connection is then closed with 1008 |
+| Frames being relayed | 4 MiB a room, 8 MiB a client address, 32 MiB in all, of which frames of 64 KiB and more may take 24 MiB, counted until the frame has been written to every receiver. A write has 30 seconds. A frame that finds no room waits for up to 30 seconds, then its sender's connection is closed with 1013 |
+| Ordered MLS control log | 2 MiB a room, 8 MiB for the controls of one client address, 32 MiB in all |
+| Kernel buffers of a connection | fixed at 64 KiB in each direction, which the kernel counts twice: at most 256 KiB a connection |
+| Password checks | two at a time, about 46 MiB each |
+| A message while it is parsed and written out again | up to two copies of it, on one worker thread at a time |
+| Replay cache of a room | `REPLAY_CACHE_MAX_PER_ROOM` (1000) entries, about 137 KB when full |
+| KeyPackage references a group has consumed | 1024, about 133 KB when all are in |
+
+Measured on one CPU, in a 512 MiB scope without swap, behind nginx with TLS
+(load generator, proxy and relay on one machine): an idle connection costs
+the relay about 22 KB; one whose peer keeps sending while the relay waits
+adds up to about 120 KB in the kernel, one whose peer stopped reading about
+45 KB. At the defaults, with about 360 one-to-one rooms holding full replay
+caches, 40 groups of 10 filling the connection limit with about 12 MiB in
+their control logs, and then receivers that stopped reading while pictures
+were sent to them, unfinished 1 MiB messages and password checks, all at
+once, the relay's memory (cgroup peak, kernel sockets included) reached
+about 200 MB. Before admission control and these budgets, 10000
+connections that each sent the first 63 KiB of a message killed it at
+512 MB within a second; now 400 of them are admitted, the rest refused, and
+the relay stays at about 50 MB.
+
+What a 512 MiB ceiling is sized for, at `MAX_TOTAL_ROOMS=500` and the
+defaults above: about 230 MB for the budgets, the password checks and the
+copies of one worker thread; about 135 MB for 500 rooms at their limits
+(groups; one-to-one rooms take half); about 115 MB for 400 connections at
+their worst. That leaves a margin of about 60 MB. Raising
+`MAX_WS_CONNECTIONS` or `MAX_TOTAL_ROOMS` takes from that margin, at about
+290 KB a connection and 270 KB a group room.
+
+What is not covered by any of these limits:
+
+- **Per-address state.** Rate-limit buckets and the shares above are kept
+  for every address seen recently; 100000 distinct addresses took about
+  70 MB. Behind a reverse proxy the addresses are those of real clients,
+  so this takes a botnet, not a crafted header.
+- **Sockets the relay has closed.** A connection closed while data is still
+  queued for a peer that does not read keeps its send buffer (64 KiB,
+  counted twice) in the kernel until the kernel gives up on it, outside the
+  connection limit. Reconnecting is bounded by `WS_CONN_BURST_SIZE`.
+- **The proxy and the host.** nginx and the kernel of the host have limits
+  of their own, shared by every site on the host, and with their defaults
+  they give out before the relay's: on a 1 GB host nginx's 768 connections
+  hold fewer than 400 proxied WebSocket connections, all TCP buffers
+  together get about 80 MiB (`net.ipv4.tcp_mem`) and every connection is
+  slowed above 53 MiB, and the connection tracking table holds 8192
+  connections. Measured on a machine built like such a host, 380
+  legitimate connections exchanging pictures through nginx's defaults lost
+  most of their pictures, and 3000 connections opened in a loop from 30
+  addresses cut every service off, SSH included. docs/reverse-proxy.md has
+  the settings that fixed both and what they leave: clients that stop
+  reading can still fill the host's TCP memory, with hundreds of
+  connections instead of a few dozen.
+
+What remains possible:
+
+- **A few addresses can hold up everyone.** Eight addresses (or two IPv6
+  /48s) can hold every connection slot, and four can fill the broadcast and
+  inbound budgets with frames their own receivers do not read. New
+  connections are then refused, or messages of other rooms wait; text and
+  group controls keep a quarter of the broadcast budget that pictures
+  cannot take, and messages up to 4 KiB are never kept waiting by the
+  inbound budget. Rate limits, proof of work and the login gate raise the
+  cost of holding them; they do not remove it.
+- **A shared address is shared.** All clients behind one address (a
+  household, an office, a carrier's NAT) share its 50 connections.
+- **A receiver must keep up.** A member who cannot take a frame within 30
+  seconds is disconnected, and with the largest image allowed that is a
+  link of about 1 Mbit/s. Until then the frame holds its room's budget, so
+  the room relays at the pace of its slowest connected member.
+- **Bursts of pictures queue up.** When every member of 50 full groups sent
+  a 2 MiB image at the same moment, on one core of a recent desktop CPU,
+  all of them arrived, the slowest after 2.3 seconds, the whole burst in
+  93 seconds. A burst that keeps a frame waiting beyond 30 seconds costs
+  its sender the connection (1013). On a virtual CPU without AES
+  instructions, like that of a small hosted server, the proxy's TLS
+  encryption of every receiver's copy costs more than the relay itself
+  (see docs/reverse-proxy.md).
+- **A receiver may fall 64 messages behind its room.** A room hands its
+  messages to each receiver through a ring; a receiver further behind than
+  the ring holds is disconnected (1008), its browser reconnects, and what
+  the room sent meanwhile is lost to it. A receiver writes one message at a
+  time, so it falls behind while it writes a picture or when the members
+  of a group send at the same moment. The ring held 8 messages until this
+  release; on a machine built like a small hosted server (one virtual
+  CPU), that disconnected 19 of 20 members when all of them sent a message
+  at the same moment, and 166 of 380 connections in 19 full groups
+  exchanging pictures. With 64, nobody was disconnected in those tests or
+  under the expected load; the furthest any receiver fell behind was 42
+  messages. Messages leave the ring as soon as every receiver has written
+  them, and those waiting are counted against the broadcast budgets above,
+  so the length of the ring does not raise the memory bound; its slots
+  take about 1 MiB for 500 rooms.
+- **Reaching the memory ceiling ends every session.** If the relay is
+  killed at the ceiling it restarts empty: rooms and connections are gone.
+  No message content is exposed by that, and none was stored.
+
 ## Attack Surface Analysis
 
 ### Transport Layer
@@ -603,7 +713,9 @@ one, and share the new link only with the people who should be in it.
 | Component | Protection | Attack Vector | Mitigation |
 |-----------|------------|---------------|------------|
 | Memory | Data persistence | Memory dumps | No keys stored, auto-cleanup |
-| Logs | User privacy | Log analysis | PRIVACY_MODE=strict (zero logs) |
+| Swap | Data held in memory reaching a disk | Host swap device | `docker-compose.yml` gives the container a memory ceiling and no swap; the reverse proxy and the rest of the host are for the operator to configure, and nothing here covers them |
+| Relay memory | Availability | Many connections, large frames, receivers that do not read, many uploads at once | Connection limits (relay, address, IPv6 /48) applied before the upgrade, byte budgets for messages coming in and frames going out, fixed socket buffers; see "Relay Memory: Admission, Budgets and What Is Left" |
+| Logs | User privacy | Log analysis | PRIVACY_MODE=strict (start-up notices and error messages only, written without addresses, identifiers or request data) |
 | IP Addresses | User tracking | IP logging | HMAC-hashed IPs in the rate limiter and, while a connection is open, in the relay's per-address share of the broadcast budget; memory only |
 
 ---

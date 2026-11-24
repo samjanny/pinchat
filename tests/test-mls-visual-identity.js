@@ -138,6 +138,48 @@ async function main() {
         && !chatHtml.includes(':key="p.userId"'),
     'chat template keys roster/messages by authenticated identity fields');
 
+    // The whole fingerprint must be reachable without a pointer: a touch
+    // screen cannot show the tooltip that used to be the only place for it.
+    const entries = chatStore.groupFingerprintEntries();
+    assert(entries.length === 2
+        && entries[0].isSelf === true && entries[0].role === 'You · member'
+        && entries[1].isSelf === false && entries[1].role === 'Creator',
+    'fingerprint panel lists this device first, then the peers, by MLS role');
+    assert(entries[0].groups.join('') === selfMember.fingerprint
+        && entries[1].groups.join('') === creator.fingerprint
+        && entries.every((entry) => entry.groups.length === 16
+            && entry.groups.every((group) => /^[0-9a-f]{4}$/.test(group))),
+    'fingerprint panel shows every authenticated fingerprint in full, in groups of four');
+    assert(entries[0].key === selfMember.fingerprint && entries[1].key === creator.fingerprint
+        && !JSON.stringify(entries).includes('relay'),
+    'fingerprint panel is keyed by fingerprint and carries no relay data');
+    assert(chatStore.fingerprintPanelOpen === false, 'fingerprint panel starts closed');
+    chatStore.openFingerprintPanel();
+    assert(chatStore.fingerprintPanelOpen === true, 'fingerprint panel opens in an authenticated group');
+    chatStore.handleEscape();
+    assert(chatStore.fingerprintPanelOpen === false, 'Escape closes the fingerprint panel');
+    chatStore.openFingerprintPanel();
+    chatStore.closeFingerprintPanel();
+    assert(chatStore.fingerprintPanelOpen === false, 'fingerprint panel closes on request');
+    assert(chatHtml.includes('@click="openFingerprintPanel()"')
+        && chatHtml.includes('x-for="entry in groupFingerprintEntries()"')
+        && chatHtml.includes('Open Fingerprints, or tap a name')
+        && !chatHtml.includes('hover a name'),
+    'chat template offers the fingerprints by tap and no longer points at a tooltip');
+    {
+        // Outside an authenticated group there is nothing to list.
+        const savedType = chatStore.roomType;
+        chatStore.roomType = 'onetoone';
+        assert(chatStore.groupFingerprintEntries().length === 0, 'no fingerprint list in a one-to-one room');
+        chatStore.openFingerprintPanel();
+        assert(chatStore.fingerprintPanelOpen === false, 'the panel does not open in a one-to-one room');
+        chatStore.roomType = savedType;
+        const savedValid = chatStore.mlsRosterValid;
+        chatStore.mlsRosterValid = false;
+        assert(chatStore.groupFingerprintEntries().length === 0, 'no fingerprint list without a validated roster');
+        chatStore.mlsRosterValid = savedValid;
+    }
+
     const messagesBefore = chatStore.messages.length;
     chatStore._handleMlsEvent({
         kind: 'message',

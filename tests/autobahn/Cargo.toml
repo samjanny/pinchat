@@ -1,0 +1,23 @@
+[package]
+name = "pinchat-ws-conformance"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# An echo server around the relay's own WebSocket transport, for the Autobahn
+# test suite (see README.md next to this file). It is not part of the relay:
+# the transport is compiled in from ../../src/ws_transport.rs as it is.
+
+[dependencies]
+axum = "0.7"
+hyper = "1"
+hyper-util = { version = "0.1", features = ["tokio"] }
+sha1 = "0.10"
+base64 = "0.22"
+tokio = { version = "1", features = ["full"] }
+
+[workspace]
+members = ["."]
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }

@@ -1,28 +1,31 @@
 use axum::{
-    extract::{
-        ConnectInfo, Path, State, WebSocketUpgrade,
-        ws::{Message as WsMessage, WebSocket},
-    },
+    extract::{ConnectInfo, Path, State},
     http::{HeaderMap, StatusCode, header, header::SEC_WEBSOCKET_PROTOCOL},
     response::{IntoResponse, Response},
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::Utc;
-use futures_util::{SinkExt, StreamExt};
+use futures_util::FutureExt;
 use sha2::{Digest, Sha256};
 use std::net::SocketAddr;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
+use tokio::sync::broadcast::error::RecvError;
 use tokio::time::{Duration, Instant, interval};
 use uuid::Uuid;
 
-use crate::ip_hash::{extract_client_ip_with_proxy, hash_ip};
+use crate::ip_hash::extract_client_ip_with_proxy;
 
 use crate::jwt::{WsResumeTokenClaims, WsTokenClaims, sign_resume_token, verify_token};
 use crate::models::message::MessageHeader;
 use crate::models::{IncomingMessage, Message, RoomType};
 use crate::state::app_state::MlsControlAppendError;
+use crate::state::app_state::{AdmissionRefused, WsAdmission};
 use crate::state::{
     AppState, ClientBroadcastLease, ConnectionAdmission, MlsControlAdmission, ReplayAdmission,
+};
+use crate::ws_transport::{
+    self, Closing, Incoming, Outgoing, Reader, Writer, WsSocket, WsUpgrade, close_code,
 };
 
 /// Maximum allowed size for ECDH public key payload (8KB)
@@ -62,7 +65,8 @@ enum PublicMessageKind {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReplayAckError {
-    Transport,
+    /// The connection ends, and this is how.
+    Transport(Closing),
     Protocol,
 }
 
@@ -574,7 +578,7 @@ pub async fn require_ws_token(
 /// - Requires explicit `pinchat.v1` subprotocol (gate against v0 clients)
 /// - Validates JWT signature + expiration (30s) + room_id claim + single-use jti
 pub async fn ws_handler(
-    ws: WebSocketUpgrade,
+    ws: WsUpgrade,
     State(state): State<AppState>,
     Path(room_id): Path<Uuid>,
     connect_info: Option<ConnectInfo<SocketAddr>>,
@@ -598,6 +602,25 @@ pub async fn ws_handler(
         )
             .into_response();
     }
+
+    // Admission control, before anything is looked up or allocated for the
+    // connection and before the single-use token is spent: a refused client
+    // may come back with the same token while it is valid. The client is
+    // counted by the keyed hash of its address, never the address itself.
+    // The server is always run with connection info; only a router
+    // assembled without it (tests) has none, and then only the relay-wide
+    // limit applies.
+    let client = connect_info.map(|connect_info| {
+        state.client_address(&extract_client_ip_with_proxy(
+            &connect_info,
+            &headers,
+            &state.config.trusted_proxies,
+        ))
+    });
+    let admission = match state.admit_ws_connection(client.as_ref()) {
+        Ok(admission) => admission,
+        Err(refused) => return admission_refused(refused, false),
+    };
 
     // Audit M-2: room-state gate BEFORE the single-use jti is burned.
     //
@@ -689,36 +712,64 @@ pub async fn ws_handler(
     let ws_size = max_ws_size(state.config.max_image_size);
 
     // What this connection sends into the room counts against the share of
-    // the broadcast budget of the address it comes from, identified by the
-    // same keyed hash the request quotas use. The lease lives as long as
-    // the connection. The server is always run with connection info; only
-    // a router assembled without it (tests) has none, and then no share
-    // applies.
-    let client_share = connect_info.map(|connect_info| {
-        let client_ip =
-            extract_client_ip_with_proxy(&connect_info, &headers, &state.config.trusted_proxies);
-        Arc::new(state.lease_client_broadcast_share(&hash_ip(&client_ip, &state.ip_hash_secret)))
-    });
-
+    // the broadcast budget of the address it comes from, the share its
+    // admission took; it lives as long as the connection.
     // Echo only the base subprotocol back (do NOT echo the jwt.* companion -
     // the RFC requires the response subprotocol to be one the client offered,
     // but we pick the non-secret one so the 101 response carries no token).
-    ws.protocols(["pinchat.v1"])
-        .max_message_size(ws_size)
-        .max_frame_size(ws_size)
-        .on_upgrade(move |socket| {
-            handle_socket(
-                socket,
-                state,
-                room_id,
-                connection_id,
-                resume_requested,
-                mls_control_cursor,
-                creator_bootstrap_generation,
-                client_share,
-            )
-        })
+    let inbound = state.inbound_budget(admission.share.as_deref());
+    ws.on_upgrade("pinchat.v1", ws_size, inbound, move |socket| {
+        handle_socket(
+            socket,
+            state,
+            room_id,
+            connection_id,
+            resume_requested,
+            mls_control_cursor,
+            creator_bootstrap_generation,
+            admission,
+        )
+    })
 }
+
+/// The answer to an upgrade, or to a request for a token or a room, that
+/// the admission control refuses: 503 when the relay holds all the
+/// connections it may, 429 when the client's address does. Neither is a
+/// fault of the client, so both say when to try again. `json` gives the
+/// API's error form.
+pub(crate) fn admission_refused(refused: AdmissionRefused, json: bool) -> Response {
+    let (status, code, message) = match refused {
+        AdmissionRefused::RelayFull => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "RELAY_FULL",
+            "The relay is at its connection limit; try again later",
+        ),
+        AdmissionRefused::AddressFull => (
+            StatusCode::TOO_MANY_REQUESTS,
+            "ADDRESS_FULL",
+            "Too many connections from this address; try again later",
+        ),
+    };
+    let mut response = if json {
+        (
+            status,
+            axum::Json(serde_json::json!({ "error": message, "code": code })),
+        )
+            .into_response()
+    } else {
+        (status, message).into_response()
+    };
+    response.headers_mut().insert(
+        header::RETRY_AFTER,
+        header::HeaderValue::from_static(ADMISSION_RETRY_AFTER_SECS),
+    );
+    response
+}
+
+/// `Retry-After` of a refused admission, in seconds: about how long a
+/// connection slot takes to come free when the relay is busy (a closing
+/// handshake takes up to 5 seconds, a reconnect grace period 20).
+const ADMISSION_RETRY_AFTER_SECS: &str = "30";
 
 /// Increments the per-connection protocol-error counter. Returns true once the
 /// counter reaches `config.protocol_error_limit`, signalling the recv loop to
@@ -855,15 +906,57 @@ const WS_SEND_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(test)]
 const WS_SEND_TIMEOUT: Duration = Duration::from_secs(1);
 
+/// How long the relay waits for the next frame of a client before it closes
+/// the connection, and how long one message may take from its first frame to
+/// its last byte.
+#[cfg(not(test))]
+const IDLE_TIMEOUT: Duration = Duration::from_secs(90);
+#[cfg(test)]
+const IDLE_TIMEOUT: Duration = Duration::from_secs(6);
+
+/// How long the closing handshake may take: the relay's Close frame, the
+/// client's answer, and the end of the TCP connection. A browser answers at
+/// once; a peer that does not costs this long and nothing more.
+#[cfg(not(test))]
+const CLOSE_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const CLOSE_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// How a connection that is no longer active in its room is closed: 1001
+/// when the room itself is gone (expired, closed), 1008 when the relay took
+/// the participant out of a room that still exists (evicted, or replaced by
+/// a resumed connection). Both loops of a connection may notice either first.
+fn no_longer_active(state: &AppState, room_id: &Uuid) -> Closing {
+    if state.rooms.contains_key(room_id) {
+        Closing::Initiate(close_code::POLICY)
+    } else {
+        Closing::Initiate(close_code::GOING_AWAY)
+    }
+}
+
+/// End the connection as `closing` says (RFC 6455, section 7).
+async fn close_connection(sender: &mut Writer, receiver: &mut Reader, closing: Closing) {
+    ws_transport::close(sender, receiver, closing, CLOSE_HANDSHAKE_TIMEOUT).await;
+}
+
+/// How long a frame a client sent waits for room in the broadcast budgets
+/// before its connection is closed, as it used to be at once. The budgets
+/// are held by frames that are being written, and a write that takes longer
+/// than [`WS_SEND_TIMEOUT`] ends its connection, so the wait is given the
+/// same length.
+const BROADCAST_ADMISSION_WAIT: Duration = WS_SEND_TIMEOUT;
+
 /// Write one frame, giving up after [`WS_SEND_TIMEOUT`]. Returns whether the
 /// frame was handed to the transport; `false` means the caller must drop the
 /// connection.
-async fn send_within_deadline<S>(sender: &mut S, message: WsMessage) -> bool
-where
-    S: futures_util::Sink<WsMessage> + Unpin,
-{
+///
+/// The payload is borrowed: a broadcast frame is written from the allocation
+/// every receiver of the room shares, and nothing of it is copied or kept by
+/// the connection. A write that the deadline cuts short leaves the writer
+/// refusing every later frame.
+async fn send_within_deadline(sender: &mut Writer, frame: Outgoing<'_>) -> bool {
     matches!(
-        tokio::time::timeout(WS_SEND_TIMEOUT, sender.send(message)).await,
+        tokio::time::timeout(WS_SEND_TIMEOUT, sender.send(frame)).await,
         Ok(Ok(()))
     )
 }
@@ -939,15 +1032,18 @@ fn schedule_connection_departure(state: &AppState, connection_id: Uuid) {
 // together here.
 #[allow(clippy::too_many_arguments)]
 async fn handle_socket(
-    socket: WebSocket,
+    socket: WsSocket,
     state: AppState,
     room_id: Uuid,
     connection_id: Uuid,
     resume_requested: bool,
     mls_control_cursor: Option<u64>,
     creator_bootstrap_generation: Option<u64>,
-    client_share: Option<Arc<ClientBroadcastLease>>,
+    admission: WsAdmission,
 ) {
+    // Held to the end of this function, closing handshake included: the
+    // connection's slots come free when the connection is really gone.
+    let client_share: Option<Arc<ClientBroadcastLease>> = admission.share.clone();
     // Verify that the room exists AND is not expired.
     // Without the is_expired() gate, a room past its hard TTL can still accept
     // new WebSocket connections until the next cleanup tick (default 60s).
@@ -982,7 +1078,12 @@ async fn handle_socket(
         None => {
             #[cfg(debug_assertions)]
             tracing::debug!("Failed to add connection to room (full, active, or unavailable)");
-            let _ = send_error(socket, "Room is full or reconnect is unavailable").await;
+            send_error(
+                socket,
+                "Room is full or reconnect is unavailable",
+                close_code::POLICY,
+            )
+            .await;
             return;
         }
     };
@@ -1032,7 +1133,12 @@ async fn handle_socket(
         Err(err) => {
             tracing::error!("Failed to sign WebSocket resume credential: {}", err);
             state.remove_connection(&connection_id);
-            let _ = send_error(socket, "Unable to establish reconnect state").await;
+            send_error(
+                socket,
+                "Unable to establish reconnect state",
+                close_code::INTERNAL,
+            )
+            .await;
             return;
         }
     };
@@ -1082,7 +1188,12 @@ async fn handle_socket(
                 } else {
                     let _ = state.evict_participant(&connection_id, room_id);
                 }
-                let _ = send_error(socket, "Secure group replay window is unavailable").await;
+                send_error(
+                    socket,
+                    "Secure group replay window is unavailable",
+                    close_code::POLICY,
+                )
+                .await;
                 return;
             }
         }
@@ -1105,7 +1216,12 @@ async fn handle_socket(
     if room_type == RoomType::Group {
         evict_lagging_group_participants(&state, room_id);
         if !state.connection_is_active(&room_id, &connection_id) {
-            let _ = send_error(socket, "Secure group control stream did not advance").await;
+            send_error(
+                socket,
+                "Secure group control stream did not advance",
+                close_code::POLICY,
+            )
+            .await;
             return;
         }
     }
@@ -1126,7 +1242,12 @@ async fn handle_socket(
             // lifecycle can no longer be represented in the authenticated
             // control order.
             state.remove_room(&room_id);
-            let _ = send_error(socket, "Unable to establish secure group lifecycle").await;
+            send_error(
+                socket,
+                "Unable to establish secure group lifecycle",
+                close_code::INTERNAL,
+            )
+            .await;
             return;
         }
         let creator_needs_handoff = state
@@ -1138,7 +1259,12 @@ async fn handle_socket(
             .unwrap_or(false);
         if creator_needs_handoff && !state.mark_creator_control_ready(&room_id, connection_id) {
             state.remove_room(&room_id);
-            let _ = send_error(socket, "Unable to establish group creator control boundary").await;
+            send_error(
+                socket,
+                "Unable to establish group creator control boundary",
+                close_code::INTERNAL,
+            )
+            .await;
             return;
         }
     }
@@ -1163,7 +1289,7 @@ async fn handle_socket(
     };
 
     let connected_sent = match serde_json::to_string(&connected_msg) {
-        Ok(json) => send_within_deadline(&mut sender, WsMessage::Text(json)).await,
+        Ok(json) => send_within_deadline(&mut sender, Outgoing::Text(&json)).await,
         Err(_) => false,
     };
     if !connected_sent {
@@ -1184,11 +1310,7 @@ async fn handle_socket(
         loop {
             for window in stream.replay.chunks(MLS_REPLAY_WINDOW_ENTRIES) {
                 for entry in window {
-                    if !send_within_deadline(
-                        &mut sender,
-                        WsMessage::Text(entry.json.as_str().to_owned()),
-                    )
-                    .await
+                    if !send_within_deadline(&mut sender, Outgoing::Text(entry.json.as_str())).await
                     {
                         schedule_connection_departure(&state, connection_id);
                         return;
@@ -1201,14 +1323,17 @@ async fn handle_socket(
                     loop {
                         let frame = match receiver.next().await {
                             Some(Ok(frame)) => frame,
-                            Some(Err(_)) | None => return Err(ReplayAckError::Transport),
+                            Some(Err(error)) => {
+                                return Err(ReplayAckError::Transport(error.closing()));
+                            }
+                            None => return Err(ReplayAckError::Transport(Closing::Abort)),
                         };
                         replay_frames = replay_frames.saturating_add(1);
                         if replay_frames > MLS_REPLAY_WINDOW_ENTRIES.saturating_mul(4) {
                             return Err(ReplayAckError::Protocol);
                         }
                         match frame {
-                            WsMessage::Text(text) => {
+                            Incoming::Text(text) => {
                                 if text.len() > max_ws_size(state.config.max_image_size) {
                                     return Err(ReplayAckError::Protocol);
                                 }
@@ -1239,16 +1364,18 @@ async fn handle_socket(
                                     return Ok(());
                                 }
                             }
-                            WsMessage::Ping(payload) => {
-                                if sender.send(WsMessage::Pong(payload)).await.is_err() {
-                                    return Err(ReplayAckError::Transport);
+                            Incoming::Ping(payload) => {
+                                if !send_within_deadline(&mut sender, Outgoing::Pong(&payload))
+                                    .await
+                                {
+                                    return Err(ReplayAckError::Transport(Closing::Abort));
                                 }
                             }
-                            WsMessage::Pong(_) => {}
-                            WsMessage::Close(_) => {
-                                return Err(ReplayAckError::Transport);
+                            Incoming::Pong => {}
+                            Incoming::Close(code) => {
+                                return Err(ReplayAckError::Transport(Closing::Answer(code)));
                             }
-                            WsMessage::Binary(_) => {
+                            Incoming::Binary => {
                                 return Err(ReplayAckError::Protocol);
                             }
                         }
@@ -1258,8 +1385,9 @@ async fn handle_socket(
 
                 match ack_result {
                     Ok(Ok(())) => {}
-                    Ok(Err(ReplayAckError::Transport)) => {
+                    Ok(Err(ReplayAckError::Transport(closing))) => {
                         schedule_connection_departure(&state, connection_id);
+                        close_connection(&mut sender, &mut receiver, closing).await;
                         return;
                     }
                     Ok(Err(ReplayAckError::Protocol)) => {
@@ -1269,7 +1397,12 @@ async fn handle_socket(
                             connection_id,
                             "invalid frame while replay ACK was required",
                         );
-                        let _ = send_within_deadline(&mut sender, WsMessage::Close(None)).await;
+                        close_connection(
+                            &mut sender,
+                            &mut receiver,
+                            Closing::Initiate(close_code::POLICY),
+                        )
+                        .await;
                         return;
                     }
                     Err(_) => {
@@ -1279,7 +1412,12 @@ async fn handle_socket(
                             connection_id,
                             "replay ACK deadline expired",
                         );
-                        let _ = send_within_deadline(&mut sender, WsMessage::Close(None)).await;
+                        close_connection(
+                            &mut sender,
+                            &mut receiver,
+                            Closing::Initiate(close_code::POLICY),
+                        )
+                        .await;
                         return;
                     }
                 }
@@ -1290,7 +1428,7 @@ async fn handle_socket(
                     through_seq: stream.through_seq,
                 })
                 .expect("MlsSync serialization cannot fail");
-                let sync_sent = send_within_deadline(&mut sender, WsMessage::Text(sync)).await;
+                let sync_sent = send_within_deadline(&mut sender, Outgoing::Text(&sync)).await;
                 if !sync_sent {
                     schedule_connection_departure(&state, connection_id);
                     return;
@@ -1315,7 +1453,12 @@ async fn handle_socket(
                         connection_id,
                         "replay cursor became unavailable",
                     );
-                    let _ = send_within_deadline(&mut sender, WsMessage::Close(None)).await;
+                    close_connection(
+                        &mut sender,
+                        &mut receiver,
+                        Closing::Initiate(close_code::POLICY),
+                    )
+                    .await;
                     return;
                 }
             }
@@ -1325,6 +1468,9 @@ async fn handle_socket(
     // Direct responses (currently Commit rate-limit rejections) share the
     // single socket writer with room broadcasts.
     let (direct_tx, mut direct_rx) = tokio::sync::mpsc::channel::<String>(8);
+    // A ping from the client is answered by the task that owns the writer.
+    // One slot: while an answer is waiting, further pings are not queued.
+    let (pong_tx, mut pong_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
 
     // Task that receives broadcast messages and forwards them to the client
     // Also sends heartbeat pings every 30 seconds to keep the connection alive,
@@ -1333,17 +1479,29 @@ async fn handle_socket(
     let send_state = state.clone();
     let connected_at = Instant::now();
     let max_connection_age = Duration::from_secs(send_state.config.max_ws_connection_age_secs);
-    let mut send_task = tokio::spawn(async move {
+    // Whichever of the two loops below ends first says how the connection
+    // closes. When the receiving one does, this tells the sending one to
+    // stop once the frame it is writing, if any, is out: a frame cut short
+    // could not be followed by a Close frame.
+    let (stop_sending, mut stopped) = tokio::sync::oneshot::channel::<()>();
+    let send_half = &mut sender;
+    let send_side = async move {
         let mut ping_interval = interval(Duration::from_secs(30));
 
         loop {
             tokio::select! {
+                _ = &mut stopped => return Closing::Abort,
                 Some(msg) = direct_rx.recv() => {
                     if !send_state.connection_is_active(&room_id, &connection_id) {
-                        break;
+                        return no_longer_active(&send_state, &room_id);
                     }
-                    if !send_within_deadline(&mut sender, WsMessage::Text(msg)).await {
-                        break;
+                    if !send_within_deadline(&mut *send_half, Outgoing::Text(&msg)).await {
+                        return Closing::Abort;
+                    }
+                }
+                Some(payload) = pong_rx.recv() => {
+                    if !send_within_deadline(&mut *send_half, Outgoing::Pong(&payload)).await {
+                        return Closing::Abort;
                     }
                 }
                 result = broadcast_rx.recv() => {
@@ -1352,18 +1510,23 @@ async fn handle_socket(
                             if !send_state
                                 .connection_is_active(&room_id, &connection_id)
                             {
-                                break;
+                                return no_longer_active(&send_state, &room_id);
                             }
-                            if !send_within_deadline(
-                                &mut sender,
-                                WsMessage::Text(msg.as_str().to_owned()),
-                            )
-                            .await
+                            // Written from the allocation the whole room
+                            // shares. While this write is pending the frame
+                            // stays counted in the broadcast budgets, which
+                            // is what bounds the memory a receiver that does
+                            // not read can hold.
+                            if !send_within_deadline(&mut *send_half, Outgoing::Text(msg.as_str()))
+                                .await
                             {
-                                break;
+                                return Closing::Abort;
                             }
                         }
-                        Err(_) => break,
+                        // A receiver that fell behind the room's ring.
+                        Err(RecvError::Lagged(_)) => return Closing::Initiate(close_code::POLICY),
+                        // The room is gone.
+                        Err(RecvError::Closed) => return Closing::Initiate(close_code::GOING_AWAY),
                     }
                 }
                 _ = ping_interval.tick() => {
@@ -1371,8 +1534,7 @@ async fn handle_socket(
                         evict_lagging_group_participants(&send_state, room_id);
                     }
                     if !send_state.connection_is_active(&room_id, &connection_id) {
-                        let _ = send_within_deadline(&mut sender, WsMessage::Close(None)).await;
-                        break;
+                        return no_longer_active(&send_state, &room_id);
                     }
                     // Enforce room TTL at every ping tick (~30s). Without this,
                     // a connection can outlive its room up to the cleanup tick
@@ -1386,8 +1548,7 @@ async fn handle_socket(
                         #[cfg(debug_assertions)]
                         tracing::debug!("Room TTL expired on live connection, closing");
                         send_state.remove_room(&room_id);
-                        let _ = send_within_deadline(&mut sender, WsMessage::Close(None)).await;
-                        break;
+                        return Closing::Initiate(close_code::GOING_AWAY);
                     }
                     // Hard cap on connection lifetime: even an active client is
                     // forced to reconnect, which re-runs PoW + JWT issuance.
@@ -1396,29 +1557,41 @@ async fn handle_socket(
                     if connected_at.elapsed() > max_connection_age {
                         #[cfg(debug_assertions)]
                         tracing::debug!("Connection exceeded max age, closing");
-                        let _ = send_within_deadline(&mut sender, WsMessage::Close(None)).await;
-                        break;
+                        return Closing::Initiate(close_code::GOING_AWAY);
                     }
-                    if !send_within_deadline(&mut sender, WsMessage::Ping(vec![])).await {
-                        break;
+                    if !send_within_deadline(&mut *send_half, Outgoing::Ping).await {
+                        return Closing::Abort;
                     }
                 }
             }
         }
-    });
+    };
 
-    // Task that receives messages from the client and broadcasts them.
-    // The 90-second idle timeout closes zombie connections that stop sending
-    // frames (including pong responses) within that window, protecting
-    // against file-descriptor exhaustion from stale TCP sessions.
-    const IDLE_TIMEOUT: Duration = Duration::from_secs(90);
+    // Loop that receives messages from the client and broadcasts them.
+    // The idle timeout closes zombie connections that stop sending frames
+    // (including pong responses) within that window, protecting against
+    // file-descriptor exhaustion from stale TCP sessions. The same span is
+    // the most one message may take from its first frame to its last byte,
+    // however many control frames come in between (WsReader::next_within).
     let state_clone = state.clone();
     let recv_direct_tx = direct_tx.clone();
     let recv_client_share = client_share.clone();
-    let mut recv_task = tokio::spawn(async move {
-        while let Ok(Some(Ok(msg))) = tokio::time::timeout(IDLE_TIMEOUT, receiver.next()).await {
+    // A client that breaks the relay's rules (rate limits, malformed or
+    // misplaced relay messages) still speaks WebSocket correctly, so its
+    // connection is closed with the full handshake and code 1008, as a
+    // browser expects. Only a stream that breaks RFC 6455 itself is failed
+    // without waiting for an answer (`WsError::closing`).
+    let recv_half = &mut receiver;
+    let recv_side = async move {
+        loop {
+            let msg = match recv_half.next_within(IDLE_TIMEOUT).await {
+                Some(Ok(Incoming::Close(code))) => return Closing::Answer(code),
+                Some(Ok(msg)) => msg,
+                Some(Err(error)) => return error.closing(),
+                None => return Closing::Abort,
+            };
             if !state_clone.connection_is_active(&room_id, &connection_id) {
-                break;
+                return no_longer_active(&state_clone, &room_id);
             }
             // C-14: classify the frame up front. Close terminates the loop
             // and is not counted against the rate limit. All other frame
@@ -1426,10 +1599,15 @@ async fn handle_socket(
             // gates and the global rate limiter, but only Text is
             // application-relevant - Binary/Ping/Pong are accounted for
             // and dropped.
+            let mut ping = None;
             let text = match msg {
-                WsMessage::Close(_) => break,
-                WsMessage::Text(t) => Some(t),
-                _ => None,
+                Incoming::Text(t) => Some(t),
+                Incoming::Ping(payload) => {
+                    ping = Some(payload);
+                    None
+                }
+                // A Close frame has ended the loop above.
+                Incoming::Close(_) | Incoming::Pong | Incoming::Binary => None,
             };
 
             // Enforce room TTL on the receive path. Hoisted above the
@@ -1443,7 +1621,7 @@ async fn handle_socket(
             if !room_alive {
                 #[cfg(debug_assertions)]
                 tracing::debug!("Recv on expired room, closing");
-                break;
+                return Closing::Initiate(close_code::GOING_AWAY);
             }
             // Hard cap on connection lifetime. The send-side ping check
             // already enforces this, but applying it here closes the
@@ -1452,16 +1630,16 @@ async fn handle_socket(
             if connected_at.elapsed() > max_connection_age {
                 #[cfg(debug_assertions)]
                 tracing::debug!("Recv past max connection age, closing");
-                break;
+                return Closing::Initiate(close_code::GOING_AWAY);
             }
 
             // GLOBAL FRAME RATE LIMIT (C-14): counts EVERY non-Close frame,
             // not just Text. Previously the limiter sat inside the Text
             // branch; a hostile peer could flood Ping/Pong/Binary frames
             // to keep the recv loop busy without consuming the budget.
-            // axum/tungstenite auto-answers Ping with Pong, but the recv
-            // task still wakes up for each frame and burns CPU; this
-            // closes the gap. Lifecycle-bound (Close + max age + room
+            // Each of those frames wakes this task, and a Ping is answered
+            // further down; counting them all closes the gap.
+            // Lifecycle-bound (Close + max age + room
             // expiry) frames still bypass the counter because they break
             // the loop above.
             {
@@ -1481,14 +1659,17 @@ async fn handle_socket(
                         ts.len(),
                         window
                     );
-                    break;
+                    return Closing::Initiate(close_code::POLICY);
                 }
                 ts.push_back(now);
             }
 
             // Per-type handling: only Text frames carry application data.
-            // Binary/Ping/Pong have been counted above and are dropped
-            // silently here.
+            // Binary and Pong have been counted above and are dropped
+            // silently here. A Ping, counted like the rest, is answered.
+            if let Some(payload) = ping {
+                let _ = pong_tx.try_send(payload);
+            }
             let Some(text) = text else {
                 continue;
             };
@@ -1503,12 +1684,16 @@ async fn handle_socket(
                     ws_limit,
                     connection_id
                 );
-                break; // Close connection
+                return Closing::Fail(close_code::TOO_BIG);
             }
 
             {
-                // Parse the incoming message
-                match serde_json::from_str::<IncomingMessage>(&text) {
+                // Parse the incoming message. The parsed form owns its
+                // strings, so the frame it was read from goes at once: a
+                // picture is not held twice while it is checked and sent on.
+                let parsed = serde_json::from_str::<IncomingMessage>(&text);
+                drop(text);
+                match parsed {
                     Ok(incoming) => {
                         // Room types are cryptographic protocol boundaries,
                         // not a UI preference. A group room accepts only MLS;
@@ -1521,7 +1706,7 @@ async fn handle_socket(
                                 connection_id
                             );
                             if bump_protocol_error(&state_clone, connection_id) {
-                                break;
+                                return Closing::Initiate(close_code::POLICY);
                             }
                             continue;
                         }
@@ -1553,7 +1738,7 @@ async fn handle_socket(
                                     connection_id
                                 );
                                 if bump_protocol_error(&state_clone, connection_id) {
-                                    break;
+                                    return Closing::Initiate(close_code::POLICY);
                                 }
                             }
                             continue;
@@ -1586,7 +1771,7 @@ async fn handle_socket(
                                         ts.len(),
                                         window
                                     );
-                                    break;
+                                    return Closing::Initiate(close_code::POLICY);
                                 }
                                 ts.push_back(now);
                             }
@@ -1610,7 +1795,7 @@ async fn handle_socket(
                                     );
 
                                     if bump_protocol_error(&state_clone, connection_id) {
-                                        break;
+                                        return Closing::Initiate(close_code::POLICY);
                                     }
                                     continue;
                                 }
@@ -1627,11 +1812,15 @@ async fn handle_socket(
                                             "ECDH message serialized, attempting broadcast..."
                                         );
 
-                                        match state_clone.broadcast_room_message_from(
-                                            &room_id,
-                                            json,
-                                            recv_client_share.as_deref(),
-                                        ) {
+                                        match state_clone
+                                            .broadcast_room_message_when_room(
+                                                &room_id,
+                                                json,
+                                                recv_client_share.as_deref(),
+                                                BROADCAST_ADMISSION_WAIT,
+                                            )
+                                            .await
+                                        {
                                             Ok(receiver_count) => {
                                                 tracing::info!(
                                                     "✅ ECDH public key broadcasted to {} receivers in room={}",
@@ -1672,7 +1861,7 @@ async fn handle_socket(
                                     connection_id
                                 );
                                 if bump_protocol_error(&state_clone, connection_id) {
-                                    break;
+                                    return Closing::Initiate(close_code::POLICY);
                                 }
                                 continue;
                             }
@@ -1684,7 +1873,7 @@ async fn handle_socket(
                                         connection_id
                                     );
                                     if bump_protocol_error(&state_clone, connection_id) {
-                                        break;
+                                        return Closing::Initiate(close_code::POLICY);
                                     }
                                     continue;
                                 }
@@ -1697,7 +1886,7 @@ async fn handle_socket(
                                         connection_id
                                     );
                                     if bump_protocol_error(&state_clone, connection_id) {
-                                        break;
+                                        return Closing::Initiate(close_code::POLICY);
                                     }
                                     continue;
                                 }
@@ -1723,7 +1912,7 @@ async fn handle_socket(
                                         reason
                                     );
                                     if bump_protocol_error(&state_clone, connection_id) {
-                                        break;
+                                        return Closing::Initiate(close_code::POLICY);
                                     }
                                     continue;
                                 }
@@ -1756,7 +1945,7 @@ async fn handle_socket(
                                     "Connection {} exceeded rate limit on mls, disconnecting",
                                     connection_id
                                 );
-                                break;
+                                return Closing::Initiate(close_code::POLICY);
                             }
                             timestamps.push_back(now);
                             // Release the entry guard before grabbing the
@@ -1814,7 +2003,7 @@ async fn handle_socket(
                                         max_proposals,
                                         proposal_window
                                     );
-                                    break;
+                                    return Closing::Initiate(close_code::POLICY);
                                 }
                                 proposal_ts.push_back(now);
                             }
@@ -1869,7 +2058,7 @@ async fn handle_socket(
                                 // causes the exact KeyPackage/Proposal/Welcome
                                 // to be retried after replay sync rather than
                                 // silently accepting-and-dropping it.
-                                break;
+                                return Closing::Initiate(close_code::TRY_AGAIN_LATER);
                             }
                             if is_commit {
                                 state_clone
@@ -1882,7 +2071,7 @@ async fn handle_socket(
                             if wire_format != WIRE_PRIVATE_MESSAGE {
                                 evict_lagging_group_participants(&state_clone, room_id);
                                 if !state_clone.connection_is_active(&room_id, &connection_id) {
-                                    break;
+                                    return no_longer_active(&state_clone, &room_id);
                                 }
                             }
 
@@ -1898,7 +2087,9 @@ async fn handle_socket(
                             match state_clone.record_replay_hash(&room_id, &payload_hash, now) {
                                 ReplayAdmission::New => {}
                                 ReplayAdmission::Duplicate => continue,
-                                ReplayAdmission::RoomGone => break,
+                                ReplayAdmission::RoomGone => {
+                                    return Closing::Initiate(close_code::GOING_AWAY);
+                                }
                             }
 
                             if wire_format == WIRE_PRIVATE_MESSAGE {
@@ -1912,14 +2103,21 @@ async fn handle_socket(
                                     control_seq: None,
                                     sender_id: connection_id,
                                 };
-                                match serde_json::to_string(&broadcast_msg) {
+                                let serialized = serde_json::to_string(&broadcast_msg);
+                                // Only the serialized frame is kept while it
+                                // waits for room in the broadcast budgets.
+                                drop(broadcast_msg);
+                                drop(validated);
+                                match serialized {
                                     Ok(json) => {
                                         if state_clone
-                                            .broadcast_room_message_from(
+                                            .broadcast_room_message_when_room(
                                                 &room_id,
                                                 json,
                                                 recv_client_share.as_deref(),
+                                                BROADCAST_ADMISSION_WAIT,
                                             )
+                                            .await
                                             .is_err()
                                         {
                                             state_clone.forget_replay_hash(&room_id, &payload_hash);
@@ -1927,7 +2125,7 @@ async fn handle_socket(
                                                 "Room {} broadcast byte budget exhausted",
                                                 room_id
                                             );
-                                            break;
+                                            return Closing::Initiate(close_code::TRY_AGAIN_LATER);
                                         }
                                     }
                                     Err(error) => {
@@ -1936,7 +2134,7 @@ async fn handle_socket(
                                             "Failed to serialize MLS PrivateMessage: {}",
                                             error
                                         );
-                                        break;
+                                        return Closing::Initiate(close_code::INTERNAL);
                                     }
                                 }
                             } else {
@@ -2018,11 +2216,11 @@ async fn handle_socket(
                                             connection_id
                                         );
                                     }
-                                    break;
+                                    return Closing::Initiate(close_code::TRY_AGAIN_LATER);
                                 }
                                 evict_lagging_group_participants(&state_clone, room_id);
                                 if !state_clone.connection_is_active(&room_id, &connection_id) {
-                                    break;
+                                    return no_longer_active(&state_clone, &room_id);
                                 }
                             }
 
@@ -2059,7 +2257,7 @@ async fn handle_socket(
                                     if let Ok(json) = serde_json::to_string(&error)
                                         && recv_direct_tx.try_send(json).is_err()
                                     {
-                                        break;
+                                        return Closing::Initiate(close_code::POLICY);
                                     }
                                     continue;
                                 }
@@ -2092,7 +2290,7 @@ async fn handle_socket(
                                         // so a peer could sit just under it and
                                         // stream junk headers indefinitely.
                                         if bump_protocol_error(&state_clone, connection_id) {
-                                            break;
+                                            return Closing::Initiate(close_code::POLICY);
                                         }
                                         continue;
                                     }
@@ -2123,7 +2321,7 @@ async fn handle_socket(
                                         timestamps.len(),
                                         rate_window_secs
                                     );
-                                    break;
+                                    return Closing::Initiate(close_code::POLICY);
                                 }
                                 timestamps.push_back(now);
                                 drop(timestamps);
@@ -2159,7 +2357,9 @@ async fn handle_socket(
                                         );
                                         continue;
                                     }
-                                    ReplayAdmission::RoomGone => break,
+                                    ReplayAdmission::RoomGone => {
+                                        return Closing::Initiate(close_code::GOING_AWAY);
+                                    }
                                 }
 
                                 // Create the message to broadcast based on type
@@ -2178,14 +2378,20 @@ async fn handle_socket(
                                     }
                                 };
 
-                                match serde_json::to_string(&broadcast_msg) {
+                                let serialized = serde_json::to_string(&broadcast_msg);
+                                // Only the serialized frame is kept while it
+                                // waits for room in the broadcast budgets.
+                                drop(broadcast_msg);
+                                match serialized {
                                     Ok(json) => {
                                         if state_clone
-                                            .broadcast_room_message_from(
+                                            .broadcast_room_message_when_room(
                                                 &room_id,
                                                 json,
                                                 recv_client_share.as_deref(),
+                                                BROADCAST_ADMISSION_WAIT,
                                             )
+                                            .await
                                             .is_err()
                                         {
                                             state_clone.forget_replay_hash(&room_id, &payload_hash);
@@ -2193,7 +2399,7 @@ async fn handle_socket(
                                                 "Room {} broadcast byte budget exhausted",
                                                 room_id
                                             );
-                                            break;
+                                            return Closing::Initiate(close_code::TRY_AGAIN_LATER);
                                         }
                                     }
                                     Err(error) => {
@@ -2202,7 +2408,7 @@ async fn handle_socket(
                                             "Failed to serialize relay message: {}",
                                             error
                                         );
-                                        break;
+                                        return Closing::Initiate(close_code::INTERNAL);
                                     }
                                 }
 
@@ -2222,7 +2428,7 @@ async fn handle_socket(
                                 connection_id
                             );
                             if bump_protocol_error(&state_clone, connection_id) {
-                                break;
+                                return Closing::Initiate(close_code::POLICY);
                             }
                         }
                     }
@@ -2230,48 +2436,77 @@ async fn handle_socket(
                         #[cfg(debug_assertions)]
                         tracing::debug!("Failed to parse message: {}", _e);
                         if bump_protocol_error(&state_clone, connection_id) {
-                            break;
+                            return Closing::Initiate(close_code::POLICY);
                         }
                     }
                 }
             }
         }
-    });
+    };
 
-    // Wait for either task to complete
-    tokio::select! {
-        _ = &mut send_task => {
-            recv_task.abort();
-        }
-        _ = &mut recv_task => {
-            send_task.abort();
-        }
+    // Both loops run in this task, each borrowing its half of the socket.
+    // The one that ends first decides how the connection closes; the other
+    // is stopped, and the closing handshake then runs on the two halves.
+    // Dropping the receiving loop loses nothing the transport has read: a
+    // read may be abandoned at any point.
+    enum Ended {
+        Sending(Closing),
+        Receiving(Closing),
     }
+    //
+    // The loops used to run as tasks of their own, and a panic in one of
+    // them ended only that task: the connection was still detached from
+    // its room below. A panic is caught here for the same reason, and the
+    // connection then ends without a closing handshake.
+    let mut send_side = Box::pin(AssertUnwindSafe(send_side).catch_unwind());
+    let mut recv_side = Box::pin(AssertUnwindSafe(recv_side).catch_unwind());
+    let ended = tokio::select! {
+        closing = &mut send_side => Ended::Sending(closing.unwrap_or(Closing::Abort)),
+        closing = &mut recv_side => Ended::Receiving(closing.unwrap_or(Closing::Abort)),
+    };
+    drop(recv_side);
+    let closing = match ended {
+        Ended::Sending(closing) => {
+            drop(send_side);
+            closing
+        }
+        Ended::Receiving(closing) => {
+            let _ = stop_sending.send(());
+            // Bounded by the write deadline of the frame in progress. A
+            // panic there leaves the writer refusing frames, as a cut write
+            // does.
+            match send_side.await {
+                Ok(_) => closing,
+                Err(_) => Closing::Abort,
+            }
+        }
+    };
 
     // Detach the socket now, but keep the stable participant ID reserved for a
     // short grace period. A valid resume reconnect cancels departure simply by
     // reclaiming the ID before the delayed finalizer runs.
     schedule_connection_departure(&state, connection_id);
+    close_connection(&mut sender, &mut receiver, closing).await;
 }
 
-/// Sends an error message and closes the connection
-async fn send_error(mut socket: WebSocket, error: &str) -> Result<(), axum::Error> {
+/// Sends an error message and closes the connection with `code`.
+async fn send_error(socket: WsSocket, error: &str, code: u16) {
+    let (mut sender, mut receiver) = socket.split();
     let error_msg = Message::Error {
         message: error.to_string(),
     };
-
     // Best effort and bounded: a peer that does not read must not keep the
     // handler task alive.
-    let farewell = async {
-        if let Ok(json) = serde_json::to_string(&error_msg) {
-            socket.send(WsMessage::Text(json)).await?;
-        }
-        socket.send(WsMessage::Close(None)).await
+    let sent = match serde_json::to_string(&error_msg) {
+        Ok(json) => send_within_deadline(&mut sender, Outgoing::Text(&json)).await,
+        Err(_) => true,
     };
-    match tokio::time::timeout(WS_SEND_TIMEOUT, farewell).await {
-        Ok(result) => result,
-        Err(_) => Ok(()),
-    }
+    let closing = if sent {
+        Closing::Initiate(code)
+    } else {
+        Closing::Abort
+    };
+    close_connection(&mut sender, &mut receiver, closing).await;
 }
 
 #[cfg(test)]
@@ -2289,6 +2524,7 @@ mod tests {
     use crate::models::{Room, RoomConfig, RoomType};
     use crate::state::app_state::{MLS_CONTROL_LAG_GRACE, MLS_CONTROL_LAG_HARD_LIMIT};
     use axum::{Router, routing::get};
+    use futures_util::{SinkExt, StreamExt};
     use std::collections::VecDeque;
     use std::net::SocketAddr;
     use uuid::Uuid;
@@ -2772,6 +3008,8 @@ mod tests {
             port: 0,
             ws_conn_burst_size: 100,
             ws_conn_period_secs: 60,
+            max_ws_connections: crate::config::DEFAULT_MAX_WS_CONNECTIONS,
+            max_ws_connections_per_address: crate::config::DEFAULT_MAX_WS_CONNECTIONS_PER_ADDRESS,
             room_token_burst_size: 100,
             room_token_period_secs: 600,
             msg_rate_limit: 30,
@@ -3694,10 +3932,10 @@ mod tests {
         }
         let megabyte = || "x".repeat(MIB);
 
-        // Four full rooms are the whole share of one address.
-        assert_eq!(MAX_BROADCAST_CLIENT_BYTES, 16 * MIB);
+        // Two full rooms are the whole share of one address.
+        assert_eq!(MAX_BROADCAST_CLIENT_BYTES, 8 * MIB);
         let first = state.lease_client_broadcast_share("address-a");
-        for room_id in &rooms[..4] {
+        for room_id in &rooms[..2] {
             for _ in 0..4 {
                 assert!(
                     state
@@ -3707,7 +3945,7 @@ mod tests {
             }
         }
         assert_eq!(
-            state.broadcast_room_message_from(&rooms[4], megabyte(), Some(&first)),
+            state.broadcast_room_message_from(&rooms[2], megabyte(), Some(&first)),
             Err(BroadcastError::ClientByteCapacity),
             "an empty room does not help an address that is at its share"
         );
@@ -3715,7 +3953,7 @@ mod tests {
         // A second connection from the same address draws on the same share.
         let second = state.lease_client_broadcast_share("address-a");
         assert_eq!(
-            state.broadcast_room_message_from(&rooms[4], megabyte(), Some(&second)),
+            state.broadcast_room_message_from(&rooms[2], megabyte(), Some(&second)),
             Err(BroadcastError::ClientByteCapacity)
         );
 
@@ -3725,12 +3963,12 @@ mod tests {
         for _ in 0..4 {
             assert!(
                 state
-                    .broadcast_room_message_from(&rooms[4], megabyte(), Some(&other))
+                    .broadcast_room_message_from(&rooms[2], megabyte(), Some(&other))
                     .is_ok()
             );
         }
         // Frames the relay produces itself are charged to no address.
-        assert!(state.broadcast_room_message(&rooms[5], megabyte()).is_ok());
+        assert!(state.broadcast_room_message(&rooms[3], megabyte()).is_ok());
 
         // Closing every connection does not hand the address a fresh share
         // while its frames are still held by receivers that do not read.
@@ -3739,19 +3977,19 @@ mod tests {
         assert_eq!(state.sweep_client_broadcast_shares(), 2);
         let reconnected = state.lease_client_broadcast_share("address-a");
         assert_eq!(
-            state.broadcast_room_message_from(&rooms[6], megabyte(), Some(&reconnected)),
+            state.broadcast_room_message_from(&rooms[4], megabyte(), Some(&reconnected)),
             Err(BroadcastError::ClientByteCapacity)
         );
 
         // Once the frames are gone the share is available again. A frame is
         // gone when the room is and no receiver holds it any more.
-        for room_id in &rooms[..4] {
+        for room_id in &rooms[..2] {
             state.remove_room(room_id);
         }
-        receivers.drain(..4);
+        receivers.drain(..2);
         assert!(
             state
-                .broadcast_room_message_from(&rooms[6], megabyte(), Some(&reconnected))
+                .broadcast_room_message_from(&rooms[4], megabyte(), Some(&reconnected))
                 .is_ok()
         );
 
@@ -5154,6 +5392,1367 @@ mod tests {
                 !state.connection_is_active(&room_id, &stalled_id)
             })
             .await;
+        });
+    }
+
+    #[test]
+    fn a_ping_from_a_client_is_answered_with_the_same_payload() {
+        use tokio_tungstenite::tungstenite::Message as ClientMessage;
+
+        run_relay_scenario(std::time::Duration::from_secs(30), || async {
+            let mut room = live_one_to_one_room(test_config()).await;
+            room.alice_socket
+                .send(ClientMessage::Ping(b"are you there".to_vec()))
+                .await
+                .unwrap();
+            let answer = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    match room.alice_socket.next().await {
+                        Some(Ok(ClientMessage::Pong(payload))) => return payload,
+                        Some(Ok(_)) => continue,
+                        other => panic!("socket ended before the pong: {other:?}"),
+                    }
+                }
+            })
+            .await
+            .expect("the relay answers a ping");
+            assert_eq!(answer, b"are you there");
+
+            // The connection carries messages as before.
+            assert_relays(&mut room.alice_socket, room.alice, &mut room.bob_socket, 1).await;
+        });
+    }
+
+    #[test]
+    fn largest_images_are_relayed_intact_again_and_again_on_the_same_connections() {
+        use tokio_tungstenite::tungstenite::Message as ClientMessage;
+
+        run_relay_scenario(std::time::Duration::from_secs(120), || async {
+            let mut config = test_config();
+            config.max_image_size = 2 * 1024 * 1024;
+            config.room_byte_rate_limit = 64 * 1024 * 1024;
+            let mut room = live_one_to_one_room(config).await;
+            for round in 0..6usize {
+                // Every frame differs, or the relay would drop it as a replay.
+                let mut frame = browser_image_envelope(2 * 1024 * 1024 - round * 3);
+                frame["header"]["n"] = serde_json::json!(round);
+                let (from, from_id, to) = if round % 2 == 0 {
+                    (&mut room.alice_socket, room.alice, &mut room.bob_socket)
+                } else {
+                    (&mut room.bob_socket, room.bob, &mut room.alice_socket)
+                };
+                from.send(ClientMessage::Text(frame.to_string()))
+                    .await
+                    .unwrap();
+                let relayed = expect_frame(to, "image").await;
+                assert_eq!(relayed["sender_id"], from_id.to_string());
+                assert!(
+                    relayed["payload"] == frame["payload"],
+                    "round {round}: the receiver got another payload"
+                );
+                assert!(relayed["header"]["n"] == frame["header"]["n"]);
+                let echoed = expect_frame(from, "image").await;
+                assert!(
+                    echoed["payload"] == frame["payload"],
+                    "round {round}: the echo carries another payload"
+                );
+            }
+
+            // Delivered frames are no longer counted against any budget.
+            let state = room.state.clone();
+            wait_until("delivered frames leave the broadcast budget", || {
+                state.broadcast_bytes_in_flight() == 0
+            })
+            .await;
+        });
+    }
+
+    #[test]
+    fn both_peers_can_send_their_largest_image_at_the_same_moment() {
+        use tokio_tungstenite::tungstenite::Message as ClientMessage;
+
+        // One largest image takes nearly the whole byte budget of its room
+        // and keeps it while it is written out. The image the other peer
+        // sends at the same moment has to wait for it, not cost its sender
+        // the connection.
+        run_relay_scenario(std::time::Duration::from_secs(120), || async {
+            let mut config = test_config();
+            config.max_image_size = 2 * 1024 * 1024;
+            config.room_byte_rate_limit = 64 * 1024 * 1024;
+            let mut room = live_one_to_one_room(config).await;
+            let state = room.state.clone();
+            for round in 0..4usize {
+                let mut from_alice = browser_image_envelope(2 * 1024 * 1024 - round * 3);
+                from_alice["header"]["n"] = serde_json::json!(2 * round);
+                let mut from_bob = browser_image_envelope(2 * 1024 * 1024 - round * 3 - 1);
+                from_bob["header"]["n"] = serde_json::json!(2 * round + 1);
+
+                let (sent_a, sent_b) = tokio::join!(
+                    room.alice_socket
+                        .send(ClientMessage::Text(from_alice.to_string())),
+                    room.bob_socket
+                        .send(ClientMessage::Text(from_bob.to_string())),
+                );
+                sent_a.unwrap();
+                sent_b.unwrap();
+
+                // Each side gets both images, its own echo and the other's,
+                // in the order the relay let them through. Both read at the
+                // same time, as two browsers do: the second image is let
+                // through once the first has reached everybody.
+                async fn two_images(socket: &mut TestSocket) -> Vec<serde_json::Value> {
+                    let first = expect_frame(socket, "image").await;
+                    let second = expect_frame(socket, "image").await;
+                    vec![first, second]
+                }
+                let (at_alice, at_bob) = tokio::join!(
+                    two_images(&mut room.alice_socket),
+                    two_images(&mut room.bob_socket),
+                );
+                for received in [at_alice, at_bob] {
+                    assert_ne!(
+                        received[0]["sender_id"], received[1]["sender_id"],
+                        "round {round}: one image came twice"
+                    );
+                    for relayed in received {
+                        let expected = if relayed["sender_id"] == room.alice.to_string() {
+                            &from_alice
+                        } else {
+                            assert_eq!(relayed["sender_id"], room.bob.to_string());
+                            &from_bob
+                        };
+                        assert!(
+                            relayed["payload"] == expected["payload"],
+                            "round {round}: an image arrived with another payload"
+                        );
+                    }
+                }
+                assert!(state.connection_is_active(&room.room_id, &room.alice));
+                assert!(state.connection_is_active(&room.room_id, &room.bob));
+            }
+            wait_until("delivered frames leave the broadcast budget", || {
+                state.broadcast_bytes_in_flight() == 0
+            })
+            .await;
+
+            // The same with a member of the room that is slow to take the
+            // first image, which here is a receiver held by the test: the
+            // second image is held back, its sender stays connected, and it
+            // goes through when the first one has left the budget.
+            let mut slow = state
+                .broadcast_channels
+                .get(&room.room_id)
+                .expect("room broadcast sender")
+                .subscribe();
+            let mut first = browser_image_envelope(2 * 1024 * 1024 - 100);
+            first["header"]["n"] = serde_json::json!(100);
+            let mut second = browser_image_envelope(2 * 1024 * 1024 - 101);
+            second["header"]["n"] = serde_json::json!(101);
+            room.alice_socket
+                .send(ClientMessage::Text(first.to_string()))
+                .await
+                .unwrap();
+            assert!(
+                expect_frame(&mut room.bob_socket, "image").await["payload"] == first["payload"]
+            );
+            assert!(
+                expect_frame(&mut room.alice_socket, "image").await["payload"] == first["payload"]
+            );
+            room.bob_socket
+                .send(ClientMessage::Text(second.to_string()))
+                .await
+                .unwrap();
+            expect_silence(
+                &mut room.alice_socket,
+                "the second image waits for the first to leave the budget",
+            )
+            .await;
+            assert!(state.connection_is_active(&room.room_id, &room.bob));
+            drop(slow.recv().await.unwrap());
+            assert!(
+                expect_frame(&mut room.alice_socket, "image").await["payload"] == second["payload"]
+            );
+            assert!(
+                expect_frame(&mut room.bob_socket, "image").await["payload"] == second["payload"]
+            );
+            assert!(state.connection_is_active(&room.room_id, &room.bob));
+        });
+    }
+
+    #[test]
+    fn a_frame_waits_for_room_in_the_broadcast_budget_and_gives_up_in_time() {
+        use crate::state::app_state::BroadcastError;
+
+        const MIB: usize = 1024 * 1024;
+        run_relay_scenario(std::time::Duration::from_secs(30), || async {
+            let state = AppState::new(1000, test_config());
+            let room_id = state
+                .try_create_room(Room::new(RoomConfig {
+                    room_type: RoomType::OneToOne,
+                    ttl_minutes: 5,
+                    max_participants: 2,
+                }))
+                .unwrap();
+            // A receiver that takes nothing: what is sent stays counted.
+            let mut receiver = state
+                .broadcast_channels
+                .get(&room_id)
+                .expect("room broadcast sender")
+                .subscribe();
+            let megabyte = || "x".repeat(MIB);
+            for _ in 0..4 {
+                state.broadcast_room_message(&room_id, megabyte()).unwrap();
+            }
+            assert_eq!(state.broadcast_bytes_in_flight(), 4 * MIB);
+            assert_eq!(
+                state.broadcast_room_message(&room_id, megabyte()),
+                Err(BroadcastError::RoomByteCapacity),
+            );
+
+            // Too little patience: the frame is refused with the budget
+            // that was full, and nothing of it stays counted.
+            let started = Instant::now();
+            assert_eq!(
+                state
+                    .broadcast_room_message_when_room(
+                        &room_id,
+                        megabyte(),
+                        None,
+                        Duration::from_millis(80),
+                    )
+                    .await,
+                Err(BroadcastError::RoomByteCapacity),
+            );
+            assert!(started.elapsed() >= Duration::from_millis(80));
+            assert_eq!(state.broadcast_bytes_in_flight(), 4 * MIB);
+
+            // Enough patience: it goes through as soon as one frame leaves.
+            let waiting_state = state.clone();
+            let waiting = tokio::spawn(async move {
+                waiting_state
+                    .broadcast_room_message_when_room(
+                        &room_id,
+                        "y".repeat(MIB),
+                        None,
+                        Duration::from_secs(20),
+                    )
+                    .await
+            });
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(
+                !waiting.is_finished(),
+                "the frame went through a full budget"
+            );
+            drop(receiver.recv().await.unwrap());
+            assert_eq!(waiting.await.unwrap(), Ok(1));
+            assert_eq!(state.broadcast_bytes_in_flight(), 4 * MIB);
+
+            // A room that is gone is an answer at once, not a wait.
+            let started = Instant::now();
+            assert_eq!(
+                state
+                    .broadcast_room_message_when_room(
+                        &Uuid::new_v4(),
+                        megabyte(),
+                        None,
+                        Duration::from_secs(20),
+                    )
+                    .await,
+                Err(BroadcastError::MissingRoom),
+            );
+            assert!(started.elapsed() < Duration::from_secs(5));
+
+            drop(receiver);
+            state.remove_room(&room_id);
+            assert_eq!(state.broadcast_bytes_in_flight(), 0);
+        });
+    }
+
+    #[test]
+    fn every_member_of_a_full_group_can_send_at_once_without_overrunning_a_receiver() {
+        use crate::state::app_state::BROADCAST_CHANNEL_ENTRIES;
+        use tokio::sync::broadcast::error::TryRecvError;
+
+        let state = AppState::new(1000, test_config());
+        let room_id = state
+            .try_create_room(Room::new(RoomConfig {
+                room_type: RoomType::Group,
+                ttl_minutes: 60,
+                max_participants: 20,
+            }))
+            .unwrap();
+        let members = state.rooms.get(&room_id).unwrap().max_participants;
+        let mut receiver = state
+            .broadcast_channels
+            .get(&room_id)
+            .expect("room broadcast sender")
+            .subscribe();
+        // Three messages from every member before this receiver takes one:
+        // all of them sending at the same moment, while it is still writing
+        // a picture. With a ring of 8 it lagged at the ninth.
+        let sent = 3 * members;
+        assert!(sent <= BROADCAST_CHANNEL_ENTRIES);
+        for n in 0..sent {
+            state
+                .broadcast_room_message(&room_id, format!("{{\"n\":{n}}}"))
+                .unwrap();
+        }
+        for n in 0..sent {
+            let message = receiver.try_recv().expect("nothing is lost");
+            assert_eq!(message.as_str(), format!("{{\"n\":{n}}}"), "in order");
+        }
+        assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
+        state.remove_room(&room_id);
+    }
+
+    #[test]
+    fn a_message_leaves_the_broadcast_budget_once_every_receiver_has_taken_it() {
+        const KIB: usize = 1024;
+        let state = AppState::new(1000, test_config());
+        let room_id = state
+            .try_create_room(Room::new(RoomConfig {
+                room_type: RoomType::OneToOne,
+                ttl_minutes: 5,
+                max_participants: 2,
+            }))
+            .unwrap();
+        let (mut first, mut second) = {
+            let sender = state
+                .broadcast_channels
+                .get(&room_id)
+                .expect("room broadcast sender");
+            (sender.subscribe(), sender.subscribe())
+        };
+        for _ in 0..4 {
+            state
+                .broadcast_room_message(&room_id, "m".repeat(KIB))
+                .unwrap();
+        }
+        assert_eq!(state.broadcast_bytes_in_flight(), 4 * KIB);
+
+        for _ in 0..4 {
+            drop(first.try_recv().unwrap());
+        }
+        assert_eq!(
+            state.broadcast_bytes_in_flight(),
+            4 * KIB,
+            "the other receiver has not taken them yet"
+        );
+
+        // A receiver holds the message it is writing.
+        let writing = second.try_recv().unwrap();
+        for _ in 0..3 {
+            drop(second.try_recv().unwrap());
+        }
+        assert_eq!(state.broadcast_bytes_in_flight(), KIB);
+        drop(writing);
+        assert_eq!(
+            state.broadcast_bytes_in_flight(),
+            0,
+            "a slot that every receiver has read keeps nothing until it is reused"
+        );
+        state.remove_room(&room_id);
+    }
+
+    #[test]
+    fn a_receiver_further_behind_than_the_ring_lags_and_what_it_missed_is_released() {
+        use crate::state::app_state::BROADCAST_CHANNEL_ENTRIES;
+        use tokio::sync::broadcast::error::TryRecvError;
+
+        const KIB: usize = 1024;
+        let state = AppState::new(1000, test_config());
+        let room_id = state
+            .try_create_room(Room::new(RoomConfig {
+                room_type: RoomType::OneToOne,
+                ttl_minutes: 5,
+                max_participants: 2,
+            }))
+            .unwrap();
+        let mut receiver = state
+            .broadcast_channels
+            .get(&room_id)
+            .expect("room broadcast sender")
+            .subscribe();
+        for _ in 0..BROADCAST_CHANNEL_ENTRIES + 3 {
+            state
+                .broadcast_room_message(&room_id, "m".repeat(KIB))
+                .unwrap();
+        }
+        assert_eq!(
+            state.broadcast_bytes_in_flight(),
+            BROADCAST_CHANNEL_ENTRIES * KIB,
+            "the three oldest were overwritten and released"
+        );
+        // The relay closes such a connection with 1008.
+        assert!(matches!(receiver.try_recv(), Err(TryRecvError::Lagged(3))));
+        drop(receiver);
+        assert_eq!(state.broadcast_bytes_in_flight(), 0);
+        state.remove_room(&room_id);
+    }
+
+    #[test]
+    fn a_picture_overwritten_in_the_ring_while_a_receiver_writes_it_stays_counted() {
+        use crate::state::app_state::BROADCAST_CHANNEL_ENTRIES;
+        use tokio::sync::broadcast::error::TryRecvError;
+
+        const KIB: usize = 1024;
+        const MIB: usize = 1024 * KIB;
+        let state = AppState::new(1000, test_config());
+        let room_id = state
+            .try_create_room(Room::new(RoomConfig {
+                room_type: RoomType::OneToOne,
+                ttl_minutes: 5,
+                max_participants: 2,
+            }))
+            .unwrap();
+        let (mut writer, mut lagging) = {
+            let sender = state
+                .broadcast_channels
+                .get(&room_id)
+                .expect("room broadcast sender");
+            (sender.subscribe(), sender.subscribe())
+        };
+        state
+            .broadcast_room_message(&room_id, "p".repeat(2 * MIB))
+            .unwrap();
+        // The writer takes the picture and is still writing it.
+        let writing = writer.try_recv().unwrap();
+        // The room goes on until the picture's slot is reused.
+        for _ in 0..BROADCAST_CHANNEL_ENTRIES {
+            state
+                .broadcast_room_message(&room_id, "t".repeat(KIB))
+                .unwrap();
+        }
+        assert_eq!(
+            state.broadcast_bytes_in_flight(),
+            2 * MIB + BROADCAST_CHANNEL_ENTRIES * KIB,
+            "the ring no longer holds the picture, the write does, and it is still counted"
+        );
+        assert!(matches!(lagging.try_recv(), Err(TryRecvError::Lagged(1))));
+        assert_eq!(writing.as_str().len(), 2 * MIB);
+
+        drop(writing);
+        assert_eq!(
+            state.broadcast_bytes_in_flight(),
+            BROADCAST_CHANNEL_ENTRIES * KIB,
+            "the picture leaves the budget with its last reference"
+        );
+        drop(writer);
+        drop(lagging);
+        assert_eq!(state.broadcast_bytes_in_flight(), 0);
+        state.remove_room(&room_id);
+    }
+
+    #[test]
+    fn a_frame_above_the_size_limit_ends_the_connection_and_only_that_one() {
+        use tokio_tungstenite::tungstenite::Message as ClientMessage;
+
+        run_relay_scenario(std::time::Duration::from_secs(60), || async {
+            let mut room = live_one_to_one_room(test_config()).await;
+            let limit = max_ws_size(room.state.config.max_image_size);
+            let state = room.state.clone();
+            let (room_id, alice) = (room.room_id, room.alice);
+
+            // The relay stops at the header: the client may fail to push the
+            // whole body into a connection that is already gone.
+            let _ = room
+                .alice_socket
+                .send(ClientMessage::Text("x".repeat(limit + 1)))
+                .await;
+            wait_until("the relay drops the oversized sender", || {
+                !state.connection_is_active(&room_id, &alice)
+            })
+            .await;
+            // The other peer is untouched; the slot of the sender is held
+            // for the reconnect grace period like after any other drop.
+            assert!(state.connection_is_active(&room_id, &room.bob));
+            expect_silence(
+                &mut room.bob_socket,
+                "nothing of the oversized frame is relayed",
+            )
+            .await;
+        });
+    }
+
+    #[test]
+    fn binary_frames_are_dropped_and_the_stream_goes_on() {
+        use tokio_tungstenite::tungstenite::Message as ClientMessage;
+
+        run_relay_scenario(std::time::Duration::from_secs(30), || async {
+            let mut room = live_one_to_one_room(test_config()).await;
+            room.alice_socket
+                .send(ClientMessage::Binary(vec![7u8; 70_000]))
+                .await
+                .unwrap();
+            assert_relays(&mut room.alice_socket, room.alice, &mut room.bob_socket, 2).await;
+            assert_relays(&mut room.bob_socket, room.bob, &mut room.alice_socket, 3).await;
+        });
+    }
+
+    #[test]
+    fn a_message_sent_in_fragments_is_relayed_as_one() {
+        use tokio_tungstenite::tungstenite::Message as ClientMessage;
+        use tokio_tungstenite::tungstenite::protocol::frame::{
+            Frame,
+            coding::{Data, OpCode},
+        };
+
+        run_relay_scenario(std::time::Duration::from_secs(30), || async {
+            let mut room = live_one_to_one_room(test_config()).await;
+            let whole = one_to_one_text_frame(900);
+            let expected: serde_json::Value = serde_json::from_str(&whole).unwrap();
+            let (first, rest) = whole.as_bytes().split_at(whole.len() / 3);
+            let (second, third) = rest.split_at(rest.len() / 2);
+
+            let fragments = [
+                ClientMessage::Frame(Frame::message(
+                    first.to_vec(),
+                    OpCode::Data(Data::Text),
+                    false,
+                )),
+                // A control frame may sit between the fragments of a message.
+                ClientMessage::Ping(b"between".to_vec()),
+                ClientMessage::Frame(Frame::message(
+                    second.to_vec(),
+                    OpCode::Data(Data::Continue),
+                    false,
+                )),
+                ClientMessage::Frame(Frame::message(
+                    third.to_vec(),
+                    OpCode::Data(Data::Continue),
+                    true,
+                )),
+            ];
+            for fragment in fragments {
+                room.alice_socket.send(fragment).await.unwrap();
+            }
+            let relayed = expect_frame(&mut room.bob_socket, "message").await;
+            assert_eq!(relayed["sender_id"], room.alice.to_string());
+            assert!(relayed["payload"] == expected["payload"]);
+        });
+    }
+
+    /// A frame as a browser puts it on the wire, masked, with the first byte
+    /// (FIN, reserved bits, opcode) given as it is.
+    fn raw_client_frame(first: u8, payload: &[u8]) -> Vec<u8> {
+        const MASK: [u8; 4] = [0x1F, 0x2E, 0x3D, 0x4C];
+        let mut frame = vec![first];
+        if payload.len() < 126 {
+            frame.push(0x80 | payload.len() as u8);
+        } else if payload.len() <= usize::from(u16::MAX) {
+            frame.push(0x80 | 126);
+            frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        } else {
+            frame.push(0x80 | 127);
+            frame.extend_from_slice(&(payload.len() as u64).to_be_bytes());
+        }
+        frame.extend_from_slice(&MASK);
+        frame.extend(
+            payload
+                .iter()
+                .enumerate()
+                .map(|(index, byte)| byte ^ MASK[index & 3]),
+        );
+        frame
+    }
+
+    /// Bytes written to the socket under the client library, which knows
+    /// nothing of them.
+    async fn write_raw(socket: &mut TestSocket, bytes: &[u8]) {
+        use tokio::io::AsyncWriteExt;
+        match socket.get_mut() {
+            tokio_tungstenite::MaybeTlsStream::Plain(stream) => {
+                stream.write_all(bytes).await.unwrap();
+            }
+            _ => unreachable!("the test relay is plain TCP"),
+        }
+    }
+
+    /// How the connection ended for the client: the status code of the
+    /// relay's Close frame, if one came, and whether the stream then ended
+    /// with an orderly close rather than an error. The socket is dropped at
+    /// the end, as a browser closes its own once the server has.
+    async fn closing_seen_by(mut socket: TestSocket) -> (Option<u16>, bool) {
+        use tokio_tungstenite::tungstenite::Message as ClientMessage;
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let mut code = None;
+            loop {
+                match socket.next().await {
+                    Some(Ok(ClientMessage::Close(frame))) => {
+                        code = Some(frame.map(|frame| u16::from(frame.code)).unwrap_or(1005));
+                    }
+                    Some(Ok(_)) => continue,
+                    None => return (code, true),
+                    Some(Err(_)) => return (code, false),
+                }
+            }
+        })
+        .await
+        .expect("the connection ends")
+    }
+
+    #[test]
+    fn a_close_from_a_client_is_answered_with_its_code_and_ends_cleanly() {
+        use tokio_tungstenite::tungstenite::protocol::{CloseFrame, frame::coding::CloseCode};
+
+        run_relay_scenario(std::time::Duration::from_secs(30), || async {
+            let mut room = live_one_to_one_room(test_config()).await;
+            room.alice_socket
+                .close(Some(CloseFrame {
+                    code: CloseCode::Normal,
+                    reason: "Manual disconnect".into(),
+                }))
+                .await
+                .unwrap();
+            let started = Instant::now();
+            assert_eq!(closing_seen_by(room.alice_socket).await, (Some(1000), true));
+            assert!(started.elapsed() < Duration::from_secs(1));
+
+            // A departure like any other: the slot waits for a resume and the
+            // other peer stays.
+            let state = room.state.clone();
+            let (room_id, alice) = (room.room_id, room.alice);
+            wait_until("the relay lets the closed connection go", || {
+                !state.connection_is_active(&room_id, &alice)
+            })
+            .await;
+            assert!(state.rooms.get(&room_id).unwrap().holds_slot_for(&alice));
+            assert!(state.connection_is_active(&room_id, &room.bob));
+            expect_silence(&mut room.bob_socket, "nothing is relayed for a close").await;
+        });
+    }
+
+    #[test]
+    fn a_close_started_by_the_relay_carries_its_code_and_ends_cleanly() {
+        run_relay_scenario(std::time::Duration::from_secs(30), || async {
+            let room = live_one_to_one_room(test_config()).await;
+            room.state.remove_room(&room.room_id);
+            let (alice, bob) = tokio::join!(
+                closing_seen_by(room.alice_socket),
+                closing_seen_by(room.bob_socket),
+            );
+            assert_eq!(alice, (Some(1001), true));
+            assert_eq!(bob, (Some(1001), true));
+        });
+    }
+
+    #[test]
+    fn a_frame_that_breaks_the_protocol_is_answered_with_the_matching_close_code() {
+        let mut unmasked = raw_client_frame(0x81, b"hello");
+        unmasked[1] &= 0x7F;
+        unmasked.truncate(2);
+        unmasked.extend_from_slice(b"hello");
+        let mut non_minimal = vec![0x81, 0x80 | 126, 0, 5, 0, 0, 0, 0];
+        non_minimal.extend_from_slice(b"hello");
+        let cases: Vec<(&str, Vec<u8>, u16)> = vec![
+            ("unmasked frame", unmasked, 1002),
+            ("reserved bit", raw_client_frame(0xC1, b"hello"), 1002),
+            ("reserved opcode", raw_client_frame(0x83, b"x"), 1002),
+            ("length not in its shortest form", non_minimal, 1002),
+            (
+                "close frame with a bad code",
+                raw_client_frame(0x88, &[0x03, 0xED]),
+                1002,
+            ),
+            (
+                "invalid UTF-8",
+                raw_client_frame(0x81, &[b'{', 0xC3, 0x28]),
+                1007,
+            ),
+            (
+                "too many fragments",
+                {
+                    let mut frames = raw_client_frame(0x01, b"{");
+                    for _ in 0..ws_transport::MAX_MESSAGE_FRAMES {
+                        frames.extend(raw_client_frame(0x00, b""));
+                    }
+                    frames
+                },
+                1009,
+            ),
+        ];
+        for (what, bytes, code) in cases {
+            run_relay_scenario(std::time::Duration::from_secs(30), move || async move {
+                let mut room = live_one_to_one_room(test_config()).await;
+                write_raw(&mut room.alice_socket, &bytes).await;
+                let (seen, _) = closing_seen_by(room.alice_socket).await;
+                assert_eq!(seen, Some(code), "{what}");
+                assert!(room.state.connection_is_active(&room.room_id, &room.bob));
+            });
+        }
+    }
+
+    #[test]
+    fn a_client_that_breaks_the_relay_rules_gets_1008_and_a_clean_close() {
+        use tokio_tungstenite::tungstenite::Message as ClientMessage;
+
+        run_relay_scenario(std::time::Duration::from_secs(30), || async {
+            let mut room = live_one_to_one_room(test_config()).await;
+            let limit = room.state.config.protocol_error_limit;
+            for index in 0..limit {
+                // The relay may already be closing when the last ones go.
+                let _ = room
+                    .alice_socket
+                    .send(ClientMessage::Text(format!("not json {index}")))
+                    .await;
+            }
+            assert_eq!(closing_seen_by(room.alice_socket).await, (Some(1008), true));
+            assert!(room.state.connection_is_active(&room.room_id, &room.bob));
+        });
+    }
+
+    /// The case of a peer that starts a 63 KiB message in a frame that is
+    /// not final, never finishes it, and sends pings to keep the connection
+    /// busy.
+    #[test]
+    fn an_unfinished_message_cannot_be_kept_alive_with_pings() {
+        use tokio_tungstenite::tungstenite::Message as ClientMessage;
+
+        run_relay_scenario(std::time::Duration::from_secs(60), || async {
+            let mut room = live_one_to_one_room(test_config()).await;
+            let state = room.state.clone();
+            let (small_free, large_free) = state.inbound_bytes_available();
+
+            write_raw(
+                &mut room.alice_socket,
+                &raw_client_frame(0x01, &vec![b'x'; 63 * 1024]),
+            )
+            .await;
+            wait_until(
+                "the unfinished message is charged to the small class",
+                || state.inbound_bytes_available() == (small_free - 64 * 1024, large_free),
+            )
+            .await;
+
+            let started = Instant::now();
+            let mut ticker = interval(Duration::from_millis(500));
+            let mut pongs = 0usize;
+            let code = loop {
+                tokio::select! {
+                    _ = ticker.tick() => {
+                        if room.alice_socket
+                            .send(ClientMessage::Ping(b"still here".to_vec()))
+                            .await
+                            .is_err()
+                        {
+                            break None;
+                        }
+                    }
+                    frame = room.alice_socket.next() => match frame {
+                        Some(Ok(ClientMessage::Pong(_))) => pongs += 1,
+                        Some(Ok(ClientMessage::Close(frame))) => {
+                            break frame.map(|frame| u16::from(frame.code));
+                        }
+                        Some(Ok(_)) => {}
+                        None | Some(Err(_)) => break None,
+                    }
+                }
+            };
+            let elapsed = started.elapsed();
+            assert_eq!(code, Some(1008), "closed as a policy violation");
+            assert!(pongs >= 5, "the pings were answered ({pongs})");
+            assert!(
+                elapsed < IDLE_TIMEOUT + Duration::from_secs(2),
+                "the pings did not extend the message: {elapsed:?}"
+            );
+            wait_until("what the message held is returned", || {
+                state.inbound_bytes_available() == (small_free, large_free)
+            })
+            .await;
+        });
+    }
+
+    #[test]
+    fn pictures_cannot_take_what_text_needs_of_the_broadcast_budget() {
+        use crate::state::app_state::BroadcastError;
+
+        const MIB: usize = 1024 * 1024;
+        let state = AppState::new(1000, test_config());
+        let mut rooms = Vec::new();
+        let mut receivers = Vec::new();
+        for _ in 0..8 {
+            let room_id = state
+                .try_create_room(Room::new(RoomConfig {
+                    room_type: RoomType::OneToOne,
+                    ttl_minutes: 5,
+                    max_participants: 2,
+                }))
+                .unwrap();
+            // A receiver that never reads: every frame stays counted.
+            receivers.push(
+                state
+                    .broadcast_channels
+                    .get(&room_id)
+                    .expect("room broadcast sender")
+                    .subscribe(),
+            );
+            rooms.push(room_id);
+        }
+        // Large frames fill three quarters of the 32 MiB, six rooms' worth.
+        for room_id in &rooms[..6] {
+            for _ in 0..4 {
+                state
+                    .broadcast_room_message(room_id, "p".repeat(MIB))
+                    .unwrap();
+            }
+        }
+        assert_eq!(state.broadcast_bytes_in_flight(), 24 * MIB);
+        assert_eq!(
+            state.broadcast_room_message(&rooms[6], "p".repeat(MIB)),
+            Err(BroadcastError::GlobalByteCapacity),
+            "no more pictures"
+        );
+        // Text still has the last quarter.
+        for _ in 0..8 {
+            state
+                .broadcast_room_message(&rooms[6], "t".repeat(32 * 1024))
+                .unwrap();
+        }
+        state
+            .broadcast_room_message(&rooms[7], "t".repeat(2 * 1024))
+            .unwrap();
+        drop(receivers);
+        for room_id in &rooms {
+            state.remove_room(room_id);
+        }
+        assert_eq!(state.broadcast_bytes_in_flight(), 0);
+    }
+
+    #[test]
+    fn one_address_cannot_fill_the_mls_control_log() {
+        let state = AppState::new(1000, test_config());
+        let mut rooms = Vec::new();
+        let mut receivers = Vec::new();
+        for _ in 0..8 {
+            let room = Room::new(RoomConfig {
+                room_type: RoomType::Group,
+                ttl_minutes: 60,
+                max_participants: 4,
+            });
+            let creator = room.creator_connection_id().unwrap();
+            let room_id = state.try_create_room(room).unwrap();
+            state.add_connection(creator, room_id, false).unwrap();
+            let (receiver, _) = state
+                .open_mls_control_stream(&room_id, creator, None)
+                .unwrap();
+            // Kept so the frames are counted until the log lets them go;
+            // read as they come so that the room's ring does not lag.
+            receivers.push(receiver);
+            rooms.push(room_id);
+        }
+        let append = |room_id: &Uuid, lease: &ClientBroadcastLease| {
+            state.append_and_broadcast_mls_envelope_from(
+                room_id,
+                MlsControlAdmission::Ordinary,
+                Some(lease),
+                |seq| {
+                    Some(format!(
+                        "{{\"seq\":{seq},\"pad\":\"{}\"}}",
+                        "m".repeat(32 * 1024)
+                    ))
+                },
+            )
+        };
+        // One address appends in room after room until its quarter of the
+        // global log is used up, long before the global log is.
+        let a = state.lease_client_broadcast_share("address-a");
+        let mut accepted = 0usize;
+        let mut refused_with_room_to_spare = false;
+        'rooms: for room_id in &rooms[..6] {
+            loop {
+                for receiver in receivers.iter_mut() {
+                    while receiver.try_recv().is_ok() {}
+                }
+                match append(room_id, &a) {
+                    Ok(_) => accepted += 1,
+                    Err(MlsControlAppendError::CapacityExceeded) => {
+                        // Full room, or full share: a fresh room tells which.
+                        if append(&rooms[6], &a).is_err() {
+                            refused_with_room_to_spare = true;
+                            break 'rooms;
+                        }
+                        accepted += 1;
+                        break;
+                    }
+                    Err(other) => panic!("{other:?}"),
+                }
+            }
+        }
+        assert!(refused_with_room_to_spare, "the address hit its share");
+        let held = accepted * (32 * 1024 + 30);
+        assert!(held <= 8 * 1024 * 1024 + 64 * 1024, "{held} bytes");
+        assert!(held >= 7 * 1024 * 1024, "{held} bytes");
+        // Another address appends in the room the first could not.
+        let b = state.lease_client_broadcast_share("address-b");
+        append(&rooms[7], &b).unwrap();
+        drop((a, b, receivers));
+        for room_id in &rooms {
+            state.remove_room(room_id);
+        }
+        assert_eq!(state.sweep_client_broadcast_shares(), 0);
+    }
+
+    // ---------------------------------------------------------------------
+    // Admission control
+    // ---------------------------------------------------------------------
+
+    fn admission_config(max: usize, per_address: usize) -> Config {
+        let mut config = test_config();
+        config.max_ws_connections = max;
+        config.max_ws_connections_per_address = per_address;
+        config
+    }
+
+    fn client(key: &str, prefix: Option<&str>) -> crate::state::app_state::ClientAddress {
+        crate::state::app_state::ClientAddress {
+            key: key.to_string(),
+            prefix: prefix.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn admission_counts_the_relay_and_each_address_and_gives_everything_back() {
+        let state = AppState::new(10, admission_config(5, 2));
+        let a = client("a", None);
+        let b = client("b", None);
+        let first = state.admit_ws_connection(Some(&a)).unwrap();
+        let second = state.admit_ws_connection(Some(&a)).unwrap();
+        assert_eq!(
+            state.admit_ws_connection(Some(&a)).err(),
+            Some(AdmissionRefused::AddressFull)
+        );
+        assert_eq!(
+            state.ws_admission_open(&a),
+            Err(AdmissionRefused::AddressFull)
+        );
+        // A refusal for the address takes nothing of the relay's.
+        assert_eq!(state.ws_connections_open(), 2);
+        let others: Vec<_> = (0..3)
+            .map(|index| {
+                state
+                    .admit_ws_connection(Some(&client(&format!("other {index}"), None)))
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(
+            state.admit_ws_connection(Some(&b)).err(),
+            Some(AdmissionRefused::RelayFull)
+        );
+        assert_eq!(
+            state.ws_admission_open(&b),
+            Err(AdmissionRefused::RelayFull)
+        );
+        assert_eq!(
+            state.admit_ws_connection(None).err(),
+            Some(AdmissionRefused::RelayFull)
+        );
+        // A refusal for the relay leaves no count for its address behind.
+        assert_eq!(state.ws_address_connections("b"), 0);
+
+        drop(first);
+        assert_eq!(state.ws_address_connections("a"), 1);
+        let again = state.admit_ws_connection(Some(&b)).unwrap();
+        drop((second, others, again));
+        assert_eq!(state.ws_connections_open(), 0);
+        assert_eq!(state.client_broadcast_share_count(), 0);
+    }
+
+    #[test]
+    fn one_ipv6_slash_48_holds_four_addresses_worth_of_connections() {
+        let state = AppState::new(10, admission_config(1000, 2));
+        // Eight /64s of one /48: each may hold two, all of them eight.
+        let mut held = Vec::new();
+        for host in 0..8 {
+            let address = client(&format!("2001:db8:1:{host}::/64"), Some("2001:db8:1::/48"));
+            held.push(state.admit_ws_connection(Some(&address)).unwrap());
+        }
+        let ninth = client("2001:db8:1:9::/64", Some("2001:db8:1::/48"));
+        assert_eq!(
+            state.admit_ws_connection(Some(&ninth)).err(),
+            Some(AdmissionRefused::AddressFull)
+        );
+        assert_eq!(
+            state.ws_admission_open(&ninth),
+            Err(AdmissionRefused::AddressFull)
+        );
+        // The refused /64 holds nothing, the /48 holds its eight.
+        assert_eq!(state.ws_address_connections("2001:db8:1:9::/64"), 0);
+        assert_eq!(state.ws_prefix_connections("2001:db8:1::/48"), 8);
+        // Another /48 is not affected.
+        let elsewhere = client("2001:db8:2:1::/64", Some("2001:db8:2::/48"));
+        held.push(state.admit_ws_connection(Some(&elsewhere)).unwrap());
+        drop(held);
+        assert_eq!(state.ws_prefix_connections("2001:db8:1::/48"), 0);
+        assert_eq!(state.ws_connections_open(), 0);
+    }
+
+    #[test]
+    fn racing_admissions_never_pass_a_limit_and_leave_nothing_behind() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        const MAX: usize = 48;
+        const PER_ADDRESS: usize = 6;
+        let state = AppState::new(10, admission_config(MAX, PER_ADDRESS));
+        let addresses: Vec<_> = (0..20)
+            .map(|index| {
+                client(
+                    &format!("k{}", index % 10),
+                    Some(&format!("p{}", index % 2)),
+                )
+            })
+            .collect();
+        let held_now = AtomicUsize::new(0);
+        let most_held = AtomicUsize::new(0);
+        let admitted = AtomicUsize::new(0);
+        let refused = AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for thread in 0..12usize {
+                let (state, addresses) = (&state, &addresses);
+                let (held_now, most_held, admitted, refused) =
+                    (&held_now, &most_held, &admitted, &refused);
+                scope.spawn(move || {
+                    let mut mine = std::collections::VecDeque::new();
+                    for round in 0..3000usize {
+                        let address = &addresses[(thread * 7 + round) % addresses.len()];
+                        match state.admit_ws_connection(Some(address)) {
+                            Ok(admission) => {
+                                let now = held_now.fetch_add(1, Ordering::SeqCst) + 1;
+                                most_held.fetch_max(now, Ordering::SeqCst);
+                                admitted.fetch_add(1, Ordering::SeqCst);
+                                assert!(state.ws_address_connections(&address.key) <= PER_ADDRESS);
+                                assert!(
+                                    state.ws_prefix_connections(address.prefix.as_deref().unwrap())
+                                        <= PER_ADDRESS * 4
+                                );
+                                mine.push_back(admission);
+                            }
+                            Err(_) => {
+                                refused.fetch_add(1, Ordering::SeqCst);
+                            }
+                        }
+                        if (mine.len() > 5 || round % 3 == 0)
+                            && let Some(admission) = mine.pop_front()
+                        {
+                            // Counted down before the slot is given back, so
+                            // the count never runs behind the slots.
+                            held_now.fetch_sub(1, Ordering::SeqCst);
+                            drop(admission);
+                        }
+                    }
+                    held_now.fetch_sub(mine.len(), Ordering::SeqCst);
+                });
+            }
+        });
+        assert!(most_held.load(Ordering::SeqCst) <= MAX);
+        assert!(admitted.load(Ordering::SeqCst) > 1000);
+        assert!(
+            refused.load(Ordering::SeqCst) > 0,
+            "the limits were reached"
+        );
+        assert_eq!(state.ws_connections_open(), 0);
+        assert_eq!(state.client_broadcast_share_count(), 0);
+        for prefix in ["p0", "p1"] {
+            assert_eq!(state.ws_prefix_connections(prefix), 0);
+        }
+    }
+
+    fn one_to_one_rooms(state: &AppState, count: usize) -> Vec<Uuid> {
+        (0..count)
+            .map(|_| {
+                state
+                    .try_create_room(Room::new(RoomConfig {
+                        room_type: RoomType::OneToOne,
+                        ttl_minutes: 60,
+                        max_participants: 2,
+                    }))
+                    .unwrap()
+            })
+            .collect()
+    }
+
+    /// The relay as it runs in production: with the peer address of every
+    /// connection, behind a proxy at 127.0.0.1 when `proxied`.
+    async fn spawn_relay_with_addresses(state: AppState) -> SocketAddr {
+        let app: Router = Router::new()
+            .route("/ws/:room_id", get(ws_handler))
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await;
+        });
+        addr
+    }
+
+    /// An upgrade with a valid token, answered or refused: the status line
+    /// and the headers of the answer. `forwarded_for` is sent as
+    /// X-Forwarded-For. The stream is returned open so the caller decides
+    /// when it ends.
+    async fn upgrade_head(
+        addr: SocketAddr,
+        room_id: Uuid,
+        token: &str,
+        forwarded_for: Option<&str>,
+    ) -> (String, tokio::net::TcpStream) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let forwarded = forwarded_for
+            .map(|value| format!("X-Forwarded-For: {value}\r\n"))
+            .unwrap_or_default();
+        let request = format!(
+            "GET /ws/{room_id} HTTP/1.1\r\nHost: {addr}\r\nConnection: Upgrade\r\n\
+             Upgrade: websocket\r\nSec-WebSocket-Version: 13\r\n\
+             Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+             Origin: https://localhost:3000\r\n\
+             Sec-WebSocket-Protocol: pinchat.v1, pinchat.v1.jwt.{token}\r\n{forwarded}\r\n"
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            if stream.read(&mut byte).await.unwrap() == 0 {
+                break;
+            }
+            head.push(byte[0]);
+        }
+        (String::from_utf8_lossy(&head).to_lowercase(), stream)
+    }
+
+    #[test]
+    fn upgrades_beyond_the_relay_limit_are_refused_and_admitted_once_a_slot_frees() {
+        run_relay_scenario(std::time::Duration::from_secs(30), || async {
+            let state = AppState::new(100, admission_config(3, 3));
+            let rooms = one_to_one_rooms(&state, 2);
+            let addr = spawn_relay(state.clone()).await;
+            let mut open = Vec::new();
+            for (room, peer) in [
+                (rooms[0], Uuid::new_v4()),
+                (rooms[0], Uuid::new_v4()),
+                (rooms[1], Uuid::new_v4()),
+            ] {
+                let socket = try_open_socket(addr, room, &fresh_token(&state, room, peer))
+                    .await
+                    .expect("within the limit");
+                open.push(socket);
+            }
+            assert_eq!(state.ws_connections_open(), 3);
+
+            let late = Uuid::new_v4();
+            let token = fresh_token(&state, rooms[1], late);
+            let (head, _stream) = upgrade_head(addr, rooms[1], &token, None).await;
+            assert!(head.starts_with("http/1.1 503"), "{head}");
+            assert!(head.contains("retry-after: 30"), "{head}");
+            assert_eq!(state.ws_connections_open(), 3);
+
+            // One connection ends: its slot comes free, and the refused
+            // client gets in with the token it was refused with, which the
+            // refusal did not spend.
+            drop(open.remove(0));
+            wait_until("the closed connection frees its slot", || {
+                state.ws_connections_open() == 2
+            })
+            .await;
+            let mut admitted = try_open_socket(addr, rooms[1], &token)
+                .await
+                .expect("a slot is free again");
+            expect_frame(&mut admitted, "connected").await;
+            assert_eq!(state.ws_connections_open(), 3);
+
+            drop(admitted);
+            drop(open);
+            wait_until("every slot comes back", || state.ws_connections_open() == 0).await;
+        });
+    }
+
+    #[test]
+    fn refused_and_abandoned_upgrades_give_their_slot_back() {
+        use tokio::io::AsyncWriteExt;
+
+        run_relay_scenario(std::time::Duration::from_secs(30), || async {
+            let state = AppState::new(100, admission_config(2, 2));
+            let rooms = one_to_one_rooms(&state, 3);
+            let addr = spawn_relay(state.clone()).await;
+
+            // Refused after admission: no such room, a token already spent.
+            let missing = Uuid::new_v4();
+            let peer = Uuid::new_v4();
+            let (head, _) =
+                upgrade_head(addr, missing, &fresh_token(&state, missing, peer), None).await;
+            assert!(head.starts_with("http/1.1 404"), "{head}");
+            assert_eq!(state.ws_connections_open(), 0);
+            let token = fresh_token(&state, rooms[0], peer);
+            let socket = try_open_socket(addr, rooms[0], &token).await.unwrap();
+            let (head, _) = upgrade_head(addr, rooms[0], &token, None).await;
+            assert!(head.starts_with("http/1.1 403"), "{head}");
+            assert_eq!(state.ws_connections_open(), 1);
+            drop(socket);
+            wait_until("a closed connection", || state.ws_connections_open() == 0).await;
+
+            // The client goes away after its request, before reading the
+            // answer, and after the 101 without a word.
+            for room in [rooms[1], rooms[2]] {
+                let (head, stream) =
+                    upgrade_head(addr, room, &fresh_token(&state, room, Uuid::new_v4()), None)
+                        .await;
+                assert!(head.starts_with("http/1.1 101"), "{head}");
+                drop(stream);
+            }
+            let mut early = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let room = rooms[1];
+            let token = fresh_token(&state, room, Uuid::new_v4());
+            early
+                .write_all(
+                    format!(
+                        "GET /ws/{room} HTTP/1.1\r\nHost: x\r\nConnection: Upgrade\r\n\
+                         Upgrade: websocket\r\nSec-WebSocket-Version: 13\r\n\
+                         Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+                         Origin: https://localhost:3000\r\n\
+                         Sec-WebSocket-Protocol: pinchat.v1, pinchat.v1.jwt.{token}\r\n\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            drop(early);
+            // A request that never ends is never counted.
+            let mut partial = tokio::net::TcpStream::connect(addr).await.unwrap();
+            partial.write_all(b"GET /ws/").await.unwrap();
+            wait_until("abandoned upgrades free their slots", || {
+                state.ws_connections_open() == 0
+            })
+            .await;
+            drop(partial);
+
+            // And the relay is whole: two connections fit.
+            let a = try_open_socket(
+                addr,
+                rooms[2],
+                &fresh_token(&state, rooms[2], Uuid::new_v4()),
+            )
+            .await;
+            assert!(a.is_ok() || state.ws_connections_open() <= 2);
+        });
+    }
+
+    #[test]
+    fn each_address_behind_the_proxy_is_limited_on_its_own() {
+        run_relay_scenario(std::time::Duration::from_secs(30), || async {
+            let mut config = admission_config(10, 2);
+            config.trusted_proxies = vec!["127.0.0.1".to_string()];
+            let state = AppState::new(100, config);
+            let rooms = one_to_one_rooms(&state, 3);
+            let addr = spawn_relay_with_addresses(state.clone()).await;
+
+            let mut held = Vec::new();
+            for room in &rooms[..2] {
+                let (head, stream) = upgrade_head(
+                    addr,
+                    *room,
+                    &fresh_token(&state, *room, Uuid::new_v4()),
+                    Some("198.51.100.7"),
+                )
+                .await;
+                assert!(head.starts_with("http/1.1 101"), "{head}");
+                held.push(stream);
+            }
+            // The third from the same address is refused, with 429.
+            let (head, _) = upgrade_head(
+                addr,
+                rooms[2],
+                &fresh_token(&state, rooms[2], Uuid::new_v4()),
+                Some("198.51.100.7"),
+            )
+            .await;
+            assert!(head.starts_with("http/1.1 429"), "{head}");
+            assert!(head.contains("retry-after: 30"), "{head}");
+            // A client that writes another address in front of its own does
+            // not get past: the proxy appends the address it saw, and that
+            // last entry is the one that counts.
+            let (head, _) = upgrade_head(
+                addr,
+                rooms[2],
+                &fresh_token(&state, rooms[2], Uuid::new_v4()),
+                Some("203.0.113.9, 198.51.100.7"),
+            )
+            .await;
+            assert!(head.starts_with("http/1.1 429"), "{head}");
+            // Another address is not affected.
+            let (head, stream) = upgrade_head(
+                addr,
+                rooms[2],
+                &fresh_token(&state, rooms[2], Uuid::new_v4()),
+                Some("198.51.100.8"),
+            )
+            .await;
+            assert!(head.starts_with("http/1.1 101"), "{head}");
+            held.push(stream);
+            drop(held);
+            wait_until("every slot comes back", || state.ws_connections_open() == 0).await;
+            assert_eq!(state.client_broadcast_share_count(), 0);
+        });
+    }
+
+    #[test]
+    fn without_a_trusted_proxy_x_forwarded_for_is_ignored() {
+        run_relay_scenario(std::time::Duration::from_secs(30), || async {
+            let state = AppState::new(100, admission_config(10, 2));
+            let rooms = one_to_one_rooms(&state, 3);
+            let addr = spawn_relay_with_addresses(state.clone()).await;
+            let mut held = Vec::new();
+            for (index, room) in rooms.iter().enumerate() {
+                let (head, stream) = upgrade_head(
+                    addr,
+                    *room,
+                    &fresh_token(&state, *room, Uuid::new_v4()),
+                    Some(&format!("192.0.2.{index}")),
+                )
+                .await;
+                held.push((head, stream));
+            }
+            // Three different claimed addresses, one real one: the third is
+            // refused as the second connection too many of 127.0.0.1.
+            assert!(held[0].0.starts_with("http/1.1 101"));
+            assert!(held[1].0.starts_with("http/1.1 101"));
+            assert!(held[2].0.starts_with("http/1.1 429"), "{}", held[2].0);
+            drop(held);
+            wait_until("every slot comes back", || state.ws_connections_open() == 0).await;
+        });
+    }
+
+    #[test]
+    fn concurrent_upgrades_take_exactly_the_free_slots() {
+        run_relay_scenario(std::time::Duration::from_secs(60), || async {
+            const MAX: usize = 10;
+            let state = AppState::new(100, admission_config(MAX, MAX));
+            let rooms = one_to_one_rooms(&state, 15);
+            let addr = spawn_relay(state.clone()).await;
+            let attempts = rooms.iter().flat_map(|room| {
+                let state = state.clone();
+                let room = *room;
+                (0..2).map(move |_| {
+                    let token = fresh_token(&state, room, Uuid::new_v4());
+                    async move { upgrade_head(addr, room, &token, None).await }
+                })
+            });
+            let answers = futures_util::future::join_all(attempts).await;
+            let admitted = answers
+                .iter()
+                .filter(|(head, _)| head.starts_with("http/1.1 101"))
+                .count();
+            let refused = answers
+                .iter()
+                .filter(|(head, _)| head.starts_with("http/1.1 503"))
+                .count();
+            assert_eq!(admitted, MAX, "admitted");
+            assert_eq!(admitted + refused, 30);
+            assert!(state.ws_connections_open() <= MAX);
+            drop(answers);
+            wait_until("every slot comes back", || state.ws_connections_open() == 0).await;
         });
     }
 }

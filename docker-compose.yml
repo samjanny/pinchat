@@ -11,6 +11,22 @@ services:
     tmpfs:
       - /tmp:mode=1777,size=512M
     restart: unless-stopped
+
+    # Fixed address on the compose network below. nginx proxies to
+    # 172.18.0.2:3000 directly; going through the published port means
+    # docker-proxy, whose two extra sockets per connection grow their kernel
+    # buffers and held most of the host's TCP memory under image traffic.
+    networks:
+      default:
+        ipv4_address: 172.18.0.2
+
+    # Memory ceiling with no swap on top of it. `memswap_limit` is memory plus
+    # swap, so setting it equal to `mem_limit` leaves the container no swap at
+    # all: pages of the relay's memory (addresses of open connections, room
+    # state, ciphertext in transit) are not written to the host's swap device.
+    # The /tmp tmpfs above counts against the same ceiling.
+    mem_limit: 512m
+    memswap_limit: 512m
     
     # Security options
     security_opt:

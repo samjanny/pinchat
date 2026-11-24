@@ -106,6 +106,13 @@ pub async fn generate_ws_token(
         extract_client_ip_with_proxy(&ConnectInfo(addr), &headers, &state.config.trusted_proxies);
     let ip_hash = hash_ip(&client_ip, &state.ip_hash_secret);
 
+    // A client the WebSocket admission control would turn away is told now,
+    // before it spends its proof of work. Advisory: the upgrade checks again
+    // and takes the slot.
+    if let Err(refused) = state.ws_admission_open(&state.client_address(&client_ip)) {
+        return Err(crate::handlers::websocket::admission_refused(refused, true));
+    }
+
     // Resolve PoW session cookie so clients behind the same NAT do not
     // collide on the challenge cache.
     let use_secure = should_use_secure_pow_cookies(state.config.force_secure_cookies);
