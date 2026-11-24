@@ -488,10 +488,9 @@ fn check_upgrade_request(
                 .iter()
                 .any(|o| o == origin_str)
             {
-                tracing::warn!(
-                    "WebSocket upgrade rejected: Origin '{}' not in allowlist",
-                    origin_str
-                );
+                // The Origin a client sent is not logged: in minimal privacy
+                // mode warnings are kept, and they carry no client values.
+                tracing::warn!("WebSocket upgrade rejected: Origin not in allowlist");
                 return Err(Box::new(
                     (StatusCode::FORBIDDEN, "Origin not allowed").into_response(),
                 ));
@@ -525,11 +524,7 @@ fn check_upgrade_request(
 
     // Verify room_id matches token claim (prevent token reuse for different rooms)
     if claims.room_id != *room_id {
-        tracing::warn!(
-            "JWT room_id mismatch: token={}, path={}",
-            claims.room_id,
-            room_id
-        );
+        tracing::warn!("WebSocket upgrade rejected: token issued for another room");
         return Err(Box::new(
             (StatusCode::FORBIDDEN, "Token not valid for this room").into_response(),
         ));
@@ -587,11 +582,7 @@ pub async fn ws_handler(
     if let Some(generation) = claims.creator_bootstrap_generation
         && !state.creator_bootstrap_claim_is_live(&room_id, claims.connection_id, generation)
     {
-        tracing::warn!(
-            "Revoked creator-bootstrap JWT rejected for room {} generation {}",
-            room_id,
-            generation
-        );
+        tracing::warn!("Revoked creator-bootstrap JWT rejected");
         return (
             StatusCode::FORBIDDEN,
             "Group creator bootstrap token has been revoked",
@@ -710,11 +701,7 @@ pub async fn ws_handler(
     // Audit H-1: the retention window is derived from `claims.exp`, so the
     // record outlives every instant at which the signature still verifies.
     if !state.consume_token(claims.jti, claims.exp) {
-        tracing::warn!(
-            "JWT token replay attempt detected: jti={}, room={}",
-            claims.jti,
-            room_id
-        );
+        tracing::warn!("JWT token replay attempt detected");
         return (StatusCode::FORBIDDEN, "Token already used").into_response();
     }
 
@@ -804,8 +791,7 @@ fn bump_protocol_error(state: &AppState, connection_id: Uuid) -> bool {
     let current = *entry;
     if current >= limit {
         tracing::warn!(
-            "Connection {} exceeded protocol error limit ({}/{}), closing",
-            connection_id,
+            "Connection exceeded protocol error limit ({}/{}), closing",
             current,
             limit
         );
@@ -878,9 +864,7 @@ fn evict_group_participant(
         .unwrap_or(false);
     if closes_room {
         tracing::warn!(
-            "Closing MLS room {} after definitive creator eviction {}: {}",
-            room_id,
-            connection_id,
+            "Closing MLS room after definitive creator eviction: {}",
             reason
         );
         state.remove_room(&room_id);
@@ -889,12 +873,7 @@ fn evict_group_participant(
     let Some(participant_count) = state.evict_participant(&connection_id, room_id) else {
         return false;
     };
-    tracing::warn!(
-        "Evicted MLS participant {} in room {}: {}",
-        connection_id,
-        room_id,
-        reason
-    );
+    tracing::warn!("Evicted MLS participant: {}", reason);
     let _ = append_ordered_group_departure(state, room_id, connection_id, participant_count);
     true
 }
@@ -1218,11 +1197,7 @@ async fn handle_socket(
         match state.open_mls_control_stream(&room_id, connection_id, resume_cursor) {
             Ok((receiver, stream)) => (receiver, Some(stream)),
             Err(error) => {
-                tracing::warn!(
-                    "Unable to open MLS control replay for connection {}: {:?}",
-                    connection_id,
-                    error
-                );
+                tracing::warn!("Unable to open MLS control replay: {:?}", error);
                 if admission == ConnectionAdmission::Resumed {
                     let _ = evict_group_participant(
                         &state,
@@ -1711,8 +1686,7 @@ async fn handle_socket(
                 ts.retain(|&t| t > cutoff);
                 if ts.len() >= frame_limit {
                     tracing::warn!(
-                        "Connection {} exceeded frame rate limit ({}/{}s), disconnecting",
-                        connection_id,
+                        "Connection exceeded frame rate limit ({}/{}s), disconnecting",
                         ts.len(),
                         window
                     );
@@ -1736,10 +1710,9 @@ async fn handle_socket(
             let ws_limit = max_ws_size(state_clone.config.max_image_size);
             if text.len() > ws_limit {
                 tracing::warn!(
-                    "⚠️ Message exceeds size limit: {} bytes (max {}) from connection_id={} - closing connection",
+                    "Message exceeds size limit: {} bytes (max {}), closing connection",
                     text.len(),
-                    ws_limit,
-                    connection_id
+                    ws_limit
                 );
                 return Closing::Fail(close_code::TOO_BIG);
             }
@@ -1756,12 +1729,9 @@ async fn handle_socket(
                         // not a UI preference. A group room accepts only MLS;
                         // a 1:1 room accepts only the Double-Ratchet transport.
                         if !room_accepts_client_message(room_type, &incoming.msg_type) {
-                            tracing::warn!(
-                                "message type '{}' is invalid for room type {:?} (connection_id={})",
-                                incoming.msg_type,
-                                room_type,
-                                connection_id
-                            );
+                            // The type a client sent is not logged: it is
+                            // any string the client chose.
+                            tracing::warn!("message type is invalid for room type {:?}", room_type);
                             if bump_protocol_error(&state_clone, connection_id) {
                                 return Closing::Initiate(close_code::POLICY);
                             }
@@ -1790,10 +1760,7 @@ async fn handle_socket(
                                 })
                                 .unwrap_or(false);
                             if !ack_shape_valid || !acknowledged {
-                                tracing::warn!(
-                                    "invalid MLS control ACK from connection_id={}",
-                                    connection_id
-                                );
+                                tracing::warn!("invalid MLS control ACK");
                                 if bump_protocol_error(&state_clone, connection_id) {
                                     return Closing::Initiate(close_code::POLICY);
                                 }
@@ -1823,8 +1790,7 @@ async fn handle_socket(
                                 ts.retain(|&t| t > cutoff);
                                 if ts.len() >= limit {
                                     tracing::warn!(
-                                        "Connection {} exceeded ECDH burst limit ({}/{}s), disconnecting",
-                                        connection_id,
+                                        "Connection exceeded ECDH burst limit ({}/{}s), disconnecting",
                                         ts.len(),
                                         window
                                     );
@@ -1845,10 +1811,9 @@ async fn handle_socket(
                                 // SECURITY: Validate payload size to prevent DoS attacks
                                 if payload.len() > MAX_ECDH_PAYLOAD_SIZE {
                                     tracing::warn!(
-                                        "⚠️ ECDH payload too large: {} bytes (max {} bytes) from connection_id={} - rejecting",
+                                        "ECDH payload too large: {} bytes (max {} bytes), rejecting",
                                         payload.len(),
-                                        MAX_ECDH_PAYLOAD_SIZE,
-                                        connection_id
+                                        MAX_ECDH_PAYLOAD_SIZE
                                     );
 
                                     if bump_protocol_error(&state_clone, connection_id) {
@@ -1901,10 +1866,7 @@ async fn handle_socket(
                                     }
                                 }
                             } else {
-                                tracing::warn!(
-                                    "⚠️ ECDH message received but payload is missing (connection_id={})",
-                                    connection_id
-                                );
+                                tracing::warn!("ECDH message received but payload is missing");
                             }
                         }
                         // MLS envelope (RFC 9420). The relay remains blind to
@@ -1914,8 +1876,7 @@ async fn handle_socket(
                         else if incoming.msg_type == "mls" {
                             if incoming.control_seq.is_some() {
                                 tracing::warn!(
-                                    "client attempted to set server MLS control sequence (connection_id={})",
-                                    connection_id
+                                    "client attempted to set server MLS control sequence"
                                 );
                                 if bump_protocol_error(&state_clone, connection_id) {
                                     return Closing::Initiate(close_code::POLICY);
@@ -1925,10 +1886,7 @@ async fn handle_socket(
                             let payload = match incoming.payload {
                                 Some(p) => p,
                                 None => {
-                                    tracing::warn!(
-                                        "mls envelope without payload from connection_id={}",
-                                        connection_id
-                                    );
+                                    tracing::warn!("mls envelope without payload");
                                     if bump_protocol_error(&state_clone, connection_id) {
                                         return Closing::Initiate(close_code::POLICY);
                                     }
@@ -1938,10 +1896,7 @@ async fn handle_socket(
                             let wire_format = match incoming.wire_format {
                                 Some(w) => w,
                                 None => {
-                                    tracing::warn!(
-                                        "mls envelope without wire_format from connection_id={}",
-                                        connection_id
-                                    );
+                                    tracing::warn!("mls envelope without wire_format");
                                     if bump_protocol_error(&state_clone, connection_id) {
                                         return Closing::Initiate(close_code::POLICY);
                                     }
@@ -1963,11 +1918,7 @@ async fn handle_socket(
                             ) {
                                 Ok(validated) => validated,
                                 Err(reason) => {
-                                    tracing::warn!(
-                                        "invalid MLS envelope from connection_id={}: {}",
-                                        connection_id,
-                                        reason
-                                    );
+                                    tracing::warn!("invalid MLS envelope: {}", reason);
                                     if bump_protocol_error(&state_clone, connection_id) {
                                         return Closing::Initiate(close_code::POLICY);
                                     }
@@ -1999,8 +1950,7 @@ async fn handle_socket(
                             timestamps.retain(|&ts| ts > rate_cutoff);
                             if timestamps.len() >= max_messages {
                                 tracing::warn!(
-                                    "Connection {} exceeded rate limit on mls, disconnecting",
-                                    connection_id
+                                    "Connection exceeded rate limit on mls, disconnecting"
                                 );
                                 return Closing::Initiate(close_code::POLICY);
                             }
@@ -2060,8 +2010,7 @@ async fn handle_socket(
                                 commit_ts.retain(|&ts| ts > commit_cutoff);
                                 if commit_ts.len() >= max_commits {
                                     tracing::warn!(
-                                        "Connection {} exceeded MLS commit rate limit ({}/{}s), rejecting",
-                                        connection_id,
+                                        "Connection exceeded MLS commit rate limit ({}/{}s), rejecting",
                                         max_commits,
                                         commit_window
                                     );
@@ -2088,8 +2037,7 @@ async fn handle_socket(
                                 proposal_ts.retain(|&ts| ts > proposal_cutoff);
                                 if proposal_ts.len() >= max_proposals {
                                     tracing::warn!(
-                                        "Connection {} exceeded MLS Proposal rate limit ({}/{}s), disconnecting",
-                                        connection_id,
+                                        "Connection exceeded MLS Proposal rate limit ({}/{}s), disconnecting",
                                         max_proposals,
                                         proposal_window
                                     );
@@ -2116,11 +2064,7 @@ async fn handle_socket(
                                 now,
                                 traffic_bytes,
                             ) {
-                                tracing::warn!(
-                                    "Room {} rejected traffic from {} at aggregate/sender budget",
-                                    room_id,
-                                    connection_id,
-                                );
+                                tracing::warn!("Room rejected traffic at aggregate/sender budget");
                                 if is_commit {
                                     let rejection = Message::MlsRejected {
                                         commit_ref: commit_ref.clone(),
@@ -2213,10 +2157,7 @@ async fn handle_socket(
                                             .is_err()
                                         {
                                             state_clone.forget_replay_hash(&room_id, &payload_hash);
-                                            tracing::warn!(
-                                                "Room {} broadcast byte budget exhausted",
-                                                room_id
-                                            );
+                                            tracing::warn!("Room broadcast byte budget exhausted");
                                             return Closing::Initiate(close_code::TRY_AGAIN_LATER);
                                         }
                                     }
@@ -2389,9 +2330,8 @@ async fn handle_socket(
                                     }
                                     _ => {
                                         tracing::warn!(
-                                            "Rejecting {} with missing/invalid v1 header from connection_id={}",
-                                            incoming.msg_type,
-                                            connection_id
+                                            "Rejecting {} with missing/invalid v1 header",
+                                            incoming.msg_type
                                         );
                                         // Audit L-6: a malformed header is the
                                         // same class of misbehaviour as an
@@ -2428,8 +2368,7 @@ async fn handle_socket(
                                 timestamps.retain(|&ts| ts > rate_cutoff);
                                 if timestamps.len() >= max_messages {
                                     tracing::warn!(
-                                        "Connection {} exceeded rate limit ({}/{}s), disconnecting",
-                                        connection_id,
+                                        "Connection exceeded rate limit ({}/{}s), disconnecting",
                                         timestamps.len(),
                                         rate_window_secs
                                     );
@@ -2507,10 +2446,7 @@ async fn handle_socket(
                                             .is_err()
                                         {
                                             state_clone.forget_replay_hash(&room_id, &payload_hash);
-                                            tracing::warn!(
-                                                "Room {} broadcast byte budget exhausted",
-                                                room_id
-                                            );
+                                            tracing::warn!("Room broadcast byte budget exhausted");
                                             return Closing::Initiate(close_code::TRY_AGAIN_LATER);
                                         }
                                     }
