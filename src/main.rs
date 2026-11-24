@@ -27,6 +27,7 @@ use axum::{
 use axum_server::tls_rustls::RustlsConfig;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use std::time::Duration;
 use tower::ServiceBuilder;
 use tower_http::{
@@ -46,39 +47,63 @@ use crate::handlers::{
 use crate::rate_limit::{Quota, RetentionSweeper, ip_quota_layer};
 use crate::state::AppState;
 
-/// Build CSP header value based on environment
-/// In production, restricts WebSocket to specific host via CSP_WS_HOST env var
-fn build_csp_header() -> String {
-    // Default policy allows WebSocket connections to the same host; configure
-    // CSP_WS_HOST (e.g., wss://yourdomain.com) to permit additional origins in production
-    let ws_hosts = std::env::var("CSP_WS_HOST").unwrap_or_else(|_| "'self'".to_string());
+/// The Content Security Policy, in its two forms.
+struct ContentSecurityPolicy {
+    /// Every page but the login page: no form may be submitted. The forms of
+    /// the homepage and the room page are handled by scripts
+    /// (`@submit.prevent`) and never submitted by the browser.
+    pages: HeaderValue,
+    /// The login page, whose form the browser submits to `/login`.
+    login: HeaderValue,
+}
 
-    // Development mode includes localhost endpoints to support local testing
-    let connect_src = if std::env::var("PRIVACY_MODE").unwrap_or_default() == "development" {
+/// Paths that serve the login page, the only page with a form the browser
+/// submits.
+const LOGIN_PAGE_PATHS: [&str; 2] = ["/login", "/static/login.html"];
+
+/// Set once at startup, from the checked `CSP_WS_HOST`.
+static CSP: OnceLock<ContentSecurityPolicy> = OnceLock::new();
+
+/// Build the policy. `ws_hosts` comes from `config::csp_ws_hosts`, which
+/// accepts only WebSocket origins, so it cannot end a directive or add one.
+/// Development mode adds localhost endpoints for local testing.
+fn build_csp(ws_hosts: &str, development: bool) -> ContentSecurityPolicy {
+    let connect_src = if development {
         format!("'self' ws://localhost:* wss://localhost:* {}", ws_hosts)
     } else {
         format!("'self' {}", ws_hosts)
     };
-
-    format!(
-        "default-src 'self'; \
-         script-src 'self'; \
-         style-src 'self'; \
-         img-src 'self' blob:; \
-         connect-src {}; \
-         frame-ancestors 'none'; \
-         base-uri 'self'; \
-         form-action 'self';",
-        connect_src
-    )
+    let policy = |form_action: &str| {
+        let value = format!(
+            "default-src 'self'; \
+             script-src 'self'; \
+             style-src 'self'; \
+             img-src 'self' blob:; \
+             connect-src {}; \
+             frame-ancestors 'none'; \
+             base-uri 'self'; \
+             form-action {};",
+            connect_src, form_action
+        );
+        HeaderValue::from_str(&value).expect("the policy is built from checked parts")
+    };
+    ContentSecurityPolicy {
+        pages: policy("'none'"),
+        login: policy("'self'"),
+    }
 }
 
 /// Security headers middleware
 /// Adds CSP, X-Frame-Options, X-Content-Type-Options for defense-in-depth
 async fn add_security_headers(req: axum::extract::Request, next: Next) -> Response {
-    // Cache CSP header (computed once per process)
-    static CSP_HEADER: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    let csp = CSP_HEADER.get_or_init(build_csp_header);
+    // Set at startup; the default only serves tests that build the router
+    // without running `run`.
+    let csp = CSP.get_or_init(|| build_csp("'self'", false));
+    let csp = if LOGIN_PAGE_PATHS.contains(&req.uri().path()) {
+        csp.login.clone()
+    } else {
+        csp.pages.clone()
+    };
 
     let mut response = next.run(req).await;
 
@@ -90,12 +115,9 @@ async fn add_security_headers(req: axum::extract::Request, next: Next) -> Respon
     // - style-src 'self': Permit only self-hosted stylesheets; inline styles are blocked
     // - connect-src: Limit connections to the application origin and configured WS host
     // - frame-ancestors 'none': Prevent clickjacking by disallowing framing
+    // - form-action: 'none', except on the login page ('self')
     // Inline styles have been moved to CSS files to satisfy CSP enforcement
-    headers.insert(
-        header::CONTENT_SECURITY_POLICY,
-        HeaderValue::from_str(csp)
-            .unwrap_or_else(|_| HeaderValue::from_static("default-src 'self'")),
-    );
+    headers.insert(header::CONTENT_SECURITY_POLICY, csp);
 
     // X-Frame-Options: Prevent embedding in iframes (clickjacking protection)
     headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
@@ -359,6 +381,21 @@ async fn run() {
     if let Some(problem) = proxy_problem {
         eprintln!("FATAL: {}", problem);
         std::process::exit(1);
+    }
+
+    // The WebSocket origins the CSP adds. The value is written into the
+    // policy, so anything but an origin is refused at startup.
+    match config::csp_ws_hosts(
+        env::var("CSP_WS_HOST").ok().as_deref(),
+        privacy_mode == "development",
+    ) {
+        Ok(ws_hosts) => {
+            let _ = CSP.set(build_csp(&ws_hosts, privacy_mode == "development"));
+        }
+        Err(problem) => {
+            eprintln!("FATAL: {}", problem);
+            std::process::exit(1);
+        }
     }
 
     // Initialize the application state
@@ -851,6 +888,50 @@ mod tests {
         // An exhausted bucket still refuses a token-less upgrade as
         // unauthenticated, without telling it anything about the quota.
         assert_eq!(upgrade(&app, room_id, None).await, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn only_the_login_page_may_submit_a_form() {
+        let app = Router::new()
+            .route("/", get(|| async { "page" }))
+            .route("/login", get(|| async { "login" }))
+            .route("/static/:file", get(|| async { "file" }))
+            .layer(middleware::from_fn(add_security_headers));
+        let policy = |path: &'static str| {
+            let app = app.clone();
+            async move {
+                let request = Request::builder().uri(path).body(Body::empty()).unwrap();
+                let response = app.oneshot(request).await.unwrap();
+                response.headers()[header::CONTENT_SECURITY_POLICY]
+                    .to_str()
+                    .unwrap()
+                    .to_string()
+            }
+        };
+        for path in [
+            "/",
+            "/static/index.html",
+            "/static/chat.html",
+            "/static/privacy.html",
+            "/static/terms.html",
+        ] {
+            let csp = policy(path).await;
+            assert!(csp.contains("form-action 'none';"), "{path}: {csp}");
+        }
+        for path in ["/login", "/static/login.html"] {
+            let csp = policy(path).await;
+            assert!(csp.contains("form-action 'self';"), "{path}: {csp}");
+        }
+    }
+
+    #[test]
+    fn the_ws_hosts_cannot_add_a_directive() {
+        let ws_hosts = config::csp_ws_hosts(Some("wss://relay.example:8443"), false).unwrap();
+        let csp = build_csp(&ws_hosts, false);
+        let pages = csp.pages.to_str().unwrap();
+        assert!(pages.contains("connect-src 'self' wss://relay.example:8443;"));
+        assert_eq!(pages.matches(';').count(), 8, "{pages}");
+        assert!(config::csp_ws_hosts(Some("wss://a; frame-ancestors *"), false).is_err());
     }
 
     #[tokio::test]

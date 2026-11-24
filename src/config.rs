@@ -48,6 +48,83 @@ fn check_password_hash(hash: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// The WebSocket sources `CSP_WS_HOST` adds to the Content Security Policy,
+/// checked. `None` (the variable is not set) or an empty value means
+/// `'self'`.
+///
+/// The value is written into the policy as it is, so it must not carry
+/// anything else: a `;` ended `connect-src` and let the variable add
+/// directives, or override `frame-ancestors`, `base-uri` and `form-action`,
+/// which come after it and lose to an earlier copy; a wildcard or a bare
+/// scheme let scripts connect anywhere. Accepted: `'self'` and `wss://`
+/// origins (a host, an optional port, nothing after them); with
+/// `development` also `ws://` ones.
+pub fn csp_ws_hosts(value: Option<&str>, development: bool) -> Result<String, String> {
+    let sources: Vec<&str> = value.unwrap_or("").split_ascii_whitespace().collect();
+    if sources.is_empty() {
+        return Ok("'self'".to_string());
+    }
+    if let Some(source) = sources
+        .iter()
+        .find(|source| !is_websocket_source(source, development))
+    {
+        return Err(format!(
+            "CSP_WS_HOST entry {:?} is not 'self' or a wss:// origin (scheme, host and optional port only){}",
+            source,
+            if development {
+                ""
+            } else {
+                "; ws:// is accepted with PRIVACY_MODE=development only"
+            }
+        ));
+    }
+    Ok(sources.join(" "))
+}
+
+fn is_websocket_source(source: &str, development: bool) -> bool {
+    if source == "'self'" {
+        return true;
+    }
+    let rest = match (source.strip_prefix("wss://"), source.strip_prefix("ws://")) {
+        (Some(rest), _) => rest,
+        (None, Some(rest)) if development => rest,
+        _ => return false,
+    };
+    // host[:port], the host a DNS name, an IPv4 address or a bracketed IPv6
+    // address.
+    let (host, port) = if rest.starts_with('[') {
+        match rest.find(']') {
+            Some(end) => rest.split_at(end + 1),
+            None => return false,
+        }
+    } else {
+        match rest.find(':') {
+            Some(colon) => rest.split_at(colon),
+            None => (rest, ""),
+        }
+    };
+    let port_ok = port.is_empty()
+        || port.strip_prefix(':').is_some_and(|digits| {
+            (1..=5).contains(&digits.len()) && digits.bytes().all(|b| b.is_ascii_digit())
+        });
+    if !port_ok {
+        return false;
+    }
+    if let Some(literal) = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
+        return literal.parse::<std::net::Ipv6Addr>().is_ok();
+    }
+    host.len() <= 253
+        && host.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+        })
+}
+
 /// Default of `MAX_TOTAL_ROOMS`. The memory sizing below and in "Relay
 /// Memory" in SECURITY.md assumes it: 500 rooms at their limits take about
 /// 135 MB of a 512 MiB container. A larger host raises it.
@@ -923,6 +1000,53 @@ mod tests {
             );
             assert!(!message.contains(broken), "the value is not echoed");
         }
+    }
+
+    #[test]
+    fn csp_ws_host_accepts_only_websocket_origins() {
+        assert_eq!(csp_ws_hosts(None, false).unwrap(), "'self'");
+        assert_eq!(csp_ws_hosts(Some(""), false).unwrap(), "'self'");
+        assert_eq!(csp_ws_hosts(Some("   "), false).unwrap(), "'self'");
+        for (value, expected) in [
+            ("wss://chat.example.com", "wss://chat.example.com"),
+            (
+                "  wss://a.example:8443 'self'\twss://[2001:db8::1]:443 ",
+                "wss://a.example:8443 'self' wss://[2001:db8::1]:443",
+            ),
+            ("wss://192.0.2.7", "wss://192.0.2.7"),
+        ] {
+            assert_eq!(csp_ws_hosts(Some(value), false).unwrap(), expected);
+        }
+        for value in [
+            // Ends connect-src and adds a directive that wins over the
+            // policy's own, which comes later.
+            "wss://a.example; frame-ancestors *",
+            "wss://a.example;",
+            "*",
+            "wss:",
+            "wss://*",
+            "wss://*.example.com",
+            "https://a.example",
+            "wss://a.example/path",
+            "wss://a.example:",
+            "wss://a.example:123456",
+            "wss://a.example:80x",
+            "wss://user@a.example",
+            "wss://-a.example",
+            "wss://[not-an-address]",
+            "'unsafe-inline'",
+            "'none'",
+            "ws://a.example",
+            "wss://a.example,wss://b.example",
+            "wss://a.example\nX: y",
+        ] {
+            assert!(csp_ws_hosts(Some(value), false).is_err(), "{value:?}");
+        }
+        // Plain ws:// only in development.
+        assert_eq!(
+            csp_ws_hosts(Some("ws://192.168.1.5:3000"), true).unwrap(),
+            "ws://192.168.1.5:3000"
+        );
     }
 
     #[test]
