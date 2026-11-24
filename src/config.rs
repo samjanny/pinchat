@@ -61,6 +61,14 @@ pub const DEFAULT_MAX_HTTP_CONNECTIONS: usize = 256;
 /// WebSocket connections. A browser opens up to six at once.
 pub const DEFAULT_MAX_HTTP_CONNECTIONS_PER_ADDRESS: usize = DEFAULT_MAX_HTTP_CONNECTIONS / 8;
 
+/// Longest proof-of-work challenge lifetime. The privacy policy states that
+/// a challenge and its cookie last at most 5 minutes.
+pub const MAX_CHALLENGE_TTL_SECS: u64 = 300;
+/// Longest interval between two sweeps of solved challenges. The privacy
+/// policy states that the identifier of a solved challenge is deleted within
+/// a minute of its expiry.
+pub const MAX_CHALLENGE_CLEANUP_INTERVAL_SECS: u64 = 60;
+
 /// Application configuration loaded from environment variables
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -608,9 +616,14 @@ impl Config {
             panic!("PROPOSAL_RATE_WINDOW_SECS must be greater than 0");
         }
 
-        // Validate TTLs are non-zero
-        if self.challenge_ttl_secs == 0 {
-            panic!("CHALLENGE_TTL_SECS must be greater than 0");
+        // Validate TTLs. The challenge bounds are what the privacy policy
+        // states (see MAX_CHALLENGE_TTL_SECS); the lower one leaves time to
+        // solve a challenge on a slow device.
+        if !(10..=MAX_CHALLENGE_TTL_SECS).contains(&self.challenge_ttl_secs) {
+            panic!(
+                "CHALLENGE_TTL_SECS must be between 10 and {}",
+                MAX_CHALLENGE_TTL_SECS
+            );
         }
         if !(1..=300).contains(&self.jwt_token_ttl_secs) {
             panic!("JWT_TOKEN_TTL_SECS must be between 1 and 300");
@@ -632,8 +645,13 @@ impl Config {
         if self.room_cleanup_interval_secs == 0 {
             panic!("ROOM_CLEANUP_INTERVAL_SECS must be greater than 0");
         }
-        if self.challenge_cleanup_interval_secs == 0 {
-            panic!("CHALLENGE_CLEANUP_INTERVAL_SECS must be greater than 0");
+        if !(1..=MAX_CHALLENGE_CLEANUP_INTERVAL_SECS)
+            .contains(&self.challenge_cleanup_interval_secs)
+        {
+            panic!(
+                "CHALLENGE_CLEANUP_INTERVAL_SECS must be between 1 and {}",
+                MAX_CHALLENGE_CLEANUP_INTERVAL_SECS
+            );
         }
 
         // Validate session TTL is non-zero
@@ -836,6 +854,22 @@ mod tests {
             msg.contains("172.18.0.1"),
             "must name the docker-compose value: {msg}"
         );
+    }
+
+    #[test]
+    #[should_panic(expected = "CHALLENGE_TTL_SECS must be between 10 and 300")]
+    fn a_challenge_may_not_outlive_the_published_five_minutes() {
+        let mut c = base();
+        c.challenge_ttl_secs = 301;
+        c.validate();
+    }
+
+    #[test]
+    #[should_panic(expected = "CHALLENGE_CLEANUP_INTERVAL_SECS must be between 1 and 60")]
+    fn solved_challenges_are_swept_at_least_every_minute() {
+        let mut c = base();
+        c.challenge_cleanup_interval_secs = 61;
+        c.validate();
     }
 
     #[test]
