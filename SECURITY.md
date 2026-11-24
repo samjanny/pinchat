@@ -123,8 +123,12 @@ URL format: https://host/c/{room_id}#key={base64url_encoded_key}
 4. Each participant extracts key from fragment
 5. Key used to encrypt/decrypt ECDH handshake
 6. After successful import, the fragment bytes are stashed in
-   sessionStorage (key: `pinchat_hash:/static/chat.html`) and removed
-   from window.location.hash via history.replaceState. Reload survives.
+   sessionStorage (key: `pinchat_hash:/static/chat.html?room=<room_id>`)
+   and removed from window.location.hash via history.replaceState. Reload
+   survives. The stash is bound to the room: a page for another room never
+   reads it (audit C-F5; up to v0.9.2 the key had no room ID, so a keyless
+   link to another room opened in the same tab reused this room's key and
+   "Copy invite link" handed it out under the other room's ID).
 7. Double Ratchet takes over for message encryption
 8. cryptoManager.deleteBootstrapKey() nulls the in-memory CryptoKey
    reference after handshake completion. resetToBootstrapKey() re-reads
@@ -560,8 +564,11 @@ The phrase "the server cannot read your messages" is only true in the first two 
 The bootstrap key is normally kept only in the URL fragment (`#key=<base64url>`), which browsers do not include in HTTP requests (RFC 3986 §3.5), keeping it server-blind. However, if an authenticated session expires mid-navigation (HTTP 401), PinChat stores the fragment in `sessionStorage` so it can be restored after login completes:
 
 ```
-sessionStorage["pinchat_hash:/c/<room_id>"] = "#key=<base64url_key>"
+sessionStorage["pinchat_hash:/static/chat.html?room=<room_id>"] = "#key=<base64url_key>"
 ```
+
+The room ID is part of the key, so the stash is used only by the room the
+invite link named.
 
 **Exposure windows** - there are two paths that put the bootstrap key into `sessionStorage`:
 

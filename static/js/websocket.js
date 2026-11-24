@@ -472,7 +472,8 @@ class WebSocketManager {
                 // leave the client. Stash it in sessionStorage (tab-scoped) so it can
                 // be restored after login; the server-facing redirect carries path+query only.
                 if (window.location.hash) {
-                    const _stashKey = `pinchat_hash:${window.location.pathname}`;
+                    // Bound to the room, as crypto.js reads it (audit C-F5).
+                    const _stashKey = `pinchat_hash:${window.location.pathname}?room=${encodeURIComponent(this.roomId)}`;
                     sessionStorage.setItem(_stashKey, window.location.hash);
                     setTimeout(() => sessionStorage.removeItem(_stashKey), 30000);
                 }
@@ -537,7 +538,7 @@ class WebSocketManager {
                     if (response.status === 401) {
                         console.log('Authentication required, redirecting to login...');
                         if (window.location.hash) {
-                            const _stashKey = `pinchat_hash:${window.location.pathname}`;
+                            const _stashKey = `pinchat_hash:${window.location.pathname}?room=${encodeURIComponent(this.roomId)}`;
                             sessionStorage.setItem(_stashKey, window.location.hash);
                             setTimeout(() => sessionStorage.removeItem(_stashKey), 30000);
                         }
@@ -556,7 +557,7 @@ class WebSocketManager {
                 if (response.status === 401) {
                     console.log('Authentication required, redirecting to login...');
                     if (window.location.hash) {
-                        const _stashKey = `pinchat_hash:${window.location.pathname}`;
+                        const _stashKey = `pinchat_hash:${window.location.pathname}?room=${encodeURIComponent(this.roomId)}`;
                         sessionStorage.setItem(_stashKey, window.location.hash);
                         setTimeout(() => sessionStorage.removeItem(_stashKey), 30000);
                     }

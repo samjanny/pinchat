@@ -1825,7 +1825,8 @@ document.addEventListener('alpine:init', () => {
             // C-06: the bootstrap secret was moved from window.location.hash
             // to sessionStorage on page load. window.location.href therefore
             // no longer carries the #key=... fragment that recipients need.
-            // Reconstruct it from the stash. Group links additionally require
+            // Reconstruct it from this room's stash (crypto.js binds it to
+            // the room ID, audit C-F5). Group links additionally require
             // the creator-generated group_id + creator-key pins; never copy a
             // PSK-only group link because it permits alternative-group joins.
             let link = window.location.href;
@@ -1842,14 +1843,6 @@ document.addEventListener('alpine:init', () => {
                     link = window.location.origin + window.location.pathname
                         + window.location.search + fragment;
                 }
-            } else if (!window.location.hash) {
-                try {
-                    const stash = sessionStorage.getItem(`pinchat_hash:${window.location.pathname}`);
-                    if (stash) {
-                        const frag = stash.startsWith('#') ? stash : '#' + stash;
-                        link = window.location.origin + window.location.pathname + window.location.search + frag;
-                    }
-                } catch (_) { /* sessionStorage unavailable: fall back to bare URL */ }
             }
             return link;
         },

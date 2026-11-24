@@ -298,7 +298,7 @@ async function runTests() {
         const savedWindow = global.window;
         const savedSessionStorage = global.sessionStorage;
         const storage = new Map([
-            ['pinchat_hash:/static/chat.html', '#key=bootstrap-secret'],
+            ['pinchat_hash:/static/chat.html?room=test', '#key=bootstrap-secret'],
         ]);
         global.window = {
             location: {
@@ -599,6 +599,88 @@ async function runTests() {
             failed++;
         } finally {
             global.indexedDB = savedIndexedDB;
+        }
+    }
+    console.log('');
+
+    // -------------------------------------------------------------------------
+    // Test 11: audit C-F5 - the bootstrap-key stash is bound to its room
+    // -------------------------------------------------------------------------
+    // Every room is served at /static/chat.html, the room ID travels in
+    // ?room=. A stash keyed by pathname alone let a keyless link to room B,
+    // opened in the tab that had room A, silently adopt room A's key, and
+    // "Copy invite link" then produced ?room=B#key=<room A's key>.
+    console.log('--- Test 11: Bootstrap-key stash is bound to the room (C-F5) ---');
+    {
+        const savedWindow = global.window;
+        const savedSessionStorage = global.sessionStorage;
+        const savedHistory = global.history;
+        try {
+            const roomA = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+            const roomB = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+            const keyA = Buffer.alloc(32, 17).toString('base64url');
+            const keyB = Buffer.alloc(32, 34).toString('base64url');
+            const storage = new Map();
+            global.sessionStorage = {
+                getItem: (k) => (storage.has(k) ? storage.get(k) : null),
+                setItem: (k, v) => storage.set(k, String(v)),
+                removeItem: (k) => storage.delete(k),
+            };
+            const location = { pathname: '/static/chat.html', search: '', hash: '' };
+            global.window = { location };
+            global.history = { replaceState() { location.hash = ''; } };
+            const open = async (roomId, hash) => {
+                location.search = `?room=${roomId}`;
+                location.hash = hash;
+                const mgr = new CryptoManager();   // a page load
+                return { mgr, key: await mgr.extractKeyFromURL() };
+            };
+
+            // Room A through its invite link; the URL is scrubbed into the stash.
+            const a = await open(roomA, `#key=${keyA}`);
+            assert(a.key, 'the invite link loads');
+            assert.strictEqual(location.hash, '', 'the fragment leaves the URL bar');
+
+            // Same tab, keyless link to room B (with a pre-fix unbound stash
+            // of room A's key lying around as well).
+            storage.set('pinchat_hash:/static/chat.html', `#key=${keyA}`);
+            const b = await open(roomB, '');
+            assert.strictEqual(b.key, null, 'a keyless link to another room gets no key');
+            assert.strictEqual(b.mgr.getInviteFragment({ requireMlsPins: false }), null,
+                '"Copy invite link" in room B cannot hand out room A\'s key');
+            assert(!storage.has('pinchat_hash:/static/chat.html'), 'the unbound legacy stash is dropped');
+
+            // A reload of room A still restores its own key from the stash.
+            const again = await open(roomA, '');
+            assert(again.key, 'reloading the same room restores its key');
+            assert.strictEqual(again.mgr.getInviteFragment({ requireMlsPins: false }), `#key=${keyA}`);
+
+            // The login bounce stashes for the room the invite link names.
+            const loginSource = fs.readFileSync(path.join(__dirname, '../static/js/login-stash.js'), 'utf8');
+            const loginLocation = {
+                hash: `#key=${keyB}`, search: `?redirect=/c/${roomB}`, pathname: '/static/login.html',
+            };
+            const vm = require('vm');
+            vm.runInNewContext(loginSource, {
+                window: { location: loginLocation },
+                URLSearchParams, sessionStorage: global.sessionStorage,
+                history: { replaceState() {} }, setTimeout() {},
+            });
+            const afterLogin = await open(roomB, '');
+            assert(afterLogin.key, 'the login stash is found by the room it was made for');
+            assert.strictEqual(afterLogin.mgr.getInviteFragment({ requireMlsPins: false }), `#key=${keyB}`);
+            const other = await open(roomA, '');
+            assert.strictEqual(other.mgr.getInviteFragment({ requireMlsPins: false }), `#key=${keyA}`,
+                'and by no other room');
+            console.log('PASSED: the stash is keyed by room; no room can use or leak another room\'s key');
+            passed++;
+        } catch (e) {
+            console.log('FAILED:', e.message);
+            failed++;
+        } finally {
+            global.window = savedWindow;
+            global.sessionStorage = savedSessionStorage;
+            global.history = savedHistory;
         }
     }
     console.log('');

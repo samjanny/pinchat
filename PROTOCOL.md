@@ -107,17 +107,19 @@ Per RFC 3986, the URL fragment (everything after `#`) is processed client-side o
 
 **Post-load lifecycle.** After the first successful import, the client
 (`crypto.js#extractKeyFromURL`) moves the fragment bytes into tab-scoped
-`sessionStorage` under the key `pinchat_hash:${pathname}` and clears
-`window.location.hash` via `history.replaceState`. The key remains
-recoverable for reload and reconnect within the tab; it is no longer
+`sessionStorage` under the key `pinchat_hash:${pathname}?room=${room_id}`
+and clears `window.location.hash` via `history.replaceState`. The key remains
+recoverable for reload and reconnect of the same room within the tab; a page
+for another room never reads it. It is no longer
 visible in the URL bar, browser history, or to any other same-origin
 code reading `window.location.hash`. The CryptoKey reference itself is
 dropped via `deleteBootstrapKey()` once the Double Ratchet takes over.
 
 If the user is unauthenticated and bounces through `/login`, a small
 head-loaded script (`login-stash.js`) detects the fragment, stashes it
-in `sessionStorage` keyed for the eventual `/static/chat.html` landing
-page, and scrubs the URL bar before the login form renders. This means
+in `sessionStorage` keyed for the eventual `/static/chat.html?room=<room_id>`
+landing page of the room named in the redirect, and scrubs the URL bar before
+the login form renders. This means
 the bootstrap secret never lingers on `/login` either.
 
 **Security Note**: The Bootstrap Key must be shared through a secure channel (encrypted messaging, voice call, in-person). If an attacker obtains both the room URL and the Bootstrap Key, they can join the room and participate in the encrypted conversation.
