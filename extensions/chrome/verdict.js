@@ -100,9 +100,17 @@
             'A service worker was registered for this site and has been removed. The site does not use one.'],
         'file-unreachable': [CLASS.SUSPICIOUS,
             'A file of the signed release could not be downloaded from the site.'],
+        'page-refresh': [CLASS.SUSPICIOUS,
+            'The page asked to load another address by itself. The page was stopped.'],
         // ---- limits -------------------------------------------------------
         'manifest-unavailable': [CLASS.LIMIT,
             'The signed release manifest could not be obtained, so nothing could be compared.'],
+        'no-host-access': [CLASS.LIMIT,
+            'The extension is not allowed to act on this site at all times, so its script policy and '
+            + 'redirect guard may not apply. Allow it in the extension\'s site access settings.'],
+        'shadow-root': [CLASS.LIMIT,
+            'Part of the page was drawn in a shadow tree while the page was loading. It may have come from '
+            + 'the server, and it could not be compared with the signed release.'],
         'document-not-attested': [CLASS.LIMIT,
             'This page was loaded without passing through the verifier. Reload it.'],
         'unlisted-document': [CLASS.LIMIT,
@@ -122,6 +130,8 @@
             'Another extension tried something the script policy forbids. It was blocked.'],
         'unattributed-policy-violation': [CLASS.ENVIRONMENT,
             'Something the script policy forbids was attempted and blocked. Its origin is unknown.'],
+        'shadow-root-added': [CLASS.ENVIRONMENT,
+            'A shadow tree was attached to the page by a script, typically by another extension.'],
     });
 
     function finding(code, detail) {
@@ -169,6 +179,7 @@
         'base-invalid': 'blocked-element',
         'base-cross-origin': 'blocked-element',
         'base-unexpected': 'blocked-element',
+        'meta-refresh': 'page-refresh',
         'hash-mismatch': 'file-hash-mismatch',
         'fetch-error': 'file-unreachable',
         'unknown-file': 'file-unreachable',
@@ -394,6 +405,77 @@
         return map;
     }
 
+    /**
+     * The policy the packaged rules give a document address: the value set
+     * by the highest-priority rule that sets Content-Security-Policy and
+     * whose filter matches. declarativeNetRequest compares a regexFilter
+     * without regard to case unless the rule says otherwise, and so does
+     * this. null when no rule matches.
+     */
+    function packagedPolicy(rules, url) {
+        let best = null;
+        for (const rule of Array.isArray(rules) ? rules : []) {
+            const action = rule && rule.action;
+            if (!action || action.type !== 'modifyHeaders' || !rule.condition) continue;
+            const header = (action.responseHeaders || []).find((entry) => entry && entry.operation === 'set'
+                && String(entry.header).toLowerCase() === 'content-security-policy');
+            if (!header) continue;
+            let matches = false;
+            try {
+                matches = new RegExp(rule.condition.regexFilter, rule.condition.isUrlFilterCaseSensitive ? '' : 'i')
+                    .test(String(url));
+            } catch (_) {
+                matches = false;
+            }
+            const priority = rule.priority || 1;
+            if (matches && (!best || priority > best.priority)) best = { priority, value: String(header.value) };
+        }
+        return best ? best.value : null;
+    }
+
+    /**
+     * The sources a policy allows scripts from: for script elements and for
+     * inline handlers, each with the fallback to script-src and then to
+     * default-src. Each is a sorted list of sources, or null when nothing
+     * restricts it. Keywords are compared without regard to case, hashes
+     * and nonces with it.
+     */
+    function scriptSources(policy) {
+        const directives = new Map();
+        for (const part of String(policy || '').split(';')) {
+            const tokens = part.trim().split(/\s+/).filter(Boolean);
+            if (tokens.length === 0) continue;
+            const name = tokens[0].toLowerCase();
+            if (directives.has(name)) continue; // the first occurrence is the one in force
+            directives.set(name, tokens.slice(1).map((token) => {
+                const value = /^'(sha256|sha384|sha512|nonce)-/i.exec(token);
+                return value ? `'${value[1].toLowerCase()}${token.slice(value[0].length - 1)}` : token.toLowerCase();
+            }).sort());
+        }
+        const effective = (name) => directives.get(name) || directives.get('script-src')
+            || directives.get('default-src') || null;
+        return { elements: effective('script-src-elem'), handlers: effective('script-src-attr') };
+    }
+
+    /**
+     * Whether a policy the browser reports as enforced lets exactly the same
+     * scripts run as the expected one.
+     *
+     * The probe in the content script only learns that an inline handler was
+     * blocked, and a policy of the server's own, such as script-src 'self',
+     * blocks one too while it runs any script of the origin. The policy the
+     * browser names for that block tells the two apart. Only the directives
+     * that decide which code runs are compared: that is what the probe tests
+     * and what a positive state claims, and a browser may report the other
+     * directives written differently.
+     */
+    function sameScriptPolicy(reported, expected) {
+        const a = scriptSources(reported);
+        const b = scriptSources(expected);
+        const same = (x, y) => (x === null || y === null ? x === y : x.join(' ') === y.join(' '));
+        return same(a.elements, b.elements) && same(a.handlers, b.handlers);
+    }
+
     return {
         INTEGRITY,
         CLASS,
@@ -410,5 +492,7 @@
         EXTERNAL_REDIRECT_TARGETS,
         documentUrl,
         documentHashes,
+        packagedPolicy,
+        sameScriptPolicy,
     };
 }));

@@ -1,8 +1,13 @@
 'use strict';
 
 /**
- * Minimal Chromium driver over the DevTools protocol. No dependencies: Node's
- * built-in WebSocket and fetch are enough for what the tests need.
+ * Minimal Chromium driver over the DevTools protocol. No dependencies.
+ *
+ * The protocol runs over a pipe, and extensions are loaded with the
+ * protocol's Extensions.loadUnpacked. Google Chrome ignores the
+ * --load-extension switch since version 137; loadUnpacked works in Chrome
+ * and Chromium alike, but only over a pipe and with
+ * --enable-unsafe-extension-debugging.
  */
 
 const { spawn } = require('child_process');
@@ -14,59 +19,53 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 async function launchChromium({ extensions, workDir, httpsPort, hosts, binary, profileDir }) {
     // A caller that wants state to survive a restart passes its own profile.
     const profile = profileDir || fs.mkdtempSync(path.join(workDir, 'chromium-'));
-    fs.rmSync(path.join(profile, 'DevToolsActivePort'), { force: true });
     const map = hosts.map((host) => `MAP ${host} 127.0.0.1:${httpsPort}`).join(', ');
     const args = [
         '--headless=new', '--no-sandbox', '--disable-gpu', '--no-first-run',
         '--disable-background-networking', '--disable-component-update', '--disable-sync',
         `--user-data-dir=${profile}`,
-        '--remote-debugging-port=0',
+        '--remote-debugging-pipe', '--enable-unsafe-extension-debugging',
         `--host-resolver-rules=${map}`,
         '--ignore-certificate-errors',
         'about:blank',
     ];
-    if (extensions.length) args.unshift(`--load-extension=${extensions.join(',')}`);
-    const child = spawn(binary || process.env.CHROMIUM || 'chromium', args, { stdio: 'ignore' });
+    // The browser reads commands from descriptor 3 and writes to 4.
+    const child = spawn(binary || process.env.CHROMIUM || 'chromium', args,
+        { stdio: ['ignore', 'ignore', 'ignore', 'pipe', 'pipe'] });
+    const toBrowser = child.stdio[3];
+    const fromBrowser = child.stdio[4];
+    toBrowser.on('error', () => { /* the browser has gone away */ });
 
-    const portFile = path.join(profile, 'DevToolsActivePort');
-    for (let i = 0; i < 100 && !fs.existsSync(portFile); i += 1) await sleep(100);
-    const [port, browserPath] = fs.readFileSync(portFile, 'utf8').trim().split('\n');
-
-    const socket = new WebSocket(`ws://127.0.0.1:${port}${browserPath}`);
-    await new Promise((resolve, reject) => {
-        socket.addEventListener('open', resolve, { once: true });
-        socket.addEventListener('error', reject, { once: true });
-    });
     let nextId = 1;
     const pending = new Map();
-    socket.addEventListener('message', (event) => {
-        const message = JSON.parse(event.data);
-        if (!message.id || !pending.has(message.id)) return;
-        const { resolve, reject } = pending.get(message.id);
-        pending.delete(message.id);
-        if (message.error) reject(new Error(message.error.message));
-        else resolve(message.result);
+    let buffered = '';
+    // Messages are JSON, each one terminated by a NUL byte.
+    fromBrowser.on('data', (chunk) => {
+        buffered += chunk.toString('utf8');
+        for (let end = buffered.indexOf('\0'); end !== -1; end = buffered.indexOf('\0')) {
+            const message = JSON.parse(buffered.slice(0, end));
+            buffered = buffered.slice(end + 1);
+            if (!message.id || !pending.has(message.id)) continue;
+            const { resolve, reject } = pending.get(message.id);
+            pending.delete(message.id);
+            if (message.error) reject(new Error(message.error.message));
+            else resolve(message.result);
+        }
     });
     const send = (method, params = {}, sessionId) => new Promise((resolve, reject) => {
         const id = nextId;
         nextId += 1;
         pending.set(id, { resolve, reject });
-        socket.send(JSON.stringify({ id, method, params, sessionId }));
+        toBrowser.write(`${JSON.stringify({ id, method, params, sessionId })}\0`);
     });
 
     const version = (await send('Browser.getVersion')).product;
 
-    // The extension id is derived from its directory; read it off the
-    // service worker target the browser starts for it.
+    // The first extension is the one whose pages the caller asks for.
     let extensionBase = null;
-    if (extensions.length) {
-        for (let i = 0; i < 50 && !extensionBase; i += 1) {
-            const { targetInfos } = await send('Target.getTargets');
-            const worker = targetInfos.find((target) => target.type === 'service_worker'
-                && /^chrome-extension:\/\/[a-p]{32}\/background\.js$/.test(target.url));
-            if (worker) extensionBase = worker.url.replace(/background\.js$/, '');
-            else await sleep(200);
-        }
+    for (const directory of extensions) {
+        const { id } = await send('Extensions.loadUnpacked', { path: path.resolve(directory) });
+        if (!extensionBase) extensionBase = `chrome-extension://${id}/`;
     }
 
     async function newTab() {

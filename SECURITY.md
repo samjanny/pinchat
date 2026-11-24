@@ -927,18 +927,32 @@ describes every state and what each may be based on.
   can do with markup alone is limited by the client, not by the extension:
   the pages that run the application carry no application markup, the
   client-side framework reads directives only from signed templates (it is
-  given a directive prefix that served markup cannot name), and whatever
-  else arrived in the page body is removed before the framework starts. Up
-  to v0.8.6 a single served element with a binding attribute made the
-  signed framework send a value held by the application to the server.
-  What remains: served markup is displayed until the page has been parsed,
-  and a page served without the framework runs no application but can show
-  anything, a form that asks for something included
-- Unsigned same-origin stylesheets in Chromium: detected, shown as a
-  failure, not blocked
+  given a directive prefix that served markup cannot name), and the body the
+  parser built is replaced, before the framework starts, by one that holds
+  only what the signed templates mounted, so that a shadow root declared in
+  the served markup goes with it. Up to v0.8.6 a single served element with
+  a binding attribute made the signed framework send a value held by the
+  application to the server. What remains: served markup, a declared
+  shadow root included, is displayed until the page has been parsed, and a
+  page served without the framework runs no application but can show
+  anything. No page but the login page may submit a form, so a served form
+  cannot post what is typed into it
+- Unsigned same-origin stylesheets in Chromium: detected, in the page and in
+  shadow trees, shown as a failure, not blocked. A shadow tree that existed
+  while the page was parsed makes the page "unverifiable" in Chromium, since
+  nothing in it can be attested
+- A `<meta http-equiv="refresh">` in the page is no HTTP redirect, and no
+  policy blocks it. The extension stops the document when it finds one,
+  which cancels the refresh
+- The data files a page fetches (`operator.json`, for the legal pages) in
+  Chromium: the extension cannot hold them, and its own download of the
+  file proves nothing about the bytes the page was given. In Firefox the
+  page receives them only as signed
 - Anything at all when the extension is not installed, is disabled, or has
   had its host permission revoked. In particular the redirect of an invite
-  link cannot be prevented by the site itself
+  link cannot be prevented by the site itself. A page the extension still
+  sees without standing access to the site (access on request) is never
+  shown as verified or partially verified
 - Compromised signing key (attacker could sign malicious hashes)
 - Malicious browser extension updates, and other extensions: an extension
   with access to the site can read and change everything. Changes to the
@@ -966,14 +980,18 @@ describes every state and what each may be based on.
 | Policy in force, page not attestable (Chromium) | Partially verified | Yellow check badge; the popup says a complete check is currently possible only in Firefox |
 | Page bytes differ from the signed hash (Firefox) | Failed | Block page, red overlay without dismiss |
 | A file served to the extension differs from its signed hash | Failed | Red overlay without dismiss |
-| Unsigned stylesheet from the site loaded | Failed | Red overlay without dismiss |
-| Script policy not in force, or service worker controls the page | Failed | Document stopped, red overlay |
+| Unsigned stylesheet from the site loaded, in the page or in a shadow tree | Failed | Red overlay without dismiss |
+| Script policy not in force, another policy reported in its place (not in Chromium, which reports no violation an extension causes), or service worker controls the page | Failed | Document stopped, red overlay |
+| Shadow tree present while the page was parsed (Chromium) | Unverifiable | Amber bar |
+| Extension without standing access to the site, where its content script still runs | Unverifiable | Amber bar |
+| Data file given to the page differs from its signed hash (Firefox) | Failed | File withheld, red overlay without dismiss |
+| `<meta http-equiv="refresh">` in the page | Notice | Document stopped, amber bar |
 | Manifest signature invalid or sequence too low | Failed | Red overlay without dismiss |
 | Redirect of a document off the site | Failed | Navigation blocked |
 | Policy violation attributed to the page | Notice | Amber bar, dismissible |
 | Manifest unavailable and nothing stored | Unverifiable | Amber bar (Chromium), block page (Firefox) |
 | Page did not pass through the response filter (Firefox) | Unverifiable | Amber overlay with reload |
-| Inline script element or other extension's resource in the DOM | unchanged | Listed in the popup only |
+| Inline script element, other extension's resource, or shadow tree attached after parsing | unchanged | Listed in the popup only |
 | File hash differs from its SRI attribute | n/a | Browser blocks the file |
 
 #### Limitations

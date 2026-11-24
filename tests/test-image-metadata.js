@@ -114,6 +114,17 @@ test('a JPEG keeps its picture and loses everything that describes it', () => {
     sameBytes(strip(output.bytes), output.bytes, 'stripping again changes nothing');
 });
 
+test('a thumbnail stored in the JFIF header itself is left out, and the header kept', () => {
+    // Xthumbnail 2, Ythumbnail 1: six bytes of RGB pixels follow the fixed fields.
+    const withThumbnail = segment(0xe0, bytes('JFIF\0', 1, 1, 0, 0, 1, 0, 1, 2, 1, 'SECRET'));
+    const picture = [DQT, SOF, DHT, SOS, SCAN1, EOI];
+    const output = strip(bytes(SOI, withThumbnail, exif(6), ...picture));
+    sameBytes(output, bytes(SOI, JFIF, EXIF_ONLY_ORIENTATION(6), ...picture));
+    assert(!containsText(output, 'SECRET'), 'the thumbnail pixels are gone');
+    // A JFIF header too short for its own fixed fields is not kept at all.
+    sameBytes(strip(bytes(SOI, segment(0xe0, bytes('JFIF\0', 1, 1)), ...picture)), bytes(SOI, ...picture));
+});
+
 test('a JPEG without a JFIF header gets its orientation right after the start marker', () => {
     const input = bytes(SOI, exif(8, { little: false }), DQT, SOF, DHT, SOS, SCAN1, EOI);
     sameBytes(strip(input), bytes(SOI, EXIF_ONLY_ORIENTATION(8), DQT, SOF, DHT, SOS, SCAN1, EOI));
@@ -303,6 +314,32 @@ test('a rotated WebP keeps its orientation, with or without the JPEG prefix on t
     sameBytes(strip(expected), expected, 'stripping again changes nothing');
 });
 
+const VP8L = riffChunk('VP8L', [0x2f, 1, 2, 3, 4]);
+const ANIM = riffChunk('ANIM', [0, 0, 0, 0, 0, 0]);
+// An animation frame: position, size, duration and flags, then its own chunks.
+const anmf = (...frameChunks) => riffChunk('ANMF', bytes(new Array(15).fill(1), 2, ...frameChunks));
+
+test('an animated WebP keeps its frames and loses what is nested inside them', () => {
+    const input = webp(vp8x(FLAG.ANIM | FLAG.ALPHA | FLAG.EXIF), ANIM,
+        anmf(riffChunk('XYZW', 'SECRET-GPS 45.1,7.6'), ALPH, VP8),
+        anmf(VP8L, riffChunk('EXIF', cameraTiff(1)), riffChunk('XMP ', 'SECRET-XMP')));
+    const output = strip(input);
+    sameBytes(output, webp(vp8x(FLAG.ANIM | FLAG.ALPHA), ANIM, anmf(ALPH, VP8), anmf(VP8L)));
+    assert(!containsText(output, 'SECRET'), 'nothing nested in a frame survives');
+    sameBytes(strip(output), output, 'stripping again changes nothing');
+});
+
+test('an animation frame that cannot be followed, or holds no picture, is refused', () => {
+    for (const [name, frame] of [
+        ['frame shorter than its header', riffChunk('ANMF', new Array(10).fill(0))],
+        ['frame without image data', anmf(ALPH)],
+        ['nested chunk larger than the frame', riffChunk('ANMF', bytes(new Array(16).fill(0), 'VP8L', le32(400), 1, 2))],
+        ['frame ends inside a nested chunk header', riffChunk('ANMF', bytes(new Array(16).fill(0), 'VP8'))],
+    ]) {
+        assert.throws(() => strip(webp(vp8x(FLAG.ANIM), ANIM, frame)), ImageMetadataError, name);
+    }
+});
+
 test('a simple WebP, which has no room for metadata, passes through unchanged', () => {
     sameBytes(strip(webp(VP8)), webp(VP8));
     sameBytes(strip(webp(riffChunk('VP8L', [0x2f, 1, 2, 3, 4]))), webp(riffChunk('VP8L', [0x2f, 1, 2, 3, 4])));
@@ -355,6 +392,7 @@ test('damaged files are refused or cleaned, never passed on with something added
         bytes(PNG_SIGNATURE, IHDR, chunk('tEXt', 'k\0v'), chunk('eXIf', cameraTiff(3)), IDAT(1), IEND, 'tail'),
         bytes(GIF_HEADER, LOOP, GIF_COMMENT, CONTROL, FRAME, CONTROL, FRAME_LOCAL, 0x3b, 'tail'),
         bytes(webp(vp8x(FLAG.EXIF | FLAG.XMP), VP8, riffChunk('EXIF', cameraTiff(6)), WEBP_XMP), 'tail'),
+        bytes(webp(vp8x(FLAG.ANIM), ANIM, anmf(riffChunk('XYZW', 'k'), ALPH, VP8), anmf(VP8L)), 'tail'),
     ];
     // The most a file can grow by: a new orientation block where the old
     // one was missing its container (WebP chunk header plus padding).

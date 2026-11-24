@@ -9,7 +9,7 @@ The extension uses a defense-in-depth approach combining a packaged CSP, SRI, an
 1. **Preventive CSP**: A static Declarative Net Request rule replaces the response CSP before parsing. Each official page gets only its signed script hashes; unknown paths get `script-src 'none'`.
 2. **Manifest Verification**: Extension fetches the signed hash list from GitHub.
 3. **Signature Verification**: Verifies its ECDSA P-256 signature using the embedded public key.
-4. **SRI DOM Verification**: Content script checks that all `<script>` and `<link>` tags in the actual page DOM have correct `integrity` attributes matching the signed manifest.
+4. **SRI DOM Verification**: Content script checks that the `<script>` and `<link>` tags in the actual page DOM have correct `integrity` attributes matching the signed manifest, including those inside shadow trees, open or closed, which it reaches through APIs only an extension has.
 5. **Browser Enforcement**: CSP + SRI block injected or modified scripts before execution.
 6. **Visual Feedback**: Green checkmark if verified, red warning overlay if issues are detected.
 
@@ -231,11 +231,20 @@ node, so the verifier does not try to decide whether an element is
   **notice**. It points at the page but proves nothing about the server:
   another extension can write markup into a document.
 - **Failed** is reserved for what is established: the page bytes differ from
-  the signed hash (Firefox), a file the site served to the extension differs
-  from its signed hash, a stylesheet from the site that is not in the signed
-  release was loaded, the script policy is not in force, a service worker
-  answered the navigation, the manifest failed its signature or rollback
-  check, or the server tried to redirect a link off the site.
+  the signed hash (Firefox), a file the site served differs from its signed
+  hash, a stylesheet from the site that is not in the signed release was
+  loaded, the script policy is not in force or the browser reported another
+  one in its place, a service worker answered the navigation, the manifest failed its
+  signature or rollback check, or the server tried to redirect a link off
+  the site.
+- A shadow tree that existed while the page was being parsed may be one the
+  server declared in its markup, and nothing in it can be attested in
+  Chromium. It makes the page **unverifiable**, never partially verified. A
+  shadow tree attached after parsing can only come from a script, and the
+  signed client attaches none: it is listed as a change of unattested
+  origin, like the elements other extensions add. In Firefox the page bytes
+  were compared with the signed page, so every shadow tree is listed that
+  way.
 
 There is no allowlist of other extensions and no exception for inline
 scripts.
@@ -245,14 +254,26 @@ scripts.
 1. **Script policy** (both browsers). `declarativeNetRequest` replaces the
    CSP of every document on the site, on any port, before parsing. Each known
    page permits only its signed script hashes; everything else permits no
-   script. The same rules remove the `Link` and `Refresh` response headers,
-   which act on a document without being part of its body.
+   script. No page but the login page may submit a form (`form-action
+   'none'`): the forms of the chat and the home page are handled by script.
+   The same rules remove the `Link` and `Refresh` response headers, which
+   act on a document without being part of its body. The browser applies
+   these rules only to a site the extension may act on: without that
+   standing access, granted at install and revocable in the browser's
+   settings for the extension, no page reaches a positive state.
 2. **Policy probe** (both). At `document_start` the content script checks,
    synchronously, that inline handlers are in fact blocked and that no
    service worker controls the document. A document answered by a service
-   worker never receives the extension's header rules. If either check
-   fails, the document is stopped and marked failed. Service workers
-   registered for the site are removed; the site uses none.
+   worker never receives the extension's header rules. A policy of the
+   server's own, such as `script-src 'self'`, blocks inline handlers too, so
+   where the browser reports the probe's violation, the policy it names is
+   also compared with the packaged policy for that address. Chromium
+   reports no violation that an extension's own code causes, so there this
+   comparison does not take place; what keeps a page from a positive state
+   when the packaged rules did not apply is the check of the extension's
+   access to the site (point 1). If any of this fails, the document is
+   stopped and marked failed. Service workers registered for the site are
+   removed; the site uses none.
 3. **Redirect guard** (both). An invite link carries its key after the `#`,
    and browsers carry that fragment across redirects, to another origin too.
    A document navigation on the site whose address carries a fragment may
@@ -262,10 +283,15 @@ scripts.
    extension stores (the "Add to Chrome" and "Add to Firefox" buttons go
    through `/ext/chrome` and `/ext/firefox`, which the reverse proxy
    redirects). The list is `EXTERNAL_REDIRECT_TARGETS` in `verdict.js`; none
-   of the three is an origin the server operator controls. Every other
+   of the three is an origin the server operator controls. Every other HTTP
    redirect off the site is refused, fragment or not. Chromium enforces this
    with rules on the `Location` response header (which is why the minimum
-   version is 128); Firefox enforces it in the background script.
+   version is 128); Firefox enforces it in the background script, where
+   only the statuses Firefox follows (301, 302, 303, 307, 308) skip the
+   body check. A `<meta http-equiv="refresh">` in the page is not an HTTP
+   redirect and no policy can block it: the content script stops the
+   document when it finds one, which cancels the refresh, and shows a
+   notice. A refresh never carries the fragment.
 4. **Page bytes** (Firefox). `webRequest.filterResponseData` holds the body
    of every document navigation on the site. It is hashed and compared with
    the signed hash for that address, and only then released to the parser,
@@ -276,9 +302,14 @@ scripts.
    declared. An answer with an error status that is not a signed page (a
    room that no longer exists, a rate limit, a gateway error) is withheld
    in the same way but reported as an error answer and as "unverifiable",
-   not as a mismatch.
-5. **DOM inspection** (both). Script, stylesheet, base, frame and form
-   elements are compared with the manifest, as described above.
+   not as a mismatch. The data files a page fetches, `operator.json` for the
+   legal pages, are held the same way: the page receives one only if it
+   matches its signed hash, and nothing otherwise. In Chromium nothing holds
+   them, as nothing holds the page.
+5. **DOM inspection** (both). Script, stylesheet, base, frame, form and
+   `<meta http-equiv="refresh">` elements are compared with the manifest, as
+   described above, in the page and inside every shadow tree, open or
+   closed, that the content script finds while the page is parsed or later.
 6. **File re-download** (both). Every file of the manifest is downloaded
    again and hashed. A match is not counted towards any positive state,
    because a server can answer this request differently from the page's own;
@@ -295,10 +326,10 @@ The manifest includes an incrementing `sequence` number to prevent replay attack
 
 | Scenario | Result |
 |----------|--------|
-| First install | Accept any sequence, store it |
+| First install | Accept a sequence at or above `MIN_KNOWN_SEQUENCE`, the floor built into the release (57 for this one), store it |
 | New manifest (sequence >= stored) | Accept, update stored |
 | Old manifest (sequence < stored) | **REJECT - Downgrade attack** |
-| Storage cleared | Like first install (acceptable risk) |
+| Storage cleared | Like first install: the built-in floor still applies |
 | Manifest host unreachable | Fall back to the cached copy, re-validated |
 | Cached copy fails re-validation | Drop it and report an error |
 
@@ -400,8 +431,13 @@ The integrity approach provides multiple layers of protection:
 | Server serves malicious JS | Blocked before execution by the hash-only policy | Same |
 | Server adds an inline script or handler to the HTML | Not run. Shown as a notice | Page replaced by the block page |
 | Server serves different HTML to the navigation than to any other request | **Not detected.** State stays "partially verified" | Page replaced by the block page |
-| Server adds markup with framework directives and no script | Not evaluated: the client's framework does not read directives from served markup (see below). The markup is removed once the page has loaded | Page replaced by the block page |
+| Server adds markup with framework directives and no script | Not evaluated: the client's framework does not read directives from served markup (see below). The markup is removed once the document has been parsed | Page replaced by the block page |
+| Server declares a shadow root in the served markup, with a layer, a form or styles of its own | Shown until the document has been parsed, then removed with the body the parser built. A stylesheet in it that is not signed: state "failed"; otherwise "unverifiable" | Page replaced by the block page |
+| Server adds a form that posts to the site | The browser refuses to submit it (`form-action 'none'`), except on the login page | Page replaced by the block page |
+| Server adds `<meta http-equiv="refresh">` | Document stopped before the refresh, notice | Page replaced by the block page |
 | Server links an unsigned same-origin stylesheet | Loaded; state "failed" | Page replaced by the block page |
+| Server answers the legal pages' `operator.json` fetch with other values | Not detected, like any other change to those pages' markup | Withheld; state "failed" |
+| Extension allowed on the site only on request | The packaged rules may not apply: "unverifiable" | Same, where the content script runs at all |
 | Server sends `Link: rel=stylesheet` | Header removed | Header removed |
 | Server redirects an invite link to another origin | Navigation blocked | Navigation blocked |
 | Server redirects an invite link to the release page or a store, directly or through `/ext/chrome` | Navigation blocked: the address carries a fragment | Same |
@@ -442,20 +478,29 @@ The client closes that path itself, since no extension can in Chromium:
   name it, and its `x-`, `:` and `@` attributes are ordinary attributes
   that nothing evaluates. The signed templates are rewritten to the prefix
   when they are mounted.
-- The framework starts once the document has been parsed. Before that,
-  everything in the body that was not mounted and is not a script is
-  removed.
+- The framework starts once the document has been parsed. Before that, the
+  body the parser built is replaced by a new one that holds only what was
+  mounted and the scripts. Replacing the element, rather than emptying it,
+  also discards a shadow root declared in the served markup: once attached,
+  a shadow root cannot be taken off its element, and a closed one cannot
+  even be seen by the page. The guard reads the document through getters it
+  saves at start-up, because a served element with a name attribute, such
+  as `<img name="body">`, shadows the property of the document with that
+  name.
 
 This holds in whatever order, and with whatever attributes, a server arranges
 the script elements of the page: it can leave the application out, it cannot
 address the application's state.
 
 What is left in Chromium is what markup can do without the framework. It is
-shown until the document has been parsed. A page served without the
-framework file runs no application but can show anything, a form that asks
-for something included, under the site's address and a "partially verified"
-state. An unsigned stylesheet from the site is detected and reported, not
-blocked. Use Firefox when the server must not be trusted with the page.
+shown until the document has been parsed, a shadow root declared in it
+included. A page served without the framework file runs no application but
+can show anything, under the site's address and a "partially verified"
+state; a form on it cannot post what is typed into it, since the policy
+lets no page but the login page submit one, but the page can still ask the
+user to copy something elsewhere. An unsigned stylesheet from the site, in
+the page or in a shadow tree, is detected and reported, not blocked. Use
+Firefox when the server must not be trusted with the page.
 
 #### Without the extension
 

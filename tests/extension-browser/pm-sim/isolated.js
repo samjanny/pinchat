@@ -17,4 +17,10 @@ const external = document.createElement('script');
 external.src = (globalThis.browser || globalThis.chrome).runtime.getURL('page.js');
 (document.head || document.documentElement).appendChild(external);
 
+// 4. An element of its own with a closed shadow root, the way extensions
+// draw their buttons and menus into a page.
+const host = document.createElement('pm-sim-host');
+host.attachShadow({ mode: 'closed' }).appendChild(document.createElement('span'));
+(document.body || document.documentElement).appendChild(host);
+
 document.documentElement.setAttribute('data-pm-sim', 'injected');

@@ -8,8 +8,10 @@
  * the browser executed, what the extension intercepted, verified and
  * blocked, and what it told the user.
  *
- * Not part of CI. It needs Chromium, Firefox with geckodriver, openssl and
- * Node 22 or later. The extension fetches the signed manifest of its pinned
+ * Not part of CI. It needs Chromium or Google Chrome (CHROMIUM names the
+ * binary; extensions are loaded through the DevTools protocol, since Chrome
+ * ignores --load-extension), Firefox with geckodriver, openssl and Node 22 or
+ * later. The extension fetches the signed manifest of its pinned
  * release from the project's release host, so a run needs network access and
  * the static/ files in the working tree must be the ones of that release.
  * Nothing is sent to the real site: its host name is remapped to 127.0.0.1
@@ -107,6 +109,10 @@ const PROBE = `() => {
         overlay: overlay ? (overlay.getAttribute('data-kind') || 'present') : null,
         blockPage: text('verifier-block-reason'),
         evilCss: !!style && style.outlineStyle === 'solid' && style.outlineColor === 'rgb(255, 0, 0)',
+        // A shadow root on the body: an open one is visible, a closed one
+        // only through what its stylesheet does to its host.
+        bodyShadowRoot: !!(document.body && document.body.shadowRoot),
+        shadowCss: !!document.body && getComputedStyle(document.body).outlineColor === 'rgb(255, 0, 0)',
         pm: root ? {
             injected: root.getAttribute('data-pm-sim'),
             inline: root.getAttribute('data-pm-inline'),
