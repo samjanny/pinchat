@@ -2764,9 +2764,138 @@ async function main() {
     assert(victim.state === 'awaiting-welcome' && victim.group === null,
         'alternative-group Add leaves victim unjoined');
 
+    await preWelcomeProposalGap();
+
     console.log('');
     console.log(`mls-session-join: ${passed} passed, ${failed} failed`);
     process.exit(failed === 0 ? 0 : 1);
+}
+
+// ---------------------------------------------------------------------------
+// A small in-memory relay for multi-member scenarios: deliver() stamps the
+// relay sender_id and drops own echoes unless the session asks for them.
+// ---------------------------------------------------------------------------
+function relayPeer(role, id, pins) {
+    const out = [];
+    const events = [];
+    const session = new MLSSession({
+        role,
+        send: (envelope) => { out.push(envelope); return true; },
+        cancelPendingControl: () => true,
+        onEvent: (event) => events.push(event),
+        pskSecret: DEFAULT_PSK,
+        expectedGroupId: pins ? pins.groupId : undefined,
+        expectedCreatorKeyHash: pins ? pins.creatorKeyHash : undefined,
+        relaySenderId: id,
+    });
+    return { session, out, events, id };
+}
+
+async function deliver(to, envelope, fromId) {
+    const message = { ...envelope, sender_id: fromId };
+    if (fromId === to.id && !to.session.shouldHandleOwnEnvelope(message)) {
+        return 'own-echo-dropped';
+    }
+    try {
+        await to.session.onRelayEnvelope(message);
+        return 'ok';
+    } catch (err) {
+        return err;
+    }
+}
+
+function takeOut(peer, predicate) {
+    const index = peer.out.findIndex(predicate);
+    return index < 0 ? null : peer.out.splice(index, 1)[0];
+}
+
+const isKeyPackageEnvelope = (e) => e.wire_format === WireFormat.MLS_KEY_PACKAGE;
+const isWelcomeEnvelope = (e) => e.wire_format === WireFormat.MLS_WELCOME;
+const isCommitEnvelope = (e) => e.wire_format === WireFormat.MLS_PUBLIC_MESSAGE
+    && typeof e.commit_ref === 'string';
+const isProposalEnvelope = (e) => e.wire_format === WireFormat.MLS_PUBLIC_MESSAGE
+    && !e.commit_ref;
+
+/** Honest join of `joiner` by `creator`, with `others` already members. */
+async function relayJoin(creator, joiner, others) {
+    await joiner.session.start();
+    await deliver(creator, takeOut(joiner, isKeyPackageEnvelope), joiner.id);
+    const commit = takeOut(creator, isCommitEnvelope);
+    for (const other of others) await deliver(other, commit, creator.id);
+    await deliver(joiner, commit, creator.id);
+    await deliver(creator, commit, creator.id);
+    const welcome = takeOut(creator, isWelcomeEnvelope);
+    await deliver(joiner, welcome, creator.id);
+    await deliver(creator, welcome, creator.id);
+}
+
+/**
+ * M-03: a member's Update Proposal sequenced between the Add Commit that
+ * admits a joiner and that joiner's Welcome belongs to the new epoch. The
+ * creator may fold it by ProposalRef, so the joiner keeps it (bounded) while
+ * it waits and verifies it after joining; otherwise the folding Commit
+ * leaves the joiner unable to resolve the reference, a terminal desync.
+ */
+async function preWelcomeProposalGap() {
+    console.log('# MLS session - Proposal between an Add Commit and its Welcome (M-03)');
+    const creator = relayPeer('creator', 'gap-creator');
+    await creator.session.start();
+    const pins = creator.session.bootstrapPins;
+    const alice = relayPeer('joiner', 'gap-alice', pins);
+    await relayJoin(creator, alice, []);
+
+    const bob = relayPeer('joiner', 'gap-bob', pins);
+    await bob.session.start();
+    await deliver(creator, takeOut(bob, isKeyPackageEnvelope), bob.id);
+    const addBob = takeOut(creator, isCommitEnvelope);
+    await deliver(alice, addBob, creator.id);
+    await deliver(bob, addBob, creator.id);
+    await deliver(creator, addBob, creator.id);
+    const welcomeBob = takeOut(creator, isWelcomeEnvelope);
+
+    // Relay order: Add(Bob), Alice's Update for the new epoch, Welcome(Bob).
+    await alice.session.proposeUpdate();
+    const update = takeOut(alice, isProposalEnvelope);
+    await deliver(creator, update, alice.id);
+    const bufferedResult = await deliver(bob, update, alice.id);
+    assert(bufferedResult === 'ok' && bob.session.state === 'awaiting-welcome'
+        && bob.session._preWelcomeProposals.length === 1,
+    'joiner awaiting its Welcome keeps the new-epoch Proposal');
+
+    // An unrelated Proposal (wrong epoch) and a third one from the same
+    // relay sender are not kept.
+    const wrongEpoch = mutateProposalEnvelope(update, (pm) => {
+        pm.content.epoch += 5n;
+    });
+    await deliver(bob, wrongEpoch, 'gap-other');
+    await deliver(bob, update, alice.id);
+    await deliver(bob, update, alice.id);
+    assert(bob.session._preWelcomeProposals.length === 2,
+        'pre-Welcome Proposals are bounded per sender and by epoch');
+
+    await deliver(bob, welcomeBob, creator.id);
+    await deliver(creator, welcomeBob, creator.id);
+    assert(bob.session.state === 'joined'
+        && bob.session._proposalStore.size === 1
+        && bob.session._preWelcomeProposals.length === 0,
+    'after joining, the kept Proposal is authenticated into the store once');
+
+    await creator.session.commitUpdate();
+    const fold = takeOut(creator, isCommitEnvelope);
+    await deliver(creator, fold, creator.id);
+    await deliver(alice, fold, creator.id);
+    const bobResult = await deliver(bob, fold, creator.id);
+    assert(bobResult === 'ok' && bob.session.state === 'joined'
+        && bob.session.group.epoch === creator.session.group.epoch
+        && equalBytes(
+            bob.session.group.epochSecrets.epochAuthenticator,
+            creator.session.group.epochSecrets.epochAuthenticator,
+        ),
+    'the new member applies the Commit that folds that Proposal by reference',
+    bobResult instanceof Error ? bobResult.message : '');
+    assert(alice.events.some((event) => event.kind === 'commit-applied'
+        && event.selfUpdated === true),
+    'the proposer installs its own Update from that Commit');
 }
 
 // A promise that never settles (for example a mutex deadlock) drains the

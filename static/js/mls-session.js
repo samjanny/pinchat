@@ -84,6 +84,9 @@
     const MAX_DEFERRED_PRIVATE_MESSAGES = 32;
     const MAX_DEFERRED_PRIVATE_BYTES = 4 * 1024 * 1024;
     const MAX_DEFERRED_KEYPACKAGE_BYTES = 512 * 1024;
+    // Proposals for the epoch a pending Welcome will introduce, kept by a
+    // joiner until it can verify them (see _bufferPreWelcomeProposal).
+    const MAX_PRE_WELCOME_PROPOSAL_BYTES = 256 * 1024;
     const MAX_CONSUMED_KEY_PACKAGE_REFS = 4096;
     // The visible label carries 80 bits of the SHA-256 fingerprint. The full
     // 256-bit value is always emitted alongside it for tooltips/comparison.
@@ -422,6 +425,12 @@
             this._keyPackageRef = null;
             this._pendingWelcomeCommits = new Map();
             this._pendingWelcomeCommitBySender = new Map();
+            // Standalone Proposals that a joiner receives between its Add
+            // Commit and its Welcome. They belong to the epoch the Welcome
+            // introduces, so the joiner keeps a bounded number and verifies
+            // them once it has joined (M-03).
+            this._preWelcomeProposals = [];
+            this._preWelcomeProposalBytes = 0;
             // Accepted Adds whose Welcome still awaits relay acceptance.
             // The MLS epoch cannot be rolled back after the Commit echo; a
             // permanent Welcome rejection therefore triggers a compensating
@@ -789,6 +798,7 @@
             this._clearEpochProposalState();
             this._pendingWelcomeCommits.clear();
             this._pendingWelcomeCommitBySender.clear();
+            this._clearPreWelcomeProposals();
             this._acceptedWelcomeByCommit.clear();
             this._deferredEnvelopes.length = 0;
             this._deferredEnvelopeBytes = 0;
@@ -846,6 +856,7 @@
             this._clearEpochProposalState();
             this._pendingWelcomeCommits.clear();
             this._pendingWelcomeCommitBySender.clear();
+            this._clearPreWelcomeProposals();
             this._acceptedWelcomeByCommit.clear();
             this._deferredEnvelopes.length = 0;
             this._deferredEnvelopeBytes = 0;
@@ -1705,9 +1716,14 @@
                 );
             }
 
-            // Standalone proposals and ordinary membership/path commits do
-            // not carry a KeyPackageRef for this joiner; ignore them while
-            // waiting for the Add that actually addresses us.
+            if (pm.content.contentType === MLS.Framing.ContentType.PROPOSAL) {
+                return this._bufferPreWelcomeProposal(
+                    mlsMessageBytes, pm, envelope,
+                );
+            }
+            // Ordinary membership/path commits do not carry a KeyPackageRef
+            // for this joiner; ignore them while waiting for the Add that
+            // actually addresses us.
             if (pm.content.contentType !== MLS.Framing.ContentType.COMMIT
                 || !envelope.key_package_ref) return false;
 
@@ -1811,6 +1827,97 @@
                 envelope.sender_id, commitRef,
             );
             return true;
+        }
+
+        /**
+         * M-03. The relay may sequence a member's Update Proposal for epoch
+         * n+1 between the Add Commit that admits us (epoch n -> n+1) and
+         * our Welcome. That Proposal is a valid message of epoch n+1, of
+         * which we are a member: RFC 9420 section 12.4 requires the
+         * committer to include every valid proposal received in the epoch,
+         * so the creator may fold it by ProposalRef, and we must be able to
+         * resolve it. We cannot verify it yet (no membership_key, no tree),
+         * so keep a bounded number of Proposals whose cleartext group_id
+         * and epoch match an Add Commit we are waiting on, and verify them
+         * after the Welcome (_adoptPreWelcomeProposals). The bounds mirror
+         * the authenticated store: MAX_PROPOSALS_PER_SENDER per relay
+         * sender and MAX_PROPOSALS_PER_EPOCH in total.
+         */
+        _bufferPreWelcomeProposal(mlsMessageBytes, pm, envelope) {
+            const content = pm.content;
+            if (!content || !this.expectedGroupId
+                || !equalBytes(content.groupId, this.expectedGroupId)
+                || !content.sender
+                || content.sender.senderType !== MLS.Framing.SenderType.MEMBER
+                || typeof envelope.sender_id !== 'string'
+                || envelope.sender_id.length === 0) {
+                return false;
+            }
+            let forPendingEpoch = false;
+            for (const candidate of this._pendingWelcomeCommits.values()) {
+                if (candidate.epoch + 1n === content.epoch) {
+                    forPendingEpoch = true;
+                    break;
+                }
+            }
+            if (!forPendingEpoch) return false;
+            const encodedBytes = mlsMessageBytes.length;
+            const fromSender = this._preWelcomeProposals.filter(
+                (entry) => entry.senderId === envelope.sender_id,
+            ).length;
+            if (fromSender >= MAX_PROPOSALS_PER_SENDER
+                || this._preWelcomeProposals.length >= MAX_PROPOSALS_PER_EPOCH
+                || this._preWelcomeProposalBytes + encodedBytes
+                    > MAX_PRE_WELCOME_PROPOSAL_BYTES) {
+                return false;
+            }
+            this._preWelcomeProposals.push({
+                bytes: MLS.MLSMessage.serializeMLSMessage(
+                    MLS.MLSMessage.WireFormat.MLS_PUBLIC_MESSAGE,
+                    mlsMessageBytes,
+                ),
+                epoch: content.epoch,
+                senderId: envelope.sender_id,
+                encodedBytes,
+            });
+            this._preWelcomeProposalBytes += encodedBytes;
+            return true;
+        }
+
+        _clearPreWelcomeProposals() {
+            this._preWelcomeProposals.length = 0;
+            this._preWelcomeProposalBytes = 0;
+        }
+
+        /**
+         * After joining, authenticate the Proposals kept by
+         * _bufferPreWelcomeProposal exactly as if they had arrived now, in
+         * relay order. Anything that fails verification (another epoch, a
+         * forged tag, a quota) is dropped: it was never accepted.
+         */
+        async _adoptPreWelcomeProposals() {
+            const kept = this._preWelcomeProposals.splice(0);
+            this._preWelcomeProposalBytes = 0;
+            for (const entry of kept) {
+                if (!this.group || entry.epoch !== this.group.epoch) continue;
+                try {
+                    const verified = await this.group.verifyUpdateProposal(
+                        entry.bytes,
+                    );
+                    const stored = this._storeAuthenticatedProposal(verified);
+                    if (stored.isNew) {
+                        this.onEvent({
+                            kind: 'update-proposal-received',
+                            senderLeafIndex: stored.entry.senderLeafIndex,
+                        });
+                    }
+                } catch (err) {
+                    this.onEvent({
+                        kind: 'error',
+                        reason: `pre-Welcome Update proposal dropped: ${err.message}`,
+                    });
+                }
+            }
         }
 
         /**
@@ -2004,6 +2111,7 @@
             this._senderIdByLeaf.set(CREATOR_LEAF_INDEX, candidate.senderId);
             this.onEvent(rosterEvent);
             this.onEvent({ kind: 'joined' });
+            await this._adoptPreWelcomeProposals();
         }
 
         async _handleApplication(mlsMessageBytes, senderId) {
