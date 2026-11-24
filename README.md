@@ -57,14 +57,19 @@ replacement for Signal, WhatsApp, Matrix, Session, or SimpleX.
 - **SAS verification.** A Short Authentication String lets participants
   authenticate the session out of band and detect an active MITM.
 - **Group chat, behind a flag.** Rooms of up to 20 members use an MLS
-  (RFC 9420) group built from scratch, validated against the IETF test
-  vectors. Off by default (`GROUP_CHAT_ENABLED`); see the section below for
+  (RFC 9420) group built from scratch, whose building blocks are checked
+  against the IETF test vectors. It departs from the RFC in a few documented
+  places ([static/js/mls/README.md](static/js/mls/README.md)) and does not
+  interoperate with other MLS implementations. Off by default (`GROUP_CHAT_ENABLED`); see the section below for
   what it does and does not provide.
 - **Double-Ratchet-inspired key progression.** Message keys advance and old
   keys are deleted where possible. This is not a claim of Signal Protocol
   equivalence.
 - **Authenticated DH ratchet.** DH public key rotations are signed with the
-  peer's ECDSA P-256 identity key. A live key swap triggers a hard abort.
+  peer's ECDSA P-256 identity key. A swapped DH key inside a session
+  triggers a hard abort. A peer that comes back with a different identity key
+  must be verified again before anything is sent or shown: the "verified"
+  state belongs to the key that was compared, not to the room.
 - **Subprotocol WebSocket auth.** JWTs travel in `Sec-WebSocket-Protocol`, not
   in the URL, so they stay out of proxy logs and referrer headers.
 - **Rate limiting and proof of work.** Configurable WebSocket, login, room
@@ -311,7 +316,7 @@ hosting-provider logs.
 | `MSG_RATE_LIMIT` | `30` | Messages per connection per window |
 | `MSG_RATE_WINDOW_SECS` | `1` | Window for per-connection message rate limiting, also used by the per-room and frame limits below |
 | `ROOM_MSG_RATE_LIMIT` | `120` | Messages per room per window, all members together |
-| `ROOM_BYTE_RATE_LIMIT` | `8MB` | Payload bytes per room per window, MLS traffic counted after Base64url decoding. 64KB to 64MB, and at least twice `MAX_IMAGE_SIZE` |
+| `ROOM_BYTE_RATE_LIMIT` | `8MB` | Payload bytes per room per window, MLS traffic counted after Base64url decoding. 64KB to 64MB, and at least twice the encoded size of a `MAX_IMAGE_SIZE` image (about 3.6 times `MAX_IMAGE_SIZE`); the relay refuses to start below that |
 | `FRAME_RATE_LIMIT` | `120` | Frames of any type per connection per window, malformed ones included; beyond it the connection is closed. At least `MSG_RATE_LIMIT` |
 | `PROTOCOL_ERROR_LIMIT` | `10` | A connection is closed once it has sent this many malformed or unknown frames |
 | `ECDH_BURST_LIMIT` | `8` | Key-exchange frames per connection per `ECDH_BURST_WINDOW_SECS`; beyond it the connection is closed |
