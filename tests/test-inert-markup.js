@@ -57,7 +57,7 @@ const guardSource = engineBytes.subarray(UPSTREAM_BYTES).toString('utf8');
 
 function fakeElement(tagName, attributes = {}, children = []) {
     const element = {
-        nodeType: 1,
+        nodeType: tagName === '#fragment' ? 11 : 1,
         tagName,
         attrs: new Map(Object.entries(attributes)),
         childNodes: children,
@@ -69,17 +69,33 @@ function fakeElement(tagName, attributes = {}, children = []) {
         get children() {
             return this.childNodes.filter((node) => node.nodeType === 1);
         },
+        getAttribute(name) { return this.attrs.has(name) ? this.attrs.get(name) : null; },
         removeAttribute(name) { this.attrs.delete(name); },
         setAttribute(name, value) { this.attrs.set(name, value); },
         remove() {
             if (this.parent) this.parent.childNodes = this.parent.childNodes.filter((node) => node !== this);
+            this.parent = null;
         },
-        append(fragment) {
-            for (const node of fragment.childNodes) {
-                node.parent = this;
-                this.childNodes.push(node);
+        // Like the real one: a fragment hands over its children, a node
+        // leaves its old parent.
+        append(...nodes) {
+            for (const node of nodes) {
+                const moved = node.nodeType === 11 ? node.childNodes : [node];
+                for (const child of [...moved]) {
+                    if (child.parent) child.remove();
+                    child.parent = this;
+                    this.childNodes.push(child);
+                }
+                if (node.nodeType === 11) node.childNodes = [];
             }
-            fragment.childNodes = [];
+        },
+        replaceWith(other) {
+            const parent = this.parent;
+            if (!parent) return;
+            if (other.parent) other.remove();
+            parent.childNodes = parent.childNodes.map((node) => (node === this ? other : node));
+            other.parent = parent;
+            this.parent = null;
         },
         querySelectorAll() {
             const all = [];
@@ -101,33 +117,69 @@ const textNode = () => ({ nodeType: 3, childNodes: [], remove() {
     if (this.parent) this.parent.childNodes = this.parent.childNodes.filter((node) => node !== this);
 } });
 
-/** Runs the guard against a fake engine and document. */
-function runGuard({ readyState = 'loading', body, html, head, nextTemplateContent } = {}) {
+// The interfaces the guard takes its getters and methods from. As in a
+// browser, the document's own properties live on the prototype, which is
+// what lets an own property of the same name shadow them.
+class FakeEventTarget {
+    addEventListener(type, listener) { this.listeners[type] = listener; }
+}
+class FakeDocument extends FakeEventTarget {
+    constructor(root, readyState, nextTemplateContent) {
+        super();
+        this.listeners = {};
+        this.root = root;
+        this.state = readyState;
+        this.nextTemplateContent = nextTemplateContent;
+    }
+
+    get documentElement() { return this.root; }
+
+    // The first body child of the root element, as the real getter defines it.
+    get body() { return this.root.childNodes.find((node) => node.tagName === 'BODY') || null; }
+
+    get head() { return this.root.childNodes.find((node) => node.tagName === 'HEAD') || null; }
+
+    get readyState() { return this.state; }
+
+    createElement(tagName) {
+        if (tagName === 'body') return fakeElement('BODY');
+        assert.strictEqual(tagName, 'template');
+        const template = fakeElement('TEMPLATE');
+        template.content = this.nextTemplateContent();
+        Object.defineProperty(template, 'innerHTML', { set() {} });
+        return template;
+    }
+}
+
+/**
+ * Runs the guard against a fake engine and document. `shadow` lists
+ * document properties to shadow with an own property, the way an element
+ * with that name attribute does in a browser.
+ */
+function runGuard({ readyState = 'loading', body, html, head, nextTemplateContent, shadow = {} } = {}) {
     const calls = { prefix: [], start: 0 };
     const engine = {
         prefix(value) { calls.prefix.push(value); },
         start() { calls.start += 1; },
     };
-    const listeners = {};
     const microtasks = [];
-    const document = {
-        readyState,
-        body: body === undefined ? fakeElement('BODY', { class: 'chat-page' }) : body,
-        documentElement: html || fakeElement('HTML', { lang: 'en' }),
-        head: head || fakeElement('HEAD'),
-        addEventListener(type, listener) { listeners[type] = listener; },
-        createElement(tagName) {
-            assert.strictEqual(tagName, 'template');
-            const template = fakeElement('TEMPLATE');
-            template.content = nextTemplateContent();
-            Object.defineProperty(template, 'innerHTML', { set() {} });
-            return template;
-        },
-    };
+    const root = html || fakeElement('HTML', { lang: 'en' });
+    for (const child of [head || fakeElement('HEAD'), body === undefined ? fakeElement('BODY', { class: 'chat-page' }) : body]) {
+        if (child && !root.childNodes.includes(child)) {
+            child.parent = root;
+            root.childNodes.push(child);
+        }
+    }
+    const document = new FakeDocument(root, readyState, nextTemplateContent);
+    for (const [name, value] of Object.entries(shadow)) {
+        Object.defineProperty(document, name, { value, configurable: true });
+    }
     const window = { Alpine: engine };
     const context = vm.createContext({
         window,
         document,
+        Document: FakeDocument,
+        EventTarget: FakeEventTarget,
         crypto: crypto.webcrypto,
         Node: { ELEMENT_NODE: 1 },
         queueMicrotask: (task) => microtasks.push(task),
@@ -141,7 +193,8 @@ function runGuard({ readyState = 'loading', body, html, head, nextTemplateConten
     vm.runInContext(guardSource, context, { filename: 'guard' });
     return {
         engine, calls, document, window,
-        parsed: () => listeners.DOMContentLoaded && listeners.DOMContentLoaded(),
+        currentBody: () => Object.getOwnPropertyDescriptor(FakeDocument.prototype, 'body').get.call(document),
+        parsed: () => document.listeners.DOMContentLoaded && document.listeners.DOMContentLoaded(),
         flush: () => { while (microtasks.length) microtasks.shift()(); },
     };
 }
@@ -233,11 +286,68 @@ test('what was not mounted is removed before the engine starts', () => {
     guard.parsed();
 
     assert.strictEqual(guard.calls.start, 1);
-    assert.deepStrictEqual(body.childNodes, [script, mountedNode],
+    const current = guard.currentBody();
+    assert.deepStrictEqual(current.childNodes, [script, mountedNode],
         'only scripts and mounted nodes are left in the body');
-    assert.deepStrictEqual([...body.attrs.keys()], ['class']);
+    assert.deepStrictEqual([...current.attrs.entries()], [['class', 'chat-page']]);
     assert.deepStrictEqual([...html.attrs.keys()].sort(), ['data-theme', 'lang']);
     assert.deepStrictEqual([...head.attrs.keys()], []);
+});
+
+test('the body the parser built is replaced, and a shadow root declared on it goes with it', () => {
+    // What <template shadowrootmode="closed"> inside <body> leaves behind: a
+    // shadow root on the body that no script can take off or even reach,
+    // holding a stylesheet and a form of the server's.
+    const script = fakeElement('SCRIPT', { src: '/static/js/app.js' });
+    const served = fakeElement('BODY', { class: 'chat-page' }, [script]);
+    served.shadowRoot = fakeElement('#fragment', {}, [
+        fakeElement('LINK', { rel: 'stylesheet', href: '/static/x-unsigned.css' }),
+        fakeElement('FORM', { method: 'post', action: '/collect' }),
+    ]);
+    const mountedNode = fakeElement('DIV', { class: 'chat-container' });
+    const guard = runGuard({ body: served, nextTemplateContent: () => fakeElement('#fragment', {}, [mountedNode]) });
+
+    guard.window.PinChatUI.mount('markup');
+    assert.strictEqual(guard.currentBody(), served, 'mounted into the parsed body while parsing');
+    guard.parsed();
+
+    const current = guard.currentBody();
+    assert.notStrictEqual(current, served, 'the parsed body is no longer in the document');
+    assert.strictEqual(served.parent, null);
+    assert.strictEqual(current.shadowRoot, undefined, 'the new body has no shadow root');
+    assert.deepStrictEqual(current.childNodes, [script, mountedNode], 'the application moved with the scripts');
+    assert.strictEqual(guard.calls.start, 1);
+});
+
+test('served elements that shadow properties of the document mislead neither mount nor the start', () => {
+    // <img name="body">, <form name="head"> and the like: an element with a
+    // name attribute shadows the property of the document with that name.
+    const image = fakeElement('IMG', { name: 'body' });
+    const marker = fakeElement('DIV', { id: 'served-marker' });
+    const served = fakeElement('BODY', { class: 'chat-page' }, [marker, image]);
+    const mountedNode = fakeElement('DIV', { class: 'chat-container' });
+    const guard = runGuard({
+        body: served,
+        nextTemplateContent: () => fakeElement('#fragment', {}, [mountedNode]),
+        shadow: {
+            body: image,
+            head: fakeElement('FORM', { name: 'head' }),
+            documentElement: fakeElement('IMG', { name: 'documentElement' }),
+            readyState: fakeElement('IMG', { name: 'readyState' }),
+            createElement: fakeElement('IMG', { name: 'createElement' }),
+            addEventListener: fakeElement('IMG', { name: 'addEventListener' }),
+        },
+    });
+
+    guard.window.PinChatUI.mount('markup');
+    assert.deepStrictEqual(served.childNodes, [marker, image, mountedNode], 'mounted into the real body');
+    assert.deepStrictEqual(image.childNodes, []);
+    guard.flush();
+    assert.strictEqual(guard.calls.start, 0, 'still waiting for the end of parsing');
+    guard.parsed();
+    assert.strictEqual(guard.calls.start, 1);
+    assert.deepStrictEqual(guard.currentBody().childNodes, [mountedNode],
+        'the served markup is gone, the element that shadowed the body included');
 });
 
 test('mount refuses to run without a body', () => {
