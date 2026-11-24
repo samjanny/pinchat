@@ -4,12 +4,35 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Dates are the repository-local commit dates; entries are curated for user-visible impact
 rather than being a 1:1 mirror of `git log`.
 
-## [2026-11-24] - extension 1.5.2
+## [2026-11-24] - v0.9.2
 
-An extension release only. The server, the signed manifest (sequence 56) and
-the extensions' pin (v0.9.1, floor 56) do not change. 1.5.1 was packaged and
-attached to the v0.9.1 release but not submitted to the stores; 1.5.2 takes
-its place.
+The manifest is re-signed at sequence 57 and both extensions move to 1.6.0
+with their pin on v0.9.2 and their floor raised to 57. Extension 1.5.1 was
+packaged and attached to the v0.9.1 release but not submitted to the stores,
+and 1.5.2 was never released; 1.6.0 takes their place. The server does not
+change.
+
+### Changed - the site moves to pinchat.im
+
+The public instance is served at pinchat.im. pinchat.io answers every request
+with a permanent redirect to the same address on pinchat.im until the domain
+expires at the end of November 2026, and is not renewed.
+
+- The extensions vouch for https://pinchat.im and https://www.pinchat.im
+  only: host permissions, the pages they run on, the packaged script policy
+  (`connect-src` names `wss://pinchat.im`) and the rules on redirects. An
+  installed build up to 1.5.1 vouches for pinchat.io only; on pinchat.im it
+  does nothing until it is replaced, and it refuses the redirect from
+  pinchat.io as a redirect off the site. Replacing it asks once for access to
+  the new site.
+- The contact addresses in the operator file, the README and SECURITY.md move
+  to pinchat.im. The Terms name pinchat.im as the hosted Service; the home
+  page, the Privacy Policy and the rest of the Terms no longer name a domain.
+- The Firefox add-on ID, `pinchat-verifier@pinchat.io`, does not change: it
+  is the add-on's permanent identifier on addons.mozilla.org, not an address.
+
+Operators of other instances are not affected: the relay takes its origins
+from `CORS_ALLOWED_ORIGINS`, as before.
 
 ### Changed - check marks for the two best states, and a color for every check
 

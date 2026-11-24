@@ -71,7 +71,7 @@ function render(state) {
     if (!state.onSite) {
         icon.textContent = '-';
         icon.className = 'status-icon status-unknown';
-        text.textContent = 'This tab is not showing pinchat.io. Nothing here is verified.';
+        text.textContent = 'This tab is not showing pinchat.im. Nothing here is verified.';
         scope.textContent = '';
         show(byId('reasons'), false);
         show(byId('environment'), false);

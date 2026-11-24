@@ -162,18 +162,18 @@ test('an inline script element in the DOM is an observation, not a verdict', () 
 });
 
 test('policy violations are attributed conservatively', () => {
-    const page = 'https://pinchat.io/static/chat.html?room=1#key=secret';
+    const page = 'https://pinchat.im/static/chat.html?room=1#key=secret';
     const byPage = V.findingForViolation({
-        sourceFile: 'https://pinchat.io/static/chat.html?room=1', blockedURI: 'inline', effectiveDirective: 'script-src-elem',
+        sourceFile: 'https://pinchat.im/static/chat.html?room=1', blockedURI: 'inline', effectiveDirective: 'script-src-elem',
     }, page);
     assert.strictEqual(byPage.class, CLASS.SUSPICIOUS, 'even a page-attributed violation is not proof against the server');
     assert(!byPage.detail.includes('secret'), 'the fragment never ends up in a finding');
     // Chromium names the document without its query string.
     assert.strictEqual(V.findingForViolation({
-        sourceFile: 'https://pinchat.io/static/chat.html', blockedURI: 'inline', effectiveDirective: 'script-src-elem',
+        sourceFile: 'https://pinchat.im/static/chat.html', blockedURI: 'inline', effectiveDirective: 'script-src-elem',
     }, page).class, CLASS.SUSPICIOUS);
     assert.strictEqual(V.findingForViolation({
-        sourceFile: 'https://pinchat.io/static/js/app.js', blockedURI: 'inline', effectiveDirective: 'script-src-elem',
+        sourceFile: 'https://pinchat.im/static/js/app.js', blockedURI: 'inline', effectiveDirective: 'script-src-elem',
     }, page).class, CLASS.ENVIRONMENT, 'another file of the site is not the document');
 
     for (const sourceFile of ['chrome-extension://abcdefghijklmnop/content.js', 'moz-extension']) {
@@ -226,15 +226,15 @@ test('verified is a green check, the best state of Chromium a yellow one that sa
 });
 
 test('redirects off the site are refused, whatever the spelling', () => {
-    const origins = ['https://pinchat.io', 'https://www.pinchat.io'];
-    const from = 'https://pinchat.io/c/00000000-0000-4000-8000-000000000000';
+    const origins = ['https://pinchat.im', 'https://www.pinchat.im'];
+    const from = 'https://pinchat.im/c/00000000-0000-4000-8000-000000000000';
     for (const location of [
         '/static/chat.html?room=00000000-0000-4000-8000-000000000000',
         '/',
         '/login?redirect=%2Fc%2Fx',
         'static/index.html',
-        'https://pinchat.io/static/index.html',
-        'https://www.pinchat.io/',
+        'https://pinchat.im/static/index.html',
+        'https://www.pinchat.im/',
         'https:static/index.html',
     ]) {
         assert.strictEqual(V.isAllowedRedirect(from, location, origins), true, location);
@@ -244,10 +244,10 @@ test('redirects off the site are refused, whatever the spelling', () => {
         '//attacker.test/collect',
         '/\\attacker.test/collect',
         '\\\\attacker.test/collect',
-        'https://pinchat.io:8444/collect',
-        'http://pinchat.io/collect',
-        'https://pinchat.io.attacker.test/',
-        'https://pinchat.io@attacker.test/',
+        'https://pinchat.im:8444/collect',
+        'http://pinchat.im/collect',
+        'https://pinchat.im.attacker.test/',
+        'https://pinchat.im@attacker.test/',
         'http:attacker.test',
         'javascript:alert(1)',
         'data:text/html,x',
@@ -258,10 +258,10 @@ test('redirects off the site are refused, whatever the spelling', () => {
 });
 
 test('only a navigation without a fragment may leave for the release page or a store', () => {
-    const origins = ['https://pinchat.io', 'https://www.pinchat.io'];
+    const origins = ['https://pinchat.im', 'https://www.pinchat.im'];
     const external = V.EXTERNAL_REDIRECT_TARGETS;
     const release = 'https://github.com/samjanny/pinchat/releases/latest';
-    const plain = 'https://pinchat.io/ext/chrome';
+    const plain = 'https://pinchat.im/ext/chrome';
     for (const location of [
         release,
         'https://chromewebstore.google.com/detail/pinchat-integrity-verifier/abcdefghijklmnopabcdefghijklmnop',
@@ -270,9 +270,9 @@ test('only a navigation without a fragment may leave for the release page or a s
         assert.strictEqual(V.isAllowedRedirect(plain, location, origins, external), true, location);
         // The same target, when the address being left carries a key.
         for (const from of [
-            'https://pinchat.io/ext/chrome#key=SECRET',
-            'https://pinchat.io/c/00000000-0000-4000-8000-000000000000#key=SECRET',
-            'https://pinchat.io/static/chat.html?room=1#k',
+            'https://pinchat.im/ext/chrome#key=SECRET',
+            'https://pinchat.im/c/00000000-0000-4000-8000-000000000000#key=SECRET',
+            'https://pinchat.im/static/chat.html?room=1#k',
         ]) {
             assert.strictEqual(V.isAllowedRedirect(from, location, origins, external), false, `${from} -> ${location}`);
         }
@@ -300,7 +300,7 @@ test('only a navigation without a fragment may leave for the release page or a s
     }
     // Redirects that stay on the site are not affected by the fragment.
     assert.strictEqual(V.isAllowedRedirect(
-        'https://pinchat.io/c/x#key=SECRET', '/static/chat.html?room=x', origins, external,
+        'https://pinchat.im/c/x#key=SECRET', '/static/chat.html?room=x', origins, external,
     ), true);
     // Every entry is a complete address or a prefix that ends after the
     // slash closing the host name, so no prefix can grow into another host.
@@ -312,8 +312,8 @@ test('only a navigation without a fragment may leave for the release page or a s
 test('the Chromium redirect rules allow only what the same check allows', () => {
     const { ALLOWED_REDIRECT_LOCATIONS, CATCH_ALL_REGEX, FRAGMENT_REGEX, buildRules }
         = require('../extensions/generate-csp-rules');
-    const origins = ['https://pinchat.io', 'https://www.pinchat.io'];
-    const from = 'https://pinchat.io/c/00000000-0000-4000-8000-000000000000';
+    const origins = ['https://pinchat.im', 'https://www.pinchat.im'];
+    const from = 'https://pinchat.im/c/00000000-0000-4000-8000-000000000000';
     // Header value patterns as the browser reads them: "*" matches any run
     // of characters, "?" zero or one character, and a backslash makes the
     // next character literal. A bare "?" in a pattern is therefore a
@@ -342,7 +342,7 @@ test('the Chromium redirect rules allow only what the same check allows', () => 
 
     // Everything the rule lets through must stay on the site.
     for (const location of [
-        'https://pinchat.io/x', 'https://www.pinchat.io/x', '/', '/?a=1', '/static/chat.html?room=1',
+        'https://pinchat.im/x', 'https://www.pinchat.im/x', '/', '/?a=1', '/static/chat.html?room=1',
         '/c/00000000-0000-4000-8000-000000000000?_=1', '/login', '/login?redirect=%2F',
         '/static//attacker.test/', '/c/../../x', '/static/\\attacker.test',
     ]) {
@@ -352,8 +352,8 @@ test('the Chromium redirect rules allow only what the same check allows', () => 
     // And the spellings that leave the site must not match any pattern.
     for (const location of [
         'https://attacker.test/collect', '//attacker.test/collect', '/\\attacker.test/collect',
-        'https://pinchat.io:8444/collect', 'http://pinchat.io/', 'https://pinchat.io.attacker.test/',
-        'https://pinchat.io@attacker.test/', '/loginx//attacker.test', '',
+        'https://pinchat.im:8444/collect', 'http://pinchat.im/', 'https://pinchat.im.attacker.test/',
+        'https://pinchat.im@attacker.test/', '/loginx//attacker.test', '',
     ]) {
         assert(!allowedByRule(location), `rule must not allow ${JSON.stringify(location)}`);
     }
@@ -377,18 +377,18 @@ test('the Chromium redirect rules allow only what the same check allows', () => 
     assert.deepStrictEqual(allowedBy(FRAGMENT_REGEX), ALLOWED_REDIRECT_LOCATIONS);
     const withFragment = new RegExp(FRAGMENT_REGEX);
     for (const [address, carriesFragment] of [
-        ['https://pinchat.io/c/00000000-0000-4000-8000-000000000000#key=SECRET', true],
-        ['https://pinchat.io/ext/chrome#key=SECRET', true],
-        ['https://www.pinchat.io/static/chat.html?room=1#k', true],
-        ['https://pinchat.io:8444/x#k', true],
-        ['https://pinchat.io/#', true],
-        ['https://pinchat.io/ext/chrome', false],
-        ['https://pinchat.io/static/chat.html?room=1', false],
+        ['https://pinchat.im/c/00000000-0000-4000-8000-000000000000#key=SECRET', true],
+        ['https://pinchat.im/ext/chrome#key=SECRET', true],
+        ['https://www.pinchat.im/static/chat.html?room=1#k', true],
+        ['https://pinchat.im:8444/x#k', true],
+        ['https://pinchat.im/#', true],
+        ['https://pinchat.im/ext/chrome', false],
+        ['https://pinchat.im/static/chat.html?room=1', false],
     ]) {
         assert.strictEqual(withFragment.test(address), carriesFragment, address);
         // The pattern and the check in verdict.js agree on what a fragment is,
         // except for an empty one, which the pattern treats as present.
-        if (address !== 'https://pinchat.io/#') {
+        if (address !== 'https://pinchat.im/#') {
             assert.strictEqual(new URL(address).hash !== '', carriesFragment, address);
         }
     }
@@ -409,7 +409,7 @@ test('the Chromium redirect rules allow only what the same check allows', () => 
     ]) {
         assert.strictEqual(
             externalMatchers.some((matcher) => matcher.test(location)),
-            V.isAllowedRedirect('https://pinchat.io/ext/chrome', location, [], V.EXTERNAL_REDIRECT_TARGETS),
+            V.isAllowedRedirect('https://pinchat.im/ext/chrome', location, [], V.EXTERNAL_REDIRECT_TARGETS),
             location,
         );
     }

@@ -164,7 +164,7 @@ window.PinChatUI.mount(String.raw`
                 <div class="extension-text">
                     <h3><svg class="icon" aria-hidden="true"><use href="#i-shield"/></svg>Verify what your browser runs</h3>
                     <p>The server that relays your encrypted messages is the same server that delivers the code doing the encrypting. If it were compromised, it could serve modified code and you would have no ordinary way to notice.</p>
-                    <p>The <strong>PinChat Integrity Verifier</strong> is the independent check: it lets pinchat.io run only the scripts published in a release manifest signed with an offline key, and warns you if anything served differs from that release. Free, open source, no data collected, active only on pinchat.io.</p>
+                    <p>The <strong>PinChat Integrity Verifier</strong> is the independent check: it lets this site run only the scripts published in a release manifest signed with an offline key, and warns you if anything served differs from that release. Free, open source, no data collected, active only on this site.</p>
                 </div>
                 <div class="extension-actions">
                     <a class="btn btn-primary" href="/ext/chrome" target="_blank" rel="noopener noreferrer">Add to Chrome</a>

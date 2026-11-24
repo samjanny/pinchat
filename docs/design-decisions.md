@@ -20,7 +20,7 @@ the sole purpose of enabling public operation. If applicable law requires
 such retention for a publicly available deployment, that deployment stays
 private and access-restricted instead.
 
-**Status.** Active. The public instance at pinchat.io runs behind a shared
+**Status.** Active. The public instance at pinchat.im runs behind a shared
 password gate; the reverse proxy writes no access log and the application
 runs in strict privacy mode.
 

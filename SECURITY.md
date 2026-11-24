@@ -759,7 +759,7 @@ Step 5 is still a separate fetch. For scripts that does not matter, because step
 │                    SRI-BASED INTEGRITY VERIFICATION                     │
 ├─────────────────────────────────────────────────────────────────────────┤
 │                                                                         │
-│   GitHub Repository                    pinchat.io Server                │
+│   GitHub Repository                    pinchat.im Server                │
 │   (Out-of-band source)                 (Potentially compromised)        │
 │   ┌──────────────────┐                 ┌──────────────────────────────┐ │
 │   │hashes.json.signed│                 │  HTML with SRI attributes    │ │
@@ -936,7 +936,7 @@ If you discover a security vulnerability in PinChat, please report it responsibl
 
 Report vulnerabilities via:
 - GitHub Security Advisories (preferred)
-- Email: security@pinchat.io
+- Email: security@pinchat.im
 
 ### What to Include
 

@@ -55,7 +55,7 @@ const CONTROL_PORT = Number(process.env.VERIFIER_TEST_CONTROL_PORT || 8442);
 // A manifest that replaces the one of the pinned release; see above.
 const TEST_MANIFEST = process.env.VERIFIER_TEST_MANIFEST
     ? path.resolve(process.env.VERIFIER_TEST_MANIFEST) : null;
-const SITE = 'https://pinchat.io';
+const SITE = 'https://pinchat.im';
 const ROOM = '00000000-0000-4000-8000-000000000000';
 // What an invite link carries after the "#". The value is a made-up key.
 const SECRET = 'key=TESTSECRET0TESTSECRET0TESTSECRET0TESTSECRET0';
@@ -125,8 +125,8 @@ async function withServer(work, body) {
     execFileSync('openssl', [
         'req', '-x509', '-newkey', 'rsa:2048', '-nodes',
         '-keyout', path.join(work, 'key.pem'), '-out', path.join(work, 'cert.pem'),
-        '-days', '1', '-subj', '/CN=pinchat.io',
-        '-addext', 'subjectAltName=DNS:pinchat.io,DNS:www.pinchat.io,DNS:attacker.test,DNS:github.com,'
+        '-days', '1', '-subj', '/CN=pinchat.im',
+        '-addext', 'subjectAltName=DNS:pinchat.im,DNS:www.pinchat.im,DNS:attacker.test,DNS:github.com,'
             + 'DNS:raw.githubusercontent.com',
     ], { stdio: 'ignore' });
     const server = spawn(process.execPath, [
@@ -167,7 +167,7 @@ function makeContext(browserName, work) {
         if (passwordManager) extensions.push(path.join(__dirname, 'pm-sim'));
         let browser;
         if (browserName === 'chromium') {
-            const hosts = ['pinchat.io', 'www.pinchat.io', 'attacker.test', 'github.com'];
+            const hosts = ['pinchat.im', 'www.pinchat.im', 'attacker.test', 'github.com'];
             // No release host: point it at the local server, which has no
             // manifest to offer.
             if (!releaseHost || TEST_MANIFEST) hosts.push('raw.githubusercontent.com');
@@ -176,7 +176,7 @@ function makeContext(browserName, work) {
             });
         } else {
             proxy = await startProxy({
-                localHosts: ['pinchat.io', 'www.pinchat.io', 'attacker.test', 'github.com',
+                localHosts: ['pinchat.im', 'www.pinchat.im', 'attacker.test', 'github.com',
                     ...(TEST_MANIFEST && releaseHost ? ['raw.githubusercontent.com'] : [])],
                 localPort: HTTPS_PORT,
                 passthroughHosts: releaseHost && !TEST_MANIFEST ? ['raw.githubusercontent.com'] : [],

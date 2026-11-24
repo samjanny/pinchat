@@ -29,10 +29,10 @@ const V = globalThis.PinChatVerdict;
 // The origins this extension vouches for. The signed manifest and the
 // packaged Content-Security-Policy rules describe exactly these two. The
 // content script's match patterns ignore the port, so it is also injected on
-// https://pinchat.io:<any port>, which is a different origin that the server
+// https://pinchat.im:<any port>, which is a different origin that the server
 // operator controls just as well: a redirect is enough to send a visitor
 // there. Such a page must never be treated as PinChat.
-const OFFICIAL_ORIGINS = ['https://pinchat.io', 'https://www.pinchat.io'];
+const OFFICIAL_ORIGINS = ['https://pinchat.im', 'https://www.pinchat.im'];
 const ON_OFFICIAL_ORIGIN = OFFICIAL_ORIGINS.includes(window.location.origin);
 const IS_TOP_LEVEL = window.top === window;
 

@@ -355,7 +355,7 @@ are welcome.
 ## License
 
 Copyright 2025 Raffaele Mangiacasale
-support@pinchat.io
+support@pinchat.im
 
 Licensed under the Apache License, Version 2.0. You may not use this file
 except in compliance with the License. You may obtain a copy of the License

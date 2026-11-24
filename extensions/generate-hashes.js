@@ -576,7 +576,7 @@ async function main() {
         version: '1.2.0',  // Bumped version for anti-downgrade support
         sequence: sequence,  // Anti-downgrade sequence number
         generated: new Date().toISOString(),
-        site: 'https://pinchat.io',
+        site: 'https://pinchat.im',
         files
     };
 

@@ -3,10 +3,10 @@
     "name": "Password manager simulator (test only)",
     "version": "0.1",
     "description": "Adds script elements to the page DOM the way autofill extensions do. Used by tests/extension-browser only.",
-    "host_permissions": ["https://pinchat.io/*"],
+    "host_permissions": ["https://pinchat.im/*"],
     "content_scripts": [
         {
-            "matches": ["https://pinchat.io/*"],
+            "matches": ["https://pinchat.im/*"],
             "js": ["isolated.js"],
             "run_at": "document_end"
         }
@@ -14,7 +14,7 @@
     "web_accessible_resources": [
         {
             "resources": ["page.js"],
-            "matches": ["https://pinchat.io/*"]
+            "matches": ["https://pinchat.im/*"]
         }
     ],
     "browser_specific_settings": {
