@@ -43,6 +43,10 @@ const RELAY_ERROR_BANNERS = new Map([
         'The message was not sent because it exceeds the server size limit.'],
     ['The image was not sent because it exceeds the server size limit.',
         'The image was not sent because it exceeds the server size limit.'],
+    ['The message was not sent because the room is over its traffic limit; send it again in a moment.',
+        'The message was not sent because the room is over its traffic limit; send it again in a moment.'],
+    ['The image was not sent because the room is over its traffic limit; send it again in a moment.',
+        'The image was not sent because the room is over its traffic limit; send it again in a moment.'],
 ]);
 
 function relayErrorBanner(relayText) {

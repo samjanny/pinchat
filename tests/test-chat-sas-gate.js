@@ -201,7 +201,24 @@ async function run() {
     });
     assert.strictEqual(banner.error, 'The image was not sent because it exceeds the server size limit.',
         'a known relay error still gets its specific banner');
-    console.log('PASSED: relay error frames select client-written banners only (C-F6)');
+
+    // Every text the relay can put in an `error` frame must have its own
+    // banner, or a real refusal shows up as the generic one. Read the texts
+    // from the relay source so a new one cannot be added without a banner.
+    const relaySource = require('fs').readFileSync(
+        require('path').join(__dirname, '..', 'src', 'handlers', 'websocket.rs'), 'utf8');
+    const relayTexts = new Set();
+    for (const m of relaySource.matchAll(/send_error\(\s*\w+,\s*"([^"]+)"/g)) relayTexts.add(m[1]);
+    for (const m of relaySource.matchAll(/Message::Error \{\s*message: format!\(\s*"([^"]+)"/g)) {
+        for (const kind of ['message', 'image']) relayTexts.add(m[1].replace(/\{kind\}|\{\}/, kind));
+    }
+    assert(relayTexts.size >= 8, `expected the relay's error texts, found ${relayTexts.size}`);
+    for (const text of relayTexts) {
+        await banner.handleWebSocketMessage({ type: 'error', message: text });
+        assert.notStrictEqual(banner.error, 'The server reported an error.',
+            `relay error text has no banner in app.js: ${text}`);
+    }
+    console.log(`PASSED: relay error frames select client-written banners only (C-F6), ${relayTexts.size} relay texts covered`);
 
     await quarantineDoesNotAgeMessages();
 }
