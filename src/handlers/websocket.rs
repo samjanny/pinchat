@@ -962,7 +962,12 @@ async fn send_within_deadline(sender: &mut Writer, frame: Outgoing<'_>) -> bool 
 }
 
 fn schedule_connection_departure(state: &AppState, connection_id: Uuid) {
-    let Some(detached_room_id) = state.detach_connection(&connection_id) else {
+    let Some((detached_room_id, detach_count)) = state.detach_connection_counted(&connection_id)
+    else {
+        // The identity was taken out of its room while this socket ran
+        // (evicted, or the room closed). What the socket recorded after
+        // that is erased here; nothing else would.
+        state.forget_departed_identity(&connection_id);
         return;
     };
     let grace_state = state.clone();
@@ -977,18 +982,19 @@ fn schedule_connection_departure(state: &AppState, connection_id: Uuid) {
                     && room.creator_control_ready(),
             )
         });
-        let Some(participant_count) =
-            grace_state.finalize_disconnection(&connection_id, detached_room_id)
-        else {
+        // Only this detach's own grace period ends here. If the identity
+        // resumed and was detached again since, a later timer owns it.
+        let Some(participant_count) = grace_state.finalize_disconnection_at(
+            &connection_id,
+            detached_room_id,
+            Some(detach_count),
+        ) else {
             return;
         };
 
         match room_departure {
             Some((RoomType::Group, true)) => {
-                tracing::warn!(
-                    "Closing MLS room {} after creator reconnect grace expired",
-                    detached_room_id
-                );
+                tracing::warn!("Closing MLS room after creator reconnect grace expired");
                 grace_state.remove_room(&detached_room_id);
             }
             Some((RoomType::Group, false)) => {

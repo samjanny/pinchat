@@ -1034,12 +1034,7 @@ impl AppState {
         );
         for connection_id in connection_ids {
             self.connections.remove(&connection_id);
-            self.connection_message_timestamps.remove(&connection_id);
-            self.connection_commit_timestamps.remove(&connection_id);
-            self.connection_proposal_timestamps.remove(&connection_id);
-            self.connection_frame_timestamps.remove(&connection_id);
-            self.connection_protocol_errors.remove(&connection_id);
-            self.connection_ecdh_timestamps.remove(&connection_id);
+            self.remove_connection_limits(&connection_id);
         }
 
         // Remove the broadcast channel
@@ -1163,14 +1158,28 @@ impl AppState {
     /// transport. Membership and limiter state are removed together after the
     /// reconnect grace period.
     pub fn detach_connection(&self, connection_id: &Uuid) -> Option<Uuid> {
-        if let Some((_, room_id)) = self.connections.remove(connection_id) {
-            if let Some(mut room) = self.rooms.get_mut(&room_id) {
-                room.update_activity();
-            }
-            Some(room_id)
-        } else {
-            None
-        }
+        self.detach_connection_counted(connection_id)
+            .map(|(room_id, _)| room_id)
+    }
+
+    /// [`Self::detach_connection`], also returning the count of this detach
+    /// (`Room::record_detach`). The grace timer passes it to
+    /// [`Self::finalize_disconnection_at`].
+    ///
+    /// The socket's entry is held while the detach is counted, so that a
+    /// resume and a further detach cannot both fall between the two and
+    /// leave this detach with the count of the later one.
+    pub fn detach_connection_counted(&self, connection_id: &Uuid) -> Option<(Uuid, u64)> {
+        let Entry::Occupied(active) = self.connections.entry(*connection_id) else {
+            return None;
+        };
+        let room_id = *active.get();
+        let detach_count = self.rooms.get_mut(&room_id).map(|mut room| {
+            room.update_activity();
+            room.record_detach(*connection_id)
+        });
+        active.remove();
+        Some((room_id, detach_count.unwrap_or(0)))
     }
 
     /// Remove a grace-reserved participant only if no newer active socket has
@@ -1181,10 +1190,27 @@ impl AppState {
         connection_id: &Uuid,
         expected_room_id: Uuid,
     ) -> Option<usize> {
+        self.finalize_disconnection_at(connection_id, expected_room_id, None)
+    }
+
+    /// [`Self::finalize_disconnection`] for the grace timer of one detach.
+    /// With `Some(count)`, nothing happens unless that detach is still the
+    /// participant's latest: a socket that resumed and was detached again
+    /// started a grace period of its own, and only that period's timer may
+    /// end it.
+    pub fn finalize_disconnection_at(
+        &self,
+        connection_id: &Uuid,
+        expected_room_id: Uuid,
+        detach_count: Option<u64>,
+    ) -> Option<usize> {
         match self.connections.entry(*connection_id) {
             Entry::Occupied(_) => None,
             Entry::Vacant(_reservation) => {
                 let mut room = self.rooms.get_mut(&expected_room_id)?;
+                if detach_count.is_some_and(|count| room.detach_count(connection_id) != count) {
+                    return None;
+                }
                 if !room.remove_participant(connection_id) {
                     return None;
                 }
@@ -1192,17 +1218,50 @@ impl AppState {
                 let participant_count = room.participant_count();
                 drop(room);
 
-                self.connection_message_timestamps.remove(connection_id);
-                self.connection_commit_timestamps.remove(connection_id);
-                self.connection_proposal_timestamps.remove(connection_id);
-                self.connection_frame_timestamps.remove(connection_id);
-                self.connection_protocol_errors.remove(connection_id);
-                self.connection_ecdh_timestamps.remove(connection_id);
+                self.remove_connection_limits(connection_id);
                 self.forget_mls_control_participant(expected_room_id, connection_id);
 
                 Some(participant_count)
             }
         }
+    }
+
+    /// The rate-limit and protocol-error state of one relay identity.
+    fn remove_connection_limits(&self, connection_id: &Uuid) {
+        self.connection_message_timestamps.remove(connection_id);
+        self.connection_commit_timestamps.remove(connection_id);
+        self.connection_proposal_timestamps.remove(connection_id);
+        self.connection_frame_timestamps.remove(connection_id);
+        self.connection_protocol_errors.remove(connection_id);
+        self.connection_ecdh_timestamps.remove(connection_id);
+    }
+
+    /// Erase the rate-limit state of an identity that has no active socket
+    /// and holds no slot in any room.
+    ///
+    /// Room teardown, an eviction and the end of a grace period erase that
+    /// state, but the receive loop of a socket that is still running can
+    /// record one more frame after them: it checks that its identity is
+    /// active, then counts the frame, and the teardown can fall in between.
+    /// Nothing else would ever remove what it recorded. Called once such a
+    /// socket has ended, when nothing can record anything for it any more.
+    ///
+    /// Rare (a socket whose identity was taken away while it ran), so it
+    /// may look through every room. The vacant entry is held throughout:
+    /// an admission of the identity cannot fall between the check and the
+    /// removal.
+    pub fn forget_departed_identity(&self, connection_id: &Uuid) {
+        let Entry::Vacant(_not_admitted) = self.connections.entry(*connection_id) else {
+            return;
+        };
+        if self
+            .rooms
+            .iter()
+            .any(|room| room.participant_ids.contains(connection_id))
+        {
+            return;
+        }
+        self.remove_connection_limits(connection_id);
     }
 
     /// Immediate removal for setup failures and explicit administrative
@@ -1247,12 +1306,7 @@ impl AppState {
         let participant_count = room.participant_count();
         drop(room);
 
-        self.connection_message_timestamps.remove(connection_id);
-        self.connection_commit_timestamps.remove(connection_id);
-        self.connection_proposal_timestamps.remove(connection_id);
-        self.connection_frame_timestamps.remove(connection_id);
-        self.connection_protocol_errors.remove(connection_id);
-        self.connection_ecdh_timestamps.remove(connection_id);
+        self.remove_connection_limits(connection_id);
         self.forget_mls_control_participant(expected_room_id, connection_id);
 
         Some(participant_count)
