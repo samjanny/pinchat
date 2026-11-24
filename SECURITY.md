@@ -44,7 +44,7 @@ We consider adversaries with the following capabilities:
 - Can record ciphertext for future analysis
 - Cannot modify traffic in transit
 
-**Mitigation**: TLS 1.3 transport encryption + E2E encryption renders captured traffic undecryptable.
+**Mitigation**: TLS transport encryption + E2E encryption renders captured traffic undecryptable. TLS is 1.2 or 1.3: when the relay terminates TLS itself it uses rustls's defaults, which accept both and offer only forward-secret AEAD cipher suites; behind a reverse proxy the proxy decides (the nginx settings in docs/reverse-proxy.md accept TLS 1.2 clients).
 
 #### Active Network Adversary (MITM)
 - Can intercept and modify network traffic
@@ -624,12 +624,13 @@ one, and share the new link only with the people who should be in it.
 
 ### Relay Memory: Admission, Budgets and What Is Left
 
-The relay admits a bounded number of WebSocket connections, and what it holds
-for messages in transit does not depend on how many connections there are or
-on what they have carried before:
+The relay admits a bounded number of connections, before the WebSocket
+upgrade and after it, and what it holds for messages in transit does not
+depend on how many connections there are or on what they have carried before:
 
 | What | Bound |
 |------|-------|
+| HTTP connections before the upgrade | `MAX_HTTP_CONNECTIONS` (256) in all, `MAX_HTTP_CONNECTIONS_PER_ADDRESS` (32) for one client address, four times that for one IPv6 /48; a trusted proxy's connections count in the total only. Beyond the total the relay accepts nothing until a connection ends, and new connections wait in the kernel's queue; beyond the address limit a new connection is closed at once. 10 seconds for the TLS handshake and for each request head, counted from the moment the connection is idle; a head may take 32 KiB (431 beyond). 60 seconds for the connection, then 30 for the request in progress; a trusted proxy's connection is closed only after 75 seconds without a request. Request bodies up to 16 KiB. HTTP/1.1 only. An upgraded connection gives its slots back and is counted as a WebSocket connection from then on (see `src/http_server.rs`) |
 | WebSocket connections | `MAX_WS_CONNECTIONS` (400) in all, `MAX_WS_CONNECTIONS_PER_ADDRESS` (50) for one client address, four times that for one IPv6 /48. A connection holds its slot from the moment its upgrade is accepted to the end of its closing handshake. An upgrade beyond a limit is refused before anything is allocated for it, with 503 (relay) or 429 (address) and `Retry-After`, and its single-use token is not spent; the token and room endpoints give the same answer before the proof of work |
 | Messages being received, from 64 KiB | 32 MiB in all, 8 MiB for the connections of one client address. A connection that finds no room stops reading its socket until there is some |
 | Messages being received, above 4 KiB and below 64 KiB | 8 MiB in all, 2 MiB for one client address, apart from the large ones so that pictures cannot starve them |
@@ -684,6 +685,24 @@ their worst. That leaves a margin of about 60 MB. Raising
 `MAX_WS_CONNECTIONS` or `MAX_TOTAL_ROOMS` takes from that margin, at about
 290 KB a connection and 270 KB a group room.
 
+HTTP connections before the upgrade come on top of that. Measured with the
+relay terminating TLS itself, on one machine (RSS of the relay and the
+kernel's queues on its side of the sockets): an idle connection costs about
+30 KB; one whose peer asked for the largest static file and stopped
+reading about 330 KB, and about 490 KB with a further request queued
+behind it, nearly half of it in the kernel. At the defaults that is up to
+about 120 MiB, more than the margin above, held for at most 90 seconds by
+each connection. A relay that terminates TLS itself on a 512 MiB host and
+has to withstand that should lower `MAX_HTTP_CONNECTIONS`. Behind a reverse
+proxy with nginx's defaults the proxy reads the relay's responses into its
+own buffers and passes a request body on only once it is complete, so the
+relay's side of those connections should not fill this way (not
+measured). Before these limits, 300 connections that each
+sent 400 KB of a request head and 300 that sent nothing after their TLS
+handshake took 125 MiB and were all still open 70 seconds later; the same
+from one address now gets at most 32 connections at a time, takes
+about 2 MiB, and nothing of it is left after 15 seconds.
+
 What is not covered by any of these limits:
 
 - **Per-address state.** Rate-limit buckets and the shares above are kept
@@ -720,6 +739,12 @@ What remains possible:
   cost of holding them; they do not remove it.
 - **A shared address is shared.** All clients behind one address (a
   household, an office, a carrier's NAT) share its 50 connections.
+- **HTTP connections before the upgrade can be held too.** Eight
+  addresses (or two IPv6 /48s) can hold all of them; new connections then
+  wait in the kernel's queue until one of those ends, at most 90 seconds
+  after it was accepted. The clients behind one address share its 32, and
+  a browser opens up to six while it loads a page and keeps them for 10
+  seconds; one beyond the 32 is closed at once.
 - **A receiver must keep up.** A member who cannot take a frame within 30
   seconds is disconnected, and with the largest image allowed that is a
   link of about 1 Mbit/s. Until then the frame holds its room's budget, so
@@ -763,7 +788,7 @@ What remains possible:
 
 | Component | Protection | Attack Vector | Mitigation |
 |-----------|------------|---------------|------------|
-| TLS 1.3 | Transport encryption | Downgrade attacks | HSTS header (1 year) |
+| TLS 1.2 and 1.3 | Transport encryption | Downgrade attacks | HSTS header (1 year) |
 | Certificates | Server authentication | Certificate spoofing | Certificate pinning (recommended) |
 | WebSocket | Persistent connection | Connection hijacking | JWT token authentication |
 
@@ -791,9 +816,9 @@ What remains possible:
 |-----------|------------|---------------|------------|
 | Memory | Data persistence | Memory dumps | No keys stored, auto-cleanup |
 | Swap | Data held in memory reaching a disk | Host swap device | `docker-compose.yml` gives the container a memory ceiling and no swap; the reverse proxy and the rest of the host are for the operator to configure, and nothing here covers them |
-| Relay memory | Availability | Many connections, large frames, receivers that do not read, many uploads at once | Connection limits (relay, address, IPv6 /48) applied before the upgrade, byte budgets for messages coming in and frames going out, fixed socket buffers; see "Relay Memory: Admission, Budgets and What Is Left" |
+| Relay memory | Availability | Many connections, slow or partial requests, large frames, receivers that do not read, many uploads at once | Connection limits (relay, address, IPv6 /48) on HTTP connections and again before the upgrade, timeouts and size limits on requests, byte budgets for messages coming in and frames going out, fixed socket buffers; see "Relay Memory: Admission, Budgets and What Is Left" |
 | Logs | User privacy | Log analysis | PRIVACY_MODE=strict (start-up notices and error messages only, written without addresses, identifiers or request data) |
-| IP Addresses | User tracking | IP logging | HMAC-hashed IPs in the rate limiter and, while a connection is open, in the relay's per-address share of the broadcast budget; memory only |
+| IP Addresses | User tracking | IP logging | HMAC-hashed IPs (for IPv6, of the /64 and the /48) in the rate limiter and, while a connection is open, in the relay's per-address connection counts and share of the broadcast budget; memory only |
 
 ---
 
