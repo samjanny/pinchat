@@ -17,7 +17,9 @@
  * 3. Identity key authenticates all ephemeral keys via digital signatures
  *
  * Security Guarantee:
- * - SAS verification authenticates identity keys (one-time, out-of-band)
+ * - SAS verification authenticates identity keys (out-of-band). The verdict
+ *   is bound to the exact peer identity key bytes it was given for (audit
+ *   C-F1): it holds only while the peer presents those same bytes.
  * - All subsequent ephemeral keys must be signed by verified identity key
  * - MITM cannot substitute ephemeral keys without detection (invalid signature)
  */
@@ -230,7 +232,9 @@ class IdentityKeyManager {
         this.identityKeyPair = null;             // ECDSA keypair (long-term)
         this.peerIdentityPublicKey = null;       // Peer's identity public key (CryptoKey, non-extractable)
         this.peerIdentityPublicKeyRaw = null;    // Peer's identity public key (Uint8Array, cached at import)
-        this.sasVerified = false;                // Whether SAS has been verified by user
+        // Peer identity key bytes the user confirmed with the SAS (audit
+        // C-F1). The verdict is not a flag: it holds only for these bytes.
+        this.verifiedPeerIdentityRaw = null;
         this.previousPeerIdentityRaw = null;     // Last known peer identity raw bytes (for reconnect diff)
         this.storedEntryKey = null;              // IndexedDB entry of this room's identity (null: ephemeral)
 
@@ -510,23 +514,59 @@ class IdentityKeyManager {
     }
 
     /**
-     * Mark SAS as verified by user (out-of-band verification)
+     * Record that the user confirmed, out of band, the SAS computed for the
+     * peer identity key `peerIdentityRaw`.
      *
-     * This indicates the user has confirmed the SAS code matches via
-     * a secondary channel (phone call, Signal, etc.)
+     * Audit C-F1: the verdict used to be a bare boolean, so after any
+     * teardown the next handshake inherited "verified" whatever identity key
+     * it carried. It is now bound to the key bytes the code was computed
+     * for, and isSASVerified() holds only while the peer presents them.
+     *
+     * @param {Uint8Array} peerIdentityRaw - 65-byte raw P-256 identity key
      */
-    markSASVerified() {
-        this.sasVerified = true;
-        debugLog('[Identity] ✅ SAS marked as verified - identity keys authenticated');
+    markSASVerified(peerIdentityRaw) {
+        if (!(peerIdentityRaw instanceof Uint8Array)
+            || peerIdentityRaw.length !== 65 || peerIdentityRaw[0] !== 0x04) {
+            throw new Error('markSASVerified needs the peer identity key the code was computed for');
+        }
+        this.verifiedPeerIdentityRaw = new Uint8Array(peerIdentityRaw);
+        debugLog('[Identity] SAS marked as verified for the current peer identity key');
     }
 
     /**
-     * Check if SAS has been verified
+     * True when the user verified the SAS for the peer identity key the
+     * peer presents now.
      *
      * @returns {boolean}
      */
     isSASVerified() {
-        return this.sasVerified;
+        return this.isVerifiedPeerIdentity(this.peerIdentityPublicKeyRaw);
+    }
+
+    /**
+     * True when `peerIdentityRaw` is the identity key the user verified.
+     *
+     * @param {Uint8Array|null} peerIdentityRaw
+     * @returns {boolean}
+     */
+    isVerifiedPeerIdentity(peerIdentityRaw) {
+        const verified = this.verifiedPeerIdentityRaw;
+        if (!verified || !peerIdentityRaw || verified.length !== peerIdentityRaw.length) {
+            return false;
+        }
+        let diff = 0;
+        for (let i = 0; i < verified.length; i++) diff |= verified[i] ^ peerIdentityRaw[i];
+        return diff === 0;
+    }
+
+    /**
+     * True when the user has verified some peer identity in this room,
+     * whether or not it is the one the peer presents now.
+     *
+     * @returns {boolean}
+     */
+    hasVerifiedPeerIdentity() {
+        return this.verifiedPeerIdentityRaw !== null;
     }
 
     /**
@@ -541,7 +581,7 @@ class IdentityKeyManager {
         this.identityKeyPair = null;
         this.peerIdentityPublicKey = null;
         this.peerIdentityPublicKeyRaw = null;
-        this.sasVerified = false;
+        this.verifiedPeerIdentityRaw = null;
         this.previousPeerIdentityRaw = null;
 
         debugLog('[Identity] ✅ Identity keys destroyed');

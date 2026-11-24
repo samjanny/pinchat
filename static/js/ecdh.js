@@ -641,8 +641,9 @@ class ECDHKeyExchange {
      * Stability note: because the transcript includes the per-handshake ephemeral
      * keys, the SAS is fresh on every new handshake (including reconnects). The
      * "verify once" UX is preserved by the identity-key persistence + peer-
-     * identity-change detection in app.js (a stable IDENTITY pair across reconnects
-     * keeps sasVerified set; only an identity-key change forces re-verification).
+     * identity-change detection in app.js (the verdict is bound to the verified
+     * peer identity key, so it carries over only while the peer presents that
+     * key; any other key forces re-verification).
      * The displayed emoji changing on reconnect is expected and is the price of
      * binding the live session; identity continuity, not SAS stability, is what
      * carries the user's trust decision forward.

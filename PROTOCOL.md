@@ -656,8 +656,11 @@ ephemeral keys that derive the root key), not merely the identity pair,
 and prevents offline precomputation by a malicious relay (audit H1; see
 SECURITY.md for the full rationale). Because the ephemerals are fresh
 per handshake, the displayed code changes on every reconnect: the
-"verify once" UX is carried by identity-key persistence plus
-peer-identity-change detection in the client, not by SAS stability.
+"verify once" UX is carried by identity-key persistence plus a verdict the
+client binds to the verified peer identity key bytes, not by SAS stability.
+A later handshake comes up verified only if the peer presents the same
+identity key; any other key requires a fresh verification that cannot be
+skipped.
 
 Historical: v1 (pre-v0.3.0) used PBKDF2 with per-handshake nonces and
 timestamps in the salt, 48-bit output, 8 emoji. v2 (v0.3.x) switched to
@@ -677,7 +680,7 @@ Alice                                    Bob
   |                                        |
   | [User confirms SAS matches]            |
   |                                        |
-  | [Mark identity as verified]            |
+  | [Record the peer identity key verified]|
   |                                        |
 ```
 

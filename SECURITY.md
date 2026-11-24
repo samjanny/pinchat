@@ -173,7 +173,8 @@ room: pre-C-04 the identity keypair was regenerated on every page load, so
 a peer who reloaded the chat came back with a new identity key and the
 other side had to treat it as an identity change and verify again. With
 persistence a reload or reconnect inside the same room presents the same
-identity key, and a verdict the other side gave for that key still applies.
+identity key, and a verdict the other side gave for that key still applies
+(see "SAS verdict binding" below).
 
 **What the relay can learn about identity keys.** The handshake carries
 the identity public key inside the AES-GCM envelope, but every 1:1 message
@@ -340,10 +341,10 @@ this in two ways:
   actually derive the root key, not merely the identity pair.
 - *Fresh per handshake.* Because the transcript includes per-handshake
   ephemerals, the displayed code changes on every reconnect. The
-  "verify once" UX is preserved by identity-key persistence plus
-  peer-identity-change detection: a stable identity pair keeps the
-  verified flag set, and only an identity-key change forces
-  re-verification.
+  "verify once" UX is preserved by identity-key persistence plus a
+  verdict bound to the verified key: confirming a code records the peer
+  identity key it was computed for, a later handshake that presents the
+  same key comes up verified, and any other key forces re-verification.
 - *Domain-separated.* The `"pinchat-sas-v4"` salt tag and the
   `"SAS-display-v4"` info prefix separate this derivation from any
   other use of the same key material.
@@ -533,6 +534,8 @@ The server maintains a per-room set of SHA-256 hashes of received encrypted payl
 Short Authentication String (SAS) verification is the mechanism by which users confirm that no man-in-the-middle has replaced their peer's ECDH identity key during the handshake. When both participants compare and confirm the emoji codes match, the session is authenticated end-to-end.
 
 **If SAS is skipped:** the chat is encrypted, but not authenticated against the server operator. The server (or anyone with full relay access) could have substituted both parties' identity public keys with its own at the ECDH exchange step, establishing a session it can decrypt. The ECDSA signatures on the DH ratchet keys only prove self-consistency of those keys - they do not prove ownership by the expected human peer. Only SAS ties the cryptographic identity to a real-world identity.
+
+**SAS verdict binding:** confirming a code records the 65-byte peer identity public key that code was computed for (`IdentityKeyManager.markSASVerified`). The verdict is not a flag: `isSASVerified()` holds only while the peer presents those same bytes. Every completed handshake is judged against them, however the previous session ended (a relay-forged `userleft`/`userjoined`, a handshake timeout, a reconnect or a failed handshake), so none of those can carry "verified" over to a different identity key. A different key after a verification produces an explicit identity-change warning, locks the composer, keeps inbound ciphertext in quarantine as for a first verification, and refuses "skip" until the user confirms the new code or declares a mismatch. Up to v0.9.2 the verdict was a boolean, and a handshake timer left armed by a discarded attempt let a relay that knew the link tear down a verified session without arming the identity comparison; the next handshake, answered with the relay's own identity key, came up "verified" (audit C-F1). Handshake timers are now stopped with the attempt they belong to, and a timer that fires for an attempt that is no longer current does nothing.
 
 **Current UX:** while the SAS decision is pending, the composer is locked and inbound application ciphertext is kept in a bounded quarantine without being decrypted or rendered. Verification releases it in arrival order. Explicitly confirming the skip sets `sasVerificationStatus = 'skipped'`, releases the quarantine, and displays a persistent "Key verification skipped - connection security not confirmed" indicator. This is a deliberate usability trade-off: the unsafe state requires an informed user choice rather than occurring silently.
 

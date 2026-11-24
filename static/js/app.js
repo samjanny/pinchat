@@ -17,6 +17,9 @@ const MAX_PENDING_IMAGE_DECODE_BYTES = 4 * 1024 * 1024;
 // largest decrypted image this client will take from a peer.
 const MIN_ROOM_IMAGE_BYTES = 1024;
 const MAX_ROOM_IMAGE_BYTES = 2 * 1024 * 1024;
+// Numbers each 1:1 handshake attempt, so that a late callback can tell
+// whether the ECDH manager it belongs to is still the current one.
+let ecdhHandshakeSerial = 0;
 window.ROOM_CONFIG = {
     roomId: urlParams.get('room')
     // roomType, ttlMinutes, maxParticipants will be set by server via WebSocket
@@ -2014,13 +2017,24 @@ document.addEventListener('alpine:init', () => {
                     debugLog('[Identity] Reusing existing identity manager (SAS verified:', this.identityManager.isSASVerified(), ')');
                 }
 
-                // Initialize ECDH manager with identity manager
-                this.ecdhManager = new ECDHKeyExchange(window.cryptoManager.key, this.identityManager);
+                // Initialize ECDH manager with identity manager. The local
+                // reference and its numeric id (audit C-F1) let this attempt
+                // and its timer tell whether they are still the current
+                // handshake: the store is reactive, so comparing the objects
+                // themselves would compare proxies.
+                const manager = new ECDHKeyExchange(window.cryptoManager.key, this.identityManager);
+                const handshakeId = ++ecdhHandshakeSerial;
+                manager.handshakeId = handshakeId;
+                this.ecdhManager = manager;
+                const superseded = () => !this.ecdhManager
+                    || this.ecdhManager.handshakeId !== handshakeId;
 
-                await this.ecdhManager.generateKeypair();
+                await manager.generateKeypair();
+                if (superseded()) return;
 
                 // SECURITY: Pass roomId and userId for AAD context binding
-                const ecdhResult = await this.ecdhManager.encryptPublicKey(this.roomId, this.userId);
+                const ecdhResult = await manager.encryptPublicKey(this.roomId, this.userId);
+                if (superseded()) return;
 
                 // Serialize AAD context as JSON string (server expects string payload)
                 const payloadJson = JSON.stringify(ecdhResult);
@@ -2039,7 +2053,11 @@ document.addEventListener('alpine:init', () => {
                 // caller (ECDHKeyExchange.startTimeout) is responsible for
                 // handling the returned Promise without leaking unhandled
                 // rejections.
-                this.ecdhManager.startTimeout(async () => {
+                manager.startTimeout(async () => {
+                    // Audit C-F1: a timer left over from a handshake that was
+                    // already discarded must not tear down the session that
+                    // replaced it. Only the attempt it was armed for counts.
+                    if (superseded()) return;
                     console.warn('[ECDH] ⏱️ Handshake timeout - other participant did not respond');
 
                     // Clean up state
@@ -2098,6 +2116,9 @@ document.addEventListener('alpine:init', () => {
             // Don't reset sasVerificationStatus if we had verified identity - will check peer identity later
             if (!hadVerifiedIdentity) {
                 this.sasVerificationStatus = 'none';
+            }
+            if (this.ecdhManager) {
+                this.ecdhManager.clearTimeout();  // audit C-F1, see handleECDHAborted
             }
             this.ecdhManager = null;
 
@@ -2217,47 +2238,34 @@ document.addEventListener('alpine:init', () => {
                     version             // Handshake protocol version
                 );
 
-                // Check if the peer's identity key changed (possible MITM on reconnect)
-                if (this.identityManager && this.identityManager.previousPeerIdentityRaw) {
-                    if (this.identityManager.hasPeerIdentityChanged()) {
-                        // Policy: if the user had explicitly verified SAS before
-                        // this reconnect, the change of peer identity is suspicious
-                        // (could be MITM, could be a legitimate peer page-refresh
-                        // since identity is in-memory only). We can't distinguish
-                        // the two automatically, so we:
-                        //   - keep the WebSocket open (a peer refresh is benign)
-                        //   - invalidate the SAS-verified flag and require fresh
-                        //     re-verification of the new SAS code
-                        //   - lock the composer until the user explicitly confirms
-                        //     the new code matches out-of-band (sasReverifyRequired)
-                        // Skipping is disabled in this state: the user already
-                        // committed to verifying, they can't silently downgrade.
-                        const wasVerified = this.identityManager.sasVerified === true;
-                        // Clear previous peer identity now (single-shot comparison)
-                        this.identityManager.previousPeerIdentityRaw = null;
-
-                        if (wasVerified) {
-                            console.warn('[SECURITY] ⚠️ Peer identity key changed after SAS verification - forcing re-verify');
-                            this.identityManager.sasVerified = false;
-                            // Force the SAS modal to reopen (set BEFORE the later
-                            // pending/verified branch so it isn't overridden).
-                            this.sasReverifyRequired = true;
-                            this.addSystemMessage('⚠️ Contact\'s identity key changed since verification - please confirm the new security code before continuing');
-                        } else {
-                            // Identity wasn't verified before: warn + force first-time
-                            // verification. No prior commitment to break, so the user
-                            // can still skip if they accept the trust trade-off.
-                            console.warn('[SECURITY] ⚠️ Peer identity key changed (pre-verification) - re-verify required');
-                            this.identityManager.sasVerified = false;
-                            this.addSystemMessage('⚠️ WARNING: Contact\'s identity key changed! Please re-verify the security code.');
-                        }
-                        // Both branches: status will be set to 'pending' below
-                        // because isSASVerified() is now false.
-                    } else {
-                        debugLog('[SECURITY] ✅ Peer identity key unchanged - SAS verification persists');
-                        // Clear previous peer identity after successful comparison
-                        this.identityManager.previousPeerIdentityRaw = null;
-                    }
+                // Peer identity decision (audit C-F1). The SAS verdict is
+                // bound to the identity key bytes the user verified, so it is
+                // re-evaluated here against the key this handshake carries,
+                // however the previous session ended. Membership frames,
+                // timers and handshake failures are all relay-influenced; none
+                // of them can carry "verified" over to a different key.
+                //   - verified key again: the verdict carries over.
+                //   - a different key after a verification: a fresh
+                //     verification is required, skipping is refused and the
+                //     composer stays locked (sasReverifyRequired).
+                //   - a different key before any verification: a warning,
+                //     then the ordinary first-time prompt.
+                const identityManager = this.identityManager;
+                const peerIdentityChanged = identityManager.hasPeerIdentityChanged();
+                // Single-shot diff against the identity seen before the last
+                // departure or reconnect.
+                identityManager.previousPeerIdentityRaw = null;
+                const peerIdentityRaw = new Uint8Array(identityManager.peerIdentityPublicKeyRaw);
+                if (identityManager.isSASVerified()) {
+                    debugLog('[SECURITY] Peer presents the verified identity key - SAS verification persists');
+                    this.sasReverifyRequired = false;
+                } else if (identityManager.hasVerifiedPeerIdentity()) {
+                    console.warn('[SECURITY] Peer identity key differs from the verified one - forcing re-verify');
+                    this.sasReverifyRequired = true;
+                    this.addSystemMessage('⚠️ Contact\'s identity key changed since verification - please confirm the new security code before continuing');
+                } else if (peerIdentityChanged) {
+                    console.warn('[SECURITY] Peer identity key changed (pre-verification) - verification required');
+                    this.addSystemMessage('⚠️ WARNING: Contact\'s identity key changed! Please re-verify the security code.');
                 }
 
                 // Deriva raw key material (Uint8Array, non CryptoKey)
@@ -2284,13 +2292,18 @@ document.addEventListener('alpine:init', () => {
                 // Generate the SAS over roomId, both identity keys, and both
                 // handshake+ratchet public-key pairs.
                 // NOTE: Must be called BEFORE destroyEphemeralKeys()
-                this.sas = await this.ecdhManager.generateSAS(this.roomId);
+                // The code carries the peer identity key it was computed for:
+                // confirming it verifies that key and no other (audit C-F1).
+                this.sas = {
+                    ...(await this.ecdhManager.generateSAS(this.roomId)),
+                    peerIdentityRaw,
+                };
                 this.sasBackup = this.sas;  // Backup for reopening verification
 
-                // Show the SAS modal only when verification is still required
-                // If the identity persisted and was verified, skip the modal because the SAS carries over
-                if (this.identityManager && this.identityManager.isSASVerified()) {
-                    debugLog('[SECURITY] ✅ SAS already verified from previous handshake - skipping modal');
+                // Show the SAS modal only when verification is still required.
+                // A verdict carries over only for the very key it was given for.
+                if (identityManager.isVerifiedPeerIdentity(peerIdentityRaw)) {
+                    debugLog('[SECURITY] SAS already verified for this identity key - skipping modal');
                     this.sasVerificationStatus = 'verified';
                 } else {
                     this.sasVerificationStatus = 'pending';  // Show verification modal
@@ -2352,7 +2365,9 @@ document.addEventListener('alpine:init', () => {
          *
          * This mirrors that reconnect handling: stash the peer's identity bytes
          * so the next completed handshake runs hasPeerIdentityChanged(), and
-         * leave sasVerified intact. What the peer's return then produces:
+         * leave the SAS verdict intact. The verdict is bound to the verified
+         * key bytes (audit C-F1), so what the peer's return produces does not
+         * depend on this stash for a verified peer:
          *
          *   - same identity key: SAS carries over, no re-prompt (this is the
          *     ordinary case, since identities persist in IndexedDB for 24h).
@@ -2410,9 +2425,12 @@ document.addEventListener('alpine:init', () => {
 
             this.clearPendingSecureMessages();
 
-            // Cleanup ECDH manager
+            // Cleanup ECDH manager. Its handshake timer goes with it (audit
+            // C-F1): left armed, it would fire up to 30 s later and tear down
+            // whatever session had replaced this one.
             this.pfsActive = false;
             if (this.ecdhManager) {
+                this.ecdhManager.clearTimeout();
                 this.ecdhManager = null;
             }
 
@@ -2522,9 +2540,16 @@ document.addEventListener('alpine:init', () => {
         async handleSasVerified() {
             debugLog('[SECURITY] SAS code verified by user - connection is secure');
 
-            // Mark SAS as verified in identity manager (persists for session)
+            // Record the verdict for the identity key this code was computed
+            // for (audit C-F1). It carries over to a later handshake only if
+            // the peer presents those same bytes again.
             if (this.identityManager) {
-                this.identityManager.markSASVerified();
+                const shown = this.sas;
+                if (!shown || !(shown.peerIdentityRaw instanceof Uint8Array)) {
+                    console.warn('[SECURITY] SAS confirmation ignored: no security code is on screen');
+                    return;
+                }
+                this.identityManager.markSASVerified(shown.peerIdentityRaw);
             }
 
             // Clear the re-verify lock (if this verification was triggered by
