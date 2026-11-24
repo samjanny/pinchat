@@ -505,6 +505,8 @@ pub struct WsReader<R> {
     held: Vec<OwnedSemaphorePermit>,
     /// Taken for the message last handed to the caller.
     lent: Vec<OwnedSemaphorePermit>,
+    /// Bytes read from the peer so far.
+    received: u64,
 }
 
 impl<R: AsyncRead + Unpin> WsReader<R> {
@@ -528,7 +530,14 @@ impl<R: AsyncRead + Unpin> WsReader<R> {
             charged: Charged::Nothing,
             held: Vec::new(),
             lent: Vec::new(),
+            received: 0,
         }
+    }
+
+    /// How many bytes the peer has sent so far, frames still being read
+    /// included: a call of [`Self::next`] that was dropped may have read some.
+    pub fn bytes_received(&self) -> u64 {
+        self.received
     }
 
     /// Make messages larger than [`INBOUND_FREE`] wait for room in `budget`
@@ -582,12 +591,17 @@ impl<R: AsyncRead + Unpin> WsReader<R> {
         }
         match tokio::time::timeout_at(deadline, self.next()).await {
             Ok(item) => item,
-            Err(_) => {
-                let in_message = self.message.is_some();
-                self.abandon();
-                Some(Err(WsError::TimedOut { in_message }))
-            }
+            Err(_) => Some(Err(self.time_out())),
         }
+    }
+
+    /// End the reader as a call of [`Self::next_within`] that runs out of
+    /// time does, and return the error that call returns. For a caller that
+    /// puts a deadline of its own on a read it has dropped.
+    pub fn time_out(&mut self) -> WsError {
+        let in_message = self.message.is_some();
+        self.abandon();
+        WsError::TimedOut { in_message }
     }
 
     /// From now on read data messages without keeping, checking or
@@ -644,6 +658,7 @@ impl<R: AsyncRead + Unpin> WsReader<R> {
         }
         let read = self.io.read(&mut self.buffer[self.end..]).await?;
         self.end += read;
+        self.received += read as u64;
         Ok(read)
     }
 
@@ -824,6 +839,7 @@ impl<R: AsyncRead + Unpin> WsReader<R> {
                         if read == 0 {
                             return Err(WsError::Truncated);
                         }
+                        self.received += read as u64;
                         unmask(&mut data[before..before + read], mask, phase);
                         frame.remaining -= read;
                         check_utf8(data, checked)?;

@@ -21,7 +21,7 @@ use crate::jwt::{WsResumeTokenClaims, WsTokenClaims, sign_resume_token, verify_t
 use crate::models::message::MessageHeader;
 use crate::models::{IncomingMessage, Message, RoomType};
 use crate::state::app_state::MlsControlAppendError;
-use crate::state::app_state::{AdmissionRefused, WsAdmission};
+use crate::state::app_state::{AdmissionRefused, SocketProbe, WsAdmission};
 use crate::state::{
     AppState, ClientBroadcastLease, ConnectionAdmission, MlsControlAdmission, ReplayAdmission,
 };
@@ -682,7 +682,16 @@ pub async fn ws_handler(
     // socket at any time rather than only reclaim one that has gone; it
     // would also need every eviction made by the old socket's replay loop
     // to know that its identity has moved on.
+    //
+    // It is probed instead (`SocketProbe`): sent a Ping now, and closed as at
+    // its idle timeout if nothing at all comes from it within
+    // SOCKET_PROBE_DEADLINE. A dead socket goes within seconds, through its
+    // own close, which detaches the identity and starts its grace period; a
+    // live one answers and stays. The first refusal arms the probe and
+    // later ones leave it as it is. A socket still replaying its backlog is
+    // not probed: it has its acknowledgement deadline.
     if state.connections.contains_key(&claims.connection_id) {
+        state.probe_socket(&claims.connection_id, SOCKET_PROBE_DEADLINE);
         #[cfg(debug_assertions)]
         tracing::debug!("WebSocket upgrade rejected: identity still has a socket");
         return (
@@ -928,6 +937,16 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 #[cfg(test)]
 const IDLE_TIMEOUT: Duration = Duration::from_secs(6);
 
+/// How long an open socket has to show that it is alive, once an upgrade of
+/// its identity was refused because of it (see `SocketProbe`): from the
+/// first such refusal to the moment the relay closes a socket that sent
+/// nothing, as at the idle timeout. Long enough for a pong over a slow
+/// mobile link, short enough for a browser that is still retrying.
+#[cfg(not(test))]
+const SOCKET_PROBE_DEADLINE: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const SOCKET_PROBE_DEADLINE: Duration = Duration::from_secs(1);
+
 /// How long the closing handshake may take: the relay's Close frame, the
 /// client's answer, and the end of the TCP connection. A browser answers at
 /// once; a peer that does not costs this long and nothing more.
@@ -973,6 +992,52 @@ async fn send_within_deadline(sender: &mut Writer, frame: Outgoing<'_>) -> bool 
         tokio::time::timeout(WS_SEND_TIMEOUT, sender.send(frame)).await,
         Ok(Ok(()))
     )
+}
+
+/// The next message of a client, read as `next_within(IDLE_TIMEOUT)` reads
+/// it, with the socket's liveness probe applied.
+///
+/// Once the probe is armed the client has until its deadline to send
+/// anything: a whole frame (the pong the probe asked for, typically), or
+/// the bytes of a message still on its way, which a live client uploading a
+/// picture over a slow link may be sending. Any of them answers the probe.
+/// If nothing at all has arrived by then, the reader ends with the error a
+/// read gets at the idle timeout, and the connection closes along that
+/// same path.
+async fn next_or_probe(
+    reader: &mut Reader,
+    probe: &SocketProbe,
+    armed: &mut tokio::sync::watch::Receiver<Option<Instant>>,
+) -> Option<Result<Incoming, ws_transport::WsError>> {
+    enum Wait {
+        Read(Option<Result<Incoming, ws_transport::WsError>>),
+        Rearmed,
+        Expired,
+    }
+    loop {
+        let deadline = *armed.borrow_and_update();
+        let received = reader.bytes_received();
+        // A read may be dropped at any point and started again without
+        // losing anything (`WsReader::next`).
+        let wait = tokio::select! {
+            item = reader.next_within(IDLE_TIMEOUT) => Wait::Read(item),
+            Ok(()) = armed.changed() => Wait::Rearmed,
+            () = tokio::time::sleep_until(deadline.unwrap_or_else(Instant::now)),
+                if deadline.is_some() => Wait::Expired,
+        };
+        match wait {
+            Wait::Read(item) => {
+                probe.clear();
+                return item;
+            }
+            Wait::Rearmed => continue,
+            Wait::Expired if reader.bytes_received() != received => {
+                // Part of a message arrived: the client is alive.
+                probe.clear();
+            }
+            Wait::Expired => return Some(Err(reader.time_out())),
+        }
+    }
 }
 
 fn schedule_connection_departure(state: &AppState, connection_id: Uuid) {
@@ -1504,6 +1569,14 @@ async fn handle_socket(
     // One slot: while an answer is waiting, further pings are not queued.
     let (pong_tx, mut pong_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
 
+    // From here to the end of the connection, an upgrade refused because
+    // this socket still holds the identity can probe it (`SocketProbe`).
+    // Held until this function returns.
+    let probe_registration = state.register_socket_probe(connection_id);
+    let probe = probe_registration.probe();
+    let mut send_probe = probe.watch();
+    let mut recv_probe = probe.watch();
+
     // Task that receives broadcast messages and forwards them to the client
     // Also sends heartbeat pings every 30 seconds to keep the connection alive,
     // and re-validates room TTL to enforce the hard expiry deadline even on
@@ -1533,6 +1606,14 @@ async fn handle_socket(
                 }
                 Some(payload) = pong_rx.recv() => {
                     if !send_within_deadline(&mut *send_half, Outgoing::Pong(&payload)).await {
+                        return Closing::Abort;
+                    }
+                }
+                // A probe was armed: ask the client for a sign of life now.
+                // Its deadline is kept by the receiving side.
+                Ok(()) = send_probe.changed() => {
+                    let armed = send_probe.borrow_and_update().is_some();
+                    if armed && !send_within_deadline(&mut *send_half, Outgoing::Ping).await {
                         return Closing::Abort;
                     }
                 }
@@ -1616,7 +1697,7 @@ async fn handle_socket(
     let recv_half = &mut receiver;
     let recv_side = async move {
         loop {
-            let msg = match recv_half.next_within(IDLE_TIMEOUT).await {
+            let msg = match next_or_probe(recv_half, probe, &mut recv_probe).await {
                 Some(Ok(Incoming::Close(code))) => return Closing::Answer(code),
                 Some(Ok(msg)) => msg,
                 Some(Err(error)) => return error.closing(),
