@@ -1007,7 +1007,9 @@ fn schedule_connection_departure(state: &AppState, connection_id: Uuid) {
                     control_seq: None,
                 };
                 if let Ok(json) = serde_json::to_string(&leave_msg) {
-                    let _ = grace_state.broadcast_room_message(&detached_room_id, json);
+                    // Never refused by a full budget: the peer must learn
+                    // that the session it holds keys for has ended.
+                    let _ = grace_state.broadcast_relay_event(&detached_room_id, json);
                 }
             }
             None => {}
@@ -1155,7 +1157,9 @@ async fn handle_socket(
             control_seq: None,
         };
         if let Ok(json) = serde_json::to_string(&join_msg) {
-            let _ = state.broadcast_room_message(&room_id, json);
+            // Never refused by a full budget: the peer starts its handshake
+            // on this event.
+            let _ = state.broadcast_relay_event(&room_id, json);
         }
     }
 

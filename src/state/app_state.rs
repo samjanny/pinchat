@@ -423,6 +423,18 @@ pub enum BroadcastError {
     GlobalByteCapacity,
 }
 
+/// Which limits a frame meets in the broadcast budgets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BroadcastPriority {
+    /// A frame a client sent, or one a test stands in for: refused when a
+    /// budget is full.
+    Ordinary,
+    /// A join or leave the relay announces itself. Never refused: it is
+    /// counted like any frame, so clients see the room it takes, but a full
+    /// budget must neither drop it nor close the room it belongs to.
+    RelayEvent,
+}
+
 /// Outcome of recording a relay replay identity for a room.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReplayAdmission {
@@ -1491,17 +1503,32 @@ impl AppState {
 
     /// Count `retained_bytes` against the room, the sender's address and the
     /// relay as a whole, or against none of them.
+    ///
+    /// A relay event is counted against the room and the relay without a
+    /// limit. Those are the joins and leaves the relay announces, about 130
+    /// bytes each, and there are few of them in flight: one for each slot
+    /// of a room's ring at most, plus the one each receiver is writing, so
+    /// about 11 KiB a room. Refusing one dropped it in a one-to-one room and
+    /// closed a group, because the group's order of controls could no longer
+    /// say who was a member.
     fn reserve_broadcast_bytes(
         &self,
         room_id: &Uuid,
         retained_bytes: usize,
         sender: Option<&ClientBroadcastLease>,
+        priority: BroadcastPriority,
     ) -> Result<(Arc<AtomicUsize>, Option<Arc<AtomicUsize>>), BroadcastError> {
         let room_bytes = self
             .broadcast_room_bytes
             .get(room_id)
             .map(|entry| entry.value().clone())
             .ok_or(BroadcastError::MissingRoom)?;
+        if priority == BroadcastPriority::RelayEvent {
+            room_bytes.fetch_add(retained_bytes, Ordering::SeqCst);
+            self.broadcast_global_bytes
+                .fetch_add(retained_bytes, Ordering::SeqCst);
+            return Ok((room_bytes, None));
+        }
         if !Self::reserve_bytes(
             room_bytes.as_ref(),
             retained_bytes,
@@ -1544,10 +1571,11 @@ impl AppState {
         room_id: &Uuid,
         json: String,
         sender: Option<&ClientBroadcastLease>,
+        priority: BroadcastPriority,
     ) -> Result<BroadcastPayload, BroadcastError> {
         let retained_bytes = json.len();
         let (room_bytes, client_bytes) =
-            self.reserve_broadcast_bytes(room_id, retained_bytes, sender)?;
+            self.reserve_broadcast_bytes(room_id, retained_bytes, sender, priority)?;
         Ok(BroadcastPayload(Arc::new(BroadcastPayloadInner {
             json,
             retained_bytes,
@@ -1558,9 +1586,10 @@ impl AppState {
         })))
     }
 
-    /// Broadcast one ephemeral room frame that the relay produced itself,
-    /// under the per-room and global byte budgets. The returned value is the
-    /// number of active receivers.
+    /// Broadcast one ephemeral frame of no address under the per-room and
+    /// global byte budgets, refused like a client's frame when one is full.
+    /// The returned value is the number of active receivers.
+    #[cfg(test)]
     pub fn broadcast_room_message(
         &self,
         room_id: &Uuid,
@@ -1569,8 +1598,31 @@ impl AppState {
         self.broadcast_room_message_from(room_id, json, None)
     }
 
+    /// Broadcast a join or leave of a one-to-one room. It is counted in the
+    /// broadcast budgets but never refused by them (see
+    /// [`BroadcastPriority::RelayEvent`]); the only error is a room that is
+    /// gone. Group rooms sequence theirs through
+    /// [`Self::append_and_broadcast_mls_lifecycle`] instead.
+    pub fn broadcast_relay_event(
+        &self,
+        room_id: &Uuid,
+        json: String,
+    ) -> Result<usize, BroadcastError> {
+        let tx = self
+            .broadcast_channels
+            .get(room_id)
+            .map(|entry| entry.value().clone())
+            .ok_or(BroadcastError::MissingRoom)?;
+        let payload =
+            self.tracked_broadcast_payload(room_id, json, None, BroadcastPriority::RelayEvent)?;
+        Ok(tx.send(payload).unwrap_or(0))
+    }
+
     /// Broadcast one ephemeral room frame that a client sent. With a lease,
     /// the frame also counts against the share of the sender's address.
+    /// The relay itself sends client frames through
+    /// [`Self::broadcast_room_message_when_room`].
+    #[cfg(test)]
     pub fn broadcast_room_message_from(
         &self,
         room_id: &Uuid,
@@ -1582,7 +1634,8 @@ impl AppState {
             .get(room_id)
             .map(|entry| entry.value().clone())
             .ok_or(BroadcastError::MissingRoom)?;
-        let payload = self.tracked_broadcast_payload(room_id, json, sender)?;
+        let payload =
+            self.tracked_broadcast_payload(room_id, json, sender, BroadcastPriority::Ordinary)?;
         Ok(tx.send(payload).unwrap_or(0))
     }
 
@@ -1620,7 +1673,12 @@ impl AppState {
                 .get(room_id)
                 .map(|entry| entry.value().clone())
                 .ok_or(BroadcastError::MissingRoom)?;
-            let full = match self.reserve_broadcast_bytes(room_id, retained_bytes, sender) {
+            let full = match self.reserve_broadcast_bytes(
+                room_id,
+                retained_bytes,
+                sender,
+                BroadcastPriority::Ordinary,
+            ) {
                 Ok((room_bytes, client_bytes)) => {
                     let payload = BroadcastPayload(Arc::new(BroadcastPayloadInner {
                         json,
@@ -1848,8 +1906,9 @@ impl AppState {
     }
 
     /// Append a lifecycle event using the capacity reserved from ordinary MLS
-    /// envelopes. Callers must still fail the room closed if even this
-    /// reserved path cannot durably sequence the event.
+    /// envelopes. The broadcast budgets and the global log never refuse it;
+    /// callers must still fail the room closed if the room's own log cannot
+    /// durably sequence the event.
     pub fn append_and_broadcast_mls_lifecycle<F>(
         &self,
         room_id: &Uuid,
@@ -2020,8 +2079,17 @@ impl AppState {
         {
             return Err(MlsControlAppendError::CapacityExceeded);
         }
+        // The relay's own joins and leaves are never refused by the broadcast
+        // budgets or the global log (see `BroadcastPriority::RelayEvent`):
+        // refusing one closed the group. The room's own log still bounds
+        // them, with the entries and bytes reserved for them above.
+        let priority = if lifecycle {
+            BroadcastPriority::RelayEvent
+        } else {
+            BroadcastPriority::Ordinary
+        };
         let broadcast_payload = self
-            .tracked_broadcast_payload(room_id, json.clone(), sender)
+            .tracked_broadcast_payload(room_id, json.clone(), sender, priority)
             .map_err(|_| MlsControlAppendError::BroadcastCapacity)?;
         let client_bytes = sender.map(|lease| lease.mls_bytes.clone());
         if let Some(client_bytes) = &client_bytes
@@ -2033,7 +2101,10 @@ impl AppState {
         {
             return Err(MlsControlAppendError::CapacityExceeded);
         }
-        if !Self::reserve_bytes(
+        if lifecycle {
+            self.mls_control_global_bytes
+                .fetch_add(json.len(), Ordering::AcqRel);
+        } else if !Self::reserve_bytes(
             self.mls_control_global_bytes.as_ref(),
             json.len(),
             MAX_MLS_CONTROL_LOG_GLOBAL_BYTES,
