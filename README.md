@@ -325,7 +325,7 @@ hosting-provider logs.
 | `CHALLENGE_TTL_SECS` | `300` | Proof-of-work challenge TTL |
 | `JWT_TOKEN_TTL_SECS` | `30` | WebSocket JWT TTL, 1 to 300 |
 | `JWT_ISSUER` | `pinchat` | Issuer the WebSocket JWT must carry. Set it explicitly when several instances share one signing key |
-| `MAX_WS_CONNECTION_AGE_SECS` | `1800` | Lifetime of a WebSocket connection. The client then reconnects through proof of work, a new token and the handshake |
+| `MAX_WS_CONNECTION_AGE_SECS` | `1800` | Lifetime of a WebSocket connection. The client then reconnects through proof of work and a new token, and resumes its place with the resume credential: the encrypted session is kept, no new handshake |
 | `WS_RECONNECT_GRACE_SECS` | `20` | How long a disconnected participant's place is held for its resume credential, 1 to 120 |
 | `ROOM_CLEANUP_INTERVAL_SECS` | `60` | Room cleanup interval |
 | `CHALLENGE_CLEANUP_INTERVAL_SECS` | `60` | Proof-of-work cache cleanup interval |
