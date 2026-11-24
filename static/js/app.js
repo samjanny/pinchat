@@ -853,15 +853,23 @@ document.addEventListener('alpine:init', () => {
             await this.processIncomingMessage(message);
         },
 
-        /** Decrypts and renders a message that has passed the SAS gate. */
-        async processIncomingMessage(message) {
+        /**
+         * Decrypts and renders a message that has passed the SAS gate.
+         *
+         * @param {Object} message - relay frame
+         * @param {number} [receivedAt] - local arrival time (ms) of a frame
+         *     released from the SAS quarantine; the message-age check is
+         *     measured at arrival, not at release (audit C-F4)
+         */
+        async processIncomingMessage(message, receivedAt) {
             try {
                 // Pass header to decryption (contains DH public key for ratchet)
                 const { text: plaintext, outOfOrder } = await window.cryptoManager.decryptMessage(
                     message.payload,
                     message.header,  // Signal Protocol header with DH public key
                     this.roomId,
-                    message.sender_id
+                    message.sender_id,
+                    receivedAt
                 );
 
                 const isOwn = message.sender_id === this.userId;
@@ -1564,15 +1572,19 @@ document.addEventListener('alpine:init', () => {
             await this.processIncomingImage(message);
         },
 
-        /** Decrypts and renders an image that has passed the SAS gate. */
-        async processIncomingImage(message) {
+        /**
+         * Decrypts and renders an image that has passed the SAS gate.
+         * `receivedAt` as for processIncomingMessage.
+         */
+        async processIncomingImage(message, receivedAt) {
             try {
                 // Decrypt image data
                 const imageData = await window.cryptoManager.decryptImage(
                     message.payload,
                     message.header,
                     this.roomId,
-                    message.sender_id
+                    message.sender_id,
+                    receivedAt
                 );
                 if (!(imageData.data instanceof Uint8Array)
                     || imageData.data.byteLength > this.maxImageSize) {
@@ -1777,7 +1789,7 @@ document.addEventListener('alpine:init', () => {
                     warningMessage += 'Duplicate message detected (replay attack blocked)';
                     break;
                 case 'REPLAY_TOO_OLD':
-                    warningMessage += 'Message too old (late-join replay attack blocked)';
+                    warningMessage += 'Message rejected: it was sent more than 5 minutes before it reached this device (delayed delivery or replay)';
                     break;
                 case 'REPLAY_FUTURE':
                     warningMessage += 'Message timestamp from future (clock manipulation detected)';
@@ -2756,7 +2768,9 @@ document.addEventListener('alpine:init', () => {
                 }
                 return;
             }
-            this.pendingSecureMessages.push({ kind, message });
+            // Record the arrival time: the message-age guard must not count
+            // the time the user spends comparing the code (audit C-F4).
+            this.pendingSecureMessages.push({ kind, message, receivedAt: Date.now() });
         },
 
         /** Releases quarantined ciphertext strictly in arrival order. */
@@ -2771,9 +2785,9 @@ document.addEventListener('alpine:init', () => {
                     && !this.isSasDecisionPending()) {
                     const pending = this.pendingSecureMessages.shift();
                     if (pending.kind === 'message') {
-                        await this.processIncomingMessage(pending.message);
+                        await this.processIncomingMessage(pending.message, pending.receivedAt);
                     } else if (pending.kind === 'image') {
-                        await this.processIncomingImage(pending.message);
+                        await this.processIncomingImage(pending.message, pending.receivedAt);
                     }
                 }
             } finally {

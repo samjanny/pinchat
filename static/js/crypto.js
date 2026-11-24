@@ -742,10 +742,12 @@ class CryptoManager {
      * @param {Object} header - Message header with DH public key
      * @param {string} roomId - Expected room UUID
      * @param {string} expectedSenderId - Expected sender's connection UUID (from server)
+     * @param {number} [receivedAt] - Local time (ms) the frame arrived, when
+     *     it was held before decryption (SAS quarantine). Defaults to now.
      * @returns {Promise<string>} Decrypted plaintext
      * @throws {Error} If authentication fails or replay attack detected
      */
-    async decryptMessage(ciphertextBase64, header, roomId, expectedSenderId) {
+    async decryptMessage(ciphertextBase64, header, roomId, expectedSenderId, receivedAt) {
         // Use the Double Ratchet for decryption (PFS + PCS)
         if (!this.doubleRatchetActive) {
             throw new Error('Double Ratchet not initialized - cannot decrypt');
@@ -753,29 +755,43 @@ class CryptoManager {
 
         debugLog('[CRYPTO] Using Double Ratchet for decryption (PFS + PCS)');
         const envelope = await this.doubleRatchet.decryptMessage(ciphertextBase64, header, roomId, expectedSenderId);
-
-        // Defence-in-depth timestamp window. The Double Ratchet's counter
-        // already rejects in-session replays, but a captured ciphertext that
-        // somehow lands inside a current skipped-key window still must respect
-        // the wall-clock guardrail: a message older than MAX_MESSAGE_AGE or
-        // farther in the future than FUTURE_TOLERANCE indicates either a
-        // stale replay across reconnects or clock manipulation.
-        if (typeof envelope.ts === 'number') {
-            const now = Date.now();
-            const age = now - envelope.ts;
-            if (age > this.MAX_MESSAGE_AGE) {
-                throw new Error('REPLAY_TOO_OLD');
-            }
-            if (age < -this.FUTURE_TOLERANCE) {
-                throw new Error('REPLAY_FUTURE');
-            }
-        }
+        this._checkMessageAge(envelope, receivedAt);
 
         // DoubleRatchet returns {ts, text} plus the receiver-only `_outOfOrder`
         // flag set when (ratchetCount, messageNumber) was below the highest
         // tuple already decrypted. We surface that flag to the app layer so
         // late arrivals can be visually marked.
         return { text: envelope.text, outOfOrder: envelope._outOfOrder === true };
+    }
+
+    /**
+     * Defence-in-depth timestamp window. The Double Ratchet's counter
+     * already rejects in-session replays, but a captured ciphertext that
+     * somehow lands inside a current skipped-key window still must respect
+     * the wall-clock guardrail: a message older than MAX_MESSAGE_AGE or
+     * farther in the future than FUTURE_TOLERANCE indicates either a stale
+     * replay across reconnects or clock manipulation.
+     *
+     * Audit C-F4: the age is measured at the local arrival time. A frame
+     * held in the SAS quarantine is decrypted only once the user decides,
+     * and the minutes spent comparing the code are not the message's age;
+     * measured at release, every message that waited more than five minutes
+     * was rejected, with its key already consumed by the ratchet.
+     *
+     * @private
+     * @param {Object} envelope - decrypted envelope ({ts, ...})
+     * @param {number} [receivedAt] - local arrival time in ms (default: now)
+     */
+    _checkMessageAge(envelope, receivedAt) {
+        if (typeof envelope.ts !== 'number') return;
+        const reference = Number.isFinite(receivedAt) ? receivedAt : Date.now();
+        const age = reference - envelope.ts;
+        if (age > this.MAX_MESSAGE_AGE) {
+            throw new Error('REPLAY_TOO_OLD');
+        }
+        if (age < -this.FUTURE_TOLERANCE) {
+            throw new Error('REPLAY_FUTURE');
+        }
     }
 
     /**
@@ -962,9 +978,10 @@ class CryptoManager {
      * @param {Object} header - Signal Protocol header
      * @param {string} roomId - Room UUID for AAD verification
      * @param {string} senderId - Sender's connection UUID
+     * @param {number} [receivedAt] - Local arrival time (ms), as for decryptMessage
      * @returns {Promise<Object>} Object with {data: Uint8Array, mimeType: string}
      */
-    async decryptImage(payloadBase64, header, roomId, senderId) {
+    async decryptImage(payloadBase64, header, roomId, senderId, receivedAt) {
         if (!this.doubleRatchetActive) {
             throw new Error('Double Ratchet not initialized - cannot decrypt');
         }
@@ -977,16 +994,7 @@ class CryptoManager {
         // Apply the same timestamp window as text messages: late replays
         // captured across reconnects must still be rejected even if the
         // Double Ratchet counter slot happens to be available.
-        if (typeof envelope.ts === 'number') {
-            const now = Date.now();
-            const age = now - envelope.ts;
-            if (age > this.MAX_MESSAGE_AGE) {
-                throw new Error('REPLAY_TOO_OLD');
-            }
-            if (age < -this.FUTURE_TOLERANCE) {
-                throw new Error('REPLAY_FUTURE');
-            }
-        }
+        this._checkMessageAge(envelope, receivedAt);
 
         // Parse the envelope (it's the inner JSON with image data)
         // The Double Ratchet returns {ts, text} but for images we encoded the full envelope as 'text'

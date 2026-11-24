@@ -710,7 +710,7 @@ Alice                                    Bob
 |-----------|-------|
 | Max Skip (DoS protection) | 100 messages |
 | Max Skipped Keys (global, FIFO eviction) | 1000 |
-| Max Message Age | 5 minutes |
+| Max Message Age (sender `ts` to local arrival) | 5 minutes |
 | Future Tolerance (clock skew) | 30 seconds |
 | Handshake Timeout | 30 seconds |
 | Max Room TTL | 1440 minutes |

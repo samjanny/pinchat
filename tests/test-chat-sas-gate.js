@@ -6,6 +6,7 @@ const assert = require('assert');
 const fs = require('fs');
 const path = require('path');
 const vm = require('vm');
+const { createChatPair } = require('./helpers/chat-pair');
 
 function loadChatStore() {
     let alpineInit;
@@ -185,6 +186,45 @@ async function run() {
     assert.strictEqual(skippedCase.store.isComposerLocked(), false, 'confirmed skip must unlock composer');
 
     console.log('PASSED: send/receive are fail-closed until verify or explicit skip');
+
+    await quarantineDoesNotAgeMessages();
+}
+
+/**
+ * Audit C-F4, with the real client cryptography. The five-minute
+ * message-age guard used to be measured when a quarantined frame was
+ * released, after the ratchet had consumed its key, so a user who took more
+ * than five minutes to compare the code lost every message that had arrived
+ * meanwhile, each reported as a blocked replay.
+ */
+async function quarantineDoesNotAgeMessages() {
+    const { alice, bob, deliver } = await createChatPair();
+    await bob.store.handleSasVerified(bob.store.sas.hex);
+    const texts = ['are you there?', 'code matches on my side', 'here is the address'];
+    for (const text of texts) {
+        bob.store.messageInput = text;
+        await bob.store.sendMessage();
+    }
+    await deliver();
+    assert.strictEqual(alice.store.pendingSecureMessages.length, 3, 'held behind the SAS decision');
+
+    // Alice spends six minutes on the phone comparing the code.
+    vm.runInContext('(() => { const real = Date.now; Date.now = () => real() + 6 * 60 * 1000; })()', alice.context);
+    await alice.store.handleSasVerified(alice.store.sas.hex);
+    // Spread: the store's arrays belong to its own realm.
+    const shown = [...alice.store.messages.filter(m => m.type === 'message' && !m.isOwn).map(m => m.text)];
+    assert.deepStrictEqual(shown, texts, 'messages that waited for the decision are shown, in order');
+    assert(!alice.systemMessages.some(t => /Security warning/.test(t)), 'and no replay is reported');
+
+    // The guard itself still holds: a message that is more than five
+    // minutes old when it arrives is rejected, and the warning says so.
+    bob.store.messageInput = 'sent six minutes before it arrived';
+    await bob.store.sendMessage();
+    await deliver();
+    assert(!alice.store.messages.some(m => m.text === 'sent six minutes before it arrived'));
+    assert(alice.systemMessages.some(t => /sent more than 5 minutes before it reached this device/.test(t)),
+        'the warning describes what happened');
+    console.log('PASSED: the message-age guard counts from arrival, not from the SAS decision (C-F4)');
 }
 
 run().catch((error) => {
