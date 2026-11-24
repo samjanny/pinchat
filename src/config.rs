@@ -33,6 +33,21 @@ fn parse_size_with_suffix(value: &str) -> Option<usize> {
     }
 }
 
+/// Why a `PINCHAT_PASSWORD_HASHES` entry cannot be used, if it cannot: it
+/// must be an Argon2id hash in PHC string form, with parameters the
+/// verifier accepts.
+fn check_password_hash(hash: &str) -> Result<(), &'static str> {
+    let parsed = argon2::PasswordHash::new(hash).map_err(|_| "not a PHC string ($argon2id$...)")?;
+    if parsed.algorithm != argon2::Algorithm::Argon2id.ident() {
+        return Err("not an Argon2id hash");
+    }
+    if parsed.hash.is_none() || parsed.salt.is_none() {
+        return Err("salt or hash missing");
+    }
+    argon2::Params::try_from(&parsed).map_err(|_| "Argon2 parameters out of range")?;
+    Ok(())
+}
+
 /// Default of `MAX_TOTAL_ROOMS`. The memory sizing below and in "Relay
 /// Memory" in SECURITY.md assumes it: 500 rooms at their limits take about
 /// 135 MB of a 512 MiB container. A larger host raises it.
@@ -659,6 +674,23 @@ impl Config {
             panic!("SESSION_TTL_SECS must be greater than 0");
         }
 
+        // Every configured hash must be one the login check can use. A
+        // value that does not parse (often one mangled by `$` interpolation
+        // in a shell or in a .env file without single quotes) used to be
+        // skipped at every login, so the server started with a password
+        // that could never be accepted. The position is reported, not the
+        // value.
+        for (index, hash) in self.password_hashes.iter().enumerate() {
+            if let Err(problem) = check_password_hash(hash) {
+                panic!(
+                    "PINCHAT_PASSWORD_HASHES entry {} of {} is not usable: {}",
+                    index + 1,
+                    self.password_hashes.len(),
+                    problem
+                );
+            }
+        }
+
         // An entry that is neither an address nor a CIDR range never
         // matches. In proxy mode that means X-Forwarded-For is silently
         // ignored and every visitor shares the proxy's rate-limit bucket.
@@ -854,6 +886,43 @@ mod tests {
             msg.contains("172.18.0.1"),
             "must name the docker-compose value: {msg}"
         );
+    }
+
+    #[test]
+    fn password_hashes_are_checked_at_startup() {
+        let mut c = base();
+        c.password_hashes = vec![crate::auth::hash_password("correct horse").unwrap()];
+        c.validate();
+
+        for (broken, expected) in [
+            // What `$` interpolation leaves of `$argon2id$v=19$m=...$salt$hash`.
+            ("=19=47104,t=1,p=1", "not a PHC string"),
+            ("placeholder", "not a PHC string"),
+            (
+                "$argon2i$v=19$m=47104,t=1,p=1$c29tZXNhbHQ$iWh06vD8Fy27wf9npn6FXWiCX4K6pW6Ue1Bnzz07Z8A",
+                "not an Argon2id hash",
+            ),
+            ("$argon2id$v=19$m=47104,t=1,p=1", "salt or hash missing"),
+            (
+                "$argon2id$v=19$m=1,t=1,p=1$c29tZXNhbHQ$iWh06vD8Fy27wf9npn6FXWiCX4K6pW6Ue1Bnzz07Z8A",
+                "parameters out of range",
+            ),
+        ] {
+            let mut c = base();
+            c.password_hashes = vec![
+                crate::auth::hash_password("correct horse").unwrap(),
+                broken.to_string(),
+            ];
+            let message = std::panic::catch_unwind(|| c.validate())
+                .expect_err(broken)
+                .downcast::<String>()
+                .unwrap();
+            assert!(
+                message.contains("entry 2 of 2") && message.contains(expected),
+                "{broken}: {message}"
+            );
+            assert!(!message.contains(broken), "the value is not echoed");
+        }
     }
 
     #[test]

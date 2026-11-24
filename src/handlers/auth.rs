@@ -223,13 +223,15 @@ pub async fn get_csrf_token(State(state): State<AppState>) -> impl IntoResponse 
     let csrf_token = generate_csrf_token(&state.csrf_secret);
     let use_secure = should_use_secure_cookies(state.config.force_secure_cookies);
 
-    // Create CSRF cookie
+    // Create CSRF cookie, for as long as the server accepts the token.
     let csrf_cookie = Cookie::build((CSRF_COOKIE_NAME, csrf_token.clone()))
         .path("/")
         .same_site(SameSite::Strict)
         .secure(use_secure)
         .http_only(true)
-        .max_age(time::Duration::minutes(15))
+        .max_age(time::Duration::seconds(
+            crate::auth::CSRF_TOKEN_TTL.as_secs() as i64,
+        ))
         .build();
 
     let mut headers = HeaderMap::new();
