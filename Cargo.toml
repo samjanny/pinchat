@@ -5,10 +5,11 @@ edition = "2024"
 
 [dependencies]
 axum = "0.7"
-# The WebSocket transport is the relay's own (src/ws_transport.rs); these
-# three are what it needs from the HTTP stack, at the versions axum uses.
-hyper = "1"
-hyper-util = { version = "0.1", features = ["tokio"] }
+# The WebSocket transport is the relay's own (src/ws_transport.rs), and so is
+# the HTTP/1.1 listener in front of it (src/http_server.rs); these three are
+# what they need from the HTTP stack, at the versions axum uses.
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "service"] }
 sha1 = "0.10"
 # Send buffer of accepted sockets, and the allocator setting made at start.
 socket2 = "0.6"

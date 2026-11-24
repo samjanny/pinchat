@@ -52,6 +52,15 @@ pub const DEFAULT_MAX_WS_CONNECTIONS: usize = 400;
 /// an office behind one address can still keep many rooms open.
 pub const DEFAULT_MAX_WS_CONNECTIONS_PER_ADDRESS: usize = DEFAULT_MAX_WS_CONNECTIONS / 8;
 
+/// Default of `MAX_HTTP_CONNECTIONS`: HTTP connections the relay serves at
+/// once before they are upgraded to WebSocket (an upgraded connection is
+/// counted by `MAX_WS_CONNECTIONS` instead). See `http_server.rs` for what
+/// one costs and how long it may stay.
+pub const DEFAULT_MAX_HTTP_CONNECTIONS: usize = 256;
+/// Default of `MAX_HTTP_CONNECTIONS_PER_ADDRESS`: an eighth of them, as for
+/// WebSocket connections. A browser opens up to six at once.
+pub const DEFAULT_MAX_HTTP_CONNECTIONS_PER_ADDRESS: usize = DEFAULT_MAX_HTTP_CONNECTIONS / 8;
+
 /// Application configuration loaded from environment variables
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -71,6 +80,14 @@ pub struct Config {
     // is allocated for it (503 for the relay, 429 for the address).
     pub max_ws_connections: usize,
     pub max_ws_connections_per_address: usize,
+
+    // HTTP connections served at once before an upgrade, in all and for one
+    // client address (an IPv6 /64; an IPv6 /48 may hold four times as many).
+    // A connection from a trusted proxy counts only in the total. Beyond the
+    // total the relay accepts nothing until a connection ends; beyond the
+    // address limit it closes the new connection at once.
+    pub max_http_connections: usize,
+    pub max_http_connections_per_address: usize,
 
     // Room/Token creation rate limiting
     pub room_token_burst_size: u32,
@@ -235,6 +252,14 @@ impl Config {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(DEFAULT_MAX_WS_CONNECTIONS_PER_ADDRESS),
+            max_http_connections: env::var("MAX_HTTP_CONNECTIONS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(DEFAULT_MAX_HTTP_CONNECTIONS),
+            max_http_connections_per_address: env::var("MAX_HTTP_CONNECTIONS_PER_ADDRESS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(DEFAULT_MAX_HTTP_CONNECTIONS_PER_ADDRESS),
 
             // Room/Token creation rate limiting (default: 100 requests per 10 minutes)
             room_token_burst_size: env::var("ROOM_TOKEN_BURST_SIZE")
@@ -559,6 +584,12 @@ impl Config {
         if !(1..=self.max_ws_connections).contains(&self.max_ws_connections_per_address) {
             panic!("MAX_WS_CONNECTIONS_PER_ADDRESS must be between 1 and MAX_WS_CONNECTIONS");
         }
+        if !(1..=100_000).contains(&self.max_http_connections) {
+            panic!("MAX_HTTP_CONNECTIONS must be between 1 and 100000");
+        }
+        if !(1..=self.max_http_connections).contains(&self.max_http_connections_per_address) {
+            panic!("MAX_HTTP_CONNECTIONS_PER_ADDRESS must be between 1 and MAX_HTTP_CONNECTIONS");
+        }
 
         // Validate periods are non-zero
         if self.ws_conn_period_secs == 0 {
@@ -709,6 +740,8 @@ impl Config {
             ws_conn_period_secs: 60,
             max_ws_connections: DEFAULT_MAX_WS_CONNECTIONS,
             max_ws_connections_per_address: DEFAULT_MAX_WS_CONNECTIONS_PER_ADDRESS,
+            max_http_connections: DEFAULT_MAX_HTTP_CONNECTIONS,
+            max_http_connections_per_address: DEFAULT_MAX_HTTP_CONNECTIONS_PER_ADDRESS,
             room_token_burst_size: 100,
             room_token_period_secs: 600,
             msg_rate_limit: 30,
@@ -803,6 +836,17 @@ mod tests {
             msg.contains("172.18.0.1"),
             "must name the docker-compose value: {msg}"
         );
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "MAX_HTTP_CONNECTIONS_PER_ADDRESS must be between 1 and MAX_HTTP_CONNECTIONS"
+    )]
+    fn http_connection_limits_are_validated() {
+        let mut c = base();
+        c.max_http_connections = 10;
+        c.max_http_connections_per_address = 11;
+        c.validate();
     }
 
     #[test]

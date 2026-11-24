@@ -4,6 +4,7 @@ mod challenge_cache;
 mod cleanup;
 mod config;
 mod handlers;
+mod http_server;
 mod ip_hash;
 mod jwt;
 mod models;
@@ -17,6 +18,7 @@ mod ws_transport;
 
 use axum::{
     Router,
+    extract::DefaultBodyLimit,
     http::{HeaderValue, Method, header},
     middleware::{self, Next},
     response::Response,
@@ -225,6 +227,12 @@ fn bound_socket_buffers<S: std::os::fd::AsFd>(listener: &S) {
         tracing::error!("Could not bound the socket buffers");
     }
 }
+
+/// Largest request body any route takes. The login form and the room
+/// settings are a few hundred bytes; axum's default was 2 MB, held in memory
+/// for a body that trickles in until the connection's age ends it (see
+/// `http_server.rs`).
+const MAX_REQUEST_BODY: usize = 16 * 1024;
 
 /// Have the allocator hand large blocks straight back to the system.
 ///
@@ -563,6 +571,7 @@ async fn run() {
 
     // Add security headers middleware (CSP, X-Frame-Options, etc.)
     app = app.layer(middleware::from_fn(add_security_headers));
+    app = app.layer(DefaultBodyLimit::max(MAX_REQUEST_BODY));
 
     // Add TraceLayer only in development mode (for privacy)
     if privacy_mode == "development" {
@@ -593,9 +602,9 @@ async fn run() {
             }
         };
 
-        let listener = match std::net::TcpListener::bind(addr)
-            .and_then(|listener| listener.set_nonblocking(true).map(|()| listener))
-        {
+        http_server::offer_http1_only(&tls_config);
+
+        let listener = match tokio::net::TcpListener::bind(addr).await {
             Ok(l) => l,
             Err(e) => {
                 tracing::error!("Failed to bind to {}: {}", addr, e);
@@ -604,19 +613,15 @@ async fn run() {
         };
         bound_socket_buffers(&listener);
 
-        let server = match axum_server::from_tcp_rustls(listener, tls_config) {
-            Ok(server) => server,
-            Err(e) => {
-                tracing::error!("Failed to start the HTTPS listener: {}", e);
-                std::process::exit(1);
-            }
-        };
-        if let Err(e) = server
-            .serve(app.into_make_service_with_connect_info::<SocketAddr>())
-            .await
-        {
-            tracing::error!("Server error: {}", e);
-        }
+        http_server::serve(
+            listener,
+            Some(tls_config),
+            app,
+            http_server::Limits::from_config(&config),
+            config.trusted_proxies.clone(),
+            app_state.ip_hash_secret,
+        )
+        .await;
     } else {
         // HTTP mode - allowed if FORCE_HTTP=true (reverse proxy) or PRIVACY_MODE=development
         if !config.force_http && privacy_mode != "development" {
@@ -665,14 +670,15 @@ async fn run() {
 
         bound_socket_buffers(&listener);
 
-        if let Err(e) = axum::serve(
+        http_server::serve(
             listener,
-            app.into_make_service_with_connect_info::<SocketAddr>(),
+            None,
+            app,
+            http_server::Limits::from_config(&config),
+            config.trusted_proxies.clone(),
+            app_state.ip_hash_secret,
         )
-        .await
-        {
-            tracing::error!("Server error: {}", e);
-        }
+        .await;
     }
 }
 

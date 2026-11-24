@@ -97,7 +97,7 @@ pub fn is_valid_trusted_proxy_entry(entry: &str) -> bool {
 /// Check if an IP address is in the trusted proxy list
 ///
 /// Supports both exact IP matches and CIDR notation (e.g., "10.0.0.0/8")
-fn is_trusted_proxy(ip: &IpAddr, trusted_proxies: &[String]) -> bool {
+pub fn is_trusted_proxy(ip: &IpAddr, trusted_proxies: &[String]) -> bool {
     let ip = &ip.to_canonical();
     for proxy in trusted_proxies {
         // Check for CIDR notation
