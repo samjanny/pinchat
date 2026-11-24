@@ -583,13 +583,32 @@ on what they have carried before:
 | Messages being received, above 4 KiB and below 64 KiB | 8 MiB in all, 2 MiB for one client address, apart from the large ones so that pictures cannot starve them |
 | Messages being received, up to 4 KiB | 4 KiB a connection, besides its 4 KiB read buffer |
 | A message that is never finished | 90 seconds from its first frame; control frames sent in between do not extend it. Its connection is then closed with 1008 |
-| Frames being relayed | 4 MiB a room, 8 MiB a client address, 32 MiB in all, of which frames of 64 KiB and more may take 24 MiB, counted until the frame has been written to every receiver. A write has 30 seconds. A frame that finds no room waits for up to 30 seconds, then its sender's connection is closed with 1013 |
-| Ordered MLS control log | 2 MiB a room, 8 MiB for the controls of one client address, 32 MiB in all |
+| Frames being relayed | 4 MiB a room, 8 MiB a client address, 32 MiB in all, of which frames of 64 KiB and more may take 24 MiB, counted until the frame has been written to every receiver. A write has 30 seconds. A message, picture or group control that finds no room waits for up to 30 seconds, then its sender's connection is closed with 1013; a handshake frame is dropped instead. The joins and leaves the relay announces itself are counted but never refused (see below) |
+| Ordered MLS control log | 2 MiB a room, 8 MiB for the controls of one client address, 32 MiB in all. Of a room's 2 MiB and 256 entries, 128 KiB and 32 entries are kept for its joins and leaves, which the 32 MiB never refuses |
 | Kernel buffers of a connection | fixed at 64 KiB in each direction, which the kernel counts twice: at most 256 KiB a connection |
 | Password checks | two at a time, about 46 MiB each |
 | A message while it is parsed and written out again | up to two copies of it, on one worker thread at a time |
 | Replay cache of a room | `REPLAY_CACHE_MAX_PER_ROOM` (1000) entries, about 137 KB when full |
 | KeyPackage references a group has consumed | 1024, about 133 KB when all are in |
+
+The joins and leaves of a room are what its members, and in a group the
+order of its controls, rely on to know who is there. A full budget used to
+drop them in a one-to-one room and close a group, because the group's order
+of controls could no longer say who was a member, so a moment of pressure
+anywhere on the relay could end an unrelated group. They are no longer
+refused by the broadcast budgets or by the 32 MiB of the control log; they
+are counted, so client frames find less room while they are there. They are
+small, about 130 bytes, and few: in the broadcast budgets at most one for
+each slot of a room's ring and one for each receiver that is writing one,
+about 11 KiB a room; in the control log at most what a room's own log holds.
+Only a room's own log can refuse one, and the group is then closed.
+
+A member that reconnects first replays the controls it missed, in windows
+it has to acknowledge one by one. It holds nothing of what its room sends
+meanwhile: its live subscription starts once the replay is acknowledged, and
+the controls sent in between reach it from the log. It used to hold every
+frame of the room for as long as it took to acknowledge, up to a minute for
+each window, beyond the 30 seconds a write may take.
 
 Measured on one CPU, in a 512 MiB scope without swap, behind nginx with TLS
 (load generator, proxy and relay on one machine): an idle connection costs
@@ -676,6 +695,12 @@ What remains possible:
   them, and those waiting are counted against the broadcast budgets above,
   so the length of the ring does not raise the memory bound; its slots
   take about 1 MiB for 500 rooms.
+- **A group closes when its order breaks.** A group is closed, not kept
+  with a membership its members cannot agree on, when its own control log
+  cannot take a join or leave, when its creator is evicted, and when its
+  creator does not come back within the reconnect grace period
+  (`WS_RECONNECT_GRACE_SECS`, 20 seconds). Members that stop acknowledging
+  controls are evicted before they can fill that log.
 - **Reaching the memory ceiling ends every session.** If the relay is
   killed at the ceiling it restarts empty: rooms and connections are gone.
   No message content is exposed by that, and none was stored.
