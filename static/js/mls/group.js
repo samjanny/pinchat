@@ -112,6 +112,13 @@
     // RFC 9420 trees are full, so 20 members need a 32-leaf tree whose
     // right-edge leaves stay blank. This bounds the tree itself.
     const MAX_TREE_LEAVES = 32;
+    // PinChat LeafNodes are about 320 bytes and KeyPackages about 450. The
+    // relay accepts a KeyPackage of up to 16 KiB but a Welcome ratchet_tree
+    // of only 64 KiB, so without a tighter bound four inflated KeyPackages
+    // would make every later Welcome too large to deliver (M-05). With
+    // these bounds 20 members fit in about 27 KiB of tree in the worst case.
+    const MAX_LEAF_NODE_BYTES = 1024;
+    const MAX_KEY_PACKAGE_BYTES = 2048;
     const MAX_KEY_PACKAGE_LIFETIME_SECONDS = 24n * 60n * 60n;
     // Clock skew tolerated between a joiner and the creator when the
     // creator admits a KeyPackage.
@@ -3721,6 +3728,13 @@
                 `${errorPrefix}: expected source=KEY_PACKAGE, got ${kp.leafNode.leafNodeSource}`,
             );
         }
+        const keyPackageSize = KeyPackage.keyPackageBytes(kp).length;
+        if (keyPackageSize > MAX_KEY_PACKAGE_BYTES) {
+            throw new Error(
+                `${errorPrefix}: KeyPackage is ${keyPackageSize} bytes; `
+                + `the profile maximum is ${MAX_KEY_PACKAGE_BYTES}`,
+            );
+        }
         // RFC 9420 section 7.2: the creator, admitting a joiner, enforces
         // now in [notBefore, notAfter) with a clock-skew margin; this
         // rejects a replayed KeyPackage from a former member. Members
@@ -4239,6 +4253,13 @@
      * of accepting an arbitrary self-asserted identity blob.
      */
     async function validateLeafNodeProfile(leaf, leafDescription, errorPrefix) {
+        const leafBytes = Nodes.leafNodeBytes(leaf).length;
+        if (leafBytes > MAX_LEAF_NODE_BYTES) {
+            throw new Error(
+                `${errorPrefix}: ${leafDescription} is ${leafBytes} bytes; `
+                + `the profile maximum is ${MAX_LEAF_NODE_BYTES}`,
+            );
+        }
         validateLeafCapabilities(leaf, leafDescription, errorPrefix);
         if (!equalBytes(leaf.credential.identity, leaf.signatureKey)) {
             throw new Error(
@@ -4614,6 +4635,8 @@
         CIPHERSUITE,
         MAX_GROUP_LEAVES,
         MAX_TREE_LEAVES,
+        MAX_LEAF_NODE_BYTES,
+        MAX_KEY_PACKAGE_BYTES,
         // Exposed for tests / future add-member path
         buildSelfLeaf,
         signLeafNodeForKeyPackage,

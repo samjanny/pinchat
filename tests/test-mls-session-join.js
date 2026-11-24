@@ -2766,6 +2766,7 @@ async function main() {
 
     await preWelcomeProposalGap();
     await collidingUpdateProposal();
+    await oversizedKeyPackages();
 
     console.log('');
     console.log(`mls-session-join: ${passed} passed, ${failed} failed`);
@@ -3021,6 +3022,104 @@ async function collidingUpdateProposal() {
         && creator.session.group.epoch === epochBeforeFallback + 1n
         && alice.session.group.epoch === creator.session.group.epoch,
     'members apply the path-only fallback Commit');
+}
+
+/** A fully signed KeyPackage whose LeafNode carries `padBytes` of extension. */
+async function paddedKeyPackage(padBytes) {
+    const M = global.MLS;
+    const sig = await M.Signature.generateKeyPair();
+    const init = await M.HPKE.generateKeyPair();
+    const enc = await M.HPKE.generateKeyPair();
+    const leaf = M.Group.buildSelfLeaf({
+        encryptionKeyBytes: enc.publicKeyBytes,
+        signatureKeyBytes: sig.publicKeyBytes,
+        credentialIdentity: sig.publicKeyBytes,
+        leafNodeSource: M.Nodes.LeafNodeSource.KEY_PACKAGE,
+    });
+    leaf.capabilities.extensions = [0xff00];
+    leaf.extensions = [{ extensionType: 0xff00, extensionData: new Uint8Array(padBytes) }];
+    leaf.signature = await M.Group.signLeafNodeForKeyPackage(sig.privateKey, leaf);
+    const kp = {
+        version: 1, cipherSuite: 2, initKey: init.publicKeyBytes,
+        leafNode: leaf, extensions: [], signature: new Uint8Array(0),
+    };
+    kp.signature = await M.Labeled.signWithLabel(
+        sig.privateKey, 'KeyPackageTBS', M.KeyPackage.keyPackageTbsBytes(kp),
+    );
+    return M.KeyPackage.keyPackageBytes(kp);
+}
+
+/**
+ * M-05: link holders could publish KeyPackages padded to the relay's
+ * 16 KiB KeyPackage cap. After four such leaves every later Welcome
+ * carried a ratchet_tree over the relay's 64 KiB limit and was silently
+ * dropped, so nobody could join any more. LeafNodes and KeyPackages are now
+ * bounded by the profile, and an Add whose Welcome or Commit would not fit
+ * the relay limits is refused before it is staged.
+ */
+async function oversizedKeyPackages() {
+    console.log('# MLS session - inflated KeyPackages cannot block later joins (M-05)');
+    const creator = relayPeer('creator', 'size-creator');
+    await creator.session.start();
+    const pins = creator.session.bootstrapPins;
+    const offer = async (keyPackageBytes, senderId) => deliver(creator, {
+        type: 'mls',
+        wire_format: WireFormat.MLS_KEY_PACKAGE,
+        payload: global.MLS.Codec.bytesToBase64Url(keyPackageBytes),
+        bootstrap_proof: await bootstrapProofForSender({
+            pskSecret: DEFAULT_PSK,
+            groupId: pins.groupId,
+            creatorKeyHash: pins.creatorKeyHash,
+            senderId,
+            keyPackageBytes,
+        }),
+    }, senderId);
+
+    const results = [];
+    for (let i = 0; i < 5; i += 1) {
+        results.push(await offer(await paddedKeyPackage(16 * 1024 - 470), `size-pad-${i}`));
+    }
+    assert(results.every((result) => result?.mlsControlRejected === true
+        && result.message.includes('profile maximum'))
+        && creator.session._pendingCommit === null
+        && creator.session.group.epoch === 0n,
+    'KeyPackages padded toward the relay cap are refused at admission',
+    results[0] instanceof Error ? results[0].message : String(results[0]));
+    const nearLimit = await offer(
+        await paddedKeyPackage(global.MLS.Group.MAX_LEAF_NODE_BYTES), 'size-near',
+    );
+    assert(nearLimit?.mlsControlRejected === true,
+        'a LeafNode just over the profile maximum is refused');
+
+    const honest = relayPeer('joiner', 'size-honest', pins);
+    await relayJoin(creator, honest, []);
+    assert(honest.session.state === 'joined' && creator.session.group.epoch === 1n,
+        'an honest joiner is still admitted afterwards');
+
+    // Defense in depth: an Add whose Welcome would exceed the relay limits
+    // is not staged even if a larger tree slipped past the leaf bounds.
+    const late = relayPeer('joiner', 'size-late', pins);
+    await late.session.start();
+    const realFork = creator.session.group.forkForPendingCommit.bind(creator.session.group);
+    creator.session.group.forkForPendingCommit = () => {
+        const candidate = realFork();
+        const realAdd = candidate.commitAddMember.bind(candidate);
+        candidate.commitAddMember = async (args) => {
+            const out = await realAdd(args);
+            const huge = new Uint8Array(129 * 1024);
+            huge.set(out.welcomeMessage.subarray(0, 4));
+            return { ...out, welcomeMessage: huge };
+        };
+        return candidate;
+    };
+    const oversized = await deliver(creator, takeOut(late, isKeyPackageEnvelope), late.id);
+    creator.session.group.forkForPendingCommit = realFork;
+    assert(oversized?.mlsControlRejected === true
+        && oversized.message.includes('relay size limits')
+        && creator.session._pendingCommit === null
+        && !creator.out.some(isCommitEnvelope),
+    'an Add whose Welcome exceeds the relay limit is refused, not staged',
+    oversized instanceof Error ? oversized.message : String(oversized));
 }
 
 // A promise that never settles (for example a mutex deadlock) drains the

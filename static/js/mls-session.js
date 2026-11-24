@@ -87,6 +87,12 @@
     // Proposals for the epoch a pending Welcome will introduce, kept by a
     // joiner until it can verify them (see _bufferPreWelcomeProposal).
     const MAX_PRE_WELCOME_PROPOSAL_BYTES = 256 * 1024;
+    // Decoded-byte ceilings the relay applies to MLS envelopes
+    // (MAX_MLS_CONTROL_BYTES and MAX_RATCHET_TREE_BYTES in
+    // src/handlers/websocket.rs). The relay drops a larger Welcome, so an
+    // Add whose Welcome would not fit is refused before it is staged.
+    const RELAY_MAX_CONTROL_BYTES = 128 * 1024;
+    const RELAY_MAX_RATCHET_TREE_BYTES = 64 * 1024;
     const MAX_CONSUMED_KEY_PACKAGE_REFS = 4096;
     // The visible label carries 80 bits of the SHA-256 fingerprint. The full
     // 256-bit value is always emitted alongside it for tooltips/comparison.
@@ -2025,6 +2031,19 @@
                 const ratchetTreeBytes = MLS.Nodes.ratchetTreeBytes(
                     candidateGroup.ratchetTree,
                 );
+                // M-05: never stage an Add whose Commit or Welcome the
+                // relay would refuse to carry. The KeyPackage is rejected
+                // deterministically instead, and later joins stay possible.
+                if (ratchetTreeBytes.length > RELAY_MAX_RATCHET_TREE_BYTES
+                    || welcomeMessage.length - 4 > RELAY_MAX_CONTROL_BYTES
+                    || commitMessage.length - 4 > RELAY_MAX_CONTROL_BYTES) {
+                    throw validationMlsControlError(
+                        'mls-session: Add would exceed the relay size limits '
+                        + `(ratchet_tree ${ratchetTreeBytes.length} bytes, `
+                        + `Welcome ${welcomeMessage.length - 4} bytes, `
+                        + `Commit ${commitMessage.length - 4} bytes)`,
+                    );
+                }
                 const commitRef = base64UrlEncode(
                     await MLS.Labeled.sha256(stripMlsWrapper(commitMessage)),
                 );
