@@ -5,11 +5,14 @@
  * This prevents MITM attacks during Double Ratchet key rotation.
  *
  * Architecture:
- * 1. Identity Keys (ECDSA P-256, long-lived) - Persisted in IndexedDB for the
- *    lifetime of the configured TTL (default 24h, aligned with session TTL).
- *    Re-loaded on every page open so the SAS stays stable across reconnects
- *    and tab refreshes (C-04). The private side is non-extractable both on
- *    initial creation and after structured-clone restore from IndexedDB.
+ * 1. Identity Keys (ECDSA P-256, one per room) - Persisted in IndexedDB under
+ *    an entry derived from the room ID, for at most 24h (the longest room
+ *    TTL). Re-loaded when the same room is reopened so the peer sees the
+ *    same identity across reconnects and tab refreshes (C-04). A different
+ *    room gets a different keypair, so the key a relay can recover from
+ *    message signatures (audit C-F2) does not link rooms. The private side
+ *    is non-extractable both on initial creation and after structured-clone
+ *    restore from IndexedDB.
  * 2. Ephemeral Keys (ECDH P-256, short-lived) - Rotated during ratcheting
  * 3. Identity key authenticates all ephemeral keys via digital signatures
  *
@@ -30,12 +33,38 @@
 // The store is scoped to the origin, never synced, and auto-bounded by the
 // expiresAt timestamp written alongside the keys. A `version` field allows
 // future schema migrations without invalidating in-flight chats.
+//
+// One entry per room (audit C-F2). The entry key is a SHA-256 digest of the
+// room ID rather than the ID itself, so the database does not list the rooms
+// this browser opened in plain text. Expired entries are swept whenever an
+// identity is requested, and the single cross-room entry written by earlier
+// releases (IDENTITY_LEGACY_ENTRY_KEY) is deleted and never read.
 
 const IDENTITY_DB_NAME = 'pinchat_identity_v1';
 const IDENTITY_STORE_NAME = 'keys';
-const IDENTITY_ENTRY_KEY = 'identity';
-const IDENTITY_TTL_MS = 24 * 60 * 60 * 1000;  // 24h, matches default session_ttl_secs
+const IDENTITY_LEGACY_ENTRY_KEY = 'identity';
+const IDENTITY_ROOM_ENTRY_PREFIX = 'room:';
+const IDENTITY_TTL_MS = 24 * 60 * 60 * 1000;  // 24h, the longest room TTL
 const IDENTITY_SCHEMA_VERSION = 1;
+
+/**
+ * IndexedDB entry key for a room's identity: "room:" + hex(SHA-256(roomId)).
+ * Returns null when there is no usable room ID, which makes the identity
+ * ephemeral (never persisted) instead of shared between rooms.
+ *
+ * @private
+ * @param {string} roomId
+ * @returns {Promise<string|null>}
+ */
+async function _identityEntryKey(roomId) {
+    if (typeof roomId !== 'string' || roomId.length === 0) return null;
+    const digest = new Uint8Array(await crypto.subtle.digest(
+        'SHA-256', new TextEncoder().encode(roomId),
+    ));
+    let hex = '';
+    for (const b of digest) hex += b.toString(16).padStart(2, '0');
+    return IDENTITY_ROOM_ENTRY_PREFIX + hex;
+}
 
 /**
  * Open (or create) the identity database. Returns null on any error or
@@ -69,19 +98,55 @@ function _openIdentityDb() {
 }
 
 /**
+ * Delete every expired or malformed entry, and the legacy cross-room entry.
+ * Best-effort: any failure leaves the store as it was.
+ *
+ * @private
+ * @returns {Promise<void>}
+ */
+async function _sweepStoredIdentities() {
+    const db = await _openIdentityDb();
+    if (!db) return;
+    const now = Date.now();
+    return new Promise((resolve) => {
+        try {
+            const tx = db.transaction(IDENTITY_STORE_NAME, 'readwrite');
+            const store = tx.objectStore(IDENTITY_STORE_NAME);
+            store.delete(IDENTITY_LEGACY_ENTRY_KEY);
+            const req = store.openCursor();
+            req.onsuccess = () => {
+                const cursor = req.result;
+                if (!cursor) return;
+                const v = cursor.value;
+                if (!v || typeof v.expiresAt !== 'number' || v.expiresAt < now) {
+                    cursor.delete();
+                }
+                cursor.continue();
+            };
+            tx.oncomplete = () => resolve();
+            tx.onerror = () => resolve();
+            tx.onabort = () => resolve();
+        } catch (_) {
+            resolve();
+        }
+    });
+}
+
+/**
  * Load the stored identity keypair if present, valid, and not expired.
  * Returns null on any failure - the caller must regenerate.
  *
  * @private
+ * @param {string} entryKey - per-room entry key from _identityEntryKey()
  * @returns {Promise<{privateKey: CryptoKey, publicKey: CryptoKey}|null>}
  */
-async function _loadStoredIdentity() {
+async function _loadStoredIdentity(entryKey) {
     const db = await _openIdentityDb();
     if (!db) return null;
     return new Promise((resolve) => {
         try {
             const tx = db.transaction(IDENTITY_STORE_NAME, 'readonly');
-            const req = tx.objectStore(IDENTITY_STORE_NAME).get(IDENTITY_ENTRY_KEY);
+            const req = tx.objectStore(IDENTITY_STORE_NAME).get(entryKey);
             req.onsuccess = () => {
                 const v = req.result;
                 if (!v
@@ -110,9 +175,10 @@ async function _loadStoredIdentity() {
  * and the in-memory keypair remains usable for the current session.
  *
  * @private
+ * @param {string} entryKey - per-room entry key from _identityEntryKey()
  * @returns {Promise<boolean>}
  */
-async function _saveStoredIdentity(privateKey, publicKey) {
+async function _saveStoredIdentity(entryKey, privateKey, publicKey) {
     const db = await _openIdentityDb();
     if (!db) return false;
     return new Promise((resolve) => {
@@ -125,7 +191,7 @@ async function _saveStoredIdentity(privateKey, publicKey) {
                 publicKey: publicKey,
                 createdAt: now,
                 expiresAt: now + IDENTITY_TTL_MS,
-            }, IDENTITY_ENTRY_KEY);
+            }, entryKey);
             tx.oncomplete = () => resolve(true);
             tx.onerror = () => resolve(false);
             tx.onabort = () => resolve(false);
@@ -136,19 +202,20 @@ async function _saveStoredIdentity(privateKey, publicKey) {
 }
 
 /**
- * Remove the stored identity. Used by IdentityKeyManager.clearStoredIdentity
+ * Remove a stored identity. Used by IdentityKeyManager.clearStoredIdentity
  * (manual user-initiated reset).
  *
  * @private
+ * @param {string} entryKey - per-room entry key from _identityEntryKey()
  * @returns {Promise<void>}
  */
-async function _deleteStoredIdentity() {
+async function _deleteStoredIdentity(entryKey) {
     const db = await _openIdentityDb();
     if (!db) return;
     return new Promise((resolve) => {
         try {
             const tx = db.transaction(IDENTITY_STORE_NAME, 'readwrite');
-            tx.objectStore(IDENTITY_STORE_NAME).delete(IDENTITY_ENTRY_KEY);
+            tx.objectStore(IDENTITY_STORE_NAME).delete(entryKey);
             tx.oncomplete = () => resolve();
             tx.onerror = () => resolve();
             tx.onabort = () => resolve();
@@ -165,21 +232,28 @@ class IdentityKeyManager {
         this.peerIdentityPublicKeyRaw = null;    // Peer's identity public key (Uint8Array, cached at import)
         this.sasVerified = false;                // Whether SAS has been verified by user
         this.previousPeerIdentityRaw = null;     // Last known peer identity raw bytes (for reconnect diff)
+        this.storedEntryKey = null;              // IndexedDB entry of this room's identity (null: ephemeral)
 
         // Configuration
         this.CURVE = 'P-256';  // Same curve for both ECDSA (signing) and ECDH (key agreement)
     }
 
     /**
-     * Obtain a long-term identity keypair (ECDSA P-256).
+     * Obtain this room's identity keypair (ECDSA P-256).
      *
-     * C-04: persistence-aware. Tries to load an existing keypair from
-     * IndexedDB first; only when none is present (first visit, expired
-     * TTL, IndexedDB unavailable) does it generate a fresh one and persist
-     * it. This keeps the SAS code stable across reconnects, tab refreshes,
-     * and short browser restarts within the TTL window - without that, the
-     * SAS would change on every page load and pressure users into the
-     * "Skip verification" path even with a trusted peer.
+     * C-04: persistence-aware. Tries to load the keypair stored for this
+     * room from IndexedDB first; only when none is present (first visit,
+     * expired TTL, IndexedDB unavailable) does it generate a fresh one and
+     * persist it. This keeps the peer's view of our identity stable across
+     * reconnects, tab refreshes and short browser restarts within the TTL
+     * window, so a reload does not look like an identity change.
+     *
+     * C-F2: the keypair is per room. Every 1:1 message header carries an
+     * ECDSA signature over cleartext fields, so a relay can recover the
+     * signing public key from two headers. A keypair shared by all rooms
+     * would let it link the rooms one browser opens; a per-room keypair
+     * links nothing beyond the room it already sees. Without a roomId the
+     * keypair is ephemeral (generated, never stored).
      *
      * SECURITY: The private key is non-extractable after generation. When
      * later restored from IndexedDB via structured-clone, the
@@ -187,16 +261,22 @@ class IdentityKeyManager {
      * WebCrypto §13) - so the bytes never become reachable to JS, neither
      * on creation nor across page loads.
      *
+     * @param {string} [roomId] - room the identity belongs to
      * @returns {Promise<CryptoKeyPair>}
      */
-    async generateIdentityKeypair() {
-        // Try to restore an existing identity first. The stored CryptoKey
-        // private side comes back non-extractable; we use it as-is.
-        const stored = await _loadStoredIdentity();
-        if (stored) {
-            this.identityKeyPair = stored;
-            debugLog('[Identity] ✅ Restored existing identity from IndexedDB');
-            return this.identityKeyPair;
+    async generateIdentityKeypair(roomId) {
+        const entryKey = await _identityEntryKey(roomId);
+        this.storedEntryKey = entryKey;
+        if (entryKey) {
+            await _sweepStoredIdentities();
+            // Try to restore this room's identity first. The stored CryptoKey
+            // private side comes back non-extractable; we use it as-is.
+            const stored = await _loadStoredIdentity(entryKey);
+            if (stored) {
+                this.identityKeyPair = stored;
+                debugLog('[Identity] Restored this room\'s identity from IndexedDB');
+                return this.identityKeyPair;
+            }
         }
 
         debugLog('[Identity] No stored identity found - generating fresh ECDSA P-256 keypair...');
@@ -221,25 +301,27 @@ class IdentityKeyManager {
             ['sign', 'verify']
         );
 
-        // Persist for SAS continuity across reconnects / refreshes (C-04).
-        // Best-effort: a write failure leaves us with an ephemeral identity
-        // for this session, which is the pre-C-04 behaviour and remains
-        // cryptographically valid.
-        const saved = await _saveStoredIdentity(
+        // Persist for identity continuity across reconnects / refreshes in
+        // this room (C-04). Best-effort: a write failure leaves us with an
+        // ephemeral identity for this session, which is the pre-C-04
+        // behaviour and remains cryptographically valid.
+        const saved = entryKey !== null && await _saveStoredIdentity(
+            entryKey,
             this.identityKeyPair.privateKey,
             this.identityKeyPair.publicKey,
         );
         if (saved) {
-            debugLog('[Identity] ✅ Identity keypair generated and persisted to IndexedDB');
+            debugLog('[Identity] Identity keypair generated and persisted to IndexedDB for this room');
         } else {
-            debugWarn('[Identity] Identity keypair generated; IndexedDB persistence unavailable (ephemeral session)');
+            debugWarn('[Identity] Identity keypair generated; not persisted (ephemeral session)');
         }
         return this.identityKeyPair;
     }
 
     /**
-     * Forget the persisted identity. Next call to generateIdentityKeypair()
-     * will mint a fresh keypair and (if IndexedDB is available) persist it.
+     * Forget this room's persisted identity. The next call to
+     * generateIdentityKeypair() for the room mints a fresh keypair and (if
+     * IndexedDB is available) persists it.
      *
      * Intended for an explicit "forget me on this device" user gesture or
      * for a clean-slate reset after a confirmed compromise. NOT called by
@@ -250,7 +332,9 @@ class IdentityKeyManager {
      * @returns {Promise<void>}
      */
     async clearStoredIdentity() {
-        await _deleteStoredIdentity();
+        if (this.storedEntryKey) {
+            await _deleteStoredIdentity(this.storedEntryKey);
+        }
         debugLog('[Identity] Stored identity cleared (next session will mint a fresh keypair)');
     }
 

@@ -172,8 +172,10 @@ class ECDHKeyExchange {
      *
      * HANDSHAKE v2:
      * - Carries two ephemeral keys: handshake (derives S, destroyed) + ratchet (DHs)
-     * - Identity key + signature are ENCRYPTED (anti-correlation: no cleartext
-     *   long-term identity for a passive relay to link across rooms)
+     * - Identity key + signature are ENCRYPTED inside the envelope. This
+     *   alone does not hide the identity key: message-header signatures let
+     *   a relay recover it (audit C-F2). Rooms stay unlinkable because the
+     *   identity keypair is per room (identity.js).
      * - Signature covers both ephemeral keys + room/sender/timestamp/nonce
      *
      * SECURITY: AAD prevents cross-context replay attacks by binding the
@@ -219,8 +221,9 @@ class ECDHKeyExchange {
         const identityPublicKeyRaw = new Uint8Array(await this.identityManager.exportIdentityPublicKey());
 
         // Plaintext envelope. Identity key + signature move INSIDE the AES-GCM
-        // ciphertext (anti-correlation: a passive relay no longer sees the
-        // long-term identity key that would link a user across rooms).
+        // ciphertext. The relay can still recover the identity key from the
+        // per-message header signatures; what keeps rooms unlinkable is the
+        // per-room identity keypair (audit C-F2, identity.js).
         //   u8(version) || lp(handshakePub) || lp(ratchetPub) || lp(identityPub) || lp(signature)
         const envelope = this._concat([
             new Uint8Array([this.HANDSHAKE_VERSION]),

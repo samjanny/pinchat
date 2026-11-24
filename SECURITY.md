@@ -135,9 +135,14 @@ URL format: https://host/c/{room_id}#key={base64url_encoded_key}
 
 ECDSA P-256 keypairs that authenticate each Double Ratchet DH header
 are persisted client-side in IndexedDB under the database name
-`pinchat_identity_v1` (object store `keys`, single entry under key
-`identity`). Entries carry a `version` field and an absolute `expiresAt`
-timestamp (24 h from creation, aligned with the default `session_ttl_secs`).
+`pinchat_identity_v1` (object store `keys`). There is one keypair per
+room, stored under the key `room:` followed by the hex SHA-256 of the room
+ID, so the database does not list room IDs in clear. Entries carry a
+`version` field and an absolute `expiresAt` timestamp (24 h from creation,
+the longest room TTL). Expired entries are deleted the next time a chat
+page asks for an identity. Releases up to v0.9.2 kept a single entry under
+the key `identity` and used it for every room; that entry is deleted on
+first use and never read.
 
 **Properties:**
 - The private side is created `extractable: false` directly from
@@ -156,18 +161,37 @@ timestamp (24 h from creation, aligned with the default `session_ttl_secs`).
   non-extractable across page loads.
 - The public side stays extractable so it can be serialised to raw
   bytes for transmission to the peer.
-- Scope: per-origin, never synced, never sent to the server.
+- Scope: per-origin and per room, never synced. The private key never
+  leaves the browser.
 - Expiry: 24 h, after which `generateIdentityKeypair()` discards the
   stale entry and mints a fresh keypair.
 - Forget gesture: `IdentityKeyManager.clearStoredIdentity()` for an
-  explicit "forget me on this device" reset.
+  explicit "forget me on this device" reset of the current room's entry.
 
-The reason this entry is persisted at all is SAS continuity: pre-C-04
-the identity keypair was regenerated on every page load, which meant
-the SAS code that a user had verified out-of-band stopped matching the
-next time they reopened the chat. The pressure to skip verification
-followed mechanically. Persistence keeps the SAS stable so verification
-becomes a one-time gesture per device-day.
+The reason this entry is persisted at all is identity continuity inside a
+room: pre-C-04 the identity keypair was regenerated on every page load, so
+a peer who reloaded the chat came back with a new identity key and the
+other side had to treat it as an identity change and verify again. With
+persistence a reload or reconnect inside the same room presents the same
+identity key, and a verdict the other side gave for that key still applies.
+
+**What the relay can learn about identity keys.** The handshake carries
+the identity public key inside the AES-GCM envelope, but every 1:1 message
+header carries `sig`, an ECDSA signature over fields that travel in clear
+(`dh`, `pn`, `n`, `rc`). ECDSA public-key recovery (SEC 1, section 4.1.6)
+turns any two such headers into the signer's identity public key. The
+relay, or anyone who can read the relay's traffic, can therefore:
+
+- recover each participant's identity public key in every 1:1 room;
+- recognise the same participant across reconnects, reloads and repeated
+  handshakes in that room, for as long as the room's keypair lives.
+
+It cannot use the identity key to link rooms: a different room gets a
+different keypair, independent of the first. Up to v0.9.2 one keypair was
+shared by every room for 24 h, which let a passive relay link all the
+1:1 rooms one browser opened that day (audit C-F2). Transport metadata
+(IP address, login session cookie, timing) is a separate matter and still
+lets the relay correlate connections across rooms.
 
 ### Symmetric Encryption
 
@@ -456,8 +480,8 @@ Ratchet design and matches the Signal specification.
 |----------|-----------|
 | Message Content | Never accessible (client-side encryption) |
 | Encryption Keys | Never transmitted (URL fragment) |
-| User Identity | Randomized per-connection UUID |
-| Cross-Room Correlation | Impossible (fresh UUID per room) |
+| User Identity | Randomized per-connection UUID. The 1:1 identity public key is recoverable from header signatures, but it is generated per room |
+| Cross-Room Correlation | Not through PinChat identifiers or keys (fresh UUID and fresh identity key per room). Still possible through transport metadata: IP address, login session cookie, timing |
 | Historical Data | None (RAM-only storage) |
 
 ### Authenticated Encryption

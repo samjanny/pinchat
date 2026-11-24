@@ -204,9 +204,19 @@ key-schedule derivations.
 
 The wire message carries only routing/context fields; all key material and the
 identity signature are inside the AES-GCM envelope encrypted under the bootstrap
-key (from the URL fragment). A passive relay therefore does not receive a stable
-identity public key that can act as a cross-room correlator. This property does
-not hide transport metadata such as IP addresses, timing, or connection data.
+key (from the URL fragment), so the handshake frame itself does not show the
+identity public key to the relay.
+
+This does not hide the identity key from the relay. Every message header
+carries `sig`, an ECDSA signature over cleartext fields (see "DH Header
+Signature"), and ECDSA public-key recovery turns any two headers into the
+sender's identity public key. Within one room the relay can therefore learn
+each participant's identity key and recognise that participant across
+reconnects and new handshakes. What prevents it from linking rooms is that the
+client generates and stores a separate identity keypair per room (one IndexedDB
+entry per room, 24 h at most): the key recovered in one room says nothing about
+the key used in another. Transport metadata such as IP addresses, the login
+session cookie, timing and connection data is not hidden either.
 
 ```
 ecdh_public_key payload (JSON)
@@ -229,7 +239,7 @@ Envelope plaintext (inside AES-GCM), length-prefixed (u16-be):
   u8(version=2)
   || lp(handshakePublicKey)   65B  - derives S, then DESTROYED
   || lp(ratchetPublicKey)     65B  - becomes Double Ratchet DHs
-  || lp(identityPublicKey)    65B  - ECDSA, encrypted (anti-correlation)
+  || lp(identityPublicKey)    65B  - ECDSA, per room, encrypted here
   || lp(signature)            64B  - P1363 ECDSA over transcript below
 
 AAD (unchanged): roomId || senderId || timestamp || nonce  (TLV)
@@ -264,7 +274,8 @@ processes the peer's frame independently.
 ```
   Alice                     Server (blind relay)                  Bob
     |                              |                               |
-    |  1. Generate Identity Keypair (ECDSA, persisted, 24h TTL)    |
+    |  1. Load or generate this room's Identity Keypair            |
+    |     (ECDSA, one per room, persisted, 24h TTL)                |
     |  2. Generate handshake + ratchet ECDH keypairs               |
     |  3. Sign transcript binding both public keys + context       |
     |  4. Encrypt keys + identity + signature with Bootstrap Key   |

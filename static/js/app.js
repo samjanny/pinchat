@@ -2006,7 +2006,9 @@ document.addEventListener('alpine:init', () => {
                 if (!this.identityManager) {
                     debugLog('[Identity] Initializing identity key manager...');
                     this.identityManager = new IdentityKeyManager();
-                    await this.identityManager.generateIdentityKeypair();
+                    // Per-room identity (audit C-F2): the key a relay can
+                    // recover from header signatures must not link rooms.
+                    await this.identityManager.generateIdentityKeypair(this.roomId);
                     debugLog('[Identity] ✅ Identity keypair generated');
                 } else {
                     debugLog('[Identity] Reusing existing identity manager (SAS verified:', this.identityManager.isSASVerified(), ')');
@@ -2193,8 +2195,9 @@ document.addEventListener('alpine:init', () => {
                 }
 
                 // Extract context from parsed payload (handshake v2 envelope).
-                // Identity key + signature are now INSIDE the encrypted envelope
-                // (anti-correlation), not on the wire.
+                // Identity key + signature are now INSIDE the encrypted envelope,
+                // not on the wire (header signatures still reveal the identity
+                // key within the room; it is per room, see identity.js).
                 const { version, encryptedEnvelope, timestamp, nonce } = payloadData;
 
                 // Validate the presence of all fields required for the handshake

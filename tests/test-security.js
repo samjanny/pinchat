@@ -541,6 +541,68 @@ async function runTests() {
     }
     console.log('');
 
+    // -------------------------------------------------------------------------
+    // Test 10: audit C-F2 - one identity key per room
+    // -------------------------------------------------------------------------
+    // Every 1:1 header signature is computed over cleartext fields, so the
+    // relay can recover the signer's identity public key from two headers.
+    // With one stored identity shared by all rooms it could link every room
+    // a browser opened; with one per room it learns nothing it cannot
+    // already see inside that room.
+    console.log('--- Test 10: Identity keys are stored per room, never shared (C-F2) ---');
+    {
+        const { createFakeIndexedDB } = require('./helpers/fake-indexeddb');
+        const savedIndexedDB = global.indexedDB;
+        try {
+            const fakeDb = createFakeIndexedDB();
+            global.indexedDB = fakeDb;
+            const raw = async (kp) => Buffer.from(await subtle.exportKey('raw', kp.publicKey)).toString('hex');
+            const fresh = () => new IdentityKeyManager();
+
+            // An identity written by an earlier release under the single
+            // cross-room entry: it must be neither reused nor kept.
+            const legacy = await subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, false, ['sign', 'verify']);
+            await fresh().generateIdentityKeypair('seed-room');
+            const store = fakeDb.store('pinchat_identity_v1', 'keys');
+            const now = Date.now();
+            store.set('identity', {
+                version: 1, privateKey: legacy.privateKey, publicKey: legacy.publicKey,
+                createdAt: now, expiresAt: now + 60 * 60 * 1000,
+            });
+            store.set('room:expired', {
+                version: 1, privateKey: legacy.privateKey, publicKey: legacy.publicKey,
+                createdAt: now - 2000, expiresAt: now - 1000,
+            });
+
+            const roomA = '0a0a0a0a-0000-4000-8000-00000000000a';
+            const roomB = '0b0b0b0b-0000-4000-8000-00000000000b';
+            const a1 = await raw(await fresh().generateIdentityKeypair(roomA));
+            const a2 = await raw(await fresh().generateIdentityKeypair(roomA));
+            const b1 = await raw(await fresh().generateIdentityKeypair(roomB));
+            const legacyRaw = await raw(legacy);
+            const ephemeralBefore = store.size;
+            const unscoped = await raw(await fresh().generateIdentityKeypair());
+
+            assert.strictEqual(a1, a2, 'reopening the same room restores its identity (C-04)');
+            assert.notStrictEqual(a1, b1, 'two rooms must not share an identity key');
+            assert.notStrictEqual(a1, legacyRaw, 'the legacy cross-room identity must not be reused');
+            assert(!store.has('identity'), 'the legacy cross-room entry is deleted');
+            assert(!store.has('room:expired'), 'expired entries are swept');
+            assert(![...store.keys()].some((k) => k.includes(roomA) || k.includes(roomB)),
+                'room IDs are not stored in clear as entry keys');
+            assert.strictEqual(store.size, ephemeralBefore, 'an identity without a room is not persisted');
+            assert.notStrictEqual(unscoped, a1);
+            console.log('PASSED: per-room identity, legacy shared entry removed, expired entries swept');
+            passed++;
+        } catch (e) {
+            console.log('FAILED:', e.message);
+            failed++;
+        } finally {
+            global.indexedDB = savedIndexedDB;
+        }
+    }
+    console.log('');
+
     // =========================================================================
     // Summary
     // =========================================================================
