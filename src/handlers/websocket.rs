@@ -7288,6 +7288,120 @@ mod tests {
             });
         }
 
+        /// Read a socket for `span` as a live browser does, answering the
+        /// relay's pings. Returns how many pings arrived; any other frame
+        /// fails the test.
+        async fn read_like_a_browser(socket: &mut TestSocket, span: Duration) -> usize {
+            let deadline = Instant::now() + span;
+            let mut pings = 0;
+            while let Ok(frame) = tokio::time::timeout_at(deadline, socket.next()).await {
+                match frame {
+                    Some(Ok(ClientMessage::Ping(_))) => pings += 1,
+                    Some(Ok(ClientMessage::Pong(_))) => {}
+                    other => panic!("unexpected {other:?}"),
+                }
+            }
+            pings
+        }
+
+        #[test]
+        fn a_silent_old_socket_is_released_soon_after_a_refused_resume() {
+            run_relay_scenario(std::time::Duration::from_secs(30), || async {
+                let LiveRoom {
+                    state,
+                    addr,
+                    room_id,
+                    alice,
+                    alice_socket,
+                    bob: _bob,
+                    mut bob_socket,
+                } = live_one_to_one_room(test_config()).await;
+
+                // After a change of network the old socket is still open on
+                // the relay, but nothing comes from it: it is kept here and
+                // never read, so it answers no ping.
+                let _silent = alice_socket;
+                let token = resume_token(&state, room_id, alice);
+                let refused_at = Instant::now();
+                assert_eq!(
+                    try_open_socket(addr, room_id, &token).await.err(),
+                    Some(409)
+                );
+                // A second refusal neither extends nor repeats the probe.
+                tokio::time::sleep(Duration::from_millis(800)).await;
+                assert_eq!(
+                    try_open_socket(addr, room_id, &token).await.err(),
+                    Some(409)
+                );
+
+                wait_until("the silent socket is released", || {
+                    !state.connection_is_active(&room_id, &alice)
+                })
+                .await;
+                let released_after = refused_at.elapsed();
+                assert!(
+                    released_after >= SOCKET_PROBE_DEADLINE,
+                    "{released_after:?}"
+                );
+                assert!(
+                    released_after < SOCKET_PROBE_DEADLINE + Duration::from_millis(600),
+                    "released {released_after:?} after the first refusal: the second one extended the probe"
+                );
+                assert!(released_after < IDLE_TIMEOUT);
+
+                // It went through its own close: the identity is held for its
+                // grace period, and the token the refusals left unspent now
+                // resumes it, with no leave or join for the peer.
+                assert!(state.rooms.get(&room_id).unwrap().holds_slot_for(&alice));
+                let mut resumed = try_open_socket(addr, room_id, &token)
+                    .await
+                    .expect("the resume succeeds once the old socket is gone");
+                assert_eq!(
+                    expect_frame(&mut resumed, "connected").await["resumed"],
+                    true
+                );
+                expect_silence(&mut bob_socket, "peer of a stable resume").await;
+            });
+        }
+
+        #[test]
+        fn a_live_old_socket_that_answers_the_probe_stays() {
+            run_relay_scenario(std::time::Duration::from_secs(30), || async {
+                let LiveRoom {
+                    state,
+                    addr,
+                    room_id,
+                    alice,
+                    mut alice_socket,
+                    bob,
+                    mut bob_socket,
+                } = live_one_to_one_room(test_config()).await;
+
+                // Someone else holding the resume credential, or a stray
+                // retry: the identity's socket is alive and stays.
+                for round in 0..2 {
+                    assert_eq!(
+                        try_open_socket(addr, room_id, &resume_token(&state, room_id, alice))
+                            .await
+                            .err(),
+                        Some(409)
+                    );
+                    let pings = read_like_a_browser(
+                        &mut alice_socket,
+                        SOCKET_PROBE_DEADLINE + Duration::from_millis(500),
+                    )
+                    .await;
+                    assert_eq!(pings, 1, "round {round}: the probe sends one ping");
+                    assert!(
+                        state.connection_is_active(&room_id, &alice),
+                        "round {round}: a socket that answered must stay"
+                    );
+                }
+                assert_relays(&mut alice_socket, alice, &mut bob_socket, 1).await;
+                assert_relays(&mut bob_socket, bob, &mut alice_socket, 2).await;
+            });
+        }
+
         // ---- Live groups --------------------------------------------------
 
         struct LiveGroup {
