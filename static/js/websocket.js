@@ -92,6 +92,9 @@ class WebSocketManager {
         // Token caching for reconnection (avoids PoW on every reconnect)
         this.cachedToken = null;
         this.tokenExpiresAt = 0;
+        // The token last handed back after a socket closed before opening;
+        // it is not handed back a second time.
+        this._reofferedToken = null;
         // Server-signed, room/member-bound reconnect credential. It is kept
         // in page memory only: persisting it across a reload would preserve a
         // relay identity while the corresponding in-memory MLS state is gone.
@@ -837,9 +840,16 @@ class WebSocketManager {
         const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
         const wsUrl = `${protocol}//${window.location.host}/ws/${this.roomId}`;
 
-        // Consume the cached token now: jti is single-use on the server, so once
-        // the upgrade is attempted the token is gone regardless of success/failure.
-        // Clearing here ensures a reconnect always requests a fresh token via PoW.
+        // jti is single-use on the server, so a token whose upgrade went through
+        // is gone. The relay refuses some upgrades before it spends the token,
+        // though: an identity whose previous socket is still open gets a 409
+        // and keeps its token. So the token leaves the cache now, and comes
+        // back once, for the next attempt, if this socket closes before it
+        // ever opened and the token has not expired. A token that already
+        // came back is not offered a third time.
+        const reusableToken = token === this._reofferedToken
+            ? null
+            : { token, expiresAt: this.tokenExpiresAt };
         this.cachedToken = null;
         this.tokenExpiresAt = 0;
 
@@ -854,9 +864,12 @@ class WebSocketManager {
             this._connectionGeneration += 1;
             const socketGeneration = this._connectionGeneration;
             let connectedFrameSeen = false;
+            let socketOpened = false;
 
             this.ws.onopen = () => {
                 if (socketGeneration !== this._connectionGeneration) return;
+                socketOpened = true;
+                this._reofferedToken = null;
                 // Subprotocol sanity: server must echo "pinchat.v1" exactly.
                 if (this.ws.protocol !== 'pinchat.v1') {
                     console.error('[WS] Unexpected negotiated subprotocol:', this.ws.protocol);
@@ -886,6 +899,14 @@ class WebSocketManager {
             this.ws.onclose = (event) => {
                 if (socketGeneration !== this._connectionGeneration) return;
                 console.log('WebSocket closed:', event.code, event.reason);
+                if (!socketOpened && reusableToken
+                    && reusableToken.expiresAt > Date.now()) {
+                    // Closed before it opened: the relay may have refused the
+                    // upgrade without spending the token. Offer it once more.
+                    this.cachedToken = reusableToken.token;
+                    this.tokenExpiresAt = reusableToken.expiresAt;
+                    this._reofferedToken = reusableToken.token;
+                }
                 if (this.roomType === 'group') {
                     this._mlsControlSyncing = true;
                 }
