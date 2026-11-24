@@ -377,6 +377,99 @@ async function main() {
             'future KeyPackage rejected', futureErr);
     }
 
+    // M-02: only the creator compares a KeyPackage Lifetime with its clock,
+    // with a skew margin, when it admits the joiner. A member applying the
+    // signed Add, or a later joiner importing the tree, must not re-check
+    // notBefore against its own clock: a joiner whose clock runs ahead (or
+    // who writes notBefore = now) would otherwise desynchronise every
+    // member whose clock is a second behind, through an authenticated
+    // Commit that can never be applied.
+    console.log('# KeyPackage Lifetime is checked only at admission (M-02)');
+    {
+        const withLifetime = async (notBefore) => {
+            const bundle = await buildKeyPackage();
+            bundle.keyPackage.leafNode.lifetime = {
+                notBefore, notAfter: notBefore + 86400n - 60n,
+            };
+            bundle.keyPackage.leafNode.signature = await Group.signLeafNodeForKeyPackage(
+                bundle.identity.signaturePrivateKey, bundle.keyPackage.leafNode,
+            );
+            bundle.keyPackage.signature = await Labeled.signWithLabel(
+                bundle.identity.signaturePrivateKey, 'KeyPackageTBS',
+                KeyPackage.keyPackageTbsBytes(bundle.keyPackage),
+            );
+            bundle.keyPackageBytes = KeyPackage.keyPackageBytes(bundle.keyPackage);
+            return bundle;
+        };
+        const realNow = Date.now;
+        const withClock = async (offsetMs, fn) => {
+            Date.now = () => realNow() + offsetMs;
+            try { return await fn(); } finally { Date.now = realNow; }
+        };
+        const creator = await Group.Group.create({ identity: await freshIdentity() });
+        const pins = await bootstrapPins(creator);
+        const join = (member, result) => Group.Group.joinFromWelcomeWithTree({
+            welcomeMessage: result.welcomeMessage,
+            keyPackageBytes: member.keyPackageBytes,
+            initPrivateKey: member.initKp.privateKey,
+            identity: member.identity,
+            leafEncKeyPair: member.leafEncKp,
+            ratchetTreeBytes: Nodes.ratchetTreeBytes(creator.ratchetTree),
+            expectedSignerLeafIndex: 0,
+            expectedCommitEpoch: creator.epoch - 1n,
+            ...pins,
+        });
+        const bob = await buildKeyPackage();
+        const bobGroup = await join(bob, await creator.commitAddMember({
+            keyPackageBytes: bob.keyPackageBytes,
+        }));
+
+        // Carol's notBefore is the creator's "now": inside the margin.
+        const nowSecs = BigInt(Math.floor(realNow() / 1000));
+        const carol = await withLifetime(nowSecs + 1n);
+        await creator.validateKeyPackageForAdd(carol.keyPackageBytes);
+        const r2 = await creator.commitAddMember({ keyPackageBytes: carol.keyPackageBytes });
+        let bobError = null;
+        await withClock(-3000, async () => {
+            try { await bobGroup.processCommit(r2.commitMessage); } catch (err) { bobError = err; }
+        });
+        assert(bobError === null && bobGroup.epoch === creator.epoch,
+            'a member whose clock is 3 s behind applies the creator Add of a KeyPackage valid from "now"',
+            bobError && bobError.message);
+        const carolGroup = await join(carol, r2);
+        assert(carolGroup.epoch === creator.epoch,
+            'the joiner with the fast clock joins as well');
+
+        // A later joiner with a slow clock imports Carol's historical leaf.
+        const dave = await buildKeyPackage();
+        const r3 = await creator.commitAddMember({ keyPackageBytes: dave.keyPackageBytes });
+        let daveGroup = null;
+        await withClock(-3000, async () => {
+            daveGroup = await join(dave, r3).catch((err) => err);
+        });
+        assert(daveGroup instanceof Group.Group && daveGroup.epoch === creator.epoch,
+            'a joiner whose clock is behind imports a leaf whose notBefore is in its future',
+            daveGroup instanceof Error ? daveGroup.message : '');
+
+        // The creator keeps a bounded margin: a few minutes of skew pass,
+        // hours do not.
+        const nearFuture = await withLifetime(nowSecs + 120n);
+        let nearError = null;
+        try {
+            await creator.validateKeyPackageForAdd(nearFuture.keyPackageBytes);
+        } catch (err) { nearError = err; }
+        assert(nearError === null,
+            'creator admits a KeyPackage whose notBefore is 2 minutes ahead (skew margin)',
+            nearError && nearError.message);
+        const farFuture = await withLifetime(nowSecs + 3600n);
+        let farError = '';
+        try {
+            await creator.validateKeyPackageForAdd(farFuture.keyPackageBytes);
+        } catch (err) { farError = err.message; }
+        assert(farError.includes('not yet valid'),
+            'creator still refuses a KeyPackage valid only from an hour ahead', farError);
+    }
+
     // ---- Bootstrap-PSK binding -------------------------------------------
     // A joiner whose PSK doesn't match the creator's MUST fail Welcome
     // decryption. This is the URL-fragment binding: relay or any party

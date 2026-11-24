@@ -113,9 +113,22 @@
     // right-edge leaves stay blank. This bounds the tree itself.
     const MAX_TREE_LEAVES = 32;
     const MAX_KEY_PACKAGE_LIFETIME_SECONDS = 24n * 60n * 60n;
+    // Clock skew tolerated between a joiner and the creator when the
+    // creator admits a KeyPackage.
+    const KEY_PACKAGE_CLOCK_SKEW_SECONDS = 5n * 60n;
 
+    /**
+     * Validate a KeyPackage Lifetime. The bounded range is checked
+     * everywhere. Only the creator, when it admits a joiner
+     * (`checkClock`), compares the range with its own clock, with a skew
+     * margin on both ends. Existing members applying the creator's signed
+     * Add, and joiners importing the tree, trust that admission: checking
+     * against their own clocks let a joiner whose clock ran ahead (or who
+     * chose notBefore = now) desynchronise any member whose clock was a
+     * second behind, permanently, through an authenticated Commit.
+     */
     function validateKeyPackageLifetimeProfile(
-        lifetime, errorPrefix, requireCurrentlyValid,
+        lifetime, errorPrefix, checkClock,
     ) {
         if (!lifetime || typeof lifetime.notBefore !== 'bigint'
             || typeof lifetime.notAfter !== 'bigint') {
@@ -130,15 +143,15 @@
                 `${errorPrefix}: Lifetime exceeds the 24-hour profile maximum`,
             );
         }
+        if (!checkClock) return;
         const nowSecs = BigInt(Math.floor(Date.now() / 1000));
-        if (nowSecs < lifetime.notBefore) {
+        if (nowSecs + KEY_PACKAGE_CLOCK_SKEW_SECONDS < lifetime.notBefore) {
             throw new Error(
                 `${errorPrefix}: Lifetime not yet valid `
                 + `(now=${nowSecs} < notBefore=${lifetime.notBefore})`,
             );
         }
-        if (!requireCurrentlyValid) return;
-        if (nowSecs >= lifetime.notAfter) {
+        if (nowSecs - KEY_PACKAGE_CLOCK_SKEW_SECONDS >= lifetime.notAfter) {
             throw new Error(
                 `${errorPrefix}: Lifetime expired `
                 + `(now=${nowSecs} >= notAfter=${lifetime.notAfter})`,
@@ -1417,7 +1430,9 @@
         async function validateKeyPackageForAdd(keyPackageBytes) {
             try {
             const kp = KeyPackage.parseKeyPackage(keyPackageBytes);
-            await verifyKeyPackageBindings(kp, 'validateKeyPackageForAdd');
+            await verifyKeyPackageBindings(
+                kp, 'validateKeyPackageForAdd', { admission: true },
+            );
             const position = addLeafWithinProfile(
                 this.ratchetTree, kp.leafNode, 'validateKeyPackageForAdd',
             );
@@ -1541,7 +1556,9 @@
         // an attacker-controlled leaf into the tree. The signing key is
         // taken from kp.leafNode.signatureKey because our credential model
         // ties identity to the signature key directly.
-        await verifyKeyPackageBindings(kp, 'commitAddMember');
+        await verifyKeyPackageBindings(
+            kp, 'commitAddMember', { admission: true },
+        );
 
         // ---- 1. Compute new tree shape, insert new leaf ----
         // RFC 9420 section 12.1.1: the leftmost blank leaf (one left by Remove) is
@@ -3651,13 +3668,13 @@
                 credentials: [Nodes.CredentialType.BASIC],
             },
             leafNodeSource,
-            // KEY_PACKAGE variant needs a Lifetime per RFC §7.2.3.
+            // KEY_PACKAGE variant needs a Lifetime (RFC 9420 section 7.2).
             // We bind it to a 24-hour window around publication; the
-            // recipient validates `now ∈ [notBefore, notAfter)` so an
-            // old or replayed KeyPackage is rejected even if its
-            // signature is intact. Rooms have a hard TTL ≤ 24h so
-            // this matches the operational lifetime of any valid
-            // KeyPackage in flight.
+            // creator, when it admits the joiner, checks that now lies in
+            // [notBefore, notAfter) up to a clock-skew margin, so an old
+            // or replayed KeyPackage is rejected even if its signature is
+            // intact. Rooms have a hard TTL of at most 24h so this matches
+            // the operational lifetime of any valid KeyPackage in flight.
             lifetime: leafNodeSource === Nodes.LeafNodeSource.KEY_PACKAGE
                 ? (() => {
                     const nowSecs = BigInt(Math.floor(Date.now() / 1000));
@@ -3681,9 +3698,14 @@
      * our credential model identifies a member by their signature key,
      * so a forgery would have to forge ECDSA-P-256.
      *
+     * `admission` is true only where the creator admits a joiner; it adds
+     * the clock check of the Lifetime (validateKeyPackageLifetimeProfile).
+     *
      * Throws on any mismatch; returns void on success.
      */
-    async function verifyKeyPackageBindings(kp, errorPrefix = 'verifyKeyPackage') {
+    async function verifyKeyPackageBindings(
+        kp, errorPrefix = 'verifyKeyPackage', { admission = false } = {},
+    ) {
         if (kp.version !== PROTOCOL_VERSION) {
             throw new Error(
                 `${errorPrefix}: protocol version ${kp.version} does not match MLS 1.0`,
@@ -3699,11 +3721,12 @@
                 `${errorPrefix}: expected source=KEY_PACKAGE, got ${kp.leafNode.leafNodeSource}`,
             );
         }
-        // RFC §7.2.3: enforce now ∈ [notBefore, notAfter). Rejects
-        // replayed KeyPackages from a former member trying to rejoin
-        // off a captured invite.
+        // RFC 9420 section 7.2: the creator, admitting a joiner, enforces
+        // now in [notBefore, notAfter) with a clock-skew margin; this
+        // rejects a replayed KeyPackage from a former member. Members
+        // applying the signed Add check only the bounded range.
         validateKeyPackageLifetimeProfile(
-            kp.leafNode.lifetime, errorPrefix, true,
+            kp.leafNode.lifetime, errorPrefix, admission,
         );
         const sigPub = await validateLeafNodeProfile(
             kp.leafNode, 'KeyPackage leaf', errorPrefix,
@@ -4258,7 +4281,8 @@
             // Historical KeyPackage-source leaves remain part of the
             // authenticated tree after their admission Lifetime expires.
             // Enforce the same bounded profile as a fresh Add without
-            // incorrectly requiring the old interval to include "now".
+            // comparing the interval with this joiner's clock: the creator
+            // checked it when it admitted the leaf.
             validateKeyPackageLifetimeProfile(
                 leaf.lifetime, `imported-tree: leaf ${leafIndex}`, false,
             );
