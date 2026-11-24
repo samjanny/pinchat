@@ -89,6 +89,36 @@ async function makeGroup({ livenessGraceMs } = {}) {
     return { creator, joiner, creatorOut, joinerOut, creatorEvents, joinerEvents };
 }
 
+/** Admit one more member into a group built by makeGroup. */
+async function addJoiner(g, senderId) {
+    const out = [];
+    const events = [];
+    const pins = g.creator.bootstrapPins;
+    const session = new MLSSession({
+        role: 'joiner',
+        send: (envelope) => { out.push(envelope); return true; },
+        onEvent: (event) => events.push(event),
+        pskSecret: PSK,
+        expectedGroupId: pins.groupId,
+        expectedCreatorKeyHash: pins.creatorKeyHash,
+        relaySenderId: senderId,
+    });
+    await session.start();
+    const creatorBefore = g.creatorOut.length;
+    const keyPackage = out.find((e) => e.wire_format === WireFormat.MLS_KEY_PACKAGE);
+    await g.creator.onRelayEnvelope({ ...keyPackage, sender_id: senderId });
+    const commit = g.creatorOut.slice(creatorBefore)
+        .find((e) => e.wire_format === WireFormat.MLS_PUBLIC_MESSAGE);
+    await g.creator.onRelayEnvelope({ ...commit, sender_id: 'creator-self' });
+    await g.joiner.onRelayEnvelope({ ...commit, sender_id: 'creator-self' });
+    await session.onRelayEnvelope({ ...commit, sender_id: 'creator-self' });
+    const welcome = g.creatorOut.slice(creatorBefore)
+        .find((e) => e.wire_format === WireFormat.MLS_WELCOME);
+    await session.onRelayEnvelope({ ...welcome, sender_id: 'creator-self' });
+    assert.strictEqual(session.state, 'joined');
+    return { session, out, events };
+}
+
 const privateMessages = (out) => out.filter((e) => e.wire_format === WireFormat.MLS_PRIVATE_MESSAGE);
 const commitsAfter = (out, n) => out.slice(n).filter((e) => e.wire_format === WireFormat.MLS_PUBLIC_MESSAGE);
 
@@ -148,20 +178,147 @@ async function main() {
         g.creator._clearLivenessChallenges();
     }
 
-    // 4. Ordinary authenticated traffic from the member also cancels it.
+    // 4. M-01: only a pong carrying the challenge's nonce proves presence.
+    // Ordinary traffic from the suspected leaf may have been written before
+    // the departure and held back, so it does not cancel the challenge, and
+    // neither does a pong for some other nonce.
     {
-        const g = await makeGroup({ livenessGraceMs: 60 });
-        await g.creator.requestRemovalAfterLivenessCheck('joiner-1');
+        const g = await makeGroup({ livenessGraceMs: 120 });
         const jb = g.joinerOut.length;
-        await g.joiner.sendMessage('still here');
-        const msg = privateMessages(g.joinerOut.slice(jb))[0];
-        await g.creator.onRelayEnvelope({ ...msg, sender_id: 'joiner-1' });
-        check('any authenticated message from the suspected leaf cancels the challenge',
+        await g.joiner.sendMessage('written before leaving');
+        const early = privateMessages(g.joinerOut.slice(jb))[0];
+        await g.creator.requestRemovalAfterLivenessCheck('joiner-1');
+        await g.creator.onRelayEnvelope({ ...early, sender_id: 'joiner-1' });
+        check('a late ordinary message from the suspected leaf is not a presence proof',
+            g.creator._livenessChallenges.size === 1
+            && !g.creatorEvents.some((e) => e.kind === 'liveness-confirmed')
+            && g.creatorEvents.some((e) => e.kind === 'message'
+                && e.text === 'written before leaving'));
+        const wrongNonce = new Uint8Array(17);
+        wrongNonce[0] = 0x04;
+        const jb2 = g.joinerOut.length;
+        await g.joiner._serializeOperation(
+            () => g.joiner._sendApplicationPayload(wrongNonce),
+        );
+        const stalePong = privateMessages(g.joinerOut.slice(jb2))[0];
+        await g.creator.onRelayEnvelope({ ...stalePong, sender_id: 'joiner-1' });
+        check('a pong with another nonce does not cancel the challenge',
+            g.creator._livenessChallenges.size === 1);
+        await sleep(300);
+        check('silence after the ping still ends in a Remove',
+            g.creatorEvents.some((e) => e.kind === 'liveness-timeout')
+            && g.creator._pendingCommit?.kind === 'remove');
+        g.creator._clearLivenessChallenges();
+    }
+
+    // 4b. M-07: a ping that never left the tab cannot justify a Remove. The
+    // creator retries until the ping is sent and waits a full grace window
+    // after that.
+    {
+        const g = await makeGroup({ livenessGraceMs: 40 });
+        const outBefore = g.creatorOut.length;
+        g.creator._localCommitBusy = true; // blocks pings like a pending Commit
+        await g.creator.requestRemovalAfterLivenessCheck('joiner-1');
+        await sleep(200); // several grace windows, every ping blocked
+        check('no Remove while every ping attempt was blocked',
+            commitsAfter(g.creatorOut, outBefore).length === 0
+            && !g.creatorEvents.some((e) => e.kind === 'liveness-timeout')
+            && g.creator._livenessChallenges.get('joiner-1')?.pingSent === false
+            && privateMessages(g.creatorOut.slice(outBefore)).length === 0);
+        g.creator._localCommitBusy = false;
+        // Run the next retry now, with a long window so the answer below
+        // cannot race the timer.
+        g.creator._livenessGraceMs = 10000;
+        await g.creator._serializeOperation(
+            () => g.creator._expireLivenessChallenge('joiner-1'),
+        );
+        const pings = privateMessages(g.creatorOut.slice(outBefore));
+        check('the ping is sent once the creator is free again',
+            pings.length === 1
+            && g.creator._livenessChallenges.get('joiner-1')?.pingSent === true
+            && commitsAfter(g.creatorOut, outBefore).length === 0);
+        const jb = g.joinerOut.length;
+        await g.joiner.onRelayEnvelope({ ...pings[0], sender_id: 'creator-self' });
+        const pong = privateMessages(g.joinerOut.slice(jb))[0];
+        await g.creator.onRelayEnvelope({ ...pong, sender_id: 'joiner-1' });
+        check('the answer to that ping keeps the member',
             g.creator._livenessChallenges.size === 0
-            && g.creatorEvents.some((e) => e.kind === 'liveness-confirmed'));
-        await sleep(120);
-        check('no Remove follows once liveness was proven',
-            g.creator._leafBySenderId.get('joiner-1') === 1 && g.creator._pendingCommit === null);
+            && g.creator._leafBySenderId.get('joiner-1') === 1
+            && g.creator._pendingCommit === null);
+        g.creator._clearLivenessChallenges();
+    }
+
+    // 4c. M-01: a member re-encrypting another member's signed message at
+    // that sender's next generations. Every member holds every sender's
+    // SecretTree chain, so only the signed generation inside the content
+    // stops the copy. The copy is refused, the sender's real next message
+    // still decrypts, and the copy cannot answer a liveness challenge.
+    {
+        const g = await makeGroup({ livenessGraceMs: 80 });
+        const mal = await addJoiner(g, 'mallory');
+        const { MLS } = global;
+        const aLeaf = g.joiner.group.myLeafIndex;
+        const jb = g.joinerOut.length;
+        await g.joiner.sendMessage('I approve the transfer');
+        const original = privateMessages(g.joinerOut.slice(jb))[0];
+        const scratch = mal.session.group.forkForPendingCommit();
+        const decoded = await MLS.PrivateMessage.decryptPrivateMessage({
+            pm: MLS.PrivateMessage.parsePrivateMessage(
+                MLS.Codec.base64UrlToBytes(original.payload),
+            ),
+            senderDataSecret: scratch.epochSecrets.senderDataSecret,
+            nLeaves: scratch.nLeaves,
+            keyNonceProvider: (l, w, gen) => scratch._chainKeyNonce(l, w, gen),
+        });
+        scratch.destroySecrets();
+        await g.creator.onRelayEnvelope({ ...original, sender_id: 'joiner-1' });
+        await mal.session.onRelayEnvelope({ ...original, sender_id: 'joiner-1' });
+        const forge = async () => {
+            const group = mal.session.group;
+            const pm = await MLS.PrivateMessage.encryptPrivateMessage({
+                groupId: group.groupId,
+                epoch: group.epoch,
+                contentType: MLS.Framing.ContentType.APPLICATION,
+                authenticatedData: new Uint8Array(0),
+                payloadBytes: decoded.content.payloadBytes,
+                auth: { signature: decoded.content.auth.signature },
+                senderData: {
+                    leafIndex: aLeaf,
+                    generation: group._chainStates.get(`${aLeaf}:application`).nextGeneration,
+                    reuseGuard: new Uint8Array([9, 9, 9, 9]),
+                },
+                paddingLen: 0,
+                senderDataSecret: group.epochSecrets.senderDataSecret,
+                nLeaves: group.nLeaves,
+                keyNonceProvider: (l, w, gen) => group._chainKeyNonce(l, w, gen),
+            });
+            return {
+                type: 'mls',
+                wire_format: WireFormat.MLS_PRIVATE_MESSAGE,
+                payload: MLS.Codec.bytesToBase64Url(
+                    MLS.PrivateMessage.privateMessageBytes(pm),
+                ),
+            };
+        };
+        const messagesBefore = g.creatorEvents.filter((e) => e.kind === 'message').length;
+        await g.creator.onRelayEnvelope({ ...(await forge()), sender_id: 'mallory' });
+        const shown = g.creatorEvents.filter((e) => e.kind === 'message');
+        check('a re-encrypted copy at the next generation is refused',
+            shown.length === messagesBefore
+            && g.creatorEvents.some((e) => e.kind === 'error'
+                && e.reason.includes('signed generation')));
+        const jb2 = g.joinerOut.length;
+        await g.joiner.sendMessage('WAIT - I revoke that');
+        const real = privateMessages(g.joinerOut.slice(jb2))[0];
+        await g.creator.onRelayEnvelope({ ...real, sender_id: 'joiner-1' });
+        check("the sender's real next message is still accepted",
+            g.creatorEvents.filter((e) => e.kind === 'message').at(-1)?.text
+                === 'WAIT - I revoke that');
+        await g.creator.requestRemovalAfterLivenessCheck('joiner-1');
+        await g.creator.onRelayEnvelope({ ...(await forge()), sender_id: 'mallory' });
+        check('a forged copy does not answer the liveness challenge',
+            g.creator._livenessChallenges.size === 1
+            && !g.creatorEvents.some((e) => e.kind === 'liveness-confirmed'));
         g.creator._clearLivenessChallenges();
     }
 

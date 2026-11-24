@@ -416,6 +416,45 @@
     // and the whole context is zeroed at expiry or on the next Commit.
     const PREV_EPOCH_GRACE_MS = 60 * 1000;
 
+    // Signed generation binding (PinChat profile). Every member holds every
+    // sender's SecretTree chain, and the FramedContent signature does not
+    // cover the sender_data generation, so any member could otherwise
+    // re-encrypt another member's signed message under that sender's next
+    // generations: receivers would accept the copies as fresh and reject
+    // the sender's real messages as replays. The application content
+    // therefore starts with the sender's generation (u32, big-endian),
+    // inside the signed and encrypted payload, and a receiver accepts it
+    // only at that exact generation.
+    const GENERATION_BINDING_BYTES = 4;
+
+    function bindGeneration(generation, payload) {
+        if (!Number.isInteger(generation) || generation < 0
+            || generation > 0xffffffff) {
+            throw new Error(`group: invalid sender generation ${generation}`);
+        }
+        const out = new Uint8Array(GENERATION_BINDING_BYTES + payload.length);
+        new DataView(out.buffer).setUint32(0, generation, false);
+        out.set(payload, GENERATION_BINDING_BYTES);
+        return out;
+    }
+
+    function unbindGeneration(content, generation) {
+        if (!(content instanceof Uint8Array)
+            || content.length < GENERATION_BINDING_BYTES) {
+            throw new Error('group: application content lacks its signed generation');
+        }
+        const signed = new DataView(
+            content.buffer, content.byteOffset, GENERATION_BINDING_BYTES,
+        ).getUint32(0, false);
+        if (signed !== generation) {
+            throw new Error(
+                `group: signed generation ${signed} does not match sender_data `
+                + `generation ${generation} (re-encrypted copy of an earlier message)`,
+            );
+        }
+        return content.slice(GENERATION_BINDING_BYTES);
+    }
+
     // --- Group class ------------------------------------------------------
 
     class Group {
@@ -431,8 +470,11 @@
             // pairs we have already accepted. Reset on every epoch
             // transition; cap per-leaf to bound memory growth. With the
             // stateful chains below this is defense-in-depth: the chain
-            // state itself rejects replays because consumed keys are
-            // deleted and cannot be re-derived.
+            // state itself rejects a replayed ciphertext because consumed
+            // keys are deleted and cannot be re-derived. That alone does
+            // not stop a member, who holds every sender's chain, from
+            // re-encrypting a signed message at a later generation; the
+            // signed generation binding (bindGeneration) does.
             this.consumedByLeaf = new Map();
             // Stateful per-sender secret-tree chains (intra-epoch forward
             // secrecy). Keyed by `${leafIndex}:${which}`; each entry holds
@@ -1018,9 +1060,10 @@
                 sender: { senderType: Framing.SenderType.MEMBER, leafIndex: this.myLeafIndex },
                 authenticatedData: new Uint8Array(0),
                 contentType: Framing.ContentType.APPLICATION,
-                payload: plaintext instanceof Uint8Array
+                // The signature below covers the generation prefix.
+                payload: bindGeneration(generation, plaintext instanceof Uint8Array
                     ? plaintext
-                    : new TextEncoder().encode(String(plaintext)),
+                    : new TextEncoder().encode(String(plaintext))),
             };
 
             const signature = await PublicMessage.signFramedContent(
@@ -1162,6 +1205,11 @@
                 if (!sigOk) {
                     throw new Error('group: application message signature invalid');
                 }
+                // A member may hold the sender's chain; only the signed
+                // generation proves this is not a re-encrypted copy.
+                const plaintext = unbindGeneration(
+                    out.content.payloadBytes, generation,
+                );
 
                 // No asynchronous or fallible validation follows this point.
                 // Swap the staged chain in one step, then destroy the
@@ -1174,7 +1222,7 @@
                 this._markGenerationConsumed(senderLeafIndex, generation);
 
                 return {
-                    plaintext: out.content.payloadBytes,
+                    plaintext,
                     senderLeafIndex,
                     senderSignatureKey: Uint8Array.from(senderLeaf.signatureKey),
                 };
@@ -1261,6 +1309,9 @@
                 if (!sigOk) {
                     throw new Error('group: application message signature invalid (prev epoch)');
                 }
+                const plaintext = unbindGeneration(
+                    out.content.payloadBytes, generation,
+                );
 
                 if (this._prevEpoch !== pe || pe.chainStates !== baseChainStates) {
                     throw new Error('group: concurrent previous-epoch receive-ratchet mutation');
@@ -1274,7 +1325,7 @@
                 consumedSet.add(generation);
 
                 return {
-                    plaintext: out.content.payloadBytes,
+                    plaintext,
                     senderLeafIndex,
                     senderSignatureKey: Uint8Array.from(senderLeaf.signatureKey),
                 };

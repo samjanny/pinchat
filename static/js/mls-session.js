@@ -71,7 +71,6 @@
     const PAYLOAD_LIVENESS_PONG = 0x04;
     const LIVENESS_NONCE_BYTES = 16;
     const DEFAULT_LIVENESS_GRACE_MS = 20 * 1000;
-    const MAX_LIVENESS_PING_ATTEMPTS = 2;
     const CREATOR_LEAF_INDEX = 0;
     const BOOTSTRAP_PIN_BYTES = 32;
     const BOOTSTRAP_PROOF_BYTES = 32;
@@ -2039,10 +2038,6 @@
                 attributionWarning = true;
             }
 
-            // Any authenticated message from a leaf is proof it is alive, so a
-            // pending challenge for it is answered by ordinary traffic too.
-            this._noteLeafAlive(senderLeafIndex);
-
             if (pt.length === 0) {
                 this.onEvent({ kind: 'error', reason: 'empty application payload' });
                 return;
@@ -2053,9 +2048,11 @@
                 return;
             }
             if (tag === PAYLOAD_LIVENESS_PONG) {
-                // Liveness was already credited above from the authenticated
-                // sender leaf; the nonce only says which challenge it answers,
-                // and a stale or foreign nonce is simply ignored.
+                // Only an authenticated pong from the challenged leaf that
+                // carries the challenge's fresh nonce proves presence. Other
+                // traffic from that leaf is not a proof: it may have been
+                // written before the departure and delivered late.
+                this._acceptLivenessPong(pt, senderLeafIndex);
                 return;
             }
             if (tag === PAYLOAD_TEXT) {
@@ -2437,10 +2434,13 @@
         /**
          * Transport-driven removal (issue #1). The relay says `senderId` has
          * left. Instead of committing a Remove on that word alone, challenge
-         * the member over MLS and remove only if it stays silent for the
-         * grace window. A relay that forged the departure must now suppress
-         * the member's authenticated reply for the whole window, and the
-         * creator is told when a "departed" member answers.
+         * the member over MLS and remove only if no authenticated pong
+         * carrying this challenge's fresh nonce arrives within the grace
+         * window that follows a ping actually sent. A relay that forged the
+         * departure must now suppress the member's reply for the whole
+         * window, and the creator is told when a "departed" member answers.
+         * Other traffic from that leaf is not a presence proof: it may have
+         * been written before the departure and delivered late.
          *
          * Falls straight through to removeMemberBySenderId when there is no
          * live leaf to challenge (deferred KeyPackage, pending Add, tombstone
@@ -2511,9 +2511,11 @@
                 this._livenessChallenges.delete(senderId);
                 return;
             }
-            // Never remove on a challenge the member could not have seen: if
-            // the ping was blocked by a pending Commit, try once more first.
-            if (!challenge.pingSent && challenge.attempts < MAX_LIVENESS_PING_ATTEMPTS) {
+            // Never remove on a challenge the member could not have seen. A
+            // ping blocked by a pending Commit (or a failed send) is retried,
+            // and the full grace window starts again from the attempt; only
+            // silence after a ping that actually left this tab removes.
+            if (!challenge.pingSent) {
                 await this._sendLivenessPing(senderId, challenge);
                 this._armLivenessTimer(senderId, challenge);
                 return;
@@ -2547,11 +2549,17 @@
             }
         }
 
-        _noteLeafAlive(leafIndex) {
+        _acceptLivenessPong(pt, senderLeafIndex) {
+            if (pt.length !== 1 + LIVENESS_NONCE_BYTES) return;
+            const nonce = pt.subarray(1);
             for (const [senderId, challenge] of this._livenessChallenges) {
-                if (challenge.leafIndex !== leafIndex) continue;
+                if (challenge.leafIndex !== senderLeafIndex
+                    || !challenge.pingSent
+                    || !equalBytes(challenge.nonce, nonce)) continue;
                 this._cancelLivenessChallenge(senderId);
-                this.onEvent({ kind: 'liveness-confirmed', senderId, leafIndex });
+                this.onEvent({
+                    kind: 'liveness-confirmed', senderId, leafIndex: senderLeafIndex,
+                });
             }
         }
 
