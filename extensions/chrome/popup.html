@@ -12,6 +12,7 @@
             --accent-dark:    #2f6fe8;
             --success:        #2dd4a4;
             --warning:        #f6a157;
+            --caution:        #facc15;
             --error:          #ff6b83;
             --error-dark:     #e04a64;
 
@@ -128,7 +129,7 @@
         }
 
         .status-verified { color: var(--success); }
-        .status-partial  { color: var(--accent); }
+        .status-partial  { color: var(--caution); }
         .status-failed   { color: var(--error); }
         .status-error    { color: var(--warning); }
         .status-checking { color: var(--accent); }
@@ -137,6 +138,13 @@
         .last-check {
             font-size: 11px;
             color: var(--text-light);
+            margin-top: 10px;
+        }
+
+        .status-note {
+            font-size: 12px;
+            line-height: 1.45;
+            color: var(--caution);
             margin-top: 10px;
         }
 
@@ -175,6 +183,14 @@
         .detail-value {
             font-weight: 600;
         }
+
+        /* The outcome of each check: passed, limited by the browser, could
+         * not be made, failed, not known yet. */
+        .detail-value.check-ok      { color: var(--success); }
+        .detail-value.check-limited { color: var(--caution); }
+        .detail-value.check-missing { color: var(--warning); }
+        .detail-value.check-failed  { color: var(--error); }
+        .detail-value.check-pending { color: var(--text-light); }
 
         .mismatches {
             padding: 14px 20px;
@@ -351,7 +367,7 @@
 </head>
 <body>
     <div id="not-on-site-banner" class="not-on-site-banner is-hidden">
-        This tab is not on pinchat.io - <a href="https://pinchat.io" target="_blank" rel="noopener">Visit site</a>
+        This tab is not on pinchat.im - <a href="https://pinchat.im" target="_blank" rel="noopener">Visit site</a>
     </div>
     <div class="header">
         <div class="brand">
@@ -364,6 +380,7 @@
     <div class="status-card">
         <div id="status-icon" class="status-icon status-unknown">?</div>
         <div id="status-text" class="status-text">Loading...</div>
+        <div id="status-note" class="status-note is-hidden"></div>
         <div id="status-scope" class="last-check"></div>
     </div>
 

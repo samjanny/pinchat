@@ -34,7 +34,7 @@
 // 2. Users can verify the extension code matches the open-source repository
 // 3. An attacker who compromises only the server CANNOT change these values
 // 4. The public key can only be changed by releasing a new extension version
-// 5. This creates a "trust anchor" that is independent of the pinchat.io server
+// 5. This creates a "trust anchor" that is independent of the pinchat.im server
 //
 // FOR SELF-HOSTED INSTANCES:
 // If you are running your own PinChat instance, you MUST:
@@ -45,19 +45,19 @@
 //
 // =============================================================================
 
-// Official PinChat.io public key - DO NOT MODIFY for official pinchat.io usage
+// Official PinChat public key - DO NOT MODIFY for official pinchat.im usage
 const PINCHAT_PUBLIC_KEY = `-----BEGIN PUBLIC KEY-----
 MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAExkuEOYHEQQfDqsyO+uamOnf5b/AH
 OqRJNIZ5zBHCr2HbJsHCtrPQUOKd4cBqfDZlQZ62rzF7ofA39ITBUyLxaA==
 -----END PUBLIC KEY-----`;
 
-// Official domain - DO NOT MODIFY for official pinchat.io usage
-const OFFICIAL_DOMAIN = 'pinchat.io';
+// Official domain - DO NOT MODIFY for official pinchat.im usage
+const OFFICIAL_DOMAIN = 'pinchat.im';
 // The only origins whose pages are treated as PinChat. Keep in step with
 // OFFICIAL_ORIGINS in content.js and popup.js.
 const OFFICIAL_ORIGINS = [`https://${OFFICIAL_DOMAIN}`, `https://www.${OFFICIAL_DOMAIN}`];
 
-// Official GitHub repository for manifest - DO NOT MODIFY for official pinchat.io usage
+// Official GitHub repository for manifest - DO NOT MODIFY for official pinchat.im usage
 const GITHUB_REPO = 'samjanny/pinchat';
 // F-15: pin the manifest URL to a release tag, not a mutable branch.
 // Rationale: an attacker with GitHub-write access (account takeover, malicious
@@ -70,7 +70,7 @@ const GITHUB_REPO = 'samjanny/pinchat';
 // release. A server-side release that does NOT ship a new extension keeps
 // using the previous pinned manifest - that is the intended behaviour and
 // reinforces the trust anchor.
-const GITHUB_TAG = 'v0.9.1';
+const GITHUB_TAG = 'v0.9.2';
 
 // Minimum acceptable manifest sequence: a hardcoded floor that defeats replay
 // attacks against fresh installs, where lastKnownSequence in storage is 0.
@@ -90,7 +90,7 @@ const GITHUB_TAG = 'v0.9.1';
 // already-installed builds (they carry their own baked-in floor and tag) but
 // it means the NEXT extension release must cut a tag containing the current
 // manifest and update GITHUB_TAG in the same commit.
-const MIN_KNOWN_SEQUENCE = 56;
+const MIN_KNOWN_SEQUENCE = 57;
 
 // Configuration
 const CONFIG = {
@@ -538,7 +538,7 @@ function isPinChatUrl(url) {
     if (!url) return false;
     try {
         // Compare the whole origin. Hostname alone also accepted
-        // http://pinchat.io and https://pinchat.io:<any port>, which are
+        // http://pinchat.im and https://pinchat.im:<any port>, which are
         // other origins: the packaged CSP rules do not cover them and the
         // signed manifest says nothing about what they serve.
         return OFFICIAL_ORIGINS.includes(new URL(url).origin);
@@ -597,10 +597,17 @@ function publicView(record) {
 }
 
 function setBadge(tabId, record) {
-    const badge = record ? V.badge(record.integrity, record.attention) : { text: '', color: '#6b7280' };
+    const badge = record
+        ? V.badge(record.integrity, record.attention)
+        : { text: '', color: '#6b7280', textColor: '#ffffff' };
     try {
         ext.action.setBadgeText({ text: badge.text, tabId });
         ext.action.setBadgeBackgroundColor({ color: badge.color, tabId });
+        // Set for every state, not only the yellow one: the color is kept
+        // per tab, and a dark text must not stay on the next badge.
+        if (typeof ext.action.setBadgeTextColor === 'function') {
+            ext.action.setBadgeTextColor({ color: badge.textColor, tabId });
+        }
     } catch {
         /* tab closed */
     }

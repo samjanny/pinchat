@@ -759,7 +759,7 @@ Step 5 is still a separate fetch. For scripts that does not matter, because step
 │                    SRI-BASED INTEGRITY VERIFICATION                     │
 ├─────────────────────────────────────────────────────────────────────────┤
 │                                                                         │
-│   GitHub Repository                    pinchat.io Server                │
+│   GitHub Repository                    pinchat.im Server                │
 │   (Out-of-band source)                 (Potentially compromised)        │
 │   ┌──────────────────┐                 ┌──────────────────────────────┐ │
 │   │hashes.json.signed│                 │  HTML with SRI attributes    │ │
@@ -886,7 +886,7 @@ describes every state and what each may be based on.
 | Condition | State | What the user sees |
 |-----------|-------|--------------------|
 | Page bytes match the signed hash, policy in force (Firefox) | Verified | Green badge |
-| Policy in force, page not attestable (Chromium) | Partially verified | Blue badge |
+| Policy in force, page not attestable (Chromium) | Partially verified | Yellow check badge; the popup says a complete check is currently possible only in Firefox |
 | Page bytes differ from the signed hash (Firefox) | Failed | Block page, red overlay without dismiss |
 | A file served to the extension differs from its signed hash | Failed | Red overlay without dismiss |
 | Unsigned stylesheet from the site loaded | Failed | Red overlay without dismiss |
@@ -936,7 +936,7 @@ If you discover a security vulnerability in PinChat, please report it responsibl
 
 Report vulnerabilities via:
 - GitHub Security Advisories (preferred)
-- Email: security@pinchat.io
+- Email: security@pinchat.im
 
 ### What to Include
 

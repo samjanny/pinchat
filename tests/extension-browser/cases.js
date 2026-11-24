@@ -503,9 +503,9 @@ module.exports = [
         title: 'same host on another port, altered HTML',
         async run(t) {
             const browser = await t.launch();
-            const url = `https://pinchat.io:8444/static/chat.html?room=${t.urls.ROOM}&poc=handler`;
+            const url = `https://pinchat.im:8444/static/chat.html?room=${t.urls.ROOM}&poc=handler`;
             const visit = await t.visit(browser, url, 4000);
-            const state = await t.verifierState(browser, 'https://pinchat.io:8444/');
+            const state = await t.verifierState(browser, 'https://pinchat.im:8444/');
             t.report(summary(visit, t, { 'verifier state': stateLabel(state) }), [
                 ['attacker code did not run', 'must', !visit.page.attacker],
                 ['a warning is shown', 'must', !!visit.page.overlay || !!visit.page.blockPage],

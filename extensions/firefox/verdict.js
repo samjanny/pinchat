@@ -258,22 +258,47 @@
         return { integrity: INTEGRITY.PARTIAL, attention };
     }
 
-    /** Badge shown on the toolbar button for a tab. Green only for VERIFIED. */
+    /**
+     * Badge shown on the toolbar button for a tab. Green only for VERIFIED.
+     * VERIFIED and PARTIAL are both a check mark and differ by color: green
+     * when the page itself was compared with the signed release, yellow when
+     * what could be checked passed and the page itself could not be checked
+     * in this browser. The yellow badge has dark text, since white does not
+     * read on yellow.
+     */
     function badge(integrity, attention) {
+        const WHITE = '#ffffff';
         switch (integrity) {
         case INTEGRITY.VERIFIED:
-            return attention ? { text: '!', color: '#f59e0b' } : { text: 'OK', color: '#16a34a' };
+            return attention
+                ? { text: '!', color: '#f59e0b', textColor: WHITE }
+                : { text: '\u2713', color: '#16a34a', textColor: WHITE };
         case INTEGRITY.PARTIAL:
-            return attention ? { text: '!', color: '#f59e0b' } : { text: '~', color: '#2563eb' };
+            return attention
+                ? { text: '!', color: '#f59e0b', textColor: WHITE }
+                : { text: '\u2713', color: '#facc15', textColor: '#111827' };
         case INTEGRITY.FAILED:
-            return { text: '!', color: '#dc2626' };
+            return { text: '!', color: '#dc2626', textColor: WHITE };
         case INTEGRITY.UNVERIFIABLE:
-            return { text: '?', color: '#f59e0b' };
+            return { text: '?', color: '#f59e0b', textColor: WHITE };
         case INTEGRITY.CHECKING:
-            return { text: '...', color: '#6b7280' };
+            return { text: '...', color: '#6b7280', textColor: WHITE };
         default:
-            return { text: '', color: '#6b7280' };
+            return { text: '', color: '#6b7280', textColor: WHITE };
         }
+    }
+
+    /**
+     * What the popup says under the headline of a state, beyond the scope
+     * line. Only PARTIAL has one: it is the best state this browser can reach,
+     * and the user should know where a complete check is available.
+     */
+    function headlineNote(integrity) {
+        if (integrity === INTEGRITY.PARTIAL) {
+            return 'A complete check, which also compares the page itself with the signed release, '
+                + 'is currently possible only in Firefox.';
+        }
+        return '';
     }
 
     /** One-line headline for a state, as shown in the popup. */
@@ -380,6 +405,7 @@
         decide,
         badge,
         headline,
+        headlineNote,
         isAllowedRedirect,
         EXTERNAL_REDIRECT_TARGETS,
         documentUrl,

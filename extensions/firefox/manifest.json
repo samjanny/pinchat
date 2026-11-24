@@ -1,8 +1,8 @@
 {
     "manifest_version": 3,
     "name": "PinChat Integrity Verifier",
-    "version": "1.5.1",
-    "description": "Prevents untrusted scripts and verifies pinchat.io files against signed hashes",
+    "version": "1.6.0",
+    "description": "Prevents untrusted scripts and verifies pinchat.im files against signed hashes",
     "permissions": [
         "storage",
         "alarms",
@@ -12,8 +12,8 @@
         "webRequestFilterResponse"
     ],
     "host_permissions": [
-        "https://pinchat.io/*",
-        "https://www.pinchat.io/*",
+        "https://pinchat.im/*",
+        "https://www.pinchat.im/*",
         "https://raw.githubusercontent.com/samjanny/pinchat/*"
     ],
     "background": {
@@ -30,7 +30,7 @@
     },
     "content_scripts": [
         {
-            "matches": ["https://pinchat.io/*", "https://www.pinchat.io/*"],
+            "matches": ["https://pinchat.im/*", "https://www.pinchat.im/*"],
             "js": ["verdict.js", "content.js"],
             "run_at": "document_start",
             "all_frames": true
@@ -60,7 +60,7 @@
     "web_accessible_resources": [
         {
             "resources": ["warning.css"],
-            "matches": ["https://pinchat.io/*", "https://www.pinchat.io/*"]
+            "matches": ["https://pinchat.im/*", "https://www.pinchat.im/*"]
         }
     ]
 }

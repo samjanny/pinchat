@@ -3,7 +3,7 @@
  *
  * When an unauthenticated user clicks an invite link such as
  *
- *   https://pinchat.io/c/<uuid>#key=<base64url>
+ *   https://<host>/c/<uuid>#key=<base64url>
  *
  * the server-side `require_auth` middleware redirects them to
  *

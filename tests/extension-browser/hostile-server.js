@@ -75,7 +75,7 @@ const REDIRECTS = {
     'cross-fragment': () => `https://${ATTACKER_HOST}/collect#chosen-by-server`,
     'scheme-relative': () => `//${ATTACKER_HOST}/collect`,
     backslash: () => `/\\${ATTACKER_HOST}/collect`,
-    port: () => 'https://pinchat.io:8444/collect',
+    port: () => 'https://pinchat.im:8444/collect',
     // Two hops that stay on the site, then off it.
     chain: () => '/static/hop1',
     // The release page, which a navigation without a fragment may reach.

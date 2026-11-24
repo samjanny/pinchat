@@ -13,10 +13,10 @@ function loadChatStore() {
     const windowObject = {
         location: {
             search: '?room=test-room',
-            href: 'https://pinchat.io/static/chat.html?room=test-room#key',
+            href: 'https://pinchat.im/static/chat.html?room=test-room#key',
             pathname: '/static/chat.html',
             hash: '#key',
-            origin: 'https://pinchat.io'
+            origin: 'https://pinchat.im'
         },
         addEventListener() {},
         alert() {},

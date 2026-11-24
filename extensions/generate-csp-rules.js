@@ -95,7 +95,7 @@ const CSP_BASE = [
     "style-src 'self'",
     "img-src 'self' blob:",
     "font-src 'self'",
-    "connect-src 'self' wss://pinchat.io wss://www.pinchat.io",
+    "connect-src 'self' wss://pinchat.im wss://www.pinchat.im",
     "object-src 'none'",
     // The site uses no worker of any kind. Stated explicitly so that it does
     // not depend on worker-src falling back to script-src.
@@ -146,8 +146,8 @@ function documentHeaders(csp) {
  * into another authority.
  */
 const ALLOWED_REDIRECT_LOCATIONS = [
-    'https://pinchat.io/*',
-    'https://www.pinchat.io/*',
+    'https://pinchat.im/*',
+    'https://www.pinchat.im/*',
     '/',
     '/\\?*',
     '/static/*',
@@ -189,7 +189,7 @@ function buildCsp(scriptPaths, hashesByPath) {
 // catch-all `script-src 'none'` rule blocked every script on the page. The
 // chat page never showed it because it always carries `?room=`. The tail
 // now accepts a query, a fragment, or both.
-const CATCH_ALL_REGEX = '^https://(www\\.)?pinchat\\.io\\.?(:[0-9]+)?/';
+const CATCH_ALL_REGEX = '^https://(www\\.)?pinchat\\.im\\.?(:[0-9]+)?/';
 
 // The same documents, when the address carries a fragment. The browser
 // matches a rule against the whole address, and the fragment an earlier
@@ -198,7 +198,7 @@ const FRAGMENT_REGEX = `${CATCH_ALL_REGEX}[^#]*#`;
 
 function pageRegex(pagePath) {
     const escapedPath = pagePath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    return `^https://(www\\.)?pinchat\\.io${escapedPath}(?:[?#].*)?$`;
+    return `^https://(www\\.)?pinchat\\.im${escapedPath}(?:[?#].*)?$`;
 }
 
 /**
@@ -227,7 +227,7 @@ function buildRules(manifestDocument, browser = 'chrome') {
                 // with or without the trailing root dot. The page rules
                 // below only match the default port, so anything else keeps
                 // this policy and can run no script at all. Anchoring this
-                // rule to the default port left https://pinchat.io:<port>
+                // rule to the default port left https://pinchat.im:<port>
                 // without any packaged policy, while the content script and
                 // the badge still treated it as the site.
                 regexFilter: CATCH_ALL_REGEX,

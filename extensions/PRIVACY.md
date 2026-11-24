@@ -1,15 +1,15 @@
 # PinChat Integrity Verifier - Privacy Notice
 
 This notice covers the browser extension only. The PinChat service has its
-own Privacy Policy at https://pinchat.io/static/privacy.html.
+own Privacy Policy at https://pinchat.im/static/privacy.html.
 
 ## What the extension does
 
-The extension runs only on pinchat.io. It applies a Content Security Policy
+The extension runs only on pinchat.im. It applies a Content Security Policy
 packaged inside the extension to pages of that site, downloads a signed
 release manifest from GitHub, verifies its signature against a public key
 compiled into the extension, and compares the scripts, stylesheets and pages
-served by pinchat.io against the hashes in that manifest. If something does
+served by pinchat.im against the hashes in that manifest. If something does
 not match, it shows a warning on the page and in the toolbar badge.
 
 ## Data the extension stores
@@ -29,10 +29,10 @@ Nothing else is stored. Uninstalling the extension removes these values.
 
 - One request to `https://raw.githubusercontent.com/samjanny/pinchat/<tag>/hashes.json.signed`
   to download the signed manifest. It is made when the extension is installed
-  or updated, when you open pinchat.io, at most every five minutes while a
-  pinchat.io tab is open, and when you press the re-check button in the
+  or updated, when you open pinchat.im, at most every five minutes while a
+  pinchat.im tab is open, and when you press the re-check button in the
   popup. An idle extension makes no requests.
-- Requests to pinchat.io for the files listed in the manifest, in order to
+- Requests to pinchat.im for the files listed in the manifest, in order to
   compute their hashes. These go to the site you are already visiting.
 
 Both requests carry the ordinary headers a browser sends. The extension adds

@@ -1,9 +1,9 @@
 {
   "data": {
     "version": "1.2.0",
-    "sequence": 56,
-    "generated": "2026-11-24T12:57:03.157Z",
-    "site": "https://pinchat.io",
+    "sequence": 57,
+    "generated": "2026-11-24T16:27:15.009Z",
+    "site": "https://pinchat.im",
     "files": [
       {
         "path": "/static/css/style.css",
@@ -59,7 +59,7 @@
       },
       {
         "path": "/static/js/login-stash.js",
-        "hash": "9d95571d0c8fe8d1405ffbaf6f18a855e02a976a2d714162e5b60526dc1e7a58"
+        "hash": "225d58d1bd995123a5988b79f055b3f3ffeb813ec396f38b9a5766c1121b2ae4"
       },
       {
         "path": "/static/js/nicknames.js",
@@ -87,7 +87,7 @@
       },
       {
         "path": "/static/js/templates/index.js",
-        "hash": "3ae06f6f76687642e686c2a7f801efad88875702f4373b232c4c2348f76f4163"
+        "hash": "4b90b7babe1b70772a46789034e743b3f8c64fe03e76c2758097d1064bce7cc1"
       },
       {
         "path": "/static/js/mls/codec.js",
@@ -199,11 +199,11 @@
       },
       {
         "path": "/static/index.html",
-        "hash": "f55373bef849e60557df4403c7b2a7415a539bc0d43739c5267b49fed46c7c47"
+        "hash": "c15bda00e448dbbc45fb4683243bddde4b79e63e429b79219dcdf21ddb648cda"
       },
       {
         "path": "/static/login.html",
-        "hash": "bd56cf62a318de832541a6e0f0df15254d0148b74f2f9943be432adcc6b8db59"
+        "hash": "a44347609ba04ad66d8bcf57bb35b087a6e45cac386f81ac7b3fe6f89d6615f0"
       },
       {
         "path": "/static/chat.html",
@@ -211,17 +211,17 @@
       },
       {
         "path": "/static/terms.html",
-        "hash": "38f229a0f281245bd34b3e1b7c8bbc4263d2980aa787843b41f61296dd9d04b9"
+        "hash": "d9179a26aa906ec05804b2fd3ab4359f1245eefa1266a35429ad3e30c23d40c6"
       },
       {
         "path": "/static/privacy.html",
-        "hash": "4423fa06908c39d2a9a168376a30cdc4b2af2f4c75f23cebaf6e97cb44c3c1d9"
+        "hash": "72d7e211222f1b73cc6d9f71166fd287f9d9830c1997064337fe3a0ec7f6d25c"
       },
       {
         "path": "/static/operator.json",
-        "hash": "99fa83f5b59faffec19a0f3a8a1d921886cee9ea7acabc5074c2961c9f30c5fe"
+        "hash": "e509fb280f0d98b6e4faea57dfd71e981256fdc18406e088503e010562513271"
       }
     ]
   },
-  "signature": "MEUCIBjjTcZszXIUx4EVngFHJZXbxTWlEE7XCwnzC9TYZTyyAiEAm47VYPwZ9Hzcitl+QZ36fwLCaRMyPiRUvTlGqp7wdEk="
+  "signature": "MEQCIH5nxsAoo0fVwCvgC3I8IcxrD8GnkttQMGLFkya7d/WVAiACGzq4CYjRQ0WyUNnUE4C1x+5sSnk+vahk7psYPk6SOg=="
 }

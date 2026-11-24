@@ -11,8 +11,8 @@ const ext = globalThis.browser || globalThis.chrome;
 const V = globalThis.PinChatVerdict;
 
 const ICONS = {
-    [V.INTEGRITY.VERIFIED]: ['OK', 'status-verified'],
-    [V.INTEGRITY.PARTIAL]: ['~', 'status-partial'],
+    [V.INTEGRITY.VERIFIED]: ['\u2713', 'status-verified'],
+    [V.INTEGRITY.PARTIAL]: ['\u2713', 'status-partial'],
     [V.INTEGRITY.FAILED]: ['!', 'status-failed'],
     [V.INTEGRITY.UNVERIFIABLE]: ['?', 'status-unverifiable'],
     [V.INTEGRITY.CHECKING]: ['...', 'status-checking'],
@@ -31,15 +31,29 @@ function renderList(container, entries, className) {
     }
 }
 
-function manifestLine(manifest) {
-    if (!manifest) return 'unknown';
+const CHECK_IDS = ['manifest-status', 'policy-status', 'document-status', 'files-status'];
+
+/**
+ * Write the outcome of one check: its text, and a color for how it went.
+ * outcome is one of ok, limited (this browser cannot do more), missing (the
+ * check could not be made), failed, pending.
+ */
+function setCheck(id, text, outcome) {
+    const element = byId(id);
+    element.textContent = text;
+    element.className = `detail-value check-${outcome}`;
+}
+
+function manifestCheck(manifest) {
+    if (!manifest) return ['unknown', 'pending'];
     if (manifest.status === 'valid') {
-        const origin = manifest.usingCached ? 'stored copy, release host unreachable' : 'from the release host';
-        return `valid, sequence ${manifest.sequence} (${origin})`;
+        return manifest.usingCached
+            ? [`valid, sequence ${manifest.sequence} (stored copy, release host unreachable)`, 'limited']
+            : [`valid, sequence ${manifest.sequence} (from the release host)`, 'ok'];
     }
-    if (manifest.status === 'invalid') return 'REJECTED: bad signature or older than the last one seen';
-    if (manifest.status === 'error') return 'not available';
-    return 'not loaded yet';
+    if (manifest.status === 'invalid') return ['REJECTED: bad signature or older than the last one seen', 'failed'];
+    if (manifest.status === 'error') return ['not available', 'missing'];
+    return ['not loaded yet', 'pending'];
 }
 
 function render(state) {
@@ -47,20 +61,23 @@ function render(state) {
     const text = byId('status-text');
     const scope = byId('status-scope');
 
+    const note = byId('status-note');
+
     show(byId('not-on-site-banner'), !state.onSite);
-    byId('manifest-status').textContent = manifestLine(state.manifest);
+    for (const id of CHECK_IDS) setCheck(id, '-', 'pending');
+    show(note, false);
 
     const verdict = state.verdict;
     if (!state.onSite) {
         icon.textContent = '-';
         icon.className = 'status-icon status-unknown';
-        text.textContent = 'This tab is not showing pinchat.io. Nothing here is verified.';
+        text.textContent = 'This tab is not showing pinchat.im. Nothing here is verified.';
         scope.textContent = '';
         show(byId('reasons'), false);
         show(byId('environment'), false);
-        for (const id of ['policy-status', 'document-status', 'files-status']) byId(id).textContent = '-';
         return;
     }
+    setCheck('manifest-status', ...manifestCheck(state.manifest));
     if (!verdict) {
         // On the site, but the document has not announced itself: it was
         // loaded before the extension started, or its check is not in yet.
@@ -70,7 +87,6 @@ function render(state) {
         scope.textContent = '';
         show(byId('reasons'), false);
         show(byId('environment'), false);
-        for (const id of ['policy-status', 'document-status', 'files-status']) byId(id).textContent = '-';
         return;
     }
 
@@ -78,6 +94,8 @@ function render(state) {
     icon.textContent = symbol;
     icon.className = `status-icon ${className}`;
     text.textContent = verdict.headline;
+    note.textContent = V.headlineNote(verdict.integrity);
+    show(note, note.textContent !== '');
     scope.textContent = 'This describes what the server delivered. It says nothing about your browser, '
         + 'your device or other extensions.';
 
@@ -92,19 +110,26 @@ function render(state) {
     renderList(byId('environment-list'), environment, 'file-item');
 
     const has = (code) => reasons.some((entry) => entry.code === code);
-    byId('policy-status').textContent = has('policy-not-in-force') || has('service-worker-controlled')
-        ? 'NOT in force' : 'in force: only signed scripts can run';
-    if (verdict.attested) {
-        byId('document-status').textContent = 'compared with the signed page before it was shown';
-    } else if (verdict.canAttest) {
-        byId('document-status').textContent = 'not checked';
+    if (has('policy-not-in-force') || has('service-worker-controlled')) {
+        setCheck('policy-status', 'NOT in force', 'failed');
     } else {
-        byId('document-status').textContent = 'cannot be checked in this browser';
+        setCheck('policy-status', 'in force: only signed scripts can run', 'ok');
     }
-    byId('files-status').textContent = verdict.files
-        ? `${verdict.files.checked - verdict.files.failed} of ${verdict.files.checked} match `
-            + '(a second download, not proof of what the page loaded)'
-        : 'not yet';
+    if (verdict.attested) {
+        setCheck('document-status', 'compared with the signed page before it was shown', 'ok');
+    } else if (verdict.canAttest) {
+        setCheck('document-status', 'not checked', 'missing');
+    } else {
+        setCheck('document-status', 'cannot be checked in this browser', 'limited');
+    }
+    if (verdict.files) {
+        const { checked, failed } = verdict.files;
+        setCheck('files-status', `${checked - failed} of ${checked} match `
+            + '(a second download, not proof of what the page loaded)',
+        failed > 0 ? 'failed' : checked > 0 ? 'ok' : 'missing');
+    } else {
+        setCheck('files-status', 'not yet', 'pending');
+    }
 }
 
 async function activeTab() {

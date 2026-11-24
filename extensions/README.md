@@ -1,6 +1,6 @@
 # PinChat Integrity Verifier Browser Extensions
 
-Browser extensions that prevent unapproved scripts from executing on pinchat.io and verify served files using Subresource Integrity (SRI).
+Browser extensions that prevent unapproved scripts from executing on pinchat.im and verify served files using Subresource Integrity (SRI).
 
 ## How It Works
 
@@ -78,7 +78,7 @@ git push
 
 The extensions fetch the manifest from the immutable release tag configured by
 `GITHUB_TAG` in both background scripts. For the current security release this is:
-`https://raw.githubusercontent.com/samjanny/pinchat/v0.9.1/hashes.json.signed`.
+`https://raw.githubusercontent.com/samjanny/pinchat/v0.9.2/hashes.json.signed`.
 
 On every extension release, both background scripts move to the new tag,
 `MIN_KNOWN_SEQUENCE` rises to the signed manifest sequence, both extension
@@ -180,8 +180,8 @@ file, `verdict.js`, and pinned by `tests/test-verifier-verdict.js`.
 
 | Badge | State | Meaning |
 |-------|-------|---------|
-| `OK` (green) | Verified | The bytes of the page were compared with the signed hash before the browser parsed them, and the script policy is in force. Firefox only |
-| `~` (blue) | Partially verified | The script policy is in force, so only signed scripts can run. The page itself could not be attested. This is the best state Chromium can reach |
+| `✓` (green) | Verified | The bytes of the page were compared with the signed hash before the browser parsed them, and the script policy is in force. Firefox only |
+| `✓` (yellow) | Partially verified | The script policy is in force, so only signed scripts can run. The page itself could not be attested. This is the best state Chromium can reach; the popup adds that a complete check is currently possible only in Firefox |
 | `!` (red) | Failed | A mismatch with the signed release was established |
 | `?` (amber) | Unverifiable | The check could not be made: no manifest, or the page did not pass through the verifier |
 | `!` (amber) | Notice | Something on the page was blocked, or looks wrong, without proof against the server |
@@ -190,6 +190,11 @@ file, `verdict.js`, and pinned by `tests/test-verifier-verdict.js`.
 Green is shown for the first row only. "Verified" is a statement about what
 the server delivered; it says nothing about the browser, the device, or other
 extensions.
+
+In the popup, each line under "What was checked" is colored by its own
+outcome: green when the check passed, yellow when this browser cannot make
+it (the page as received, in Chromium), amber when it could not be made,
+red when it failed, grey while it is not known yet.
 
 ### What is shown on the page
 
@@ -207,7 +212,7 @@ extensions.
 The overlay uses a closed Shadow DOM with a stylesheet loaded from the
 extension's `web_accessible_resources`, so it renders under the page's strict
 CSP. Firefox MV3 exposes only `warning.css` and restricts it to
-`https://pinchat.io/*` via `matches`.
+`https://pinchat.im/*` via `matches`.
 
 ### Server integrity and page changes are separate questions
 
@@ -301,9 +306,9 @@ The manifest includes an incrementing `sequence` number to prevent replay attack
 
 The extension verifies integrity:
 - On extension install/update
-- On every navigation to pinchat.io
+- On every navigation to pinchat.im
 - On the `CONFIG.CHECK_INTERVAL_MINUTES` alarm (default 5 minutes), but only
-  while a pinchat.io tab is open, or while no usable manifest is cached yet
+  while a pinchat.im tab is open, or while no usable manifest is cached yet
 - When manually triggered via the popup, which always re-fetches
 
 The alarm is gated on purpose. An unconditional timer means every install
@@ -332,11 +337,11 @@ are attack signals rather than transport problems, and they fail closed.
 
 ## Updating Hashes
 
-After deploying changes to pinchat.io:
+After deploying changes to pinchat.im:
 
 1. Run the hash generator with your private key
 2. Commit and push the new `hashes.json.signed`
-3. Extensions pick up the change on the next navigation to pinchat.io, or
+3. Extensions pick up the change on the next navigation to pinchat.im, or
    within `CHECK_INTERVAL_MINUTES` if a tab is already open
 
 ## Security Considerations
@@ -347,7 +352,7 @@ The public key (`PINCHAT_PUBLIC_KEY`) and domain (`OFFICIAL_DOMAIN`) are **inten
 
 **Security benefits of hardcoding:**
 
-1. **Server compromise protection**: If an attacker gains access to the pinchat.io server, they CANNOT change the public key used to verify file signatures. The key is baked into the extension code that users have already installed.
+1. **Server compromise protection**: If an attacker gains access to the pinchat.im server, they CANNOT change the public key used to verify file signatures. The key is baked into the extension code that users have already installed.
 
 2. **Independent trust anchor**: The extension creates a verification path that is completely independent of the server:
    - Signed manifests are hosted on GitHub (separate from the main server)
@@ -461,7 +466,7 @@ link is always the server's.
 
 ## Self-Hosted Instances
 
-If you are running your own PinChat instance (not using the official pinchat.io), you **MUST** create your own extension with your own keys. Using the official extension with a self-hosted instance will not work because:
+If you are running your own PinChat instance (not using the official pinchat.im), you **MUST** create your own extension with your own keys. Using the official extension with a self-hosted instance will not work because:
 
 1. The hardcoded public key won't match your private key
 2. The hardcoded domain won't match your server
@@ -531,7 +536,7 @@ extensions/
 │   ├── blocked.html       # Shown in place of a refused navigation
 │   ├── blocked.js
 │   ├── blocked.css
-│   ├── warning.css        # Overlay styles (web_accessible_resource limited to pinchat.io)
+│   ├── warning.css        # Overlay styles (web_accessible_resource limited to pinchat.im)
 │   └── icons/             # Extension icons
 └── firefox/               # Firefox build: same sources, own manifest and rules
     ├── manifest.json      # Adds the webRequest permissions for the response check
@@ -559,7 +564,7 @@ extensions/
 
 ### Files not found (HTTP 404)
 - Check file paths start with `/` (e.g., `/index.html`)
-- Verify files exist at the expected URLs on pinchat.io
+- Verify files exist at the expected URLs on pinchat.im
 - Update `FILES_TO_HASH` in generate-hashes.js if paths changed
 
 ## Signing Stays Offline
@@ -577,7 +582,7 @@ or an editor backup would still pick it up.
 
 ## License
 
-Copyright 2025 Raffaele Mangiacasale <support@pinchat.io>
+Copyright 2025 Raffaele Mangiacasale <support@pinchat.im>
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
