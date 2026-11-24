@@ -109,6 +109,9 @@
     // honest member an arbitrarily large tree and force unbounded TreeKEM /
     // SecretTree work.
     const MAX_GROUP_LEAVES = 20;
+    // RFC 9420 trees are full, so 20 members need a 32-leaf tree whose
+    // right-edge leaves stay blank. This bounds the tree itself.
+    const MAX_TREE_LEAVES = 32;
     const MAX_KEY_PACKAGE_LIFETIME_SECONDS = 24n * 60n * 60n;
 
     function validateKeyPackageLifetimeProfile(
@@ -417,10 +420,10 @@
 
     class Group {
         constructor(state) {
-            if (!state || !Number.isInteger(state.nLeaves)
-                || state.nLeaves < 1 || state.nLeaves > MAX_GROUP_LEAVES) {
+            if (!state || !TreeMath.isFullTreeLeafCount(state.nLeaves)
+                || state.nLeaves > MAX_TREE_LEAVES) {
                 throw new Error(
-                    `group: nLeaves must be in [1,${MAX_GROUP_LEAVES}]`,
+                    `group: nLeaves must be a power of two in [1,${MAX_TREE_LEAVES}]`,
                 );
             }
             Object.assign(this, state);
@@ -1297,11 +1300,12 @@
     // which decrypts the appropriate path_secret out of the UpdatePath,
     // walks it up to root, and advances the local epoch state.
     //
-    // Tree growth: new members are always appended at the next free leaf
-    // (newLeafIndex = nLeaves). The ratchet tree is padded to the new
-    // node-width on each Add. Parent nodes that are NOT on the
-    // committer's direct path stay blank - TreeKEM resolution recurses
-    // through them automatically.
+    // Tree shape: RFC 9420 full trees. An Add takes the leftmost blank
+    // leaf and doubles the tree only when there is none; a Remove blanks
+    // the leaf and its direct path and halves the tree while its right
+    // subtree has no member (RatchetTree.addLeaf / removeLeaf). Parent
+    // nodes that are NOT on the committer's direct path stay blank -
+    // TreeKEM resolution recurses through them automatically.
     //
     // Every Commit stamps the committer's parent-hash chain (§7.9).
     // Existing members verify that newly applied path; a Welcome joiner
@@ -1320,18 +1324,35 @@
             verifyTreeKeyUniqueness(tree, operation);
         };
 
-    function nextAddPosition(tree, nLeaves, operation) {
-        for (let leafIndex = 0; leafIndex < nLeaves; leafIndex += 1) {
-            if (!RatchetTree.leafFor(tree, leafIndex)) {
-                return { leafIndex, nLeaves };
-            }
-        }
-        if (nLeaves >= MAX_GROUP_LEAVES) {
+    /**
+     * RFC 9420 section 12.1.1 Add under the PinChat profile bounds. A blank leaf
+     * left by Remove is reused (leftmost first) before the full tree is
+     * doubled, so the member cap, not churn, bounds the tree size.
+     * Returns { tree, leafIndex, nLeaves } without mutating `tree`.
+     */
+    function addLeafWithinProfile(tree, leafNode, operation) {
+        if (RatchetTree.liveLeafCount(tree) >= MAX_GROUP_LEAVES) {
             throw new Error(
-                `${operation}: group is at the ${MAX_GROUP_LEAVES}-leaf limit`,
+                `${operation}: group is at the ${MAX_GROUP_LEAVES}-member limit`,
             );
         }
-        return { leafIndex: nLeaves, nLeaves: nLeaves + 1 };
+        const added = RatchetTree.addLeaf(tree, leafNode);
+        if (added.nLeaves > MAX_TREE_LEAVES) {
+            throw new Error(
+                `${operation}: tree would exceed ${MAX_TREE_LEAVES} leaves`,
+            );
+        }
+        return added;
+    }
+
+    /**
+     * Commit secret for a fresh UpdatePath (RFC 9420 section 7.4): one "path" step
+     * beyond the last path secret. When the committer is alone in a 1-leaf
+     * tree its direct path is empty and the step starts from leaf_secret.
+     */
+    function committerCommitSecret(chain, leafSecret) {
+        return TreeKEM.commitSecret(chain.length > 0
+            ? chain[chain.length - 1].pathSecret : leafSecret);
     }
 
     /**
@@ -1346,19 +1367,11 @@
             try {
             const kp = KeyPackage.parseKeyPackage(keyPackageBytes);
             await verifyKeyPackageBindings(kp, 'validateKeyPackageForAdd');
-            const position = nextAddPosition(
-                this.ratchetTree, this.nLeaves, 'validateKeyPackageForAdd',
+            const position = addLeafWithinProfile(
+                this.ratchetTree, kp.leafNode, 'validateKeyPackageForAdd',
             );
-            const candidateTree = Nodes.padRatchetTree(
-                this.ratchetTree.slice(),
-                TreeMath.nodeWidth(position.nLeaves),
-            );
-            candidateTree[TreeMath.leafToNode(position.leafIndex)] = {
-                nodeType: Nodes.NodeType.LEAF,
-                leaf: kp.leafNode,
-            };
             verifyTreeKeyUniqueness(
-                candidateTree, 'validateKeyPackageForAdd',
+                position.tree, 'validateKeyPackageForAdd',
             );
             return {
                 keyPackage: kp,
@@ -1480,20 +1493,16 @@
         await verifyKeyPackageBindings(kp, 'commitAddMember');
 
         // ---- 1. Compute new tree shape, insert new leaf ----
-        // RFC tree slots are stable, but a blank leaf left by Remove is
-        // immediately reusable. Reusing the leftmost blank prevents harmless
-        // membership churn from growing the logical tree toward the profile
-        // cap while preserving every still-live leaf index.
-        const addPosition = nextAddPosition(
-            this.ratchetTree, this.nLeaves, 'commitAddMember',
+        // RFC 9420 section 12.1.1: the leftmost blank leaf (one left by Remove) is
+        // reused before the full tree is doubled, so harmless membership
+        // churn cannot grow the tree toward the profile cap and every
+        // still-live leaf index is preserved.
+        const addPosition = addLeafWithinProfile(
+            this.ratchetTree, kp.leafNode, 'commitAddMember',
         );
         const newLeafIndex = addPosition.leafIndex;
         const newNLeaves = addPosition.nLeaves;
-        const newWidth = TreeMath.nodeWidth(newNLeaves);
-        const newTree = Nodes.padRatchetTree(this.ratchetTree, newWidth);
-        newTree[TreeMath.leafToNode(newLeafIndex)] = {
-            nodeType: Nodes.NodeType.LEAF, leaf: kp.leafNode,
-        };
+        const newTree = addPosition.tree;
 
         let leafSecret = null;
         let leafNodePair = null;
@@ -1665,8 +1674,7 @@
         };
         const epochGroupContextBytes = GroupContext.groupContextBytes(epochGroupContext);
 
-        const rootChainEntry = chain[chain.length - 1];
-        const commitSecretBytes = await TreeKEM.commitSecret(rootChainEntry.pathSecret);
+        const commitSecretBytes = await committerCommitSecret(chain, leafSecret);
         try {
             epochSecrets = await KeySchedule.deriveEpoch({
                 initSecretPrev: this.epochSecrets.initSecret,
@@ -1841,15 +1849,10 @@
             throw new Error(`commitRemoveMember: leaf ${removedLeafIndex} already blank or non-leaf`);
         }
 
-        // ---- 1. Build new tree: blank the removed leaf and its ancestors ----
-        const newNLeaves = this.nLeaves;
-        const newWidth = TreeMath.nodeWidth(newNLeaves);
-        const newTree = Nodes.padRatchetTree(this.ratchetTree.slice(), newWidth);
-        newTree[removedLeafNode] = null;
-        const removedDirectPath = TreeMath.directPathWithRoot(removedLeafNode, newNLeaves);
-        for (const nodeIdx of removedDirectPath) {
-            newTree[nodeIdx] = null;
-        }
+        // ---- 1. Build new tree: blank the removed leaf and its ancestors,
+        // then truncate a right subtree left without members (section 12.1.3) ----
+        const newTree = RatchetTree.removeLeaf(this.ratchetTree, removedLeafIndex);
+        const newNLeaves = TreeMath.numLeaves(newTree.length);
 
         let leafSecret = null;
         let leafNodePair = null;
@@ -2006,8 +2009,7 @@
         };
         const epochGroupContextBytes = GroupContext.groupContextBytes(epochGroupContext);
 
-        const rootChainEntry = chain[chain.length - 1];
-        const commitSecretBytes = await TreeKEM.commitSecret(rootChainEntry.pathSecret);
+        const commitSecretBytes = await committerCommitSecret(chain, leafSecret);
         try {
             epochSecrets = await KeySchedule.deriveEpoch({
                 initSecretPrev: this.epochSecrets.initSecret,
@@ -2045,6 +2047,7 @@
         // window for in-flight messages), then overwrite.
         this._snapshotPrevEpoch([removedLeafIndex]);
         this.ratchetTree = newTree;
+        this.nLeaves = newNLeaves;
         this.epoch = newEpoch;
         this.treeHash = newTreeHash;
         this.confirmedTranscriptHash = newConfirmedTranscriptHash;
@@ -2246,17 +2249,9 @@
             proposal.leafNode, senderLeaf.signatureKey, senderLeaf.encryptionKey,
             this.groupId, senderLeafIndex,
         );
-        const candidateTree = this.ratchetTree.slice();
-        const senderNodeIndex = TreeMath.leafToNode(senderLeafIndex);
-        candidateTree[senderNodeIndex] = {
-            nodeType: Nodes.NodeType.LEAF,
-            leaf: proposal.leafNode,
-        };
-        for (const ancestor of TreeMath.directPathWithRoot(
-            senderNodeIndex, this.nLeaves,
-        )) {
-            candidateTree[ancestor] = null;
-        }
+        const candidateTree = RatchetTree.updateLeaf(
+            this.ratchetTree, senderLeafIndex, proposal.leafNode,
+        );
         verifyTreeKeyUniqueness(candidateTree, 'verifyUpdateProposal');
         const authenticatedContent = Framing.authenticatedContentBytes({
             wireFormat, content, auth: pm.auth,
@@ -2330,8 +2325,7 @@
             );
         }
         const newNLeaves = this.nLeaves;
-        const newWidth = TreeMath.nodeWidth(newNLeaves);
-        const newTree = Nodes.padRatchetTree(this.ratchetTree.slice(), newWidth);
+        let newTree = this.ratchetTree.slice();
 
         const proposalStore = new Map();
         const proposalOrRefs = updateProposals.map((up, index) => {
@@ -2374,12 +2368,7 @@
                 this.groupId,
                 li,
             );
-            newTree[TreeMath.leafToNode(li)] = {
-                nodeType: Nodes.NodeType.LEAF, leaf: entry.proposal.leafNode,
-            };
-            for (const ancestor of TreeMath.directPathWithRoot(TreeMath.leafToNode(li), newNLeaves)) {
-                newTree[ancestor] = null;
-            }
+            newTree = RatchetTree.updateLeaf(newTree, li, entry.proposal.leafNode);
         }
 
         let leafSecret = null;
@@ -2526,8 +2515,7 @@
         };
         const epochGroupContextBytes = GroupContext.groupContextBytes(epochGroupContext);
 
-        const rootChainEntry = chain[chain.length - 1];
-        const commitSecretBytes = await TreeKEM.commitSecret(rootChainEntry.pathSecret);
+        const commitSecretBytes = await committerCommitSecret(chain, leafSecret);
         try {
             epochSecrets = await KeySchedule.deriveEpoch({
                 initSecretPrev: this.epochSecrets.initSecret,
@@ -2727,24 +2715,16 @@
                 this.groupId,
                 updLeafIndex,
             );
-            newTree[TreeMath.leafToNode(updLeafIndex)] = {
-                nodeType: Nodes.NodeType.LEAF, leaf: newLeaf,
-            };
-            for (const ancestor of TreeMath.directPathWithRoot(
-                TreeMath.leafToNode(updLeafIndex), newNLeaves,
-            )) {
-                newTree[ancestor] = null;
-            }
+            newTree = RatchetTree.updateLeaf(newTree, updLeafIndex, newLeaf);
             updatedLeafIndices.push(updLeafIndex);
         }
 
+        // RFC 9420 section 12.1.3: each Remove blanks the leaf and its direct path
+        // and truncates a right subtree left without members.
         for (const entry of proposalPlan.removes) {
             const rmIdx = entry.targetLeafIndex;
-            const rmNode = TreeMath.leafToNode(rmIdx);
-            newTree[rmNode] = null;
-            for (const ancestor of TreeMath.directPathWithRoot(rmNode, newNLeaves)) {
-                newTree[ancestor] = null;
-            }
+            newTree = RatchetTree.removeLeaf(newTree, rmIdx);
+            newNLeaves = TreeMath.numLeaves(newTree.length);
             removedLeafIndices.push(rmIdx);
             lastRemovedLeafIndex = rmIdx;
         }
@@ -2753,17 +2733,12 @@
             await verifyKeyPackageBindings(
                 entry.proposal.keyPackage, 'processCommit',
             );
-            const addPosition = nextAddPosition(
-                newTree, newNLeaves, 'processCommit',
+            const addPosition = addLeafWithinProfile(
+                newTree, entry.proposal.keyPackage.leafNode, 'processCommit',
             );
             const addLeafIndex = addPosition.leafIndex;
             newNLeaves = addPosition.nLeaves;
-            const newWidth = TreeMath.nodeWidth(newNLeaves);
-            newTree = Nodes.padRatchetTree(newTree, newWidth);
-            newTree[TreeMath.leafToNode(addLeafIndex)] = {
-                nodeType: Nodes.NodeType.LEAF,
-                leaf: entry.proposal.keyPackage.leafNode,
-            };
+            newTree = addPosition.tree;
             addedLeafIndices.push(addLeafIndex);
             lastAddedLeafIndex = addLeafIndex;
         }
@@ -3322,23 +3297,30 @@
             );
         }
 
-        // Parse the ratchet tree. The committer always serialises with
-        // node_width(nLeaves) entries (no trailing-blank truncation), so
-        // the wire length tells us nLeaves directly.
+        // Parse the ratchet tree in its RFC 9420 section 12.4.3.3 wire form: the
+        // committer omits trailing blank nodes, the last node must be
+        // non-blank, and we extend it with the fewest blanks that give a
+        // full tree. That full width determines nLeaves.
         const parsedTree = Nodes.parseRatchetTree(ratchetTreeBytes);
-        if (parsedTree.length === 0 || (parsedTree.length & 1) === 0
-            || parsedTree.length > TreeMath.nodeWidth(MAX_GROUP_LEAVES)) {
+        if (parsedTree.length === 0
+            || parsedTree.length > TreeMath.nodeWidth(MAX_TREE_LEAVES)) {
             throw new Error(
-                `group.join: ratchet_tree exceeds the ${MAX_GROUP_LEAVES}-leaf profile limit`,
+                `group.join: ratchet_tree exceeds the ${MAX_TREE_LEAVES}-leaf profile limit`,
             );
         }
-        const nLeaves = TreeMath.numLeaves(parsedTree.length);
-        if (nLeaves > MAX_GROUP_LEAVES) {
+        if (!parsedTree[parsedTree.length - 1]) {
             throw new Error(
-                `group.join: ratchet_tree has ${nLeaves} leaves; maximum is ${MAX_GROUP_LEAVES}`,
+                'group.join: ratchet_tree must not end with a blank node',
             );
         }
-        const tree = Nodes.padRatchetTree(parsedTree, TreeMath.nodeWidth(nLeaves));
+        const tree = RatchetTree.fromWireNodes(parsedTree);
+        const nLeaves = TreeMath.numLeaves(tree.length);
+        if (nLeaves > MAX_TREE_LEAVES
+            || RatchetTree.liveLeafCount(tree) > MAX_GROUP_LEAVES) {
+            throw new Error(
+                `group.join: ratchet_tree exceeds the ${MAX_GROUP_LEAVES}-member profile limit`,
+            );
+        }
 
         // Verify GroupInfo signature with the signer's signature_key.
         const signerLeafIndex = groupInfo.signer;
@@ -4556,6 +4538,7 @@
         PROTOCOL_VERSION,
         CIPHERSUITE,
         MAX_GROUP_LEAVES,
+        MAX_TREE_LEAVES,
         // Exposed for tests / future add-member path
         buildSelfLeaf,
         signLeafNodeForKeyPackage,

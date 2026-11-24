@@ -26,6 +26,7 @@ const TreeKEM = require(path.join(__dirname, '..', 'static', 'js', 'mls', 'tree-
 const TreeMath = require(path.join(__dirname, '..', 'static', 'js', 'mls', 'tree-math.js'));
 const KeySchedule = require(path.join(__dirname, '..', 'static', 'js', 'mls', 'key-schedule.js'));
 const Nodes = require(path.join(__dirname, '..', 'static', 'js', 'mls', 'nodes.js'));
+const RatchetTree = require(path.join(__dirname, '..', 'static', 'js', 'mls', 'ratchet-tree.js'));
 
 let passed = 0;
 let failed = 0;
@@ -166,7 +167,10 @@ async function main() {
         let totalUpdatePaths = 0;
         for (const tc of ours) {
             const treeBytes = new Uint8Array(Buffer.from(tc.ratchet_tree, 'hex'));
-            const tree = Nodes.parseRatchetTree(treeBytes);
+            // The vector carries the RFC 9420 wire form, which omits
+            // trailing blank nodes. Restore the full tree before using
+            // the tree math: the wire length alone is not the tree size.
+            const tree = RatchetTree.fromWireNodes(Nodes.parseRatchetTree(treeBytes));
             const nLeaves = TreeMath.numLeaves(tree.length);
             for (const up of tc.update_paths) {
                 totalUpdatePaths += 1;
@@ -239,7 +243,6 @@ async function main() {
                 //     have nothing to compare against.
                 const upBytes = new Uint8Array(Buffer.from(up.update_path, 'hex'));
                 const parsedUp = Nodes.parseUpdatePath(upBytes);
-                const RatchetTree = require(path.join(__dirname, '..', 'static', 'js', 'mls', 'ratchet-tree.js'));
                 const senderNode = TreeMath.leafToNode(sender);
                 const filteredIdx = [];
                 for (let i = 0; i < directPath.length; i += 1) {

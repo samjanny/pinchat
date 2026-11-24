@@ -1938,12 +1938,21 @@ async function main() {
     // An outer signature and membership_tag are necessary but not sufficient
     // for terminal teardown. The removed member must first validate all public
     // UpdatePath/tree structure that it can check without the new path secret.
+    // Removing the only other member truncates the full tree to the
+    // creator's single leaf (RFC 9420 section 12.1.3), whose direct path is empty:
+    // the valid UpdatePath has no nodes, so one extra node is malformed.
     const malformedRemove = await rewriteCommitEnvelope(
         exchange.creator,
         removeCommit,
         (commit) => ({
             ...commit,
-            path: { ...commit.path, nodes: [] },
+            path: {
+                ...commit.path,
+                nodes: [...commit.path.nodes, {
+                    encryptionKey: commit.path.leafNode.encryptionKey,
+                    encryptedPathSecret: [],
+                }],
+            },
         }),
     );
     const joinerBeforeMalformedRemove = captureLiveGroup(exchange.joiner);

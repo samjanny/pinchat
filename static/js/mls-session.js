@@ -77,6 +77,7 @@
     const BOOTSTRAP_PROOF_BYTES = 32;
     const CORRELATION_REF_BYTES = 32;
     const MAX_GROUP_LEAVES = MLS.Group.MAX_GROUP_LEAVES || 20;
+    const MAX_TREE_LEAVES = MLS.Group.MAX_TREE_LEAVES || 32;
     const MAX_PENDING_WELCOME_SENDERS = MAX_GROUP_LEAVES;
     const MAX_PROPOSALS_PER_SENDER = 2;
     const MAX_PROPOSALS_PER_EPOCH =
@@ -720,7 +721,7 @@
             }
             const senderLeafIndex = verified.senderLeafIndex;
             if (!Number.isInteger(senderLeafIndex)
-                || senderLeafIndex < 0 || senderLeafIndex >= MAX_GROUP_LEAVES) {
+                || senderLeafIndex < 0 || senderLeafIndex >= MAX_TREE_LEAVES) {
                 throw new Error(
                     'mls-session: proposal store entry has invalid sender leaf',
                 );

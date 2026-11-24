@@ -4,7 +4,10 @@
  * MLS tree math test suite.
  *
  * Cross-checks `static/js/mls/tree-math.js` against the RFC 9420 §4.1
- * worked examples and against a small-tree brute-force reference.
+ * worked examples, the RFC 9420 Appendix C reference formulas and the IETF
+ * tree-math vectors. RFC 9420 trees are always full (a power-of-two leaf
+ * count); the shape functions must refuse any other count instead of
+ * computing the left-balanced shape of earlier MLS drafts.
  */
 
 const path = require('path');
@@ -43,9 +46,37 @@ eq(TreeMath.root(1), 0, 'root(1)');
 eq(TreeMath.root(2), 1, 'root(2)');
 eq(TreeMath.root(4), 3, 'root(4)');
 eq(TreeMath.root(8), 7, 'root(8)');
-// Non-power-of-two: a 5-leaf tree has 9 nodes, log2(9)=3 so root is 2^3-1 = 7.
-eq(TreeMath.root(5), 7, 'root(5)');
-eq(TreeMath.root(3), 3, 'root(3)');
+eq(TreeMath.root(32), 31, 'root(32)');
+
+// A full tree that holds a given wire vector (RFC 9420 section 12.4.3.3).
+eq(TreeMath.fullTreeLeafCount(1), 1, 'fullTreeLeafCount(1 node)');
+eq(TreeMath.fullTreeLeafCount(3), 2, 'fullTreeLeafCount(3 nodes)');
+eq(TreeMath.fullTreeLeafCount(4), 4, 'fullTreeLeafCount(4 nodes)');
+eq(TreeMath.fullTreeLeafCount(5), 4, 'fullTreeLeafCount(5 nodes)');
+eq(TreeMath.fullTreeLeafCount(7), 4, 'fullTreeLeafCount(7 nodes)');
+eq(TreeMath.fullTreeLeafCount(8), 8, 'fullTreeLeafCount(8 nodes)');
+eq(TreeMath.fullTreeLeafCount(17), 16, 'fullTreeLeafCount(17 nodes)');
+
+// ---------------------------------------------------------------------------
+// Leaf counts that are not a power of two have no RFC 9420 shape. The old
+// left-balanced math answered root(3)=3, right(3,3)=4 and parent(4,3)=3,
+// which differ from the full 4-leaf tree (right(3)=5, parent(4)=5).
+// ---------------------------------------------------------------------------
+console.log('# non-power-of-two leaf counts are refused');
+function rejects(fn) {
+    try { fn(); return false; } catch (_e) { return true; }
+}
+for (const n of [3, 5, 6, 7, 9, 12, 20]) {
+    assert(rejects(() => TreeMath.root(n)), `root(${n}) is refused`);
+    assert(rejects(() => TreeMath.parent(0, n)), `parent(0,${n}) is refused`);
+    assert(rejects(() => TreeMath.right(3, n)), `right(3,${n}) is refused`);
+    assert(rejects(() => TreeMath.directPathWithRoot(0, n)),
+        `directPathWithRoot(0,${n}) is refused`);
+    assert(rejects(() => TreeMath.leafDescendants(1, n)),
+        `leafDescendants(1,${n}) is refused`);
+    assert(!TreeMath.isFullTreeLeafCount(n), `isFullTreeLeafCount(${n}) is false`);
+}
+assert(rejects(() => TreeMath.parent(7, 4)), 'parent of a node outside a 4-leaf tree is refused');
 
 // ---------------------------------------------------------------------------
 // Level
@@ -92,17 +123,52 @@ eq(TreeMath.commonAncestor(0, 4, 4), 3, 'commonAncestor(L0,L2)');
 eq(TreeMath.commonAncestor(0, 6, 4), 3, 'commonAncestor(L0,L3)');
 
 // ---------------------------------------------------------------------------
-// Truncated 3-leaf tree (width 5, root 3)
-// Infinite-tree right(3) = 5, but width=5 so right(3,3) must skip the missing
-// node and descend to left(5) = 4.
+// Three members live in the full 4-leaf tree (width 7, root 3) with leaf 3
+// blank. RFC 9420 Appendix C: right(3)=5, parent(4)=5, direct_path(4)=[5,3].
 // ---------------------------------------------------------------------------
-console.log('# truncated 3-leaf tree (width 5)');
-eq(TreeMath.right(3, 3), 4, 'right(3,3) - truncated to leaf');
-eq(TreeMath.parent(4, 3), 3, 'parent(4,3) - skips missing parent at 5');
-eq(TreeMath.sibling(4, 3), 1, 'sibling(4,3)');
-eq(TreeMath.directPathWithRoot(0, 3), [1, 3], 'directPathWithRoot(L0,3)');
-eq(TreeMath.directPathWithRoot(4, 3), [3], 'directPathWithRoot(L2,3) - only root on path');
-eq(TreeMath.copath(4, 3), [1], 'copath(L2,3)');
+console.log('# three members in a full 4-leaf tree');
+eq(TreeMath.right(3, 4), 5, 'right(3,4)');
+eq(TreeMath.parent(4, 4), 5, 'parent(4,4)');
+eq(TreeMath.sibling(4, 4), 6, 'sibling(L2,4) is the blank leaf 3');
+eq(TreeMath.directPathWithRoot(4, 4), [5, 3], 'directPathWithRoot(L2,4)');
+eq(TreeMath.copath(4, 4), [6, 1], 'copath(L2,4)');
+
+// RFC 9420 Appendix C formulas, written out independently of the module.
+console.log('# RFC 9420 Appendix C reference formulas');
+(function () {
+    const refLevel = (x) => {
+        if ((x & 1) === 0) return 0;
+        let k = 0;
+        while (((x >> k) & 1) === 1) k += 1;
+        return k;
+    };
+    const refRight = (x) => x ^ (0x03 << (refLevel(x) - 1));
+    const refLeft = (x) => x ^ (0x01 << (refLevel(x) - 1));
+    const refParent = (x) => {
+        const k = refLevel(x);
+        const b = (x >> (k + 1)) & 0x01;
+        return (x | (1 << k)) ^ (b << (k + 1));
+    };
+    let ok = true;
+    for (const n of [1, 2, 4, 8, 16, 32, 64]) {
+        const w = 2 * (n - 1) + 1;
+        const r = n - 1;
+        if (TreeMath.root(n) !== r) ok = false;
+        for (let x = 0; x < w; x += 1) {
+            if (refLevel(x) > 0) {
+                if (TreeMath.left(x) !== refLeft(x)) ok = false;
+                if (TreeMath.right(x, n) !== refRight(x)) ok = false;
+            }
+            if (x !== r) {
+                const p = refParent(x);
+                if (TreeMath.parent(x, n) !== p) ok = false;
+                const s = x < p ? refRight(p) : refLeft(p);
+                if (TreeMath.sibling(x, n) !== s) ok = false;
+            }
+        }
+    }
+    assert(ok, 'root/left/right/parent/sibling equal Appendix C for n=1..64');
+})();
 
 // ---------------------------------------------------------------------------
 // Single-leaf tree (degenerate)
@@ -110,16 +176,16 @@ eq(TreeMath.copath(4, 3), [1], 'copath(L2,3)');
 console.log('# 1-leaf tree');
 eq(TreeMath.root(1), 0, 'root(1) == 0');
 eq(TreeMath.directPath(0, 1), [], 'directPath(0,1) is empty');
-eq(TreeMath.directPathWithRoot(0, 1), [0], 'directPathWithRoot(0,1) is just the root');
+eq(TreeMath.directPathWithRoot(0, 1), [], 'directPathWithRoot(0,1) is empty (the leaf is the root)');
 eq(TreeMath.copath(0, 1), [], 'copath(0,1) is empty');
 
 // ---------------------------------------------------------------------------
 // Invariant check on many tree sizes: for every non-root node x, the sibling
 // of its sibling is itself, and x ∈ directPathWithRoot of leaf(x) ⇒ root.
 // ---------------------------------------------------------------------------
-console.log('# invariants on trees up to 16 leaves');
+console.log('# invariants on full trees up to 64 leaves');
 let invariantsOk = true;
-for (let n = 1; n <= 16; n += 1) {
+for (let n = 1; n <= 64; n *= 2) {
     const w = TreeMath.nodeWidth(n);
     const r = TreeMath.root(n);
     for (let x = 0; x < w; x += 1) {
@@ -135,8 +201,8 @@ for (let n = 1; n <= 16; n += 1) {
             invariantsOk = false;
         }
     }
-    // Each leaf's direct path must end at the root.
-    for (let leaf = 0; leaf < n; leaf += 1) {
+    // Each leaf's direct path must end at the root (a 1-leaf tree has none).
+    for (let leaf = 0; leaf < n && n > 1; leaf += 1) {
         const path = TreeMath.directPathWithRoot(TreeMath.leafToNode(leaf), n);
         if (path[path.length - 1] !== r) {
             console.log(`    invariant violated: leaf ${leaf} path does not end at root (n=${n})`);
@@ -144,7 +210,7 @@ for (let n = 1; n <= 16; n += 1) {
         }
     }
 }
-assert(invariantsOk, 'sibling/parent/directPath invariants on n=1..16');
+assert(invariantsOk, 'sibling/parent/directPath invariants on n=1..64');
 
 // ---------------------------------------------------------------------------
 // leafDescendants sanity
@@ -152,7 +218,9 @@ assert(invariantsOk, 'sibling/parent/directPath invariants on n=1..16');
 console.log('# leafDescendants');
 eq(TreeMath.leafDescendants(3, 4), [0, 1, 2, 3], 'leafDescendants(root, n=4)');
 eq(TreeMath.leafDescendants(1, 4), [0, 1], 'leafDescendants(node 1, n=4)');
-eq(TreeMath.leafDescendants(3, 3), [0, 1, 2], 'leafDescendants(root, n=3) - truncated');
+eq(TreeMath.leafDescendants(5, 4), [2, 3], 'leafDescendants(node 5, n=4)');
+eq(TreeMath.leafDescendants(4, 4), [2], 'leafDescendants(leaf 2, n=4)');
+eq(TreeMath.leafDescendants(23, 32), [8, 9, 10, 11, 12, 13, 14, 15], 'leafDescendants(node 23, n=32)');
 
 // ---------------------------------------------------------------------------
 // IETF reference vectors (mlswg/mls-implementations test-vectors/tree-math.json)

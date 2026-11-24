@@ -29,6 +29,7 @@ const TreeMath = require(path.join(__dirname, '..', 'static', 'js', 'mls', 'tree
 const RatchetTree = require(path.join(__dirname, '..', 'static', 'js', 'mls', 'ratchet-tree.js'));
 const KeyPackage = require(path.join(__dirname, '..', 'static', 'js', 'mls', 'key-package.js'));
 const Labeled = require(path.join(__dirname, '..', 'static', 'js', 'mls', 'labeled.js'));
+const Codec = require(path.join(__dirname, '..', 'static', 'js', 'mls', 'codec.js'));
 
 let passed = 0;
 let failed = 0;
@@ -137,6 +138,107 @@ function groupSecretRefs(group) {
         }
     }
     return refs.filter((value) => value instanceof Uint8Array);
+}
+
+async function joinWith(committer, member, welcomeMessage) {
+    return Group.Group.joinFromWelcomeWithTree({
+        welcomeMessage,
+        keyPackageBytes: member.keyPackageBytes,
+        initPrivateKey: member.initKp.privateKey,
+        identity: member.identity,
+        leafEncKeyPair: member.leafEncKp,
+        ratchetTreeBytes: Nodes.ratchetTreeBytes(committer.ratchetTree),
+        expectedSignerLeafIndex: 0,
+        expectedCommitEpoch: committer.epoch - 1n,
+        ...await bootstrapPins(committer),
+    });
+}
+
+/**
+ * M-08: RFC 9420 trees are full. Three members live in a 4-leaf tree, a
+ * Remove that empties the right subtree halves the tree, and removing the
+ * last member leaves the creator alone in a 1-leaf tree with an empty
+ * direct path. Every member must reach the same tree hash at each step.
+ */
+async function fullTreeShape() {
+    console.log('# Group - RFC 9420 full-tree extend and truncate');
+    const alice = await Group.Group.create({ identity: await freshIdentity() });
+    const bob = await buildKeyPackage();
+    const r1 = await alice.commitAddMember({ keyPackageBytes: bob.keyPackageBytes });
+    const bobGroup = await joinWith(alice, bob, r1.welcomeMessage);
+    const carol = await buildKeyPackage();
+    const r2 = await alice.commitAddMember({ keyPackageBytes: carol.keyPackageBytes });
+    await bobGroup.processCommit(r2.commitMessage);
+    const carolGroup = await joinWith(alice, carol, r2.welcomeMessage);
+    assert(alice.nLeaves === 4 && alice.ratchetTree.length === 7
+        && bobGroup.nLeaves === 4 && carolGroup.nLeaves === 4,
+    'three members share a full 4-leaf tree (left-balanced math would use 3)');
+    assert(TreeMath.directPathWithRoot(TreeMath.leafToNode(2), 4).join(',') === '5,3'
+        && alice.ratchetTree[5] === null,
+    'Carol at leaf 2 sits under the blank parent 5, as in RFC 9420');
+    assert(Nodes.parseRatchetTree(
+        Nodes.ratchetTreeBytes(alice.ratchetTree),
+    ).length === 5,
+    'Welcome ratchet_tree omits the two trailing blank nodes (RFC 9420 section 12.4.3.3)');
+
+    const r3 = await alice.commitRemoveMember({ removedLeafIndex: 2 });
+    await bobGroup.processCommit(r3.commitMessage);
+    assert(alice.nLeaves === 2 && alice.ratchetTree.length === 3
+        && bobGroup.nLeaves === 2
+        && hex(alice.treeHash) === hex(bobGroup.treeHash),
+    'Remove of the only right-subtree member truncates the tree to 2 leaves');
+    assert(!bobGroup.parentKeyPairs.has(3) && bobGroup.parentKeyPairs.has(1),
+        'truncation drops the parent key pair of the discarded root');
+
+    const dave = await buildKeyPackage();
+    const r4 = await alice.commitAddMember({ keyPackageBytes: dave.keyPackageBytes });
+    await bobGroup.processCommit(r4.commitMessage);
+    const daveGroup = await joinWith(alice, dave, r4.welcomeMessage);
+    assert(alice.nLeaves === 4 && daveGroup.myLeafIndex === 2
+        && hex(daveGroup.treeHash) === hex(bobGroup.treeHash),
+    'the next Add extends the tree again and reuses leaf 2');
+
+    const r5 = await alice.commitRemoveMember({ removedLeafIndex: 2 });
+    await bobGroup.processCommit(r5.commitMessage);
+    const r6 = await alice.commitRemoveMember({ removedLeafIndex: 1 });
+    const bobRemoved = await bobGroup.processCommit(r6.commitMessage);
+    assert(alice.nLeaves === 1 && alice.ratchetTree.length === 1
+        && bobRemoved.removedSelf === true,
+    'removing the last member leaves the creator in a 1-leaf tree');
+    const erin = await buildKeyPackage();
+    const r7 = await alice.commitAddMember({ keyPackageBytes: erin.keyPackageBytes });
+    const erinGroup = await joinWith(alice, erin, r7.welcomeMessage);
+    const wire = await alice.encryptApplicationMessage('after the 1-leaf epoch');
+    assert(alice.nLeaves === 2 && erinGroup.myLeafIndex === 1
+        && new TextDecoder().decode(
+            (await erinGroup.decryptApplicationMessage(wire)).plaintext,
+        ) === 'after the 1-leaf epoch',
+    'a creator left alone can admit a new member afterwards');
+
+    // A ratchet_tree that keeps its trailing blank nodes is not the RFC
+    // wire form and is refused at join.
+    const frank = await buildKeyPackage();
+    const r8 = await alice.commitAddMember({ keyPackageBytes: frank.keyPackageBytes });
+    const enc = new Codec.Encoder();
+    Nodes.writeRatchetTree(enc, alice.ratchetTree);
+    let trailingRefused = false;
+    try {
+        await Group.Group.joinFromWelcomeWithTree({
+            welcomeMessage: r8.welcomeMessage,
+            keyPackageBytes: frank.keyPackageBytes,
+            initPrivateKey: frank.initKp.privateKey,
+            identity: frank.identity,
+            leafEncKeyPair: frank.leafEncKp,
+            ratchetTreeBytes: enc.bytes(),
+            expectedSignerLeafIndex: 0,
+            expectedCommitEpoch: alice.epoch - 1n,
+            ...await bootstrapPins(alice),
+        });
+    } catch (err) {
+        trailingRefused = err.message.includes('blank node');
+    }
+    assert(alice.ratchetTree[alice.ratchetTree.length - 1] === null && trailingRefused,
+        'a ratchet_tree that ends with a blank node is refused');
 }
 
 async function main() {
@@ -306,7 +408,7 @@ async function main() {
     await carolGroup.processCommit(r4.commitMessage);
     assert(alice.epoch === 4n && carolGroup.epoch === 4n,
         'Alice and Carol advanced to epoch 4 after add-after-remove');
-    assert(alice.nLeaves === 3,
+    assert(alice.nLeaves === 4,
         'Alice tree reuses Bob\'s blank leaf without growing');
 
     const tree4 = Nodes.ratchetTreeBytes(alice.ratchetTree);
@@ -336,9 +438,11 @@ async function main() {
     const existingLeaf = RatchetTree.leafFor(
         cappedCandidate.ratchetTree, 0,
     );
-    cappedCandidate.nLeaves = Group.MAX_GROUP_LEAVES;
+    // 20 members occupy leaves 0..19 of the full 32-leaf tree; leaves
+    // 20..31 stay blank, yet the member cap still refuses a 21st member.
+    cappedCandidate.nLeaves = Group.MAX_TREE_LEAVES;
     cappedCandidate.ratchetTree = new Array(
-        TreeMath.nodeWidth(Group.MAX_GROUP_LEAVES),
+        TreeMath.nodeWidth(Group.MAX_TREE_LEAVES),
     ).fill(null);
     for (let leafIndex = 0;
         leafIndex < Group.MAX_GROUP_LEAVES;
@@ -355,12 +459,14 @@ async function main() {
             keyPackageBytes: overflowMember.keyPackageBytes,
         });
     } catch (error) {
-        leafCapRejected = error.message.includes('20-leaf limit');
+        leafCapRejected = error.message.includes('20-member limit');
     } finally {
         cappedCandidate.destroySecrets();
     }
     assert(leafCapRejected,
-        'cryptographic Add path enforces the 20-leaf profile cap');
+        'cryptographic Add path enforces the 20-member profile cap');
+
+    await fullTreeShape();
 
     console.log('');
     console.log(`group-remove: ${passed} passed, ${failed} failed`);

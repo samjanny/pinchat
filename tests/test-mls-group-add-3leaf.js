@@ -27,6 +27,7 @@ const Group = require(path.join(__dirname, '..', 'static', 'js', 'mls', 'group.j
 const Signature = require(path.join(__dirname, '..', 'static', 'js', 'mls', 'signature.js'));
 const HPKE = require(path.join(__dirname, '..', 'static', 'js', 'mls', 'hpke.js'));
 const Nodes = require(path.join(__dirname, '..', 'static', 'js', 'mls', 'nodes.js'));
+const RatchetTree = require(path.join(__dirname, '..', 'static', 'js', 'mls', 'ratchet-tree.js'));
 const KeyPackage = require(path.join(__dirname, '..', 'static', 'js', 'mls', 'key-package.js'));
 const Labeled = require(path.join(__dirname, '..', 'static', 'js', 'mls', 'labeled.js'));
 
@@ -121,13 +122,17 @@ async function main() {
     const carol = await buildKeyPackage();
     const r2 = await alice.commitAddMember({ keyPackageBytes: carol.keyPackageBytes });
     assert(alice.epoch === 2n, 'Alice advanced to epoch 2');
-    assert(alice.nLeaves === 3, 'Alice has 3 leaves');
+    // RFC 9420 trees are full: three members live in a 4-leaf tree whose
+    // rightmost leaf stays blank.
+    assert(alice.nLeaves === 4 && alice.ratchetTree.length === 7
+        && RatchetTree.leafFor(alice.ratchetTree, 3) === null,
+    'Alice has a full 4-leaf tree with 3 members');
 
     // Bob processes the Commit broadcast.
     const bobResult = await bobGroup.processCommit(r2.commitMessage);
     assert(bobResult.addedLeafIndex === 2, 'Bob saw addedLeafIndex=2');
     assert(bobGroup.epoch === 2n, 'Bob advanced to epoch 2');
-    assert(bobGroup.nLeaves === 3, 'Bob sees 3 leaves after processCommit');
+    assert(bobGroup.nLeaves === 4, 'Bob sees the full 4-leaf tree after processCommit');
 
     // Carol joins via Welcome.
     const tree2Bytes = Nodes.ratchetTreeBytes(alice.ratchetTree);
@@ -142,8 +147,8 @@ async function main() {
         expectedCommitEpoch: alice.epoch - 1n,
         ...await bootstrapPins(alice),
     });
-    assert(carolGroup.epoch === 2n && carolGroup.nLeaves === 3,
-        'Carol joined into 3-leaf tree at epoch 2');
+    assert(carolGroup.epoch === 2n && carolGroup.nLeaves === 4,
+        'Carol joined into the full 4-leaf tree at epoch 2');
     assert(carolGroup.myLeafIndex === 2, 'Carol is leaf 2');
 
     // All three share the authenticated epoch state at epoch 2.
