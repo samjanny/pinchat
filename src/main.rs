@@ -186,8 +186,11 @@ fn limited_websocket_routes(
     let quota_layer = ip_quota_layer!(app_state, quota, sweeper);
     Router::new()
         .route("/ws/:room_id", get(ws_handler))
-        .layer(quota_layer)
-        .layer(middleware::from_fn_with_state(
+        // route_layer, not layer: a layer also wraps the router's fallback,
+        // and require_ws_token takes the room ID from the path, so every
+        // address that matches no route used to answer 500 instead of 404.
+        .route_layer(quota_layer)
+        .route_layer(middleware::from_fn_with_state(
             app_state.clone(),
             require_ws_token,
         ))
@@ -203,8 +206,9 @@ fn limited_api_routes(
     Router::new()
         .route("/api/rooms", post(create_room))
         .route("/api/ws-token/:room_id", post(generate_ws_token))
-        .layer(quota_layer)
-        .layer(middleware::from_fn_with_state(
+        // Only for these routes, not for the fallback; see above.
+        .route_layer(quota_layer)
+        .route_layer(middleware::from_fn_with_state(
             app_state.clone(),
             require_auth_api,
         ))
@@ -810,6 +814,35 @@ mod tests {
         assert_eq!(
             post_api(&app, "/api/rooms", None).await,
             StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[tokio::test]
+    async fn an_address_that_matches_no_route_is_not_found() {
+        let state = gated_state();
+        let mut sweeper = RetentionSweeper::default();
+        let (quota, _) = Quota::new(2, 600);
+        let app = Router::new()
+            .merge(limited_api_routes(&state, quota, &mut sweeper))
+            .merge(limited_websocket_routes(&state, quota, &mut sweeper));
+        for path in ["/favicon.ico", "/robots.txt", "/ws", "/api/nothing"] {
+            for method in ["GET", "POST"] {
+                let mut request = Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .body(Body::empty())
+                    .unwrap();
+                request
+                    .extensions_mut()
+                    .insert(ConnectInfo(SocketAddr::from((CLIENT, 40000))));
+                let status = app.clone().oneshot(request).await.unwrap().status();
+                assert_eq!(status, StatusCode::NOT_FOUND, "{method} {path}");
+            }
+        }
+        assert_eq!(
+            sweeper.sweep_all(),
+            0,
+            "an unknown address must not spend a quota"
         );
     }
 
