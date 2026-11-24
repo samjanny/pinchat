@@ -32,7 +32,7 @@ This document specifies the PinChat messaging protocol, including message format
 |         (AES-GCM, ECDH, ECDSA, HKDF)             |
 +--------------------------------------------------+
 |              Transport Layer                      |
-|         (WebSocket over TLS 1.3)                  |
+|         (WebSocket over TLS 1.2 or 1.3)           |
 +--------------------------------------------------+
 ```
 

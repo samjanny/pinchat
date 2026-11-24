@@ -176,7 +176,9 @@ reverse proxy. The WebSocket transport is the relay's own
 (`src/ws_transport.rs`), fuzzed in `fuzz/` and run against the Autobahn
 conformance suite in `tests/autobahn/`. Application state lives in memory.
 Rate limiting uses tower-governor with HMAC-hashed IPs, alongside
-proof-of-work anti-spam and a cap on open WebSocket connections.
+proof-of-work anti-spam, a cap on open WebSocket connections, and caps,
+deadlines and size limits on HTTP connections before they are upgraded. The
+relay serves HTTP/1.1 only.
 
 **Frontend.** Vanilla JavaScript with Alpine.js (CSP build), WebCrypto,
 responsive CSS. No build step. The application markup lives in signed
@@ -228,6 +230,8 @@ only.
 (support email, DPA information, hosting note, last-updated date). It is
 gitignored and deployment-specific, typically served from `WEBSITE_DIR` in
 production. If it is missing the legal pages still render, with placeholders.
+With the extension in Firefox, an `operator.json` that does not match the
+signed manifest is withheld from the page.
 
 ### Docker
 
@@ -308,10 +312,12 @@ hosting-provider logs.
 | `GROUP_CHAT_ENABLED` | `false` | MLS group rooms of up to 20 members. Off, group-room creation answers 404 |
 | `MAX_WS_CONNECTIONS` | `400` | WebSocket connections open at once. An upgrade beyond it is refused with 503 and `Retry-After`, before anything is allocated for it; the token and room endpoints refuse with the same answer before the proof of work. Sized for a 512 MiB container |
 | `MAX_WS_CONNECTIONS_PER_ADDRESS` | `50` | WebSocket connections open at once from one client address (an IPv6 /64; an IPv6 /48 may hold four times as many). Beyond it: 429 and `Retry-After` |
-| `CSP_WS_HOST` | `'self'` | Extra WebSocket origins allowed by the CSP |
-| `WS_CONN_BURST_SIZE` | `30` | WebSocket connections per window, per client address, counted only for upgrades that carry a valid token. Also the burst a client may spend at once |
+| `MAX_HTTP_CONNECTIONS` | `256` | HTTP connections served at once before they are upgraded to WebSocket, 1 to 100000. Beyond it, new connections wait in the kernel queue. With direct TLS a slow reader holds up to about 0.5 MB: lower it on a small host that is not behind a reverse proxy |
+| `MAX_HTTP_CONNECTIONS_PER_ADDRESS` | `32` | The same for one client address (an IPv6 /64; an IPv6 /48 may hold four times as many), 1 to `MAX_HTTP_CONNECTIONS`. A connection beyond it is closed at once. Connections from `TRUSTED_PROXIES` count in the total only |
+| `CSP_WS_HOST` | `'self'` | Extra WebSocket origins allowed by the CSP, space-separated. Each must be `'self'` or `wss://host[:port]` (`ws://` only in `development`), or the server refuses to start |
+| `WS_CONN_BURST_SIZE` | `30` | WebSocket connections per window, per client address (an IPv6 /64, with a second budget four times as large for its /48), counted only for upgrades that carry a valid token. Also the burst a client may spend at once |
 | `WS_CONN_PERIOD_SECS` | `60` | Window over which the WebSocket connection budget refills evenly |
-| `ROOM_TOKEN_BURST_SIZE` | `100` | Room and token requests per window, per client address, counted after the session check |
+| `ROOM_TOKEN_BURST_SIZE` | `100` | Room and token requests per window, per client address (an IPv6 /64, with a second budget four times as large for its /48), counted after the session check |
 | `ROOM_TOKEN_PERIOD_SECS` | `600` | Window over which the room and token budget refills evenly |
 | `MSG_RATE_LIMIT` | `30` | Messages per connection per window |
 | `MSG_RATE_WINDOW_SECS` | `1` | Window for per-connection message rate limiting, also used by the per-room and frame limits below |
@@ -327,17 +333,17 @@ hosting-provider logs.
 | `PROPOSAL_RATE_WINDOW_SECS` | `60` | Window for the proposal limit |
 | `POW_MIN_DIFFICULTY` | `12` | Minimum proof-of-work difficulty, in bits |
 | `POW_MAX_DIFFICULTY` | `18` | Maximum proof-of-work difficulty, in bits |
-| `CHALLENGE_TTL_SECS` | `300` | Proof-of-work challenge TTL |
+| `CHALLENGE_TTL_SECS` | `300` | Proof-of-work challenge lifetime, 10 to 300. Challenges are signed by the relay and kept by the client, not stored |
 | `JWT_TOKEN_TTL_SECS` | `30` | WebSocket JWT TTL, 1 to 300 |
 | `JWT_ISSUER` | `pinchat` | Issuer the WebSocket JWT must carry. Set it explicitly when several instances share one signing key |
 | `MAX_WS_CONNECTION_AGE_SECS` | `1800` | Lifetime of a WebSocket connection. The client then reconnects through proof of work and a new token, and resumes its place with the resume credential: the encrypted session is kept, no new handshake |
 | `WS_RECONNECT_GRACE_SECS` | `20` | How long a disconnected participant's place is held for its resume credential, 1 to 120 |
 | `ROOM_CLEANUP_INTERVAL_SECS` | `60` | Room cleanup interval |
-| `CHALLENGE_CLEANUP_INTERVAL_SECS` | `60` | Proof-of-work cache cleanup interval |
-| `PINCHAT_PASSWORD_HASHES` | empty | Semicolon-separated Argon2id hashes. Empty disables password auth, and the server then needs `ALLOW_ANONYMOUS=true` to start |
+| `CHALLENGE_CLEANUP_INTERVAL_SECS` | `60` | How often the IDs of solved challenges, kept so that each is accepted once, are forgotten after they expire, 1 to 60 |
+| `PINCHAT_PASSWORD_HASHES` | empty | Semicolon-separated Argon2id hashes, each checked at startup. Empty disables password auth, and the server then needs `ALLOW_ANONYMOUS=true` to start |
 | `ALLOW_ANONYMOUS` | `false` | Open access with no password. Required when `PINCHAT_PASSWORD_HASHES` is empty, outside `development` |
-| `SESSION_TTL_SECS` | `86400` | Session lifetime |
-| `LOGIN_BURST_SIZE` | `5` | Login attempts per window, per client address |
+| `SESSION_TTL_SECS` | `86400` | Session lifetime, counted from login; activity does not extend it |
+| `LOGIN_BURST_SIZE` | `5` | Login attempts per window, per client address (an IPv6 /64, with a second budget four times as large for its /48) |
 | `LOGIN_PERIOD_SECS` | `720` | Window over which the login budget refills evenly. Windows that would keep a hashed client address for more than 15 minutes are shortened at startup; see `.env.example` |
 | `TRUSTED_PROXIES` | empty | Comma-separated proxy IPs or CIDRs trusted for `X-Forwarded-For`. Set this behind a reverse proxy, or every client shares one rate-limit bucket |
 | `REPLAY_CACHE_MAX_PER_ROOM` | `1000` | Anti-replay entries per room, at most 10000. Advisory only; the authoritative check is the client-side Double Ratchet counter |
