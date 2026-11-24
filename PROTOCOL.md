@@ -350,10 +350,15 @@ Input: sharedSecret (32 bytes), isInitiator (boolean)
 
 ### DH Ratchet (Receive-Side)
 
-Triggered when receiving a message with a new DH public key:
+Triggered when receiving a message with a new DH public key, after its
+header signature has verified:
 
 ```
-1. Save previous chain state:
+HKDF(ikm, salt, info, L) = HKDF-SHA256 with input key material ikm,
+                           salt salt, info info, L output bytes
+
+1. Store the skipped keys of the current receiving chain up to pn
+   (bounded by MAX_SKIP), then save the previous chain state:
    PN = Ns (previous chain length)
    Ns = 0
    Nr = 0
@@ -361,27 +366,39 @@ Triggered when receiving a message with a new DH public key:
 2. Update peer public key:
    DHr = new_public_key
 
-3. Derive receiving chain:
+3. Derive receiving chain (one 64-byte HKDF output, split in two):
    DH_out = ECDH(DHs.private, DHr)
-   rootKey' = HKDF(rootKey, DH_out, "DoubleRatchet-RootKey", 32)
-   receivingChainKey = HKDF(rootKey', zeros(32), "ChainKey", 32)
+   out    = HKDF(rootKey, DH_out, "DoubleRatchet-RootKey", 64)
+   rootKey'          = out[0..32]
+   receivingChainKey = out[32..64]
 
 4. Generate new keypair:
    DHs = new ECDH keypair
 
 5. Derive sending chain:
-   DH_out = ECDH(DHs.private, DHr)
-   rootKey'' = HKDF(rootKey', DH_out, "DoubleRatchet-RootKey", 32)
-   sendingChainKey = HKDF(rootKey'', zeros(32), "ChainKey", 32)
+   DH_out' = ECDH(DHs.private, DHr)
+   out'    = HKDF(rootKey', DH_out', "DoubleRatchet-RootKey", 64)
+   rootKey''       = out'[0..32]
+   sendingChainKey = out'[32..64]
 
 6. Update root key:
-   rootKey = rootKey''
+   rootKey.fill(0); rootKey = rootKey''
    ratchetCount++
+   drop skipped keys more than one ratchet round old
+   sign the new DHs (see DH Header Signature)
 ```
+
+The root key is the HKDF input key material and the DH output is the salt.
+Chain keys come from the same HKDF output as the next root key, never from a
+second expansion of the retained root key, so the root key kept after a step
+does not reconstruct the chain keys it produced. Releases before v0.5.0 derived
+each chain key as `HKDF(rootKey', zeros(32), "ChainKey", 32)` from the root
+key they kept; that derivation is gone.
 
 ### DH Ratchet (Send-Side)
 
-Triggered before sending when `hasRatchetedSinceReceive == false`:
+Triggered before sending when a peer DH key is known (`DHr` set) and
+`hasRatchetedSinceReceive == false`:
 
 ```
 1. Save previous chain state:
@@ -393,13 +410,15 @@ Triggered before sending when `hasRatchetedSinceReceive == false`:
 
 3. Derive new sending chain:
    DH_out = ECDH(DHs.private, DHr)
-   rootKey' = HKDF(rootKey, DH_out, "DoubleRatchet-RootKey", 32)
-   sendingChainKey = HKDF(rootKey', zeros(32), "ChainKey", 32)
+   out    = HKDF(rootKey, DH_out, "DoubleRatchet-RootKey", 64)
+   rootKey'        = out[0..32]
+   sendingChainKey = out[32..64]
 
 4. Update root key:
-   rootKey = rootKey'
+   rootKey.fill(0); rootKey = rootKey'
    ratchetCount++
    hasRatchetedSinceReceive = true
+   sign the new DHs
 ```
 
 ### Symmetric Ratchet (Chain Ratchet)
@@ -411,7 +430,8 @@ messageKey = HMAC-SHA256(chainKey, "MessageKey-" || counter)
 // Advance chain
 chainKey' = HMAC-SHA256(chainKey, "ChainRatchet")
 
-// Delete old chain key
+// Replace the old chain key (the reference is dropped; the old buffer is
+// not overwritten, see SECURITY.md "JS Memory Zeroization is Best-Effort")
 chainKey = chainKey'
 ```
 

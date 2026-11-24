@@ -214,7 +214,7 @@ lets the relay correlate connections across rooms.
 **Security Properties**:
 - Confidentiality: Plaintext hidden from adversary
 - Integrity: Tampering detected via authentication tag
-- Authenticity: AAD binds ciphertext to context (room ID, sender ID, message number)
+- Authenticity: AAD binds ciphertext to context (room ID, sender ID, message number, message type, ratchet count, previous chain length)
 
 **IV Generation**:
 ```
@@ -247,7 +247,7 @@ IVs are generated using CSPRNG and never reused within a key's lifetime.
 **Algorithm**: ECDSA (Elliptic Curve Digital Signature Algorithm)
 - Curve: P-256 (NIST secp256r1)
 - Hash: SHA-256
-- Signature Size: 64 bytes (DER encoded)
+- Signature Size: 64 bytes, IEEE P1363 encoding (`r || s`, 32 bytes each), which is what WebCrypto produces and verifies; not DER
 
 **Usage**:
 - Identity key authentication
@@ -302,7 +302,7 @@ CK_{n+1} = HMAC-SHA256(CK_n, "ChainRatchet")
 - One-way: Cannot derive CK_n from CK_{n+1}
 - Independence: Compromise of MK_n does not reveal MK_{n+1}
 
-### SAS Generation (v3, current)
+### SAS Generation (v4, current)
 
 **Algorithm**: HKDF-SHA256
 - Output: 96 bits (16 emoji from a 64-character alphabet, 6 bits per emoji)
@@ -408,7 +408,7 @@ two-sided birthday search over attacker-chosen identity keys, fully
 precomputable offline against the v2 inputs (both are known to the
 relay before the handshake). The ECDSA-keygen cost argument above
 mitigates but does not eliminate that search within the 24h identity
-TTL. v3 (see above) therefore binds the live handshake transcript AND
+TTL. v3 (since superseded by v4, see above) therefore binds the live handshake transcript AND
 widens the output to 96 bits. This section is retained as the record
 of the v0.3.x design.
 
@@ -498,7 +498,8 @@ AAD = TLV_encode([
     SENDER_ID,
     MESSAGE_NUMBER,
     MESSAGE_TYPE,
-    RATCHET_COUNT
+    RATCHET_COUNT,
+    PREVIOUS_CHAIN_LENGTH
 ])
 ```
 
@@ -513,11 +514,26 @@ AAD = TLV_encode([
 
 ### JS Memory Zeroization is Best-Effort
 
-After a message key or chain key is used, PinChat calls `Uint8Array.fill(0)` on the raw key material. This is a best-effort mitigation: JavaScript engines (V8, SpiderMonkey) do not guarantee that the backing buffer is zeroed in native memory or that the GC reclaims it promptly. A memory dump of the browser process may still recover key material.
+PinChat overwrites some raw key material with `Uint8Array.fill(0)` and leaves the rest to the garbage collector. Where `fill(0)` runs it is still a best-effort mitigation: JavaScript engines (V8, SpiderMonkey) do not guarantee that copies made by the engine are zeroed or that the GC reclaims them promptly. A memory dump of the browser process may still recover key material.
+
+**Overwritten with `fill(0)`:**
+- the previous root key, on every DH ratchet step (send side and receive side);
+- the initial ECDH shared secret, once the Double Ratchet is initialised;
+- the root key and both chain keys when the ratchet is destroyed (`DoubleRatchet.destroy()`, which calls `ChainRatchet.reset()`). This runs on every session teardown: peer departure, handshake restart, SAS mismatch;
+- the final temporary chain-key copy used to derive a message key;
+- the MLS PSK derived from the invite key, when the bootstrap key is dropped.
+
+**Not overwritten, only released to the garbage collector:**
+- the previous chain key on each symmetric ratchet step: `ChainRatchet.ratchet()` replaces the reference to the old buffer and does not zero it;
+- the chains a DH ratchet step replaces;
+- the raw message-key bytes, which exist briefly as HMAC output before they are imported as a non-extractable AES-GCM `CryptoKey`;
+- the copies of the root key and chain keys that every encryption and decryption takes as a rollback snapshot;
+- HKDF outputs and the intermediate chain-key copies made when deriving a key several steps ahead;
+- the raw invite-key bytes decoded from the URL fragment (the fragment itself stays in `sessionStorage`, see "Bootstrap Key Temporarily Stored in `sessionStorage`" below).
 
 **What does help:**
-- Identity private keys are imported with `extractable: false` - WebCrypto's opaque `CryptoKey` objects cannot be exported or read by JS, even with a memory dump via `exportKey`.
-- Double Ratchet chain keys are zeroized (`fill(0)`) after ratchet progression; the old material is no longer reachable from JS once the typed array reference is released.
+- Identity private keys are created with `extractable: false` - WebCrypto's opaque `CryptoKey` objects cannot be exported or read by JS via `exportKey`. The same holds for the ECDH private keys and for message keys, which exist as non-extractable `CryptoKey` objects.
+- Old chain keys and message keys stop being reachable from page scripts as soon as the ratchet moves past them, even where their buffers are not overwritten. Skipped message keys are the exception: they stay in the skipped-key store until used or pruned.
 
 **Recommendation:** Use incognito/private mode for sensitive chats. Close the tab immediately after the conversation ends. Do not use PinChat on shared or potentially compromised devices.
 

@@ -441,7 +441,9 @@ class ChainRatchet {
         // Compute next chain key: HMAC-SHA256(currentChainKey, "ChainRatchet")
         const nextChainKeyRaw = await crypto.subtle.sign('HMAC', hmacKey, info);
 
-        // Overwrite old chain key material to keep the ratchet one-way
+        // Replace the old chain key material to keep the ratchet one-way.
+        // The old buffer is released, not overwritten (SECURITY.md, "JS
+        // Memory Zeroization is Best-Effort").
         this.chainKeyMaterial = new Uint8Array(nextChainKeyRaw);
 
         // NOTE: messageNumber is incremented in deriveMessageKey() to prevent race conditions
