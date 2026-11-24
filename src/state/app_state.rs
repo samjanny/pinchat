@@ -2,6 +2,7 @@ use crate::challenge_cache::ChallengeCache;
 use crate::config::Config;
 use crate::models::Room;
 use crate::session::SessionStore;
+use crate::ws_transport::{InboundBudget, InboundTier};
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
@@ -10,7 +11,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::broadcast;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, broadcast};
 use uuid::Uuid;
 
 /// Retention margin applied on top of a token's own `exp` when recording a
@@ -109,6 +110,7 @@ mod resource_bound_tests {
             json: "control".to_string(),
             retained_bytes,
             global_bytes: global_bytes.clone(),
+            client_bytes: None,
         }));
         let replay_clone = payload.clone();
 
@@ -136,21 +138,70 @@ pub enum ConnectionAdmission {
     Resumed,
 }
 
-const BROADCAST_CHANNEL_ENTRIES: usize = 8;
+/// How many messages the ring of a room holds. Each receiver takes them one
+/// at a time and writes each to its socket before it takes the next; one
+/// that falls further behind than this is disconnected with 1008, and what
+/// the room sent meanwhile is lost to it. Its browser reconnects and gets
+/// the group controls again from the ordered log.
+///
+/// Writing a picture to a receiver takes seconds on a small host while the
+/// rest of the room goes on sending, and the members of a group may all send
+/// at the same moment. With 8, on a single virtual CPU, that disconnected
+/// most members of a busy group. 64 is three messages from every member of
+/// a full group, or about 16 seconds of their expected text while one
+/// picture is being written.
+///
+/// The count does not bound memory: a message stays counted in the
+/// broadcast budgets below until the last receiver has written it, and
+/// leaves them then, before its slot is reused. A slot costs 32 bytes, so
+/// 500 rooms take about 1 MiB of rings.
+pub(crate) const BROADCAST_CHANNEL_ENTRIES: usize = 64;
+/// Large enough for one image at the largest `MAX_IMAGE_SIZE` (3.7 MB on
+/// the wire for 2 MiB), and so for every frame a room carries.
 const MAX_BROADCAST_ROOM_BYTES: usize = 4 * 1024 * 1024;
-const MAX_BROADCAST_GLOBAL_BYTES: usize = 64 * 1024 * 1024;
+/// The global budgets below were 64 MiB each. Together with the password
+/// checks they then took about 300 MiB of a 512 MiB container before a
+/// single room or connection, and the heaviest honest load measured (every
+/// member of 50 full groups sending a 2 MiB image at once, on one CPU)
+/// peaked at 77 MB. Half leaves room for the state of the rooms and the
+/// connections the relay admits.
+const MAX_BROADCAST_GLOBAL_BYTES: usize = 32 * 1024 * 1024;
+/// Frames of at least this size may take only three quarters of the global
+/// broadcast budget: pictures held by receivers that do not read cannot
+/// leave text and group controls without room.
+const LARGE_BROADCAST_FRAME: usize = 64 * 1024;
+const MAX_BROADCAST_GLOBAL_LARGE_BYTES: usize = MAX_BROADCAST_GLOBAL_BYTES / 4 * 3;
 /// What the clients behind one address may hold of the global broadcast
-/// budget at a time. Frames stay counted until every receiver has taken
-/// them, so a sender paired with receivers that do not read keeps its bytes
-/// in the budget for as long as the write deadline allows. With the per-room
-/// limit alone, sixteen such rooms opened from one address filled the global
-/// budget and no other room could relay. A quarter leaves an address room
-/// for several full-size images in flight at once and takes at least four
-/// addresses to fill the budget.
+/// budget at a time. Frames stay counted until they have been written to
+/// every receiver, so a sender paired with receivers that do not read keeps
+/// its bytes in the budget for as long as the write deadline allows. With
+/// the per-room limit alone, a few such rooms opened from one address
+/// filled the global budget and no other room could relay. A quarter leaves
+/// an address room for two full-size images in flight at once and takes at
+/// least four addresses to fill the budget.
 pub(crate) const MAX_BROADCAST_CLIENT_BYTES: usize = MAX_BROADCAST_GLOBAL_BYTES / 4;
+/// Large messages on their way in, before the relay has them whole: how
+/// many bytes of them may be in memory at once, for all connections and for
+/// the connections of one address. A connection that finds no room stops
+/// reading its socket until there is some. The figures mirror the broadcast
+/// budget, which takes over once a message has been accepted.
+const MAX_INBOUND_GLOBAL_BYTES: usize = 32 * 1024 * 1024;
+const MAX_INBOUND_CLIENT_BYTES: usize = MAX_INBOUND_GLOBAL_BYTES / 4;
+/// The same for messages between the free allowance of the transport (4 KiB)
+/// and the large class (64 KiB), kept apart so that pictures cannot starve
+/// them. A message of that size that is never finished holds up to 64 KiB
+/// until its deadline: 8 MiB is 128 of them for the whole relay, a quarter
+/// of that for one address.
+const MAX_INBOUND_SMALL_GLOBAL_BYTES: usize = 8 * 1024 * 1024;
+const MAX_INBOUND_SMALL_CLIENT_BYTES: usize = MAX_INBOUND_SMALL_GLOBAL_BYTES / 4;
 pub(crate) const MAX_MLS_CONTROL_LOG_ENTRIES: usize = 256;
 const MAX_MLS_CONTROL_LOG_BYTES: usize = 2 * 1024 * 1024;
-const MAX_MLS_CONTROL_LOG_GLOBAL_BYTES: usize = 64 * 1024 * 1024;
+const MAX_MLS_CONTROL_LOG_GLOBAL_BYTES: usize = 32 * 1024 * 1024;
+/// What the controls sent from one address may hold of the global log, so
+/// that the rooms of one client cannot keep every group from admitting
+/// members. A quarter, as for the broadcast budget: four addresses at least
+/// to fill it.
+const MAX_MLS_CONTROL_LOG_CLIENT_BYTES: usize = MAX_MLS_CONTROL_LOG_GLOBAL_BYTES / 4;
 // Ordinary MLS envelopes may not consume the final lifecycle slots. A
 // UserLeft that cannot be durably sequenced would leave relay membership and
 // the authenticated MLS roster disagreeing about who is still authorised.
@@ -175,7 +226,41 @@ pub(crate) const MLS_CONTROL_LAG_HARD_LIMIT: u64 =
     (MAX_MLS_CONTROL_LOG_ENTRIES - 2 * MLS_LIFECYCLE_RESERVED_ENTRIES) as u64;
 const MLS_LIFECYCLE_RESERVED_BYTES: usize = 128 * 1024;
 const MAX_PENDING_MLS_WELCOME_CORRELATIONS: usize = 64;
-const MAX_CONSUMED_MLS_KEY_PACKAGE_REFS: usize = 4096;
+/// KeyPackage references a group may consume over its lifetime, each kept
+/// so that it cannot be used twice. A group has at most 20 members and lives
+/// at most 24 hours, so 1024 joins is far more than it will see; the set
+/// takes about 133 KB at that size, a quarter of the 537 KB 4096 took, and the
+/// relay may hold `MAX_TOTAL_ROOMS` groups. A group that reaches it can
+/// admit nobody more, which is what its creator would see as a full room.
+const MAX_CONSUMED_MLS_KEY_PACKAGE_REFS: usize = 1024;
+
+/// Wakes the senders that wait for room in the broadcast budgets whenever a
+/// frame leaves them.
+///
+/// A waiter counts itself in `waiting` before it registers and tries, and a
+/// release looks at the count after it has given its bytes back. Whichever
+/// comes second sees the other: either the attempt finds the bytes, or the
+/// release finds the waiter. With nobody waiting a release costs one load.
+#[derive(Debug, Default)]
+struct BroadcastRelease {
+    waiting: AtomicUsize,
+    released: tokio::sync::Notify,
+}
+
+struct BroadcastWaiter<'a>(&'a BroadcastRelease);
+
+impl<'a> BroadcastWaiter<'a> {
+    fn new(release: &'a BroadcastRelease) -> Self {
+        release.waiting.fetch_add(1, Ordering::SeqCst);
+        Self(release)
+    }
+}
+
+impl Drop for BroadcastWaiter<'_> {
+    fn drop(&mut self) {
+        self.0.waiting.fetch_sub(1, Ordering::SeqCst);
+    }
+}
 
 #[derive(Debug)]
 struct BroadcastPayloadInner {
@@ -186,17 +271,21 @@ struct BroadcastPayloadInner {
     /// relay produces itself.
     client_bytes: Option<Arc<AtomicUsize>>,
     global_bytes: Arc<AtomicUsize>,
+    release: Arc<BroadcastRelease>,
 }
 
 impl Drop for BroadcastPayloadInner {
     fn drop(&mut self) {
         self.room_bytes
-            .fetch_sub(self.retained_bytes, Ordering::AcqRel);
+            .fetch_sub(self.retained_bytes, Ordering::SeqCst);
         if let Some(client_bytes) = &self.client_bytes {
-            client_bytes.fetch_sub(self.retained_bytes, Ordering::AcqRel);
+            client_bytes.fetch_sub(self.retained_bytes, Ordering::SeqCst);
         }
         self.global_bytes
-            .fetch_sub(self.retained_bytes, Ordering::AcqRel);
+            .fetch_sub(self.retained_bytes, Ordering::SeqCst);
+        if self.release.waiting.load(Ordering::SeqCst) > 0 {
+            self.release.released.notify_waiters();
+        }
     }
 }
 
@@ -204,7 +293,28 @@ impl Drop for BroadcastPayloadInner {
 #[derive(Debug)]
 struct ClientBroadcastShare {
     bytes: Arc<AtomicUsize>,
+    /// Bytes of the MLS control log appended from this address.
+    mls_bytes: Arc<AtomicUsize>,
+    inbound: InboundShare,
     connections: usize,
+}
+
+impl ClientBroadcastShare {
+    /// Whether the entry can go: no connection, and nothing it sent still
+    /// held by a receiver or the control log. A client must not get a fresh
+    /// share by reconnecting while its earlier bytes are still counted.
+    fn idle(&self) -> bool {
+        self.connections == 0
+            && self.bytes.load(Ordering::Acquire) == 0
+            && self.mls_bytes.load(Ordering::Acquire) == 0
+    }
+}
+
+/// The shares of one address in the two classes of the inbound budget.
+#[derive(Debug, Clone)]
+struct InboundShare {
+    small: InboundTier,
+    large: InboundTier,
 }
 
 /// Held by a WebSocket connection for as long as it lives. Frames the
@@ -221,6 +331,8 @@ struct ClientBroadcastShare {
 pub struct ClientBroadcastLease {
     key: String,
     bytes: Arc<AtomicUsize>,
+    mls_bytes: Arc<AtomicUsize>,
+    inbound: InboundShare,
     shares: Arc<DashMap<String, ClientBroadcastShare>>,
 }
 
@@ -232,9 +344,62 @@ impl Drop for ClientBroadcastLease {
         // The entry outlives its last connection only while frames are in
         // flight: a client must not get a fresh share by reconnecting while
         // its earlier frames are still held by receivers that do not read.
-        self.shares.remove_if(&self.key, |_, share| {
-            share.connections == 0 && share.bytes.load(Ordering::Acquire) == 0
-        });
+        self.shares.remove_if(&self.key, |_, share| share.idle());
+    }
+}
+
+/// The connections of one IPv6 /48 may hold this many times the slots of one
+/// address. A household or an office has one /48 at most, and often a /56
+/// or a /64; someone with a whole /48 to rotate through gets four addresses'
+/// worth of connections, not 65536.
+const PREFIX_SHARE_FACTOR: usize = 4;
+
+/// Why a WebSocket connection was not admitted. Both are the relay's own
+/// limits, not faults of the client: the answer says to come back later.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdmissionRefused {
+    /// Every connection slot of the relay is taken.
+    RelayFull,
+    /// The connections of the client's address, or of its IPv6 /48, hold
+    /// all the slots they may.
+    AddressFull,
+}
+
+/// Where a connection comes from, as admission control counts it: the
+/// keyed hash of the client address that the request quotas use (an IPv6
+/// address counts as its /64) and, for IPv6, the keyed hash of its /48.
+/// Neither outlives the per-boot secret, and neither is logged.
+#[derive(Debug, Clone)]
+pub struct ClientAddress {
+    pub key: String,
+    pub prefix: Option<String>,
+}
+
+/// What an admitted WebSocket connection holds while it exists, from the
+/// moment its upgrade is accepted to the end of its closing handshake: a
+/// slot of the relay, one of its address (the share it also uses for the
+/// broadcast and inbound budgets) and one of its IPv6 /48. Each is given
+/// back when this is dropped, whatever ends the connection: a close, an
+/// error, a timeout, an upgrade that never completes, or the task being
+/// cancelled.
+pub struct WsAdmission {
+    _slot: OwnedSemaphorePermit,
+    _prefix: Option<PrefixLease>,
+    pub share: Option<Arc<ClientBroadcastLease>>,
+}
+
+/// A connection counted against an IPv6 /48.
+struct PrefixLease {
+    key: String,
+    counts: Arc<DashMap<String, usize>>,
+}
+
+impl Drop for PrefixLease {
+    fn drop(&mut self) {
+        if let Some(mut count) = self.counts.get_mut(&self.key) {
+            *count = count.saturating_sub(1);
+        }
+        self.counts.remove_if(&self.key, |_, count| *count == 0);
     }
 }
 
@@ -271,8 +436,26 @@ pub enum ReplayAdmission {
 
 #[derive(Debug, Default)]
 pub struct ReplayCache {
-    by_hash: HashMap<String, DateTime<Utc>>,
-    insertion_order: VecDeque<(String, DateTime<Utc>)>,
+    by_hash: HashMap<ReplayKey, DateTime<Utc>>,
+    insertion_order: VecDeque<(ReplayKey, DateTime<Utc>)>,
+}
+
+/// An identity as the replay cache keeps it: the 32 bytes of the SHA-256
+/// the relay computes for an envelope, rather than the 64 hexadecimal
+/// characters it is handed, held twice. A full cache of 1000 entries took
+/// about 285 KB that way and takes about 137 KB this way: at 500 rooms,
+/// about 70 MB instead of about 140 MB. Anything that is not 64 hexadecimal characters
+/// (the tests use short names) is hashed to 32 bytes instead; two distinct
+/// identities collide only if SHA-256 does.
+type ReplayKey = [u8; 32];
+
+fn replay_key(identity: &str) -> ReplayKey {
+    let mut key = [0u8; 32];
+    if identity.len() == 64 && hex::decode_to_slice(identity, &mut key).is_ok() {
+        return key;
+    }
+    use sha2::{Digest, Sha256};
+    Sha256::digest(identity.as_bytes()).into()
 }
 
 impl ReplayCache {
@@ -294,6 +477,7 @@ impl ReplayCache {
         {
             self.pop_oldest();
         }
+        let hash = replay_key(&hash);
         if self.by_hash.contains_key(&hash) {
             return false;
         }
@@ -303,7 +487,7 @@ impl ReplayCache {
             }
             self.pop_oldest();
         }
-        self.by_hash.insert(hash.clone(), now);
+        self.by_hash.insert(hash, now);
         self.insertion_order.push_back((hash, now));
         true
     }
@@ -314,6 +498,7 @@ impl ReplayCache {
     /// other envelopes for the room may have been recorded in between. The
     /// entry is still at or near the tail, hence the scan from the back.
     pub fn remove(&mut self, hash: &str) {
+        let hash = &replay_key(hash);
         let Some(inserted_at) = self.by_hash.remove(hash) else {
             return;
         };
@@ -342,7 +527,7 @@ impl ReplayCache {
 
     #[cfg(test)]
     fn contains(&self, hash: &str) -> bool {
-        self.by_hash.contains_key(hash)
+        self.by_hash.contains_key(&replay_key(hash))
     }
 
     #[cfg(test)]
@@ -362,12 +547,18 @@ struct MlsControlPayloadInner {
     json: String,
     retained_bytes: usize,
     global_bytes: Arc<AtomicUsize>,
+    /// The counter of the address the control came from; `None` for the
+    /// lifecycle events the relay appends itself.
+    client_bytes: Option<Arc<AtomicUsize>>,
 }
 
 impl Drop for MlsControlPayloadInner {
     fn drop(&mut self) {
         self.global_bytes
             .fetch_sub(self.retained_bytes, Ordering::AcqRel);
+        if let Some(client_bytes) = &self.client_bytes {
+            client_bytes.fetch_sub(self.retained_bytes, Ordering::AcqRel);
+        }
     }
 }
 
@@ -499,6 +690,12 @@ pub struct AppState {
     broadcast_room_bytes: Arc<DashMap<Uuid, Arc<AtomicUsize>>>,
     broadcast_client_shares: Arc<DashMap<String, ClientBroadcastShare>>,
     broadcast_global_bytes: Arc<AtomicUsize>,
+    broadcast_release: Arc<BroadcastRelease>,
+    inbound_global: InboundShare,
+    /// Connection slots of the relay (`MAX_WS_CONNECTIONS`).
+    ws_slots: Arc<Semaphore>,
+    /// Connections per IPv6 /48, by keyed hash.
+    ws_prefix_connections: Arc<DashMap<String, usize>>,
 
     /// Ordered, bounded replay log for MLS group-control envelopes
     /// (UserJoined/UserLeft, KeyPackage, Proposal, Commit, Welcome). MLS
@@ -615,6 +812,13 @@ impl AppState {
             broadcast_room_bytes: Arc::new(DashMap::new()),
             broadcast_client_shares: Arc::new(DashMap::new()),
             broadcast_global_bytes: Arc::new(AtomicUsize::new(0)),
+            broadcast_release: Arc::new(BroadcastRelease::default()),
+            ws_slots: Arc::new(Semaphore::new(config.max_ws_connections)),
+            ws_prefix_connections: Arc::new(DashMap::new()),
+            inbound_global: InboundShare {
+                small: InboundTier::new(MAX_INBOUND_SMALL_GLOBAL_BYTES),
+                large: InboundTier::new(MAX_INBOUND_GLOBAL_BYTES),
+            },
             mls_control_logs: Arc::new(DashMap::new()),
             mls_control_global_bytes: Arc::new(AtomicUsize::new(0)),
             seen_message_hashes: Arc::new(DashMap::new()),
@@ -714,11 +918,12 @@ impl AppState {
         // Atomic insert (inside lock)
         let room_id = room.id;
 
-        // Ephemeral application traffic is intentionally a small ring. Slow
-        // clients are disconnected on lag and group controls are recovered
-        // from the separate ordered replay log. Scaling this count by room
-        // size previously allowed image-sized payloads to retain hundreds of
-        // MiB per room.
+        // The same ring for every room, whatever its size. Scaling the count
+        // by room size once let image-sized payloads retain hundreds of MiB
+        // per room; the byte budgets now bound what a ring holds, and its
+        // length only how far a receiver may fall behind. Group controls are
+        // also kept in the ordered log, which a receiver disconnected for
+        // lagging replays when it reconnects.
         let buffer_size = BROADCAST_CHANNEL_ENTRIES;
         let (tx, _) = tokio::sync::broadcast::channel(buffer_size);
 
@@ -1077,7 +1282,7 @@ impl AppState {
 
     fn reserve_bytes(counter: &AtomicUsize, amount: usize, limit: usize) -> bool {
         counter
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
                 current.checked_add(amount).filter(|next| *next <= limit)
             })
             .is_ok()
@@ -1085,20 +1290,190 @@ impl AppState {
 
     /// Register a connection from the address behind `client_key` (its
     /// keyed hash) for the per-address share of the broadcast budget.
+    #[cfg(test)]
     pub fn lease_client_broadcast_share(&self, client_key: &str) -> ClientBroadcastLease {
+        self.lease_client_share_within(client_key, usize::MAX)
+            .expect("no limit applies")
+    }
+
+    /// The share of the address `client_key` in the broadcast and inbound
+    /// budgets, counting one more connection of that address, unless its
+    /// connections already number `limit`.
+    fn lease_client_share_within(
+        &self,
+        client_key: &str,
+        limit: usize,
+    ) -> Option<ClientBroadcastLease> {
         let mut share = self
             .broadcast_client_shares
             .entry(client_key.to_string())
             .or_insert_with(|| ClientBroadcastShare {
                 bytes: Arc::new(AtomicUsize::new(0)),
+                mls_bytes: Arc::new(AtomicUsize::new(0)),
+                inbound: InboundShare {
+                    small: InboundTier::new(MAX_INBOUND_SMALL_CLIENT_BYTES),
+                    large: InboundTier::new(MAX_INBOUND_CLIENT_BYTES),
+                },
                 connections: 0,
             });
+        if share.connections >= limit {
+            drop(share);
+            // An entry this call created for nothing goes again.
+            self.broadcast_client_shares
+                .remove_if(client_key, |_, share| share.idle());
+            return None;
+        }
         share.connections += 1;
-        ClientBroadcastLease {
+        Some(ClientBroadcastLease {
             key: client_key.to_string(),
             bytes: share.bytes.clone(),
+            mls_bytes: share.mls_bytes.clone(),
+            inbound: share.inbound.clone(),
             shares: self.broadcast_client_shares.clone(),
+        })
+    }
+
+    fn lease_prefix_within(&self, prefix_key: &str, limit: usize) -> Option<PrefixLease> {
+        let mut count = self
+            .ws_prefix_connections
+            .entry(prefix_key.to_string())
+            .or_insert(0);
+        if *count >= limit {
+            return None;
         }
+        *count += 1;
+        Some(PrefixLease {
+            key: prefix_key.to_string(),
+            counts: self.ws_prefix_connections.clone(),
+        })
+    }
+
+    /// The admission identity of a client address (see [`ClientAddress`]).
+    pub fn client_address(&self, ip: &str) -> ClientAddress {
+        ClientAddress {
+            key: crate::ip_hash::hash_ip(ip, &self.ip_hash_secret),
+            prefix: crate::ip_hash::hash_ipv6_prefix48(ip, &self.ip_hash_secret),
+        }
+    }
+
+    /// Admit a WebSocket connection from `client`, or say which limit is in
+    /// the way. Called before the upgrade is answered and before anything
+    /// is allocated for the connection; checking and taking are one step for
+    /// each counter, so upgrades that race each other cannot both take the
+    /// last slot. The address is counted first: a client at its own limit
+    /// takes nothing of the relay's, not even for a moment.
+    pub fn admit_ws_connection(
+        &self,
+        client: Option<&ClientAddress>,
+    ) -> Result<WsAdmission, AdmissionRefused> {
+        let per_address = self.config.max_ws_connections_per_address;
+        let mut prefix = None;
+        let mut share = None;
+        if let Some(client) = client {
+            if let Some(prefix_key) = &client.prefix {
+                prefix = Some(
+                    self.lease_prefix_within(
+                        prefix_key,
+                        per_address.saturating_mul(PREFIX_SHARE_FACTOR),
+                    )
+                    .ok_or(AdmissionRefused::AddressFull)?,
+                );
+            }
+            share = Some(Arc::new(
+                self.lease_client_share_within(&client.key, per_address)
+                    .ok_or(AdmissionRefused::AddressFull)?,
+            ));
+        }
+        let slot = self
+            .ws_slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| AdmissionRefused::RelayFull)?;
+        Ok(WsAdmission {
+            _slot: slot,
+            _prefix: prefix,
+            share,
+        })
+    }
+
+    /// Whether a connection from `client` would be admitted now. It takes
+    /// nothing and promises nothing; the token and room endpoints ask it so
+    /// that a client which would be refused is told before it spends its
+    /// proof of work.
+    pub fn ws_admission_open(&self, client: &ClientAddress) -> Result<(), AdmissionRefused> {
+        let per_address = self.config.max_ws_connections_per_address;
+        if let Some(prefix_key) = &client.prefix
+            && self
+                .ws_prefix_connections
+                .get(prefix_key)
+                .is_some_and(|count| *count >= per_address.saturating_mul(PREFIX_SHARE_FACTOR))
+        {
+            return Err(AdmissionRefused::AddressFull);
+        }
+        if self
+            .broadcast_client_shares
+            .get(&client.key)
+            .is_some_and(|share| share.connections >= per_address)
+        {
+            return Err(AdmissionRefused::AddressFull);
+        }
+        if self.ws_slots.available_permits() == 0 {
+            return Err(AdmissionRefused::RelayFull);
+        }
+        Ok(())
+    }
+
+    /// Open connections, counted by their slots.
+    #[cfg(test)]
+    pub(crate) fn ws_connections_open(&self) -> usize {
+        self.config.max_ws_connections - self.ws_slots.available_permits()
+    }
+
+    /// Connections counted against the address `key`, and against the IPv6
+    /// /48 `prefix`.
+    #[cfg(test)]
+    pub(crate) fn ws_address_connections(&self, key: &str) -> usize {
+        self.broadcast_client_shares
+            .get(key)
+            .map(|share| share.connections)
+            .unwrap_or(0)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn ws_prefix_connections(&self, prefix: &str) -> usize {
+        self.ws_prefix_connections
+            .get(prefix)
+            .map(|count| *count)
+            .unwrap_or(0)
+    }
+
+    /// The inbound budget of one connection: in each class, the share of
+    /// its address if the address is known, then what all connections have
+    /// between them.
+    pub fn inbound_budget(&self, lease: Option<&ClientBroadcastLease>) -> InboundBudget {
+        let tiers = |class: fn(&InboundShare) -> &InboundTier| {
+            lease
+                .map(|lease| class(&lease.inbound).clone())
+                .into_iter()
+                .chain([class(&self.inbound_global).clone()])
+                .collect()
+        };
+        InboundBudget::new(tiers(|share| &share.small), tiers(|share| &share.large))
+    }
+
+    /// Bytes free in the global tiers of the inbound budget: small class,
+    /// large class.
+    #[cfg(test)]
+    pub(crate) fn inbound_bytes_available(&self) -> (usize, usize) {
+        (
+            self.inbound_global.small.available_bytes(),
+            self.inbound_global.large.available_bytes(),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn broadcast_bytes_in_flight(&self) -> usize {
+        self.broadcast_global_bytes.load(Ordering::Acquire)
     }
 
     #[cfg(test)]
@@ -1110,22 +1485,23 @@ impl AppState {
     /// were still in flight at the time. Returns how many addresses remain.
     pub fn sweep_client_broadcast_shares(&self) -> usize {
         self.broadcast_client_shares
-            .retain(|_, share| share.connections > 0 || share.bytes.load(Ordering::Acquire) > 0);
+            .retain(|_, share| !share.idle());
         self.broadcast_client_shares.len()
     }
 
-    fn tracked_broadcast_payload(
+    /// Count `retained_bytes` against the room, the sender's address and the
+    /// relay as a whole, or against none of them.
+    fn reserve_broadcast_bytes(
         &self,
         room_id: &Uuid,
-        json: String,
+        retained_bytes: usize,
         sender: Option<&ClientBroadcastLease>,
-    ) -> Result<BroadcastPayload, BroadcastError> {
+    ) -> Result<(Arc<AtomicUsize>, Option<Arc<AtomicUsize>>), BroadcastError> {
         let room_bytes = self
             .broadcast_room_bytes
             .get(room_id)
             .map(|entry| entry.value().clone())
             .ok_or(BroadcastError::MissingRoom)?;
-        let retained_bytes = json.len();
         if !Self::reserve_bytes(
             room_bytes.as_ref(),
             retained_bytes,
@@ -1141,26 +1517,44 @@ impl AppState {
                 MAX_BROADCAST_CLIENT_BYTES,
             )
         {
-            room_bytes.fetch_sub(retained_bytes, Ordering::AcqRel);
+            room_bytes.fetch_sub(retained_bytes, Ordering::SeqCst);
             return Err(BroadcastError::ClientByteCapacity);
         }
+        let global_limit = if retained_bytes >= LARGE_BROADCAST_FRAME {
+            MAX_BROADCAST_GLOBAL_LARGE_BYTES
+        } else {
+            MAX_BROADCAST_GLOBAL_BYTES
+        };
         if !Self::reserve_bytes(
             self.broadcast_global_bytes.as_ref(),
             retained_bytes,
-            MAX_BROADCAST_GLOBAL_BYTES,
+            global_limit,
         ) {
-            room_bytes.fetch_sub(retained_bytes, Ordering::AcqRel);
+            room_bytes.fetch_sub(retained_bytes, Ordering::SeqCst);
             if let Some(client_bytes) = &client_bytes {
-                client_bytes.fetch_sub(retained_bytes, Ordering::AcqRel);
+                client_bytes.fetch_sub(retained_bytes, Ordering::SeqCst);
             }
             return Err(BroadcastError::GlobalByteCapacity);
         }
+        Ok((room_bytes, client_bytes))
+    }
+
+    fn tracked_broadcast_payload(
+        &self,
+        room_id: &Uuid,
+        json: String,
+        sender: Option<&ClientBroadcastLease>,
+    ) -> Result<BroadcastPayload, BroadcastError> {
+        let retained_bytes = json.len();
+        let (room_bytes, client_bytes) =
+            self.reserve_broadcast_bytes(room_id, retained_bytes, sender)?;
         Ok(BroadcastPayload(Arc::new(BroadcastPayloadInner {
             json,
             retained_bytes,
             room_bytes,
             client_bytes,
             global_bytes: self.broadcast_global_bytes.clone(),
+            release: self.broadcast_release.clone(),
         })))
     }
 
@@ -1190,6 +1584,68 @@ impl AppState {
             .ok_or(BroadcastError::MissingRoom)?;
         let payload = self.tracked_broadcast_payload(room_id, json, sender)?;
         Ok(tx.send(payload).unwrap_or(0))
+    }
+
+    /// Like [`Self::broadcast_room_message_from`], for a frame that may wait.
+    ///
+    /// A frame stays in the budgets while it is being written to the room,
+    /// which takes as long as the slowest receiver. A second frame that finds
+    /// no room meanwhile is not a fault of its sender: two people who send a
+    /// picture at the same moment are enough. It waits here, for at most
+    /// `patience`, and its connection reads nothing more until it is through.
+    /// The error returned after that says which budget was still full.
+    pub async fn broadcast_room_message_when_room(
+        &self,
+        room_id: &Uuid,
+        json: String,
+        sender: Option<&ClientBroadcastLease>,
+        patience: Duration,
+    ) -> Result<usize, BroadcastError> {
+        let retained_bytes = json.len();
+        let deadline = tokio::time::Instant::now() + patience;
+        // Nearly every frame finds room at once and never registers as a
+        // waiter.
+        let mut waiter = None;
+        loop {
+            // Registered before the attempt it belongs to: a release that
+            // lands between that attempt and the wait is not lost.
+            let released = self.broadcast_release.released.notified();
+            tokio::pin!(released);
+            if waiter.is_some() {
+                released.as_mut().enable();
+            }
+
+            let tx = self
+                .broadcast_channels
+                .get(room_id)
+                .map(|entry| entry.value().clone())
+                .ok_or(BroadcastError::MissingRoom)?;
+            let full = match self.reserve_broadcast_bytes(room_id, retained_bytes, sender) {
+                Ok((room_bytes, client_bytes)) => {
+                    let payload = BroadcastPayload(Arc::new(BroadcastPayloadInner {
+                        json,
+                        retained_bytes,
+                        room_bytes,
+                        client_bytes,
+                        global_bytes: self.broadcast_global_bytes.clone(),
+                        release: self.broadcast_release.clone(),
+                    }));
+                    return Ok(tx.send(payload).unwrap_or(0));
+                }
+                Err(BroadcastError::MissingRoom) => return Err(BroadcastError::MissingRoom),
+                Err(full) => full,
+            };
+            drop(tx);
+            if waiter.is_none() {
+                // The first refusal: count as a waiter and try once more
+                // with the wake-up registered.
+                waiter = Some(BroadcastWaiter::new(&self.broadcast_release));
+                continue;
+            }
+            if tokio::time::timeout_at(deadline, released).await.is_err() {
+                return Err(full);
+            }
+        }
     }
 
     /// Aggregate room-level count and byte limiter. Per-connection limits
@@ -1567,11 +2023,24 @@ impl AppState {
         let broadcast_payload = self
             .tracked_broadcast_payload(room_id, json.clone(), sender)
             .map_err(|_| MlsControlAppendError::BroadcastCapacity)?;
+        let client_bytes = sender.map(|lease| lease.mls_bytes.clone());
+        if let Some(client_bytes) = &client_bytes
+            && !Self::reserve_bytes(
+                client_bytes.as_ref(),
+                json.len(),
+                MAX_MLS_CONTROL_LOG_CLIENT_BYTES,
+            )
+        {
+            return Err(MlsControlAppendError::CapacityExceeded);
+        }
         if !Self::reserve_bytes(
             self.mls_control_global_bytes.as_ref(),
             json.len(),
             MAX_MLS_CONTROL_LOG_GLOBAL_BYTES,
         ) {
+            if let Some(client_bytes) = &client_bytes {
+                client_bytes.fetch_sub(json.len(), Ordering::AcqRel);
+            }
             return Err(MlsControlAppendError::CapacityExceeded);
         }
         let retained_bytes = json.len();
@@ -1579,6 +2048,7 @@ impl AppState {
             json,
             retained_bytes,
             global_bytes: self.mls_control_global_bytes.clone(),
+            client_bytes,
         }));
         log.head_seq = seq;
         log.retained_bytes = log.retained_bytes.saturating_add(retained_bytes);

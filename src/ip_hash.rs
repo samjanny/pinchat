@@ -225,6 +225,30 @@ pub fn hash_ip(ip: &str, secret: &[u8; 32]) -> String {
     hex::encode(result.into_bytes())
 }
 
+/// Keyed hash of the IPv6 /48 an address belongs to, `None` for IPv4.
+///
+/// A client is counted by its /64 (see `hash_ip`). A tunnel broker hands
+/// out a whole /48 for free, 65536 /64s, so limits that one client must not
+/// multiply that way also count the /48. The hashed input is marked, so a
+/// prefix can never hash to the same key as an address. Like `hash_ip` the
+/// key is only as stable as the per-boot secret.
+pub fn hash_ipv6_prefix48(ip: &str, secret: &[u8; 32]) -> Option<String> {
+    let IpAddr::V6(v6) = ip.parse::<IpAddr>().ok()?.to_canonical() else {
+        return None;
+    };
+    let s = v6.segments();
+    let prefix = format!(
+        "prefix48:{}",
+        std::net::Ipv6Addr::new(s[0], s[1], s[2], 0, 0, 0, 0, 0)
+    );
+    if std::env::var("PRIVACY_MODE").unwrap_or_default() == "development" {
+        return Some(prefix);
+    }
+    let mut mac = HmacSha256::new_from_slice(secret).expect("HMAC can take key of any size");
+    mac.update(prefix.as_bytes());
+    Some(hex::encode(mac.finalize().into_bytes()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -246,6 +270,34 @@ mod tests {
         let hash2 = hash_ip(ip, &secret);
 
         assert_eq!(hash1, hash2, "Same IP should produce same hash");
+    }
+
+    #[test]
+    fn the_slash_48_of_an_ipv6_address_has_a_key_of_its_own() {
+        let _env_guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        unsafe {
+            std::env::remove_var("PRIVACY_MODE");
+        }
+        let secret = [7u8; 32];
+        let a = hash_ipv6_prefix48("2001:db8:1:2::5", &secret).unwrap();
+        // Any address of the same /48, whatever its /64.
+        assert_eq!(
+            hash_ipv6_prefix48("2001:db8:1:ffff:1:2:3:4", &secret).unwrap(),
+            a
+        );
+        assert_ne!(hash_ipv6_prefix48("2001:db8:2::5", &secret).unwrap(), a);
+        // Not the key of an address, not even of the prefix itself.
+        assert_ne!(hash_ip("2001:db8:1::", &secret), a);
+        assert_ne!(hash_ip("2001:db8:1:2::5", &secret), a);
+        // IPv4, also when written as IPv4-mapped IPv6, has none.
+        assert!(hash_ipv6_prefix48("192.0.2.1", &secret).is_none());
+        assert!(hash_ipv6_prefix48("::ffff:192.0.2.1", &secret).is_none());
+        assert!(hash_ipv6_prefix48("not an address", &secret).is_none());
+        // Keyed: another secret, another key.
+        assert_ne!(
+            hash_ipv6_prefix48("2001:db8:1:2::5", &[8u8; 32]).unwrap(),
+            a
+        );
     }
 
     #[test]

@@ -168,6 +168,7 @@ document.addEventListener('alpine:init', () => {
 
         // Emoji picker state
         emojiPickerOpen: false,
+        fingerprintPanelOpen: false,   // group rooms: the members' full key fingerprints
         selectedEmojiCategory: 'Smileys',
         emojiCategories: [],   // Will be populated from emojiManager
         currentEmojis: [],     // Current category's emoji
@@ -865,7 +866,7 @@ document.addEventListener('alpine:init', () => {
                     id: this.nextMessageId++,
                     type: 'message',
                     text: plaintext,
-                    timestamp: new Date(message.timestamp),
+                    timestamp: new Date(), // time of arrival: the relay sends none
                     isOwn: isOwn,
                     nickname: nicknameData.display,        // "Cosmic Fox"
                     senderId: message.sender_id,           // Full UUID (for tooltip)
@@ -1583,7 +1584,7 @@ document.addEventListener('alpine:init', () => {
                     id: this.nextMessageId++,
                     type: 'image',
                     imageUrl: imageUrl,
-                    timestamp: new Date(message.timestamp),
+                    timestamp: new Date(), // time of arrival: the relay sends none
                     isOwn: false,
                     nickname: nicknameData.display,
                     senderId: message.sender_id,
@@ -1648,6 +1649,47 @@ document.addEventListener('alpine:init', () => {
                 return this.mlsIdentityTitle(this.mlsSelfIdentity);
             }
             return this.userId || '';
+        },
+
+        /**
+         * The members of a group as the fingerprint panel lists them: this
+         * device first, then the others, each with the whole SHA-256
+         * fingerprint of the signature key the group authenticated, cut into
+         * groups of four for reading aloud. The names in the conversation
+         * carry only its first twenty digits, and the whole one was only in
+         * a tooltip, which a touch screen cannot show.
+         *
+         * Built from the validated MLS roster and nothing else: no relay
+         * identifier or nickname reaches this list.
+         */
+        groupFingerprintEntries() {
+            if (this.roomType !== 'group' || !this.mlsRosterValid || !this.mlsSelfIdentity) {
+                return [];
+            }
+            const entry = (identity, isSelf) => {
+                const role = identity.isCreator === true ? 'Creator' : 'Member';
+                return {
+                    key: identity.fingerprint,
+                    isSelf,
+                    role: isSelf ? `You · ${role.toLowerCase()}` : role,
+                    groups: String(identity.fingerprint).match(/.{1,4}/g) || [],
+                };
+            };
+            return [
+                entry(this.mlsSelfIdentity, true),
+                ...this.groupPeers.map((peer) => entry(peer, false)),
+            ];
+        },
+
+        openFingerprintPanel() {
+            // Nothing to show outside an authenticated group; in a one-to-one
+            // room identities are settled by the security code instead.
+            if (this.groupFingerprintEntries().length === 0) return;
+            this.fingerprintPanelOpen = true;
+        },
+
+        closeFingerprintPanel() {
+            this.fingerprintPanelOpen = false;
         },
 
         ownAvatarLetter() {
@@ -1911,6 +1953,7 @@ document.addEventListener('alpine:init', () => {
          * Formats a message timestamp
          */
         formatTimestamp(date) {
+            if (!(date instanceof Date) || Number.isNaN(date.getTime())) return '';
             const hours = String(date.getHours()).padStart(2, '0');
             const minutes = String(date.getMinutes()).padStart(2, '0');
             return `${hours}:${minutes}`;
@@ -2590,6 +2633,10 @@ document.addEventListener('alpine:init', () => {
          * attribute values.
          */
         handleEscape() {
+            if (this.fingerprintPanelOpen) {
+                this.fingerprintPanelOpen = false;
+                return;
+            }
             if (this.emojiPickerOpen) {
                 this.emojiPickerOpen = false;
                 return;

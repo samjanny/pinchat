@@ -30,14 +30,14 @@ window.PinChatUI.mount(String.raw`
 
             <div class="hero-eyebrow">
                 <span class="dot"></span>
-                <span>Protocol v1 · Zero persistence · End-to-end encrypted</span>
+                <span>Protocol v1 · Real-time relay · End-to-end encrypted</span>
             </div>
 
             <h1 class="hero-title">
                 Ephemeral chats,<br>
                 <span class="hero-title-accent">authenticated end-to-end.</span>
             </h1>
-            <p class="hero-lede">No accounts, no stored messages, no server access to your conversations. Generate a room, share the link out-of-band, and the Double Ratchet takes care of the rest.</p>
+            <p class="hero-lede">No accounts and no stored messages. Your browser encrypts each message and the server relays it without holding the keys. Generate a room, share the link out-of-band, and the Double Ratchet takes care of the rest.</p>
 
             <div class="hero-chips">
                 <span class="hero-chip"><svg class="icon" aria-hidden="true"><use href="#i-lock"/></svg>AES-GCM 256</span>
@@ -116,7 +116,7 @@ window.PinChatUI.mount(String.raw`
                     </div>
                     <div class="info-card">
                         <h3>What the server sees</h3>
-                        <p>A room ID, a TTL, and opaque encrypted payloads. No message content, no metadata, no persistent identifier tying sessions together.</p>
+                        <p>A room ID, a TTL, opaque encrypted payloads, and what a connection needs while it lasts: your IP address and random identifiers for the room and the connection. No message content in normal operation, no access log, no persistent identifier tying sessions together.</p>
                     </div>
                     <div class="info-card">
                         <h3>No retention, by design</h3>
@@ -135,17 +135,17 @@ window.PinChatUI.mount(String.raw`
                 <div class="feature">
                     <div class="feature-icon"><svg class="icon" aria-hidden="true"><use href="#i-lock"/></svg></div>
                     <div class="feature-title">End-to-End Encryption</div>
-                    <div class="feature-desc">Only you and your contacts can read the messages. The server only relays ciphertext.</div>
+                    <div class="feature-desc">Messages are encrypted in your browser. The server relays ciphertext and does not hold the keys. Compare the security code with your contact to rule out an intermediary.</div>
                 </div>
                 <div class="feature">
                     <div class="feature-icon"><svg class="icon" aria-hidden="true"><use href="#i-eye-off"/></svg></div>
                     <div class="feature-title">No accounts</div>
-                    <div class="feature-desc">No registration, no personal data, no persistent identifier across sessions.</div>
+                    <div class="feature-desc">No registration, no name, email or phone number. Only short-lived technical identifiers, none that persists across sessions.</div>
                 </div>
                 <div class="feature">
                     <div class="feature-icon"><svg class="icon" aria-hidden="true"><use href="#i-cloud-off"/></svg></div>
                     <div class="feature-title">No persistence</div>
-                    <div class="feature-desc">Messages are never stored on disk. Server keeps only in-RAM state until the room TTL.</div>
+                    <div class="feature-desc">The application never writes messages to disk. It keeps only in-memory state until the room expires.</div>
                 </div>
                 <div class="feature">
                     <div class="feature-icon"><svg class="icon" aria-hidden="true"><use href="#i-timer"/></svg></div>

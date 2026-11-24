@@ -1,10 +1,18 @@
 [package]
 name = "pinchat"
-version = "0.9.0"
+version = "0.9.1"
 edition = "2024"
 
 [dependencies]
-axum = { version = "0.7", features = ["ws"] }
+axum = "0.7"
+# The WebSocket transport is the relay's own (src/ws_transport.rs); these
+# three are what it needs from the HTTP stack, at the versions axum uses.
+hyper = "1"
+hyper-util = { version = "0.1", features = ["tokio"] }
+sha1 = "0.10"
+# Send buffer of accepted sockets, and the allocator setting made at start.
+socket2 = "0.6"
+libc = "0.2"
 axum-server = { version = "0.8", features = ["tls-rustls"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
@@ -32,11 +40,17 @@ axum-extra = { version = "0.9", default-features = false, features = ["cookie"] 
 time = "0.3"
 urlencoding = "2"
 
+# `fuzzing` is set by cargo-fuzz for the harness in fuzz/, which compiles
+# src/ws_transport.rs into its own crate.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }
+
 [dev-dependencies]
 # Enable tower's "util" feature in tests for `ServiceExt::oneshot`, used by
 # integration-style tests that drive the router without a real listener.
 tower = { version = "0.4", features = ["util"] }
-# Same version already used by axum; exercise real WebSocket relay frames.
+# An independent WebSocket client: the tests talk to the relay's own
+# transport through it.
 tokio-tungstenite = "0.24"
 
 [[bin]]

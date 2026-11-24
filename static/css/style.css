@@ -4174,3 +4174,581 @@ input[type="password"]:focus {
     .cookie-notice-ok { width: 100%; }
 }
 
+/* ==========================================================================
+   Key fingerprints of a group's members
+   A dialog that lists every member with the whole fingerprint of their
+   signature key. It is opened from the header, from a name in the
+   conversation or from the sidebar, so that it does not take a pointer to
+   reach what used to live in a tooltip.
+   ========================================================================== */
+
+/* A header chip that is a button. */
+.chat-header .badge-button {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    font-family: inherit;
+    cursor: pointer;
+    color: var(--primary);
+    border-color: color-mix(in srgb, var(--primary) 35%, var(--border));
+    background: color-mix(in srgb, var(--primary) 8%, var(--bg-card));
+}
+.chat-header .badge-button:hover {
+    background: color-mix(in srgb, var(--primary) 14%, var(--bg-card));
+}
+.chat-header .badge-button:focus-visible,
+.fingerprint-close:focus-visible {
+    outline: 2px solid var(--primary);
+    outline-offset: 2px;
+}
+.message-sender-link,
+.sidebar-item-link { cursor: pointer; }
+
+.fingerprint-modal {
+    position: fixed;
+    inset: 0;
+    z-index: 1000;
+    display: grid;
+    place-items: center;
+    padding: 24px;
+    background: color-mix(in srgb, var(--bg-dark) 65%, transparent);
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+}
+[data-theme="light"] .fingerprint-modal {
+    background: color-mix(in srgb, #111528 28%, transparent);
+}
+.fingerprint-panel {
+    width: 100%;
+    max-width: 460px;
+    max-height: calc(100vh - 48px);
+    overflow-y: auto;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    box-shadow: var(--shadow-xl);
+    padding: 20px 22px 22px;
+}
+.fingerprint-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+}
+.fingerprint-head h2 {
+    margin: 0;
+    font-size: 17px;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+    color: var(--text);
+}
+.fingerprint-close {
+    flex: 0 0 auto;
+    width: 40px;
+    height: 40px;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    background: var(--bg-secondary);
+    color: var(--text-medium);
+    font-size: 22px;
+    line-height: 1;
+    cursor: pointer;
+}
+.fingerprint-close:hover { color: var(--text); }
+.fingerprint-intro {
+    margin: 10px 0 16px;
+    font-size: 13.5px;
+    line-height: 1.5;
+    color: var(--text-light);
+}
+.fingerprint-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+.fingerprint-entry {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 12px 14px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    background: var(--bg-secondary);
+}
+.fingerprint-entry-self {
+    border-color: color-mix(in srgb, var(--primary) 40%, var(--border));
+}
+.fingerprint-role {
+    font-size: 12px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--text-light);
+}
+.fingerprint-entry-self .fingerprint-role { color: var(--primary); }
+/* Sixteen groups of four digits, four to a row: a line to read, a line to
+   check. */
+.fingerprint-value {
+    display: grid;
+    grid-template-columns: repeat(4, max-content);
+    gap: 6px 14px;
+    padding: 0;
+    border: none;
+    background: transparent;
+    font-family: var(--font-mono, ui-monospace, "SF Mono", Menlo, Consolas, monospace);
+    font-size: 15px;
+    line-height: 1.3;
+    letter-spacing: 0.03em;
+    color: var(--text);
+    user-select: all;
+}
+@supports (height: 100dvh) {
+    .fingerprint-panel { max-height: calc(100dvh - 48px); }
+}
+
+/* ---- Emoji picker: as many columns as fit ----
+   Eight fixed columns of 36px did not fit beside the scrollbar: the last
+   column was cut off and the grid scrolled sideways. */
+.emoji-grid {
+    grid-template-columns: repeat(auto-fill, minmax(36px, 1fr));
+    overflow-x: hidden;
+}
+.emoji-item { width: 100%; }
+
+/* ==========================================================================
+   Phones
+   The rules above were written for a desktop window and grew a breakpoint
+   here and there. This section, last in the file so that it wins, holds what
+   a phone needs, in one place: content that fits the width, controls a
+   finger can hit, text fields that do not make the browser zoom, and a chat
+   screen where the conversation has most of the height.
+   ========================================================================== */
+
+/* The single column of the chat page must be allowed to be narrower than its
+   content. "1fr" alone means minmax(auto, 1fr), so the widest row of the
+   header set the width of the whole page and everything on the right edge,
+   the send button included, was cut off. */
+@media (max-width: 900px) {
+    .chat-container { grid-template-columns: minmax(0, 1fr); }
+}
+/* The chat column was a grid of four rows, the third one flexible, and its
+   children took the rows in order. That only worked while exactly four of
+   them were visible: with an error banner showing, or with the context
+   strip hidden, the flexible row went to the wrong child and the
+   conversation shrank to its content. As a column, the conversation takes
+   what the others leave, however many of them there are. */
+.chat-main {
+    display: flex;
+    flex-direction: column;
+}
+.chat-main > * { flex: 0 0 auto; }
+.chat-main > .messages-container {
+    flex: 1 1 0;
+    min-height: 0;
+    overflow-y: auto;
+}
+/* A text field has a width of its own, about twenty characters, and counts
+   with it towards the narrowest its row can be. In the composer it takes
+   whatever the buttons leave. */
+.message-form .message-input {
+    flex: 1 1 0;
+    width: 0;
+    min-width: 0;
+}
+
+/* A mobile browser counts the area under its own address bar into 100vh, so
+   the composer ended up below what is visible. The dynamic unit follows the
+   bar. */
+@supports (height: 100dvh) {
+    .chat-page,
+    .chat-container { height: 100dvh; }
+    .chat-container { grid-template-rows: 100dvh; }
+    .sas-modal-content { max-height: calc(100dvh - 48px); }
+}
+
+/* Short labels for narrow headers; see the buttons in the chat template. */
+.label-short { display: none; }
+
+/* Between a phone and a wide window the header chips wrap onto a second
+   row. The header had no vertical padding, so the wrapped rows touched its
+   edges, and the invite button gave way before the chips did and broke its
+   label over two lines. A single row is as tall as before (61px). */
+.chat-header {
+    padding-top: 8px;
+    padding-bottom: 8px;
+}
+.header-actions { flex-shrink: 0; }
+.header-actions .btn { white-space: nowrap; }
+/* The title sat centred over its subtitle, out of line with the logo. */
+.room-brand-text { text-align: left; }
+
+/* Below a wide window the header is two rows by design, not by accident:
+   the room and its actions, then the status chips. */
+@media (max-width: 1100px) {
+    .chat-header {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) auto;
+        grid-template-areas:
+            "brand actions"
+            "details details";
+        align-items: center;
+        gap: 8px 10px;
+    }
+    .room-info { display: contents; }
+    .room-brand {
+        grid-area: brand;
+        min-width: 0;
+    }
+    .header-actions { grid-area: actions; }
+    .room-details { grid-area: details; }
+}
+
+@media (max-width: 640px) {
+    /* ---- Every page ---- */
+
+    .theme-toggle {
+        top: 8px;
+        right: 8px;
+        width: 40px;
+        height: 40px;
+        font-size: 17px;
+    }
+
+    /* The notice was centred with a transform, which left it half the
+       screen to lay itself out in: a tall box in the middle of the page.
+       On a phone it is a bar along the bottom edge. */
+    .cookie-notice {
+        left: 8px;
+        right: 8px;
+        bottom: calc(8px + env(safe-area-inset-bottom, 0px));
+        transform: none;
+        max-width: none;
+        flex-direction: row;
+        align-items: center;
+        gap: 10px;
+        padding: 10px 12px;
+        font-size: 12.5px;
+        line-height: 1.35;
+    }
+    .cookie-notice-ok {
+        width: auto;
+        min-height: 40px;
+        padding: 0 16px;
+    }
+    /* On the chat screen every edge is taken: a notice floating over it
+       covers the composer, the newest message or an error banner. There it
+       is a row of the page itself, under the composer, and covers nothing
+       until it is dismissed. */
+    .chat-page {
+        display: flex;
+        flex-direction: column;
+    }
+    .chat-page .chat-container {
+        flex: 1 1 0;
+        min-height: 0;
+        height: auto;
+        grid-template-rows: minmax(0, 1fr);
+    }
+    .chat-page .cookie-notice {
+        position: static;
+        flex: 0 0 auto;
+        margin: 0 8px calc(8px + env(safe-area-inset-bottom, 0px));
+        z-index: auto;
+    }
+
+    /* ---- Chat: header ---- */
+
+    /* The two rows of the header, tightened: the chips scroll sideways
+       instead of wrapping into three rows. */
+    .chat-header {
+        padding: 8px 12px;
+        min-height: 0;
+    }
+    .room-brand-text { overflow: hidden; }
+    .room-info .room-brand-text h1,
+    .room-brand-sub {
+        overflow: hidden;
+        text-overflow: ellipsis;
+    }
+    .header-actions {
+        /* The theme toggle is fixed in this corner. */
+        margin-right: 44px;
+        gap: 6px;
+    }
+    .header-actions .btn {
+        min-height: 40px;
+        padding: 0 12px;
+        white-space: nowrap;
+    }
+    .label-long { display: none; }
+    .label-short { display: inline; }
+
+    .room-details {
+        flex-wrap: nowrap;
+        overflow-x: auto;
+        scrollbar-width: none;
+        gap: 6px;
+        padding-bottom: 2px;
+    }
+    .room-details::-webkit-scrollbar { display: none; }
+    .room-details > * { flex: 0 0 auto; }
+
+    /* The callout hangs under the invite button and may be as wide as the
+       screen allows. */
+    .invite-callout {
+        left: auto;
+        right: -44px;
+        max-width: calc(100vw - 24px);
+    }
+    .invite-callout::before {
+        left: auto;
+        right: calc(44px + 1.5rem);
+    }
+
+    /* What the strip repeats is already in the chips above it. */
+    .chat-context-strip { display: none; }
+
+    /* "Reconnect" is a link inside a sentence, and the one control that
+       matters when the connection is gone. */
+    .status-banner .link-button {
+        display: inline-flex;
+        align-items: center;
+        min-height: 44px;
+        min-width: 44px;
+        padding: 0 8px;
+    }
+
+    /* ---- Chat: conversation ---- */
+
+    .messages { padding: 12px; }
+    .message-bubble { max-width: 86%; }
+    .message-image { max-width: 100%; height: auto; }
+
+    /* ---- Chat: notices above the composer ---- */
+
+    /* They stay until they are answered, between the conversation and the
+       composer. Stacked and centred they took a third of the screen; the
+       text keeps every word and loses the decoration around it. */
+    .mitm-warning-banner,
+    .unverified-warning-banner {
+        flex-direction: row;
+        flex-wrap: wrap;
+        align-items: center;
+        justify-content: flex-end;
+        gap: 6px 10px;
+        margin: 6px 0 0;
+        padding: 10px 12px;
+        text-align: left;
+    }
+    .mitm-warning-content,
+    .unverified-warning-content {
+        flex: 1 1 100%;
+        flex-direction: row;
+        align-items: flex-start;
+        text-align: left;
+    }
+    .mitm-warning-icon,
+    .unverified-warning-icon { display: none; }
+    .mitm-warning-text p,
+    .unverified-warning-text p {
+        margin: 2px 0 0;
+        font-size: 12.5px;
+        line-height: 1.4;
+    }
+    .btn-new-chat,
+    .btn-verify-now {
+        width: auto;
+        min-height: 40px;
+        padding: 0 16px;
+    }
+
+    /* ---- Chat: composer ---- */
+
+    .input-area {
+        padding: 8px 8px calc(8px + env(safe-area-inset-bottom, 0px));
+    }
+    .message-form {
+        position: relative;
+        gap: 2px;
+    }
+    /* Below 16px, iOS zooms the page when the field takes focus. */
+    .message-input {
+        font-size: 16px;
+        min-height: 44px;
+        padding: 8px 4px;
+    }
+    .input-area .btn-image,
+    .input-area .btn-emoji {
+        min-width: 44px;
+        min-height: 44px;
+        padding: 0;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+    }
+    .input-area .btn-send {
+        width: 44px !important;
+        min-width: 44px;
+        height: 44px;
+    }
+    /* Keyboard shortcuts, on a device without a keyboard. */
+    .composer-hint { display: none; }
+
+    /* The picker opens just above the composer, as wide as it is. */
+    .emoji-picker-container { position: static; }
+    .emoji-picker {
+        left: 0;
+        right: 0;
+        bottom: calc(100% + 6px);
+        width: auto;
+        margin-bottom: 0;
+        max-height: min(52dvh, 380px);
+    }
+    .emoji-picker-header {
+        flex-wrap: nowrap;
+        overflow-x: auto;
+        scrollbar-width: none;
+    }
+    .emoji-picker-header::-webkit-scrollbar { display: none; }
+    .emoji-category-btn {
+        flex: 0 0 auto;
+        min-height: 40px;
+        padding: 0 12px;
+        font-size: 12.5px;
+    }
+    .emoji-grid {
+        grid-template-columns: repeat(auto-fill, minmax(44px, 1fr));
+        max-height: none;
+        flex: 1 1 auto;
+        min-height: 0;
+    }
+    .emoji-item {
+        width: 100%;
+        height: 44px;
+    }
+    .emoji-picker-footer { display: none; }
+
+    .image-preview-cancel {
+        width: 36px;
+        height: 36px;
+    }
+
+    /* ---- Chat: identity check ---- */
+
+    /* The dialog is the whole screen: its content scrolls, its buttons
+       stay where the thumb is. */
+    .sas-modal { padding: 0; }
+    .sas-modal-content {
+        max-width: none;
+        height: 100%;
+        max-height: none;
+        border: none;
+        border-radius: 0;
+        display: flex;
+        flex-direction: column;
+    }
+    .sas-body {
+        flex: 1 1 auto;
+        overflow-y: auto;
+        min-height: 0;
+    }
+    .sas-footer {
+        grid-template-columns: 1fr;
+        padding: 12px 16px;
+    }
+    .sas-footer .btn { min-height: 48px; }
+    /* The confirming answer first, nearest the thumb's rest position. */
+    .sas-btn-match { order: -1; }
+    .sas-skip-row {
+        padding: 6px 16px calc(12px + env(safe-area-inset-bottom, 0px));
+    }
+    .sas-skip-row .btn { min-height: 44px; }
+    .sas-hex-row .btn-copy { min-height: 40px; }
+
+    /* ---- Chat: key fingerprints ---- */
+
+    /* In the row of chips this one is a control, and gets the height of
+       one. */
+    .chat-header .badge-button {
+        min-height: 40px;
+        padding: 0 12px;
+    }
+    .fingerprint-modal {
+        padding: 0;
+        place-items: end stretch;
+    }
+    .fingerprint-panel {
+        max-width: none;
+        max-height: 88dvh;
+        border-radius: var(--radius-lg) var(--radius-lg) 0 0;
+        border-width: 1px 0 0;
+        padding: 16px 16px calc(20px + env(safe-area-inset-bottom, 0px));
+    }
+    .fingerprint-value {
+        justify-content: space-between;
+        font-size: 16px;
+    }
+
+    /* ---- Home ---- */
+
+    /* Brand on the first row, next to the theme toggle; links on the second. */
+    .topbar {
+        gap: 2px 4px;
+        padding: 4px 0 12px;
+    }
+    .topbar .brand { min-height: 44px; }
+    .topbar .spacer {
+        flex: 0 0 100%;
+        height: 0;
+    }
+    .topbar-link {
+        display: inline-flex;
+        align-items: center;
+        min-height: 44px;
+        padding: 0 10px;
+    }
+    .topbar-link:first-of-type { padding-left: 0; }
+    /* The fourth link does not fit the row; the footer has it as well. */
+    .topbar-link.muted { display: none; }
+
+    /* The two room types side by side, each with its note under its name
+       instead of squeezed beside it. */
+    .segmented .radio-label span {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 4px;
+        white-space: nowrap;
+    }
+    .segmented .radio-label { min-height: 56px; }
+
+    .slider-row { min-height: 44px; }
+    .create-room-card .btn-primary { min-height: 48px; }
+    .image-preview-container .btn-primary { min-height: 44px; }
+
+    /* ---- Login ---- */
+
+    .login-container {
+        padding: 48px 20px 24px;
+    }
+    .password-input {
+        font-size: 16px;
+        min-height: 48px;
+    }
+    .login-btn { min-height: 48px; }
+
+    /* ---- Links that are only text ---- */
+
+    footer a {
+        display: inline-block;
+        padding: 12px 6px;
+    }
+}
+
+/* Too narrow for a title next to two buttons. */
+@media (max-width: 350px) {
+    .room-brand-text { display: none; }
+}

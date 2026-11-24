@@ -4,6 +4,398 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Dates are the repository-local commit dates; entries are curated for user-visible impact
 rather than being a 1:1 mirror of `git log`.
 
+## [2026-11-24] - v0.9.1
+
+The manifest is at sequence 56 and both extensions move to 1.5.1 with their
+pin on v0.9.1 and their floor raised to 56. An installed build that pins an
+earlier release reports a mismatch on the pages that changed until it is
+replaced. v0.9.0 and extension 1.5.0 were tagged and packaged but never
+deployed or published, so what is listed under v0.9.0 below reaches users
+with this release.
+
+The relay entries that follow, up to the one on the closing handshake,
+change the server and its deployment only: the client, the protocol and
+what is encrypted stay as they are.
+
+Upgrade notes for operators: the container now has a fixed address and a
+memory limit of 512 MiB without swap, so the dry run before an upgrade goes
+through `docker-compose.dryrun.yml` (see "Docker" in README.md), and
+`MAX_TOTAL_ROOMS` defaults to 500. Run the dry run before deploying.
+
+### Fixed - the relay kept the memory of the largest image each connection had carried
+
+The WebSocket library kept two buffers for every connection, one for reading
+and one for writing, let both grow to the largest message that had passed
+through and never made them smaller. Its newest release still does so on
+the reading side. The relay added a copy of each message for every
+receiver, and the allocator kept what was freed instead of returning it to
+the system. A connection that had carried one image of 2 MiB, 3.7 MiB on
+the wire, cost about 8 MiB for as long as it stayed open, and part of that
+remained after it had closed.
+
+Measured on v0.9.0 with `MAX_IMAGE_SIZE=2MB`: 200 one-to-one rooms held
+3.3 GB after one image from each side, and 40 groups of 20 held 2.5 GB
+after one image each. With the default limit of 300 KiB, 1000 rooms held
+2.3 GB after two images from each side.
+
+The relay now reads and writes WebSocket frames itself
+(`src/ws_transport.rs`). A connection has one read buffer of 4 KiB. A
+message is read into an allocation of its own size, which is freed when
+the message has been handled, and it is written to every receiver from the
+one allocation the room shares, with no copy for each of them. The same
+three runs now end at 22 MB, 28 MB and 47 MB, and a relay that has carried
+images goes back to the size of an idle one. On the wire the frames and the
+size limits are the same; where the transport departs from what the
+library did, it is to follow RFC 6455 more closely, as the entry on the
+closing handshake below describes.
+
+The tests cover the transport frame by frame, against the client of the
+library it replaces, and through the whole relay with the largest images
+sent again and again over the same connections.
+
+### Changed - what bounds the relay's memory while messages are in flight
+
+Messages on their way in are counted. Above 64 KiB a message is charged
+from the moment its length is known, against 16 MiB for the connections of
+one address and 64 MiB for the whole relay. A connection that finds no room
+stops reading its socket until there is some, so the sender is slowed down
+and nothing piles up.
+
+A frame now stays in the broadcast budgets (4 MiB a room, 16 MiB an
+address, 64 MiB in all) until it has been written to every receiver; it
+used to leave them when each receiver had copied it. That takes as long as
+the slowest receiver, so a second frame can find the budget full through no
+fault of its sender: two people sending a large image at the same moment
+are enough. Such a frame used to cost its sender the connection. It now
+waits for up to 30 seconds, the deadline of a write, and only then is the
+connection closed. While it waits the relay reads nothing more from that
+connection. Members of a group who all send the largest image at once are
+therefore relayed one after the other. With 200 rooms sending a 2 MiB image
+from both sides in the same instant, v0.9.0 delivered 393 of 400 and held
+3.4 GB afterwards; the relay now delivers all 400 and peaks at 107 MB.
+
+The kernel's buffers of a connection are fixed at 128 KiB in each direction
+(the kernel counts twice that) instead of growing to several megabytes. A
+peer that does not read, or one that keeps sending into a connection the
+relay has stopped reading, costs that much and no more. The other side of
+it: a receiver has to take a whole frame within the 30 second deadline with
+less of it parked in the kernel. Where the relay terminates TLS itself, the
+largest image of 2 MiB needs a receiver of about 1 Mbit/s, where about a
+third of that used to do; an image at the default 300 KiB limit needs about
+0.1 Mbit/s. Behind a reverse proxy the proxy's own buffers stand in between.
+
+On Linux with glibc the allocator is told to return large blocks to the
+system as soon as they are freed.
+
+### Added - admission control for WebSocket connections
+
+The relay did not limit how many connections it held at once; rooms and
+members did, up to 20 times `MAX_TOTAL_ROOMS`. Every connection costs memory
+in the relay and, more, in the kernel's socket buffers, which the container
+pays for: 10000 connections that each sent the first 63 KiB of a message
+killed the relay at a 512 MB ceiling within a second.
+
+Now a connection is admitted before its upgrade is answered, and holds its
+slot until its closing handshake is over: `MAX_WS_CONNECTIONS` (400) in all,
+`MAX_WS_CONNECTIONS_PER_ADDRESS` (50) for one client address, as the request
+quotas identify it (the keyed hash of the address, an IPv6 address counted
+as its /64), and four times that for one IPv6 /48, which a tunnel broker
+hands out for free. An upgrade beyond a limit is refused with 503 (relay) or
+429 (address) and `Retry-After: 30`, before anything is allocated for it,
+and its single-use token is not spent. The token and room endpoints give the
+same answer, as JSON with the code `RELAY_FULL` or `ADDRESS_FULL`, before
+the proof of work. Nothing of this is logged. The slots are released by
+dropping what holds them, whatever ends the connection: a close, an error, a
+timeout, an upgrade that never completes, a cancelled task.
+
+Measured on one CPU in a 512 MiB scope without swap, behind nginx with TLS:
+800 connections asked for at once were 400 admitted and the rest refused;
+after receivers that stopped reading, unfinished 1 MiB messages, 240
+upgrades abandoned at every point of the handshake and every connection
+closed, the relay admitted exactly 400 again; one address got 50, one /48
+got 200. The 10000 connections with an unfinished 63 KiB message: 400
+admitted, the rest refused, the relay at about 50 MB, every admitted one
+closed with 1008 within 90 seconds although it kept sending pings.
+
+### Changed - budgets and buffers sized for a 512 MiB relay
+
+What a connection costs is now the unit the relay is sized in, so the
+budgets that do not depend on connections were made to fit beside them:
+
+- The kernel's socket buffers of a connection are fixed at 64 KiB in each
+  direction instead of 128 KiB. Peers that stop reading, or keep sending
+  while the relay waits, took about 210 KiB in each direction at 128 KiB;
+  now at most 128 KiB, measured about 120 KB receiving and 45 KB sending.
+  32 KiB would have halved that again, but over loopback (a relay on the
+  same host as its proxy, outside a container) a 3.7 MB message then took
+  1.4 to 1.8 seconds instead of 10 to 30 milliseconds: the window no longer
+  held one of loopback's 64 KiB segments.
+- Inbound budget 32 MiB (8 MiB an address) for messages from 64 KiB, 8 MiB
+  (2 MiB) for those between 4 and 64 KiB; broadcast budget 32 MiB (8 MiB an
+  address), of which frames of 64 KiB and more may take 24 MiB, so that
+  pictures held by receivers that do not read leave room for text and group
+  controls; MLS control log 32 MiB, and 8 MiB for the controls of one
+  address, which had no share of its own: the rooms of one client could
+  fill it for every group.
+- The replay cache of a room keeps 32-byte keys instead of hexadecimal
+  strings twice, about 137 KB when full instead of 285 KB, with the same
+  behaviour. A group may consume 1024 KeyPackages over its lifetime instead
+  of 4096 (133 KB instead of 537 KB); 20 members in at most 24 hours do not
+  come near it.
+
+At the defaults, with about 360 one-to-one rooms holding full replay
+caches, 40 groups of 10 at the connection limit with about 12 MiB in their
+control logs, and then, all at once, pictures sent to receivers that stopped
+reading, unfinished 1 MiB messages and password checks, the relay's memory
+reached about 200 MB (cgroup peak, kernel sockets included). When every
+member of 50 full groups sent a 2 MiB image at the same moment, all of them
+arrived, the slowest after 2.3 seconds, as before these changes.
+
+A connection whose room is gone is now always closed with 1001; it could
+get 1008, depending on which of its two loops noticed first.
+
+### Changed - 500 rooms by default, and a fixed address for the relay container
+
+`MAX_TOTAL_ROOMS` defaults to 500 instead of 1000, the number the memory
+sizing above is made for. A deployment that sets it keeps its value; one
+that relied on the old default now admits half as many rooms.
+
+`docker-compose.yml` gives the container the fixed address 172.18.0.2 on its
+network, so that a reverse proxy on the host can connect to it directly
+instead of through the published port. That port is served by
+docker-proxy, which adds two sockets to every connection; on a host with
+1 GB of memory their kernel buffers took most of the memory the kernel
+allows for TCP as a whole, and pictures then stalled for every connection
+of the host. The published port stays for local checks. With the fixed
+address the dry run before an upgrade can no longer start a second
+container on that network: run it with `docker-compose.dryrun.yml`, which
+leaves the container without a network, and name an existing
+`docker-compose.override.yml` as well, since files given with `-f` replace
+the automatic one (see "Docker" in README.md).
+
+docs/reverse-proxy.md describes the nginx and host settings a small host
+needs in front of the relay, and what they were measured to do.
+
+### Fixed - members of a busy group were disconnected
+
+A room hands its messages to each of its receivers through a ring, and a
+receiver that falls further behind than the ring holds is disconnected
+with 1008: its browser reconnects, and what the room sent in between is
+lost to it. The ring held 8 messages. A receiver takes one message at a
+time and writes it to its connection before it takes the next, so 8 was
+soon passed while it wrote a picture, or when the members of a group sent
+at the same moment. On a machine built like the production host (one
+virtual CPU without AES instructions, nginx with TLS in front, clients
+40 ms away):
+
+- the 20 members of a group sending a message at the same moment: 19 were
+  disconnected;
+- 380 connections under the expected load (10 groups of 20 and 90
+  one-to-one rooms, text every 5 seconds, pictures of 2 MiB): 14 were
+  disconnected, and 26 more when their group closed with its creator;
+- 19 full groups, with pictures sent two at a time: 166 were disconnected
+  and 14 more with their groups;
+- groups in which 3 members stopped reading: besides those 3, 17 members
+  who were reading were disconnected.
+
+The ring now holds 64 messages, and in the same tests the only
+connections closed were those of the members who had stopped reading,
+when their writes timed out. 16 was not enough for the members of a group
+sending at the same moment, and 32 not for the full groups, in which a
+receiver fell up to 42 messages behind.
+
+The memory bound does not change. A message stays counted in the broadcast
+budgets until the last receiver has written it and leaves them then,
+whatever the length of the ring; an empty slot costs 32 bytes, about 1 MiB
+for 500 rooms of 64.
+
+### Fixed - closing handshake, handshake checks and unfinished messages in the WebSocket transport
+
+An audit of the new transport against RFC 6455, with the Autobahn test
+suite and a fuzzing harness, found these, now fixed:
+
+- **No closing handshake.** The relay never answered a client's Close frame
+  and never sent one of its own with a status code: it dropped the TCP
+  connection, and the page saw 1006 (abnormal closure). This was the case
+  before the new transport as well. The relay now answers a Close frame
+  with the client's code, and when it ends a connection itself it sends a
+  Close frame with a code that says why: 1001 when the room is gone or has
+  expired, or the connection reached its age limit; 1002 for a frame that
+  breaks the protocol; 1007 for text that is not UTF-8; 1008 for rate
+  limits, invalid relay messages and a message not finished in time; 1009
+  for a message that is too large or made of too many frames; 1011 for an
+  internal error; 1013 when the broadcast budget stayed full. It then
+  waits up to 5 seconds for the client's answer, closes its side of the TCP
+  connection first, as section 7.1.1 asks of a server, and reads at most
+  64 KiB more until the client closes its side. Browsers report a clean
+  close with the relay's code. The page does not look at the code, so
+  reconnecting works as before.
+- **Unfinished messages were outside every budget, and pings kept them
+  alive.** Messages below 64 KiB were not counted at all: a peer that
+  started one in a frame that was not final and never finished it held up
+  to 64 KiB of the relay's memory. The idle limit of 90 seconds started
+  again with every frame, so a ping between two fragments let such a
+  message, and any large one, live for the 30 minutes a connection may
+  last. Now every message above 4 KiB takes its share of the inbound budget
+  before its body is read, messages below 64 KiB from a class of their own
+  (16 MiB in all, 4 MiB for one address) so that pictures cannot starve
+  them; the allocation for a message grows with what arrives, from 4 KiB,
+  instead of starting at the length a frame announces up to 64 KiB; and a
+  message must be complete within 90 seconds of its first frame, whatever
+  comes in between. A message of more than 1024 frames is refused: none of
+  the fragments reached the frame rate limit.
+- **Handshake.** `Sec-WebSocket-Key` must be one value, the Base64 encoding
+  of 16 bytes; the request must be HTTP/1.1 and carry `Host`; an
+  unsupported version is answered with 426 and `Sec-WebSocket-Version: 13`.
+  The subprotocol is named in the answer only if the client offered it. The
+  relay refuses an upgrade without `pinchat.v1` before answering, so for
+  the relay this last point changes nothing.
+- **Frames.** A length must be given in its shortest form. A Close frame
+  with a one-byte payload, a status code that may not be sent, or a reason
+  that is not UTF-8 is refused. Nothing is sent after a Close frame. Text
+  is checked for UTF-8 as it arrives and refused at the first byte that
+  cannot belong to valid text, not once the whole message is in.
+
+The two loops of a connection, reading and writing, now run in the
+connection's own task instead of two more, one task per connection instead
+of three. A panic in either loop is caught, as it was when they were tasks
+of their own, and the connection is detached from its room.
+
+`tests/autobahn/` is an echo server around the transport for the Autobahn
+suite, `fuzz/` a cargo-fuzz harness with four targets (raw bytes, a
+reference model of RFC 6455, connections sharing the budget, the writer and
+the closing handshake). Neither is part of the relay build.
+
+axum's `ws` feature is off and the WebSocket library is a test dependency
+only, the independent client the tests talk through. `hyper`, `hyper-util`,
+`sha1`, `socket2` and `libc`, all of them already in the dependency tree,
+are named directly.
+
+### Fixed - the pages on a phone
+
+The chat page was wider than a phone screen: its text field counted with a
+width of its own towards the narrowest the page could be, so at 360 pixels
+the whole column was 391 wide and the send button, the right edge of every
+message and half of the header were cut off. The header wrapped into five
+rows and took about 300 of 740 pixels. The cookie notice was centred with a
+transform that left it half the screen to lay itself out in, and sat as a
+tall box over the message field.
+
+On a narrow screen the chat page now fits the width. The header is two rows,
+the room with its actions and a row of status chips that scrolls sideways,
+about 90 pixels in all, and the strip that repeated the same information is
+hidden. The composer has a 16 pixel text field, so iOS no longer zooms the
+page when it takes focus, and controls of at least 44 pixels; the keyboard
+hints are hidden. The emoji picker opens as wide as the screen. The identity
+check is the whole screen, with its buttons at the bottom and the confirming
+answer first. The cookie notice is a bar along the bottom edge, and on the
+chat page a row of its own under the composer, so that it covers nothing
+until it is dismissed. The warnings
+shown above the composer (key not verified, identities not verified, group
+ended) keep their text and lose about a third of their height. The page
+height follows the browser's address bar (`100dvh`).
+
+The chat column was a grid whose flexible row went to whichever child came
+third. That held only while exactly four of them were visible: with an
+error banner showing, the conversation shrank to its content and the
+composer took the free height. It is a column now, at every width, and the
+conversation takes what the rest leaves.
+
+The home page puts its brand and its links on two rows and shows the two
+room types with their notes under their names. The login page keeps a
+margin around its field and button. Navigation links, buttons and the
+"Reconnect" link are large enough to touch.
+
+Between a phone and a wide window (641 to 1100 pixels) the chat header is
+two rows on purpose; it used to wrap unevenly, touch the top edge and break
+the invite button's label over two lines. The title is aligned with the
+logo instead of centred over its subtitle. Nothing else changes in a wide
+window.
+
+`tests/layout-browser/run.js` measures all of this in a headless Chromium at
+320, 360 and 414 pixels. On the v0.9.0 pages it reports ten failures at 360.
+
+### Added - a group member's whole key fingerprint, without a pointer
+
+In a group room the members are told apart by the fingerprint of their
+signature key. The names carry its first twenty digits; the whole one was
+only in a tooltip, which a touch screen cannot show, while the notice told
+people to hover a name to see it. A "Fingerprints" button in the header, and
+a tap on any sender's name or on a member in the sidebar, now open a panel
+that lists this device and every other member with the complete SHA-256
+fingerprint, in sixteen groups of four digits. The list is built from the
+validated MLS roster only. The notice says where to find it.
+
+### Fixed - the emoji picker cut its last column, and its tabs their names
+
+Eight fixed columns did not fit beside the scrollbar, so the last one was
+cut off and the grid scrolled sideways, on every screen. The grid now takes
+as many columns as fit. The category tabs show their whole names instead of
+the first four letters.
+
+### Fixed - received messages showed "NaN:NaN" as their time
+
+The relay puts no timestamp on what it relays, and the client read one
+anyway, so every message and image received in a one-to-one room carried an
+invalid date. A received message is now stamped with the time it arrived.
+
+### Changed - Terms and Privacy Policy say what the code and the server do
+
+The Terms no longer say that no identifier is requested or stored: no name,
+email address or phone number is asked for, and the temporary technical
+identifiers the Service does process are named, with a pointer to the
+Privacy Policy. "The Operator cannot read your messages" became "the server
+does not hold the keys", followed by the limits of that: the code is served
+by the Service itself, the integrity extension narrows that risk and does
+not attest the page in Chromium, an unverified security code leaves a
+conversation unauthenticated, groups have no such code. Closing one room is
+not possible at present, so the text says that ending a room may mean
+restarting the Service. Continued use is not treated as agreement where the
+law requires more. Italian and English are named as the languages accepted
+at the published addresses.
+
+The Privacy Policy lists what it left out: the identifier given to each
+connection, the keyed hash of the address kept next to an open connection,
+the contents of the tab's storage, what the CSRF cookie covers, how group
+rooms differ, when a group room closes.
+
+Statements about logs and disk now separate the application from what is
+under it. The application keeps no access log; apart from start-up notices
+about its own configuration it writes only error messages, worded without
+addresses or identifiers. The reverse proxy is configured not to write
+access or error logs. The server has swap space, which the container is
+denied (below) and other software on the machine is not.
+
+### Changed - the legal notes in the operator file state what is open
+
+The notes on the legal classification of the Service, NIS2, the Digital
+Services Act, cooperation with authorities, case law and legal risks are
+rewritten in `operator.example.json`. Each keeps apart what the source code
+shows, what the operator declares about a deployment, what is
+interpretation, and what is undecided. None of them says any longer that a
+duty does not apply, that the Service is an "important entity", or that a
+registration is under way.
+
+### Changed - the home page promises what the rest of the site does
+
+"No metadata", "no personal data", "no server access to your conversations",
+"only you and your contacts can read the messages" and "messages are never
+stored on disk" are gone. The page says that the browser encrypts and the
+server relays without holding the keys, names what the server does see while
+a connection lasts, and says that the application writes no message to disk.
+The label above the title reads "Real-time relay" where it read "Zero
+persistence".
+
+### Changed - the container gets no swap
+
+`docker-compose.yml` sets a memory ceiling of 512 MB with `memswap_limit`
+equal to it, so the relay's memory is not written to the host's swap device.
+A deployment that needs more memory raises both values together. What the
+ceiling has to cover is in SECURITY.md under "Relay Memory": with the
+default 1000 rooms, all of them full groups and every kind of load at once,
+the relay peaked at about 500 MB, which is at the ceiling; with 250 such
+rooms it peaked at 212 MB.
+
 ## [2026-11-19] - v0.9.0
 
 The manifest is at sequence 55 and both extensions move to 1.5.0 with their

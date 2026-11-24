@@ -119,9 +119,15 @@ persistence. It is not an anonymous or metadata-private messaging system.
 
 Note also that "in memory" does not mean "unrecoverable". A live compromise,
 memory dump, swap misconfiguration, crash dump, container or VM snapshot, or
-hosting-provider inspection may expose runtime data. Operators should disable
-or encrypt swap, review crash dump settings and container logs, and understand
-their provider's snapshot behaviour.
+hosting-provider inspection may expose runtime data. The provided
+`docker-compose.yml` gives the container a memory ceiling and no swap on top
+of it, which keeps the relay's own memory off a swap device; it does nothing
+for the reverse proxy or the rest of the host. Operators should disable or
+encrypt swap, review crash dump settings and container logs, and understand
+their provider's snapshot behaviour. A reverse proxy that serves several
+sites logs a request by the settings of the site that answers it, so turn its
+access and error logs off for the proxy as a whole, not only for PinChat's
+host names.
 
 The full threat model, trust assumptions, security goals and non-goals,
 bootstrap key analysis, and known limitations are in
@@ -208,9 +214,19 @@ on a setting it cannot honour (see the upgrade notes in `CHANGELOG.md`):
 
 ```bash
 docker compose build
-timeout 8 docker compose run --rm --no-deps -T pinchat   # must print "Starting HTTP server"
+# must print "Starting HTTP server"; the override takes the dry run off the
+# network, whose fixed address the running container holds
+timeout 8 docker compose -f docker-compose.yml -f docker-compose.dryrun.yml run --rm --no-deps -T pinchat
 docker compose up -d
 ```
+
+Naming files with `-f` turns off the automatic `docker-compose.override.yml`.
+If you keep one, name it too, before the dry-run file, or the dry run starts
+without its mounts and environment:
+`-f docker-compose.yml -f docker-compose.override.yml -f docker-compose.dryrun.yml`.
+
+Behind nginx on a small host, the defaults of nginx and of the kernel give
+out before the relay's own limits: see docs/reverse-proxy.md.
 
 ### Tests
 
@@ -247,7 +263,9 @@ hosting-provider logs.
 | `FORCE_HTTP` | `false` | Allow HTTP for reverse-proxy deployments |
 | `FORCE_SECURE_COOKIES` | `false` | Force the Secure cookie flag |
 | `CORS_ALLOWED_ORIGINS` | `https://localhost:3000` | Comma-separated origins for CORS and the WebSocket Origin check. Required in production: must include your public origin or the WebSocket upgrade fails with 403 |
-| `MAX_TOTAL_ROOMS` | `1000` | Maximum concurrent rooms |
+| `MAX_TOTAL_ROOMS` | `500` | Maximum concurrent rooms, sized for a 512 MiB memory limit (see "Relay Memory" in SECURITY.md); raise it only with more memory |
+| `MAX_WS_CONNECTIONS` | `400` | WebSocket connections open at once. An upgrade beyond it is refused with 503 and `Retry-After`, before anything is allocated for it; the token and room endpoints refuse with the same answer before the proof of work. Sized for a 512 MiB container |
+| `MAX_WS_CONNECTIONS_PER_ADDRESS` | `50` | WebSocket connections open at once from one client address (an IPv6 /64; an IPv6 /48 may hold four times as many). Beyond it: 429 and `Retry-After` |
 | `CSP_WS_HOST` | `'self'` | Extra WebSocket origins allowed by the CSP |
 | `WS_CONN_BURST_SIZE` | `30` | WebSocket connections per window, per client address, counted only for upgrades that carry a valid token. Also the burst a client may spend at once |
 | `WS_CONN_PERIOD_SECS` | `60` | Window over which the WebSocket connection budget refills evenly |

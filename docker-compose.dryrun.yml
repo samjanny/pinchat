@@ -1,0 +1,15 @@
+# Override for the pre-deploy dry run only: the service in docker-compose.yml
+# has a fixed address on its network, which the running container already
+# holds, so a second container started from it cannot join that network.
+# The dry run only has to show that the server accepts its configuration
+# and starts; it needs no network.
+#
+#   timeout 8 docker compose -f docker-compose.yml -f docker-compose.dryrun.yml \
+#       run --rm --no-deps -T pinchat        # must print "Starting HTTP server"
+#
+# Naming files with -f turns off the automatic docker-compose.override.yml:
+# if there is one, add "-f docker-compose.override.yml" before this file.
+services:
+  pinchat:
+    networks: !reset {}
+    network_mode: none

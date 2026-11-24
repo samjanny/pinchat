@@ -33,6 +33,25 @@ fn parse_size_with_suffix(value: &str) -> Option<usize> {
     }
 }
 
+/// Default of `MAX_TOTAL_ROOMS`. The memory sizing below and in "Relay
+/// Memory" in SECURITY.md assumes it: 500 rooms at their limits take about
+/// 135 MB of a 512 MiB container. A larger host raises it.
+pub const DEFAULT_MAX_TOTAL_ROOMS: usize = 500;
+
+/// Default of `MAX_WS_CONNECTIONS`, sized for a relay in a 512 MiB container
+/// with `MAX_TOTAL_ROOMS=500` (see "Relay Memory" in SECURITY.md). Measured
+/// on one CPU behind a TLS proxy, a connection costs about 22 KB to the
+/// relay when idle and up to 256 KiB more in kernel socket buffers when its
+/// peer stops reading or keeps sending while the relay waits. With the
+/// global budgets, the password checks and 500 rooms at their limits taking
+/// about 360 MB, 400 connections at their worst add about 115 MB and leave a
+/// margin of about 60 MB. A larger host raises it.
+pub const DEFAULT_MAX_WS_CONNECTIONS: usize = 400;
+/// Default of `MAX_WS_CONNECTIONS_PER_ADDRESS`: an eighth of the relay, so
+/// that it takes at least eight addresses to fill it, while a household or
+/// an office behind one address can still keep many rooms open.
+pub const DEFAULT_MAX_WS_CONNECTIONS_PER_ADDRESS: usize = DEFAULT_MAX_WS_CONNECTIONS / 8;
+
 /// Application configuration loaded from environment variables
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -43,6 +62,15 @@ pub struct Config {
     // WebSocket connection rate limiting
     pub ws_conn_burst_size: u32,
     pub ws_conn_period_secs: u64,
+
+    // Admission control for WebSocket connections: how many may be open at
+    // once in all, and how many for one client address (an IPv6 /64; an
+    // IPv6 /48 may hold four times as many). A connection holds its slot
+    // from the moment its upgrade is accepted to the end of its closing
+    // handshake. An upgrade beyond either limit is refused before anything
+    // is allocated for it (503 for the relay, 429 for the address).
+    pub max_ws_connections: usize,
+    pub max_ws_connections_per_address: usize,
 
     // Room/Token creation rate limiting
     pub room_token_burst_size: u32,
@@ -198,6 +226,15 @@ impl Config {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(60),
+
+            max_ws_connections: env::var("MAX_WS_CONNECTIONS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(DEFAULT_MAX_WS_CONNECTIONS),
+            max_ws_connections_per_address: env::var("MAX_WS_CONNECTIONS_PER_ADDRESS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(DEFAULT_MAX_WS_CONNECTIONS_PER_ADDRESS),
 
             // Room/Token creation rate limiting (default: 100 requests per 10 minutes)
             room_token_burst_size: env::var("ROOM_TOKEN_BURST_SIZE")
@@ -516,6 +553,13 @@ impl Config {
             panic!("PROTOCOL_ERROR_LIMIT must be greater than 0");
         }
 
+        if !(1..=100_000).contains(&self.max_ws_connections) {
+            panic!("MAX_WS_CONNECTIONS must be between 1 and 100000");
+        }
+        if !(1..=self.max_ws_connections).contains(&self.max_ws_connections_per_address) {
+            panic!("MAX_WS_CONNECTIONS_PER_ADDRESS must be between 1 and MAX_WS_CONNECTIONS");
+        }
+
         // Validate periods are non-zero
         if self.ws_conn_period_secs == 0 {
             panic!("WS_CONN_PERIOD_SECS must be greater than 0");
@@ -663,6 +707,8 @@ impl Config {
             port: 3000,
             ws_conn_burst_size: 100,
             ws_conn_period_secs: 60,
+            max_ws_connections: DEFAULT_MAX_WS_CONNECTIONS,
+            max_ws_connections_per_address: DEFAULT_MAX_WS_CONNECTIONS_PER_ADDRESS,
             room_token_burst_size: 100,
             room_token_period_secs: 600,
             msg_rate_limit: 30,

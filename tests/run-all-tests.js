@@ -54,6 +54,11 @@ const TEST_SUITES = {
         file: 'test-chat-image-limits.js',
         description: 'The relay cannot raise the image limit; a selected image is cleaned before it is previewed or sent'
     },
+    'chat-message-time': {
+        name: 'Chat message times',
+        file: 'test-chat-message-time.js',
+        description: 'Received messages and images carry the time of arrival; the relay sends none'
+    },
     'websocket-resume': {
         name: 'WebSocket stable-identity resume',
         file: 'test-websocket-resume.js',

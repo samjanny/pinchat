@@ -177,6 +177,8 @@ mod tests {
             port: 0,
             ws_conn_burst_size: 100,
             ws_conn_period_secs: 60,
+            max_ws_connections: crate::config::DEFAULT_MAX_WS_CONNECTIONS,
+            max_ws_connections_per_address: crate::config::DEFAULT_MAX_WS_CONNECTIONS_PER_ADDRESS,
             room_token_burst_size: 100,
             room_token_period_secs: 600,
             msg_rate_limit: 30,
