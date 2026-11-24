@@ -597,10 +597,17 @@ function publicView(record) {
 }
 
 function setBadge(tabId, record) {
-    const badge = record ? V.badge(record.integrity, record.attention) : { text: '', color: '#6b7280' };
+    const badge = record
+        ? V.badge(record.integrity, record.attention)
+        : { text: '', color: '#6b7280', textColor: '#ffffff' };
     try {
         ext.action.setBadgeText({ text: badge.text, tabId });
         ext.action.setBadgeBackgroundColor({ color: badge.color, tabId });
+        // Set for every state, not only the yellow one: the color is kept
+        // per tab, and a dark text must not stay on the next badge.
+        if (typeof ext.action.setBadgeTextColor === 'function') {
+            ext.action.setBadgeTextColor({ color: badge.textColor, tabId });
+        }
     } catch {
         /* tab closed */
     }

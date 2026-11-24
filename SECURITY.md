@@ -886,7 +886,7 @@ describes every state and what each may be based on.
 | Condition | State | What the user sees |
 |-----------|-------|--------------------|
 | Page bytes match the signed hash, policy in force (Firefox) | Verified | Green badge |
-| Policy in force, page not attestable (Chromium) | Partially verified | Blue badge |
+| Policy in force, page not attestable (Chromium) | Partially verified | Yellow check badge; the popup says a complete check is currently possible only in Firefox |
 | Page bytes differ from the signed hash (Firefox) | Failed | Block page, red overlay without dismiss |
 | A file served to the extension differs from its signed hash | Failed | Red overlay without dismiss |
 | Unsigned stylesheet from the site loaded | Failed | Red overlay without dismiss |

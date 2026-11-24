@@ -4,6 +4,28 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Dates are the repository-local commit dates; entries are curated for user-visible impact
 rather than being a 1:1 mirror of `git log`.
 
+## [2026-11-24] - extension 1.5.2
+
+An extension release only. The server, the signed manifest (sequence 56) and
+the extensions' pin (v0.9.1, floor 56) do not change. 1.5.1 was packaged and
+attached to the v0.9.1 release but not submitted to the stores; 1.5.2 takes
+its place.
+
+### Changed - check marks for the two best states, and a color for every check
+
+In Chromium, where the page itself cannot be compared with the signed release
+before it is shown, the verifier showed a blue `~` as its best state. It now
+shows a yellow check mark, on the toolbar badge and in the popup, and the
+popup says under it that a complete check, which also compares the page
+itself, is currently possible only in Firefox. The verified state, which only
+Firefox reaches, is a green check mark where it was `OK`; green stays
+reserved for it.
+
+The lines under "What was checked" in the popup are colored by their own
+outcome: green when the check passed, yellow when the browser cannot make it,
+amber when it could not be made, red when it failed, grey while it is not
+known yet.
+
 ## [2026-11-24] - v0.9.1
 
 The manifest is at sequence 56 and both extensions move to 1.5.1 with their

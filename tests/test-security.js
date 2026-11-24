@@ -366,7 +366,7 @@ async function runTests() {
             && chromeFloor > 0
             && chromeFloor <= signed.data.sequence
             && firefoxFloor === chromeFloor
-            && chromeManifest.version === '1.5.1'
+            && chromeManifest.version === '1.5.2'
             && firefoxManifest.version === chromeManifest.version
             && readPublicKey(chromeBackground) === readPublicKey(firefoxBackground);
         if (!pinsOk) {

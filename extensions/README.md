@@ -180,8 +180,8 @@ file, `verdict.js`, and pinned by `tests/test-verifier-verdict.js`.
 
 | Badge | State | Meaning |
 |-------|-------|---------|
-| `OK` (green) | Verified | The bytes of the page were compared with the signed hash before the browser parsed them, and the script policy is in force. Firefox only |
-| `~` (blue) | Partially verified | The script policy is in force, so only signed scripts can run. The page itself could not be attested. This is the best state Chromium can reach |
+| `✓` (green) | Verified | The bytes of the page were compared with the signed hash before the browser parsed them, and the script policy is in force. Firefox only |
+| `✓` (yellow) | Partially verified | The script policy is in force, so only signed scripts can run. The page itself could not be attested. This is the best state Chromium can reach; the popup adds that a complete check is currently possible only in Firefox |
 | `!` (red) | Failed | A mismatch with the signed release was established |
 | `?` (amber) | Unverifiable | The check could not be made: no manifest, or the page did not pass through the verifier |
 | `!` (amber) | Notice | Something on the page was blocked, or looks wrong, without proof against the server |
@@ -190,6 +190,11 @@ file, `verdict.js`, and pinned by `tests/test-verifier-verdict.js`.
 Green is shown for the first row only. "Verified" is a statement about what
 the server delivered; it says nothing about the browser, the device, or other
 extensions.
+
+In the popup, each line under "What was checked" is colored by its own
+outcome: green when the check passed, yellow when this browser cannot make
+it (the page as received, in Chromium), amber when it could not be made,
+red when it failed, grey while it is not known yet.
 
 ### What is shown on the page
 

@@ -191,10 +191,38 @@ test('only verified gets the green badge', () => {
             const badge = V.badge(integrity, attention);
             if (integrity === INTEGRITY.VERIFIED && !attention) continue;
             assert.notStrictEqual(badge.color, green.color, `${integrity}/${attention} must not look verified`);
-            assert.notStrictEqual(badge.text, green.text);
+            // The yellow check of PARTIAL is the one state that shares the
+            // verified symbol; it is told apart by its color, checked above
+            // and in the test below.
+            if (integrity !== INTEGRITY.PARTIAL || attention) assert.notStrictEqual(badge.text, green.text);
         }
     }
     assert.strictEqual(V.badge('nonsense', false).text, '');
+});
+
+test('verified is a green check, the best state of Chromium a yellow one that says where a complete check is made', () => {
+    const partial = V.badge(INTEGRITY.PARTIAL, false);
+    assert.strictEqual(V.badge(INTEGRITY.VERIFIED, false).text, '✓');
+    assert.strictEqual(V.badge(INTEGRITY.VERIFIED, false).color, '#16a34a');
+    assert.strictEqual(partial.text, '✓');
+    assert.strictEqual(partial.color, '#facc15');
+    assert.strictEqual(partial.textColor, '#111827', 'white does not read on yellow');
+    // Every badge names its text color: it is kept per tab, so a state that
+    // left it out would inherit the dark text of an earlier yellow badge.
+    for (const integrity of Object.values(INTEGRITY)) {
+        for (const attention of [false, true]) {
+            assert.match(V.badge(integrity, attention).textColor, /^#[0-9a-f]{6}$/, `${integrity}/${attention}`);
+        }
+    }
+    assert.match(V.headlineNote(INTEGRITY.PARTIAL), /only in Firefox/);
+    for (const integrity of Object.values(INTEGRITY)) {
+        if (integrity !== INTEGRITY.PARTIAL) assert.strictEqual(V.headlineNote(integrity), '', integrity);
+    }
+    // The popup and the verdict logic are the same file in both browsers.
+    for (const file of ['verdict.js', 'popup.js', 'popup.html']) {
+        assert.strictEqual(fs.readFileSync(path.join(root, 'extensions/chrome', file), 'utf8'),
+            fs.readFileSync(path.join(root, 'extensions/firefox', file), 'utf8'), file);
+    }
 });
 
 test('redirects off the site are refused, whatever the spelling', () => {
