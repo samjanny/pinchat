@@ -11,6 +11,8 @@ on:
       - 'extensions/generate-csp-rules.js'
       - '.github/scripts/verify-sri.js'
       - '.github/workflows/sri-check.yml'
+  # The same paths as for push: a pull request that changes only this
+  # workflow, or anything else the gate reads, must run it too.
   pull_request:
     paths:
       - 'static/**'
@@ -19,6 +21,7 @@ on:
       - 'extensions/firefox/**'
       - 'extensions/generate-csp-rules.js'
       - '.github/scripts/verify-sri.js'
+      - '.github/workflows/sri-check.yml'
 
 jobs:
   verify-sri:

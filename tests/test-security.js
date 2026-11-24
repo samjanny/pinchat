@@ -541,6 +541,59 @@ async function runTests() {
     }
     console.log('');
 
+    // -------------------------------------------------------------------------
+    // Test 10: The CI SRI gate reads every script and stylesheet tag
+    // -------------------------------------------------------------------------
+    console.log('--- Test 10: SRI gate covers every tag, whatever its attribute order ---');
+    try {
+        const root = path.join(__dirname, '..');
+        const { sriReferences } = require('../.github/scripts/verify-sri.js');
+        const references = sriReferences([
+            '<script integrity="sha256-AAA=" src="/static/js/first.js"></script>',
+            '<script src="/static/js/second.js" defer integrity="sha256-BBB="></script>',
+            "<script src='/static/js/third.js'></script>",
+            '<link href="/static/css/a.css" crossorigin="anonymous" rel="stylesheet" integrity="sha256-CCC=">',
+            '<link rel="Stylesheet preload" href="/static/css/b.css">',
+            '<link rel="icon" href="/static/icon.png">',
+            '<script>document.title = "inline, not a reference"</script>',
+        ].join('\n'));
+        assert.deepStrictEqual(references.map((entry) => [entry.kind, entry.url, entry.integrity]), [
+            ['script', '/static/js/first.js', 'sha256-AAA='],
+            ['script', '/static/js/second.js', 'sha256-BBB='],
+            ['script', '/static/js/third.js', null],
+            ['link', '/static/css/a.css', 'sha256-CCC='],
+            ['link', '/static/css/b.css', null],
+        ]);
+
+        // Every page of the release: each script and stylesheet tag is a
+        // reference, and each one carries an integrity attribute.
+        for (const page of ['index', 'login', 'chat', 'terms', 'privacy']) {
+            const html = fs.readFileSync(path.join(root, 'static', `${page}.html`), 'utf8');
+            const tags = (html.match(/<script\b[^>]*\ssrc=/g) || []).length
+                + (html.match(/<link\b[^>]*rel="stylesheet"/g) || []).length;
+            const found = sriReferences(html);
+            assert.strictEqual(found.length, tags, `${page}.html: every tag is read`);
+            assert(found.every((entry) => entry.integrity !== null), `${page}.html: a tag without integrity`);
+        }
+
+        // The workflow runs the gate for a pull request on the same paths
+        // as for a push.
+        const workflow = fs.readFileSync(path.join(root, '.github/workflows/sri-check.yml'), 'utf8');
+        const pathsOf = (trigger) => {
+            const block = workflow.split(new RegExp(`\\n  ${trigger}:\\n`))[1].split(/\n  [a-z_]+:\n|\njobs:/)[0];
+            return [...block.matchAll(/^\s+- '([^']+)'$/gm)].map((match) => match[1]).sort();
+        };
+        assert.deepStrictEqual(pathsOf('pull_request'), pathsOf('push'));
+        assert(pathsOf('pull_request').includes('.github/workflows/sri-check.yml'));
+
+        console.log('PASSED: the SRI gate reads tags by attribute name and runs for every change it reads');
+        passed++;
+    } catch (e) {
+        console.log('FAILED:', e.message);
+        failed++;
+    }
+    console.log('');
+
     // =========================================================================
     // Summary
     // =========================================================================
