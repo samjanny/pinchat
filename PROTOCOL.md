@@ -156,11 +156,27 @@ Client                                    Server
    |                                         |
 ```
 
-**Server rejection paths** (pre-upgrade, before `on_upgrade`):
+**Server rejection paths** (pre-upgrade, before `on_upgrade`), in this order:
 - No `Sec-WebSocket-Protocol` header -> **401 Unauthorized**
 - No `pinchat.v1` base offered -> **426 Upgrade Required**
 - No `pinchat.v1.jwt.<token>` companion -> **401 Unauthorized**
-- Invalid / expired JWT -> **401**; wrong room_id -> **403**; replayed jti -> **403**
+- `Origin` not in `CORS_ALLOWED_ORIGINS`, or missing outside development
+  mode -> **403**
+- Invalid / expired JWT -> **401**; wrong room_id -> **403**; a creator
+  bootstrap token of a generation already revoked -> **403**
+- The relay, or the client's address, at its connection limit -> **503**
+  or **429**, with `Retry-After: 30`
+- Room missing, expired, or full for an identity that holds no slot in it
+  -> **404** (one answer for the three)
+- The token's identity still has an open socket -> **409 Conflict**
+- Replayed jti -> **403**
+
+Every rejection but the last leaves the single-use token unspent: the client
+may present it again while it is valid. A browser sees any of them only as a
+failed connection (close code 1006). After the upgrade, admission can still
+refuse the socket (a concurrent resume of the same identity won, or its
+reservation ended in between): the relay then sends an `error` frame and
+closes with 1008.
 
 ### Room Creation Response (v1)
 
@@ -538,45 +554,206 @@ messages; the server rejects an image envelope without them.
 
 ## WebSocket Protocol
 
-### Message Types
+What follows is the relay as implemented in `src/handlers/websocket.rs` and
+the browser client of `static/js/websocket.js` and `static/js/app.js`. Every
+frame is a JSON text frame. Binary frames are counted against the frame rate
+limit and dropped. The relay checks the shape of what it relays, never its
+cryptographic content, and it takes `sender_id` from the signed upgrade
+token, never from the frame.
 
-| Type | Direction | Description |
-|------|-----------|-------------|
-| `ecdh_public_key` | C -> S -> C | Opaque handshake-v2 envelope with separate handshake/ratchet keys (both sides send one) |
-| `message` | Bidirectional | Encrypted text message |
-| `image` | Bidirectional | Encrypted image |
-| `join` | S -> C | Participant joined |
-| `leave` | S -> C | Participant left |
-| `error` | S -> C | Error notification |
-| `room_expired` | S -> C | Room TTL exceeded |
+### Tokens and Reconnects
 
-### Server Relay Behavior
+`POST /api/ws-token/{room_id}` (session cookie, `X-CSRF-Token`, a proof of
+work in `X-Pow-Nonce`) returns a single-use upgrade token, valid for
+`JWT_TOKEN_TTL_SECS` (30 seconds), for a newly allocated `connection_id`.
+Three optional request headers change that:
 
-The server operates as a blind relay:
+| Header | Meaning |
+|--------|---------|
+| `X-PinChat-Resume-Token` | The `resume_token` of a `connected` frame: the token is minted for that same `connection_id`, marked as a resume |
+| `X-PinChat-MLS-Control-Seq` | Group rooms, required with the resume credential: the highest control sequence the browser has applied, bound into the token |
+| `X-PinChat-Creator-Bootstrap` | The `creator_bootstrap_token` of a group room, until the creator's first `mlsack`: the token is minted for the creator's preallocated `connection_id` |
 
-1. Receives encrypted message from sender
-2. Validates message structure (not content)
-3. Broadcasts to all other room participants
-4. Does not store, decrypt, or modify payload
+The first two are refused together with the third (400). Refusals specific
+to reconnects are `409` with a JSON `code`:
 
-### Connection Management
+| `code` | When | Client |
+|--------|------|--------|
+| `RESUME_REJECTED` | The credential is invalid or expired, or the identity's reconnect grace period is over | One-to-one: continues as a new participant, with a new handshake. Group: stops; the tab has to join again |
+| `MLS_CONTROL_RESYNC_REQUIRED` | Group: the cursor is missing, or no longer in the log | Stops: it cannot catch up safely |
+| `CREATOR_BOOTSTRAP_REJECTED` | The bootstrap capability is invalid, used up, or names a one-to-one room | Stops |
 
-```
-// JWT Token Validation
-Token contains:
-- room_id: Target room
-- user_id: Assigned user ID
-- exp: Expiration timestamp
+A relay or an address at its connection limit is answered before the proof
+of work, with 503 (`RELAY_FULL`) or 429 (`ADDRESS_FULL`) and
+`Retry-After: 30`; a missing, expired or full room with 404.
 
-// Connection Lifecycle
-1. WebSocket upgrade with token
-2. Validate token signature and expiration
-3. Check room exists and has capacity
-4. Assign connection to room
-5. Notify other participants (join)
-6. Relay messages until disconnect/expiry
-7. Notify other participants (leave)
-```
+A participant whose socket goes away keeps its place in the room for
+`WS_RECONNECT_GRACE_SECS` (20 seconds). A resume within that time reclaims
+the same `connection_id`: the room sees no `userleft` and no `userjoined`, a
+one-to-one session keeps its Double Ratchet and its SAS decision, and a group
+member keeps its MLS leaf. The departure is announced only when the grace
+period has passed without a resume. Each disconnect has its own grace
+period: one that the participant resumed from ends nothing later.
+
+The resume credential is a bearer token. It is sent only in the
+participant's own `connected` frame, is valid for the room's TTL from that
+admission, and is kept in page memory only. While the relay still holds an
+earlier socket of the identity, for instance after a change of network until
+that socket times out, an upgrade with a resume token is refused with 409
+and its token is not spent; the old socket is not taken over.
+
+### Client Messages
+
+| `type` | Room | Fields | Relay |
+|--------|------|--------|-------|
+| `ecdh_public_key` | one-to-one | `payload`, at most 8192 characters | Relayed with `sender_id`. At most `ECDH_BURST_LIMIT` (8) per `ECDH_BURST_WINDOW_SECS` (60 s), then closed with 1008 |
+| `message` | one-to-one | `payload`, at most 64 KiB; `header` with `v` = 1 and `dh`, `sig` of at most 100 characters | Relayed with `sender_id` |
+| `image` | one-to-one | `payload`, at most the encoded size of a `MAX_IMAGE_SIZE` picture; `header` | Relayed with `sender_id` |
+| `mls` | group | `payload` (canonical Base64url), `wire_format`, and per format `ratchet_tree`, `key_package_ref`, `commit_ref`, `bootstrap_proof` | See "Group Rooms" |
+| `mlsack` | group | `control_seq` and nothing else | Recorded, never relayed |
+
+Every frame counts against `FRAME_RATE_LIMIT` (120 per
+`MSG_RATE_WINDOW_SECS`), every `message`, `image` and `mls` against
+`MSG_RATE_LIMIT` (30); beyond either the connection is closed with 1008. A
+type that is not valid for the room, an unknown type, malformed JSON, a
+malformed header or MLS envelope and an ACK of a sequence the relay has not
+sent count as protocol errors; at `PROTOCOL_ERROR_LIMIT` (10) the
+connection is closed with 1008. A `message` or `image` above its size limit
+is not relayed and its sender gets an `error`.
+
+A frame identical to one already relayed in the room, payload and metadata
+alike, is dropped without an answer. The browsers do not depend on this:
+their own replay protection is authoritative.
+
+Messages, pictures and group envelopes also count against the room's
+traffic limit: `ROOM_MSG_RATE_LIMIT` (120) frames and `ROOM_BYTE_RATE_LIMIT`
+(8 MiB) bytes per `MSG_RATE_WINDOW_SECS`, of which one sender may take half
+while another participant is present. A `message`, an `image` or an MLS
+PrivateMessage beyond it is not relayed, and its sender gets an `error`
+saying so; a group control beyond it is handled as described under
+"Group Rooms".
+
+A frame accepted for relaying that finds the relay's broadcast budgets full
+waits up to 30 seconds for room, and the connection reads nothing else
+meanwhile. After that its connection is closed with 1013; an
+`ecdh_public_key` frame is dropped instead.
+
+### Relay Messages
+
+| `type` | Fields | Sent |
+|--------|--------|------|
+| `connected` | `user_id`, `room_id`, `participant_count`, `room_type`, `ttl_minutes`, `max_participants`, `max_image_size`, `created_at`, `resume_token`, `resumed`, and for a group `mls_control_cursor` | To the socket alone, first, once it is admitted |
+| `userjoined` | `user_id`, `participant_count`, and for a group `control_seq` | To the room, when a participant is admitted for the first time |
+| `userleft` | `user_id`, `participant_count`, and for a group `control_seq` | To the room, when a participant's grace period ends or it is evicted |
+| `ecdh_public_key`, `message`, `image` | As sent, with `sender_id` | To the room |
+| `mls` | As sent, with `sender_id` and, for a control, `control_seq` | To the room |
+| `mlssync` | `through_seq` | To a group socket alone, when its replay is complete |
+| `mlsrejected` | `commit_ref`, `reason`, `retry_after_secs` | To the sender alone, when a group control is refused |
+| `error` | `message` | To the socket alone: text for the user, not a code |
+
+What is relayed to the room goes to every socket of the room, the sender's
+included. Browsers ignore frames that carry their own `sender_id`, except
+the echo of their own pending Commit, which is how the relay tells them it
+accepted it. In a one-to-one room the `userjoined` of a participant is sent
+before its socket subscribes, so it does not get its own; in a group the
+participant receives its own `userjoined`, in sequence.
+
+The relay never refuses its own `userjoined` and `userleft` for lack of room
+in its budgets: a peer starts or ends its handshake on them, and a group's
+membership depends on them.
+
+### Group Rooms
+
+An `mls` envelope has a `wire_format` of RFC 9420:
+
+| `wire_format` | Content | Fields | Decoded size |
+|---------------|---------|--------|--------------|
+| 1 | PublicMessage: a Proposal or a Commit, told apart from the framing | A Commit needs `commit_ref`, the Base64url SHA-256 of its payload, and an Add Commit also `key_package_ref`; a Proposal carries neither | 128 KiB |
+| 2 | PrivateMessage | None | `MAX_IMAGE_SIZE` + 64 KiB |
+| 3 | Welcome | `key_package_ref`, `commit_ref` and `ratchet_tree` (at most 64 KiB) | 128 KiB |
+| 5 | KeyPackage | `bootstrap_proof` | 16 KiB |
+
+References and the proof are 43-character canonical Base64url SHA-256
+values. A Commit counts against `COMMIT_RATE_LIMIT` (24 per
+`COMMIT_RATE_WINDOW_SECS`, 60 s) and is answered with `mlsrejected` beyond
+it; a Proposal against `PROPOSAL_RATE_LIMIT` (8 per 60 s), beyond which the
+connection is closed with 1008.
+
+**The control log.** Proposals, Commits, Welcomes and KeyPackages (the
+controls) and the relay's `userjoined` and `userleft` share one sequence per
+room, `control_seq`, from 1, and are kept in order in the room's log: 256
+entries and 2 MiB, of which 32 entries and 128 KiB are kept for joins and
+leaves. PrivateMessages have no sequence and are not kept: a member that is
+not connected when one is sent never gets it.
+
+- Only the group's creator may send a Commit or a Welcome. From anyone else
+  it is answered with `mlsrejected` `not_group_creator` before it counts
+  against the room's traffic limit, and counts as a protocol error.
+- A KeyPackage needs a reference that is new to the room, and each
+  participant may publish one per admission. An Add Commit names an accepted
+  KeyPackage; the Welcome that follows it must carry the same `commit_ref`
+  and `key_package_ref`. A group consumes at most 1024 KeyPackages.
+- The browser acknowledges every control once it has applied it, with an
+  `mlsack` of the highest sequence applied. Entries acknowledged by every
+  participant leave the log.
+- A participant is evicted when a control has waited 60 seconds for its
+  acknowledgement, when 64 have waited longer than 5 seconds, or when 192
+  are waiting. Its departure is announced at once; an evicted creator
+  closes the room.
+- The creator must connect first: until its own `userjoined` is sequenced,
+  the room is full to everyone else. When the creator's grace period ends,
+  the room is closed.
+- The browser keeps every control it sent until the relay echoes it with a
+  sequence. It sends those it still holds again after each `mlssync`.
+
+A KeyPackage, Proposal or Welcome beyond the room's traffic limit, or one
+the log cannot take, gets no `mlsrejected`: the connection is closed with
+1013, and the browser sends the control again once it is back. The room is
+closed if its log cannot take a join or a leave.
+
+**Connecting.** A group socket receives, in order:
+
+1. `connected`, whose `mls_control_cursor` is the head of the log on a first
+   admission (what came before is not replayed) and the cursor bound into
+   the token on a resume.
+2. On a resume, the controls after the cursor, in windows of 16. After each
+   window the relay waits up to 60 seconds for an `mlsack` of the window's
+   last sequence and accepts nothing else meanwhile. Any other frame, more
+   than 64 frames, or no such acknowledgement evicts the participant and
+   closes the socket with 1008. Controls sequenced during the replay follow
+   in further windows. The socket receives no live frames until the replay
+   is complete, so PrivateMessages sent meanwhile do not reach it.
+3. `mlssync`, whose `through_seq` is the last sequence replayed, or the
+   cursor if there was none. The browser checks it against its own cursor.
+   Live frames follow.
+4. On a first admission, its own `userjoined`.
+
+`mlsrejected` reasons:
+
+| `reason` | `retry_after_secs` | Meaning |
+|----------|--------------------|---------|
+| `commit_rate_limited` | `COMMIT_RATE_WINDOW_SECS` | The sender's Commit rate limit |
+| `room_rate_limited` | `MSG_RATE_WINDOW_SECS` | A Commit beyond the room's traffic limit |
+| `not_group_creator` | 0 | A Commit or Welcome from someone other than the creator |
+| `unknown_key_package_ref` | 0 | An Add for a KeyPackage the relay does not hold, or in a group that has consumed its 1024 KeyPackages and can admit nobody more |
+| `commit_correlation_conflict` | 0 | A Commit reference already paired with another KeyPackage; counts as a protocol error |
+| `welcome_not_correlated` | 0 | A Welcome without its accepted Add Commit, for instance because the joiner has left |
+
+A reason with `retry_after_secs` 0 is final: the browser abandons the
+control.
+
+### Closing Codes
+
+| Code | When |
+|------|------|
+| 1001 | The room expired or was closed; the connection reached `MAX_WS_CONNECTION_AGE_SECS` (30 minutes); nothing arrived for 90 seconds |
+| 1002, 1007, 1009 | The client broke RFC 6455; sent text that is not UTF-8; sent a frame or message above the size limit |
+| 1008 | A rate or protocol-error limit; the participant was evicted, or its identity is no longer in the room; it fell more than 64 frames behind its room; a message took more than 90 seconds to arrive; the replay rules above; admission refused after the upgrade |
+| 1011 | The relay could not set up the connection |
+| 1013 | A frame or control waited 30 seconds for room in the broadcast budgets; a group control beyond the room's traffic limit or not taken by the log |
+
+The relay answers a client's Close with the same code and gives the closing
+handshake 5 seconds.
 
 ---
 
@@ -584,15 +761,14 @@ Token contains:
 
 ### Error Codes
 
-| Code | Description | Action |
-|------|-------------|--------|
-| `ROOM_NOT_FOUND` | Room does not exist | Redirect to home |
-| `ROOM_FULL` | Maximum participants reached | Display error |
-| `ROOM_EXPIRED` | TTL exceeded | Close connection |
-| `AUTH_FAILED` | Invalid/expired token | Re-authenticate |
-| `DECRYPT_FAILED` | Decryption error | Check keys |
-| `SIGNATURE_INVALID` | MITM detected | Abort session |
-| `RATE_LIMITED` | Too many requests | Wait and retry |
+The relay reports errors in four ways, all described in "WebSocket
+Protocol": HTTP status codes of the token endpoint and of the upgrade, with
+a JSON `code` for `RESUME_REJECTED`, `MLS_CONTROL_RESYNC_REQUIRED`,
+`CREATOR_BOOTSTRAP_REJECTED`, `RELAY_FULL` and `ADDRESS_FULL`; `error`
+frames, whose `message` is text for the user; `mlsrejected` frames and their
+`reason`; and close codes. Failures the client detects itself are not on the
+wire: `SIGNATURE_INVALID` (see "DH Header Signature (v2)") closes the socket
+with 1008 and stops reconnecting.
 
 ### Recovery Procedures
 
@@ -606,13 +782,17 @@ If receivedCounter > expectedCounter:
     Log warning (messages dropped)
 ```
 
-**Reconnection**:
+**Reconnection** (see "Tokens and Reconnects"):
 ```
-1. Obtain new WebSocket token
-2. Reconnect to room
-3. Re-perform ECDH handshake
-4. Initialize new Double Ratchet
-5. Continue messaging
+1. Wait 1, 2, 4, 8 then 16 seconds; after five attempts stop until
+   the user reconnects (CONNECTION_EXHAUSTED)
+2. Obtain a new upgrade token with the resume credential, and in a
+   group room the MLS control cursor
+3. Upgrade: the same relay identity is resumed
+4. One-to-one: keep the Double Ratchet, no new handshake
+   Group: replay from the cursor, continue after mlssync
+5. On RESUME_REJECTED, a one-to-one client continues as a new
+   participant with a new handshake; a group tab stops
 ```
 
 ---
