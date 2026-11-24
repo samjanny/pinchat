@@ -156,6 +156,10 @@ document.addEventListener('alpine:init', () => {
         // this state - they must either confirm the new code matches
         // (handleSasVerified) or declare mismatch (handleSasMismatch).
         sasReverifyRequired: false,
+        // Audit C-F3: hex of the code awaiting the user's decision, and
+        // whether it replaced another undecided code while the modal was up.
+        sasPendingCode: null,
+        sasCodeChanged: false,
         sasCopied: false,           // For copy button feedback
         pendingECDHKey: null,
 
@@ -2305,7 +2309,19 @@ document.addEventListener('alpine:init', () => {
                 if (identityManager.isVerifiedPeerIdentity(peerIdentityRaw)) {
                     debugLog('[SECURITY] SAS already verified for this identity key - skipping modal');
                     this.sasVerificationStatus = 'verified';
+                    this.sasPendingCode = null;
+                    this.sasCodeChanged = false;
                 } else {
+                    // Audit C-F3: a decision was still outstanding on another
+                    // code, so the modal the user may be comparing from has
+                    // just changed under them. Say so, in the chat and in the
+                    // modal, and ask again before accepting a confirmation.
+                    const previousCode = this.sasPendingCode;
+                    this.sasCodeChanged = previousCode !== null && previousCode !== this.sas.hex;
+                    this.sasPendingCode = this.sas.hex;
+                    if (this.sasCodeChanged) {
+                        this.addSystemMessage('The security code changed while you were comparing it. Compare the new code from the start before you confirm it.');
+                    }
                     this.sasVerificationStatus = 'pending';  // Show verification modal
                 }
 
@@ -2440,6 +2456,8 @@ document.addEventListener('alpine:init', () => {
                 this.identityManager.destroy();
                 this.identityManager = null;
                 this.sasVerificationStatus = 'none';
+                this.sasPendingCode = null;
+                this.sasCodeChanged = false;
                 // The re-verify lock is tied to a specific peer identity; once
                 // identity state is destroyed there is nothing left to re-verify
                 // against, so clear the flag (otherwise the composer would stay
@@ -2510,6 +2528,8 @@ document.addEventListener('alpine:init', () => {
             this.sasReverifyRequired = false;
             this.sas = null;
             this.sasVerificationStatus = 'mismatch';
+            this.sasPendingCode = null;
+            this.sasCodeChanged = false;
 
             // Close WebSocket with 1008 Policy Violation; suppress auto-reconnect
             if (this.wsManager) {
@@ -2535,22 +2555,52 @@ document.addEventListener('alpine:init', () => {
         },
 
         /**
-         * Handles SAS verification success (user clicked "Verified")
+         * Handles SAS verification success (user clicked "They match").
+         *
+         * Audit C-F3: the click carries the code the modal was showing
+         * (`confirmedCode`, its hex form) and is accepted only for that code.
+         * If the session, and with it the code, changed while the modal was
+         * open, the user is told so in the modal and asked to confirm that
+         * the comparison was made against the code shown now.
+         *
+         * @param {string} confirmedCode - hex of the code the user confirmed
          */
-        async handleSasVerified() {
+        async handleSasVerified(confirmedCode) {
+            const shown = this.sas;
+            if (!shown || typeof confirmedCode !== 'string' || confirmedCode !== shown.hex) {
+                console.warn('[SECURITY] SAS confirmation ignored: it does not name the code on screen');
+                if (shown) {
+                    this.sasCodeChanged = true;
+                    this.addSystemMessage('The security code changed before your confirmation was recorded. Compare the code shown now and confirm again.');
+                }
+                return;
+            }
+            if (this.sasCodeChanged) {
+                const ok = window.confirm(
+                    'The security code changed while this window was open.\n\n' +
+                    'Confirm only if you compared the code shown now, from the first ' +
+                    'emoji to the last:\n\n' + shown.hex + '\n\n' +
+                    'Press OK to confirm it, or Cancel to compare again.'
+                );
+                if (!ok) {
+                    debugLog('[SECURITY] SAS confirmation cancelled after a code change');
+                    return;
+                }
+            }
             debugLog('[SECURITY] SAS code verified by user - connection is secure');
 
             // Record the verdict for the identity key this code was computed
             // for (audit C-F1). It carries over to a later handshake only if
             // the peer presents those same bytes again.
             if (this.identityManager) {
-                const shown = this.sas;
-                if (!shown || !(shown.peerIdentityRaw instanceof Uint8Array)) {
-                    console.warn('[SECURITY] SAS confirmation ignored: no security code is on screen');
+                if (!(shown.peerIdentityRaw instanceof Uint8Array)) {
+                    console.warn('[SECURITY] SAS confirmation ignored: the code names no identity key');
                     return;
                 }
                 this.identityManager.markSASVerified(shown.peerIdentityRaw);
             }
+            this.sasPendingCode = null;
+            this.sasCodeChanged = false;
 
             // Clear the re-verify lock (if this verification was triggered by
             // a peer-identity-changed event after a prior verified handshake).
@@ -2616,6 +2666,8 @@ document.addEventListener('alpine:init', () => {
             // Close SAS verification dialog
             this.sas = null;
             this.sasVerificationStatus = 'skipped';
+            this.sasPendingCode = null;
+            this.sasCodeChanged = false;
 
             // Show info message
             this.addSystemMessage('ℹ️ Key verification skipped - connection security not confirmed');
@@ -2630,6 +2682,8 @@ document.addEventListener('alpine:init', () => {
             if (this.sasBackup) {
                 this.sas = this.sasBackup;
                 this.sasVerificationStatus = 'pending';
+                this.sasPendingCode = this.sas.hex;
+                this.sasCodeChanged = false;
                 debugLog('[SECURITY] Reopening SAS verification modal');
             }
         },

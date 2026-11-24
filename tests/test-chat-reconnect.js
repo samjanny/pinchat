@@ -15,8 +15,8 @@ async function reconnect(client, overrides = {}) {
 
 async function run() {
     const { alice, bob, roomId, queue, deliver } = await createChatPair();
-    await alice.store.handleSasVerified();
-    await bob.store.handleSasVerified();
+    await alice.store.handleSasVerified(alice.store.sas.hex);
+    await bob.store.handleSasVerified(bob.store.sas.hex);
     const originalRatchet = alice.crypto.doubleRatchet;
     const originalSas = alice.store.sas;
 
@@ -76,25 +76,19 @@ async function run() {
     console.log('PASSED: resume preserves the pending SAS gate');
 
     await relayForgedIdentitySwap();
+    await codeChangedWhileModalOpen();
 }
 
 const ALICE = '11111111-1111-4111-8111-111111111111';
 const BOB = '22222222-2222-4222-8222-222222222222';
 const hex = (bytes) => Buffer.from(bytes || []).toString('hex');
+const left = (id) => ({ type: 'userleft', user_id: id, participant_count: 1 });
+const joined = (id) => ({ type: 'userjoined', user_id: id, participant_count: 2 });
 
-/**
- * Audit C-F1. Membership frames come from the relay and are not
- * authenticated. A relay that knows the invite link forges a leave, a join
- * whose handshake it drops, and another leave: the handshake timer of the
- * discarded attempt used to stay armed and, up to 30 s later, tore down the
- * live session that replaced it, without arming the identity comparison.
- * The relay's own client then answered the next handshake with its own
- * identity key and inherited "verified", because the verdict was a boolean.
- */
-async function relayForgedIdentitySwap() {
+// A relay the test controls: every client has its own outbox, and nothing
+// is delivered unless the test says so.
+function controllableRelay() {
     const outbox = { alice: [], bob: [], mallory: [] };
-    const alice = createChatClient(ALICE, m => outbox.alice.push(m));
-    const bob = createChatClient(BOB, m => outbox.bob.push(m));
     const take = (name) => outbox[name].splice(0);
     async function exchange(a, aName, b, bName) {
         for (let round = 0; round < 20; round++) {
@@ -106,16 +100,31 @@ async function relayForgedIdentitySwap() {
         }
         throw new Error('handshake did not settle');
     }
-    const left = (id) => ({ type: 'userleft', user_id: id, participant_count: 1 });
-    const joined = (id) => ({ type: 'userjoined', user_id: id, participant_count: 2 });
+    const client = (name, id) => createChatClient(id, m => outbox[name].push(m));
+    return { outbox, take, exchange, client };
+}
+
+/**
+ * Audit C-F1. Membership frames come from the relay and are not
+ * authenticated. A relay that knows the invite link forges a leave, a join
+ * whose handshake it drops, and another leave: the handshake timer of the
+ * discarded attempt used to stay armed and, up to 30 s later, tore down the
+ * live session that replaced it, without arming the identity comparison.
+ * The relay's own client then answered the next handshake with its own
+ * identity key and inherited "verified", because the verdict was a boolean.
+ */
+async function relayForgedIdentitySwap() {
+    const { take, exchange, client } = controllableRelay();
+    const alice = client('alice', ALICE);
+    const bob = client('bob', BOB);
 
     for (const c of [alice, bob]) await c.crypto.extractKeyFromURL();
     await alice.store.startECDHHandshake();
     await bob.store.startECDHHandshake();
     await exchange(alice, 'alice', bob, 'bob');
     assert(alice.store.pfsActive && bob.store.pfsActive);
-    await alice.store.handleSasVerified();
-    await bob.store.handleSasVerified();
+    await alice.store.handleSasVerified(alice.store.sas.hex);
+    await bob.store.handleSasVerified(bob.store.sas.hex);
     const verifiedBob = hex(alice.store.identityManager.peerIdentityPublicKeyRaw);
     assert.equal(alice.store.sasVerificationStatus, 'verified');
 
@@ -154,7 +163,7 @@ async function relayForgedIdentitySwap() {
     // identity key is judged against the verified one.
     await alice.store.handleECDHAborted();
     alice.store.ecdhHandshakeStatus = 'none';
-    const mallory = createChatClient(BOB, m => outbox.mallory.push(m));
+    const mallory = client('mallory', BOB);
     await mallory.crypto.extractKeyFromURL();
     await alice.recv(joined(BOB));
     await mallory.store.startECDHHandshake();
@@ -176,7 +185,7 @@ async function relayForgedIdentitySwap() {
     alice.store.messageInput = 'meet at 9, bring the documents';
     await alice.store.sendMessage();
     assert(!take('alice').some(m => m.type === 'message'), 'nothing is encrypted to the new identity');
-    await mallory.store.handleSasVerified();
+    await mallory.store.handleSasVerified(mallory.store.sas.hex);
     mallory.store.messageInput = 'hi, it is me';
     await mallory.store.sendMessage();
     for (const m of take('mallory')) await alice.recv(m);
@@ -195,6 +204,51 @@ async function relayForgedIdentitySwap() {
     assert.equal(alice.store.sasReverifyRequired, false);
     assert.equal(alice.store.isComposerLocked(), false);
     console.log('PASSED: the verdict carries over only to the verified identity key');
+}
+
+/**
+ * Audit C-F3. While Alice's modal shows the honest code, the relay swaps
+ * the session under it. The "They match" click must not verify whatever
+ * session is current: it names the code it was made for, the user is told
+ * that the code changed, and confirming the new code asks again.
+ */
+async function codeChangedWhileModalOpen() {
+    const { exchange, client } = controllableRelay();
+    const alice = client('alice', ALICE);
+    const bob = client('bob', BOB);
+    for (const c of [alice, bob]) await c.crypto.extractKeyFromURL();
+    await alice.store.startECDHHandshake();
+    await bob.store.startECDHHandshake();
+    await exchange(alice, 'alice', bob, 'bob');
+    const comparedCode = alice.store.sas.hex;
+    assert.equal(alice.store.sasVerificationStatus, 'pending');
+    assert(!alice.store.sasCodeChanged, 'a first code is not a change');
+
+    await alice.recv(left(BOB));
+    const mallory = client('mallory', BOB);
+    await mallory.crypto.extractKeyFromURL();
+    await alice.recv(joined(BOB));
+    await mallory.store.startECDHHandshake();
+    await exchange(alice, 'alice', mallory, 'mallory');
+    assert(alice.store.pfsActive);
+    assert.notEqual(alice.store.sas.hex, comparedCode);
+    assert(alice.systemMessages.some(t => /security code changed while you were comparing it/.test(t)),
+        'the user is told that the code changed');
+    assert.equal(alice.store.sasCodeChanged, true, 'and the modal says so too');
+
+    await alice.store.handleSasVerified(comparedCode);
+    assert.equal(alice.store.sasVerificationStatus, 'pending',
+        'a confirmation of the compared code does not verify the session that replaced it');
+    alice.context.confirmAnswers.push(false);
+    await alice.store.handleSasVerified(alice.store.sas.hex);
+    assert(alice.dialogs.some(t => /changed while this window was open/.test(t)),
+        'confirming the new code asks first');
+    assert.equal(alice.store.sasVerificationStatus, 'pending', 'and Cancel keeps it unverified');
+    alice.context.confirmAnswers.push(true);
+    await alice.store.handleSasVerified(alice.store.sas.hex);
+    assert.equal(alice.store.sasVerificationStatus, 'verified', 'an explicit confirmation of the new code is accepted');
+    assert.equal(alice.store.sasCodeChanged, false);
+    console.log('PASSED: a SAS confirmation is bound to the code shown, and a code change is announced (C-F3)');
 }
 
 run().catch(error => { console.error(error); process.exit(1); });

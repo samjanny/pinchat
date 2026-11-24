@@ -126,7 +126,28 @@ async function run() {
     assert.deepStrictEqual(decrypted, [], 'pending SAS must not decrypt application data');
     assert.strictEqual(store.pendingSecureMessages.length, 2, 'ciphertexts must be quarantined');
 
+    // Audit C-F3: a confirmation names the code it was given for. Without
+    // a code on screen, without the code, or with another code, nothing is
+    // verified and nothing is released.
+    await store.handleSasVerified('AA-BB-CC');
+    assert.strictEqual(store.sasVerificationStatus, 'pending', 'no code on screen: nothing to confirm');
+    store.sas = { hex: 'AA-BB-CC', emoji: '' };
     await store.handleSasVerified();
+    await store.handleSasVerified('DD-EE-FF');
+    assert.strictEqual(store.sasVerificationStatus, 'pending', 'a confirmation must name the code on screen');
+    assert.deepStrictEqual(decrypted, [], 'a refused confirmation releases nothing');
+    assert.strictEqual(store.sasCodeChanged, true, 'a stale confirmation counts as a code change');
+    // After a code change the user is asked once more, and Cancel keeps the gate.
+    const questions = [];
+    windowObject.confirm = (text) => { questions.push(text); return false; };
+    await store.handleSasVerified('AA-BB-CC');
+    assert.strictEqual(questions.length, 1, 'a changed code asks before it is accepted');
+    assert(questions[0].includes('AA-BB-CC'), 'the question names the code shown now');
+    assert.strictEqual(store.sasVerificationStatus, 'pending', 'Cancel leaves the decision pending');
+    windowObject.confirm = (text) => { questions.push(text); return true; };
+
+    await store.handleSasVerified('AA-BB-CC');
+    assert.strictEqual(store.sasCodeChanged, false, 'the change notice clears once decided');
     assert.deepStrictEqual(
         decrypted,
         ['message:one', 'image:two'],
