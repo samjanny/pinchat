@@ -20,6 +20,35 @@ const MAX_ROOM_IMAGE_BYTES = 2 * 1024 * 1024;
 // Numbers each 1:1 handshake attempt, so that a late callback can tell
 // whether the ECDH manager it belongs to is still the current one.
 let ecdhHandshakeSerial = 0;
+
+// Banners for the `error` frames the relay sends, keyed by the relay's exact
+// text (src/handlers/websocket.rs). The relay's string is a lookup key and is
+// never displayed: a hostile relay could otherwise put any instruction it
+// liked in the page's error banner (audit C-F6). Unknown texts get the
+// generic banner.
+const RELAY_ERROR_BANNERS = new Map([
+    ['Room is full or reconnect is unavailable',
+        'The room is full, or this connection could not be resumed.'],
+    ['Unable to establish reconnect state',
+        'The server could not set up this connection. Refresh to try again.'],
+    ['Secure group replay window is unavailable',
+        'The server no longer has the group history this tab needs. Refresh to rejoin.'],
+    ['Secure group control stream did not advance',
+        'The server could not deliver the group updates in order. Refresh to rejoin.'],
+    ['Unable to establish secure group lifecycle',
+        'The server could not set up the group connection. Refresh to try again.'],
+    ['Unable to establish group creator control boundary',
+        'The server could not set up the group for its creator. Create a new room.'],
+    ['The message was not sent because it exceeds the server size limit.',
+        'The message was not sent because it exceeds the server size limit.'],
+    ['The image was not sent because it exceeds the server size limit.',
+        'The image was not sent because it exceeds the server size limit.'],
+]);
+
+function relayErrorBanner(relayText) {
+    return (typeof relayText === 'string' && RELAY_ERROR_BANNERS.get(relayText))
+        || 'The server reported an error.';
+}
 window.ROOM_CONFIG = {
     roomId: urlParams.get('room')
     // roomType, ttlMinutes, maxParticipants will be set by server via WebSocket
@@ -704,7 +733,10 @@ document.addEventListener('alpine:init', () => {
                     break;
 
                 case 'error':
-                    this.error = message.message;
+                    // Audit C-F6: the relay writes this frame's text, so it
+                    // is never shown as such. It only selects one of the
+                    // banners this client wrote.
+                    this.error = relayErrorBanner(message.message);
                     break;
 
                 default:

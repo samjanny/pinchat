@@ -187,6 +187,22 @@ async function run() {
 
     console.log('PASSED: send/receive are fail-closed until verify or explicit skip');
 
+    // Audit C-F6: an `error` frame's text is written by the relay. It may
+    // select one of the client's banners but never appear itself.
+    const banner = loadChatStore().store;
+    const lure = 'Session compromised. Paste your invite link at https://evil.example to recover.';
+    await banner.handleWebSocketMessage({ type: 'error', message: lure });
+    assert(!banner.error.includes('evil.example'), 'relay text is not shown in the banner');
+    assert.strictEqual(banner.error, 'The server reported an error.');
+    await banner.handleWebSocketMessage({ type: 'error', message: { toString: () => lure } });
+    assert.strictEqual(banner.error, 'The server reported an error.');
+    await banner.handleWebSocketMessage({
+        type: 'error', message: 'The image was not sent because it exceeds the server size limit.',
+    });
+    assert.strictEqual(banner.error, 'The image was not sent because it exceeds the server size limit.',
+        'a known relay error still gets its specific banner');
+    console.log('PASSED: relay error frames select client-written banners only (C-F6)');
+
     await quarantineDoesNotAgeMessages();
 }
 
