@@ -658,6 +658,9 @@ pub enum MlsControlAppendError {
     WelcomeNotCorrelated,
     UnknownKeyPackageRef,
     DuplicateKeyPackageRef,
+    /// The group has consumed `MAX_CONSUMED_MLS_KEY_PACKAGE_REFS`
+    /// KeyPackages and can admit nobody more. Final: retrying cannot help.
+    KeyPackageRefsExhausted,
 }
 
 /// Relay-visible admission metadata for an ordered MLS envelope. The relay
@@ -2141,7 +2144,10 @@ impl AppState {
                     .get(key_package_ref)
                     .ok_or(MlsControlAppendError::UnknownKeyPackageRef)?;
                 if log.consumed_key_package_refs.len() >= MAX_CONSUMED_MLS_KEY_PACKAGE_REFS {
-                    return Err(MlsControlAppendError::CapacityExceeded);
+                    // Final for this group, unlike a full log: answered with
+                    // a typed rejection, not a close the creator would come
+                    // back from to send the same Add again.
+                    return Err(MlsControlAppendError::KeyPackageRefsExhausted);
                 }
                 if let Some(existing) = log
                     .pending_welcome_by_commit

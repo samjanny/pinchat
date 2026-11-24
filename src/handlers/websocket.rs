@@ -85,7 +85,12 @@ fn permanent_mls_append_rejection(
     commit_ref: Option<String>,
 ) -> Option<Message> {
     let reason = match error {
-        MlsControlAppendError::UnknownKeyPackageRef => "unknown_key_package_ref",
+        // A group that has used every KeyPackage reference it may consume
+        // accepts no Add again. The browser already handles this reason by
+        // abandoning the Add, which is what it must do here as well; the
+        // close it got before made it reconnect and send the same Add again.
+        MlsControlAppendError::UnknownKeyPackageRef
+        | MlsControlAppendError::KeyPackageRefsExhausted => "unknown_key_package_ref",
         MlsControlAppendError::UnauthorizedGroupCreatorControl => "not_group_creator",
         MlsControlAppendError::CommitCorrelationConflict => "commit_correlation_conflict",
         MlsControlAppendError::WelcomeNotCorrelated => "welcome_not_correlated",
@@ -1998,12 +2003,45 @@ async fn handle_socket(
                             // DashMap shards across an await point.
                             drop(timestamps);
 
+                            let is_commit =
+                                validated.public_kind == Some(PublicMessageKind::Commit);
+
+                            // Only the group creator may send a Commit or a
+                            // Welcome; the log refuses them from anyone else
+                            // (`append_and_broadcast_mls_control_at`). They are
+                            // refused here already, before the room's traffic
+                            // budget: each member may take half of it, so two
+                            // identities sending controls the relay refuses
+                            // anyway took all of it from the creator. An
+                            // honest client never sends one, so each counts
+                            // as a protocol error.
+                            if (is_commit || wire_format == WIRE_WELCOME)
+                                && state_clone
+                                    .rooms
+                                    .get(&room_id)
+                                    .and_then(|room| room.creator_connection_id())
+                                    != Some(connection_id)
+                            {
+                                tracing::warn!(
+                                    "MLS Commit or Welcome from a member that is not the group creator"
+                                );
+                                if let Some(rejection) = permanent_mls_append_rejection(
+                                    MlsControlAppendError::UnauthorizedGroupCreatorControl,
+                                    commit_ref.clone(),
+                                ) && let Ok(json) = serde_json::to_string(&rejection)
+                                {
+                                    let _ = recv_direct_tx.try_send(json);
+                                }
+                                if bump_protocol_error(&state_clone, connection_id) {
+                                    return Closing::Initiate(close_code::POLICY);
+                                }
+                                continue;
+                            }
+
                             // Tighter per-connection Commit rate limit. A
                             // PublicMessage Proposal is authenticated but does
                             // not run TreeKEM/key schedule and must not consume
                             // the creator's Commit budget.
-                            let is_commit =
-                                validated.public_kind == Some(PublicMessageKind::Commit);
                             if is_commit {
                                 let max_commits = state_clone.config.commit_rate_limit;
                                 let commit_window = state_clone.config.commit_rate_window_secs;
@@ -2256,17 +2294,29 @@ async fn handle_socket(
                                         "Failed to append MLS control envelope: {:?}",
                                         error
                                     );
+                                    // What only a misbehaving client sends is
+                                    // also counted, like any other malformed
+                                    // control.
+                                    let misbehaving = matches!(
+                                        error,
+                                        MlsControlAppendError::UnauthorizedGroupCreatorControl
+                                            | MlsControlAppendError::CommitCorrelationConflict
+                                    );
                                     if let Some(rejection) =
                                         permanent_mls_append_rejection(error, submitted_commit_ref)
                                     {
-                                        if let Ok(json) = serde_json::to_string(&rejection) {
-                                            if recv_direct_tx.try_send(json).is_ok() {
-                                                continue;
-                                            }
+                                        if misbehaving
+                                            && bump_protocol_error(&state_clone, connection_id)
+                                        {
+                                            return Closing::Initiate(close_code::POLICY);
+                                        }
+                                        if let Ok(json) = serde_json::to_string(&rejection)
+                                            && recv_direct_tx.try_send(json).is_ok()
+                                        {
+                                            continue;
                                         }
                                         tracing::warn!(
-                                            "Unable to deliver permanent MLS rejection to connection {}; closing for retry",
-                                            connection_id
+                                            "Unable to deliver permanent MLS rejection; closing for retry"
                                         );
                                     }
                                     return Closing::Initiate(close_code::TRY_AGAIN_LATER);
