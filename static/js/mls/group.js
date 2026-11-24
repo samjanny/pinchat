@@ -284,23 +284,23 @@
         for (const value of Object.values(epochSecrets)) wipeBytes(value);
     }
 
-    const DETERMINISTIC_CONTROL_ERROR_PREFIXES = Object.freeze([
-        'group.join:', 'group.join ', 'processCommit:',
-        'validateKeyPackageForAdd:',
-        'verifyUpdateProposal:', 'verifyUpdateLeaf:', 'verifyCommitLeaf:',
-        'verifyKeyPackage', 'imported-tree:', 'parent-hash:',
-        'Decoder:', 'varint:', 'mls_message:', 'public-message:',
-        'authenticated_content:', 'framed_content:', 'sender:',
-        'proposal:', 'proposal_or_ref:', 'commit:', 'welcome:',
-        'group_secrets:', 'group_info:', 'key_package:', 'ratchet_tree:',
-        'leaf_node:', 'node:', 'credential:', 'extensions:',
-        'capabilities:', 'optional:',
-    ]);
-
     /**
      * Separate deterministic wire/authentication rejection from unexpected
      * platform failures. MLSSession consumes the former ordered control, but
      * reconnects and replays the latter from the unchanged cursor.
+     *
+     * The decision is made by type, not by message text (M-06). The Group
+     * control entry points (validateKeyPackageForAdd, verifyUpdateProposal,
+     * processCommit, joinFromWelcomeWithTree) are functions of unchanged
+     * local state and immutable relay bytes: replaying the same control
+     * fails in the same way, whichever module (codec, tree math, HPKE,
+     * WebCrypto) raised the Error. Every Error is therefore a deterministic
+     * rejection. A failure keeps a different class only when the code that
+     * raised it marked it: mlsRetryControl for a known transient condition,
+     * mlsFatalState for a broken local state. A thrown non-Error value is
+     * not one of ours and is retried. A prefix list had missed, among
+     * others, "ratchet-tree:" (the list had "ratchet_tree:"), so a relay
+     * could pin a joiner in a reconnect loop with a reshaped Welcome tree.
      */
     function classifyGroupControlError(error) {
         if (!error || (typeof error !== 'object' && typeof error !== 'function')) {
@@ -313,11 +313,7 @@
             || error.mlsFatalState === true) {
             return error;
         }
-        const message = error instanceof Error ? error.message : String(error);
-        if (error instanceof RangeError
-            || DETERMINISTIC_CONTROL_ERROR_PREFIXES.some(
-                (prefix) => message.startsWith(prefix),
-            )) {
+        if (error instanceof Error) {
             error.mlsValidationFailure = true;
         } else {
             error.mlsRetryControl = true;

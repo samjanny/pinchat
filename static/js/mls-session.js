@@ -1652,11 +1652,15 @@
                             reason: 'Welcome envelope missing ratchet_tree side-channel' });
                         return;
                     }
-                    await this._handleWelcome(
-                        payload,
-                        base64UrlDecode(envelope.ratchet_tree),
-                        candidate,
-                    );
+                    let ratchetTreeBytes;
+                    try {
+                        ratchetTreeBytes = base64UrlDecode(envelope.ratchet_tree);
+                    } catch (err) {
+                        throw validationMlsControlError(
+                            `mls-session: malformed Welcome ratchet_tree: ${err.message}`,
+                        );
+                    }
+                    await this._handleWelcome(payload, ratchetTreeBytes, candidate);
                     this._pendingWelcomeCommits.clear();
                     this._pendingWelcomeCommitBySender.clear();
                     return;

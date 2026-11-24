@@ -2767,6 +2767,7 @@ async function main() {
     await preWelcomeProposalGap();
     await collidingUpdateProposal();
     await oversizedKeyPackages();
+    await deterministicRejectionsByType();
 
     console.log('');
     console.log(`mls-session-join: ${passed} passed, ${failed} failed`);
@@ -3120,6 +3121,71 @@ async function oversizedKeyPackages() {
         && !creator.out.some(isCommitEnvelope),
     'an Add whose Welcome exceeds the relay limit is refused, not staged',
     oversized instanceof Error ? oversized.message : String(oversized));
+}
+
+/**
+ * M-06: failures were classified by message prefix, and the list said
+ * "ratchet_tree:" where the code throws "ratchet-tree:". A relay that
+ * rewrote the Welcome's unauthenticated ratchet_tree so node 0 is a
+ * ParentNode therefore got a retryable error: the ordered control was
+ * never consumed and the joiner reconnected and replayed it forever.
+ * Group control failures are now deterministic by type.
+ */
+async function deterministicRejectionsByType() {
+    console.log('# MLS session - deterministic rejections are classified by type (M-06)');
+    const M = global.MLS;
+    const creator = relayPeer('creator', 'class-creator');
+    await creator.session.start();
+    const joiner = relayPeer('joiner', 'class-joiner', creator.session.bootstrapPins);
+    await joiner.session.start();
+    await deliver(creator, takeOut(joiner, isKeyPackageEnvelope), joiner.id);
+    const commit = takeOut(creator, isCommitEnvelope);
+    await deliver(joiner, commit, creator.id);
+    await deliver(creator, commit, creator.id);
+    const welcome = takeOut(creator, isWelcomeEnvelope);
+
+    const tree = M.Nodes.parseRatchetTree(M.Codec.base64UrlToBytes(welcome.ratchet_tree));
+    tree[0] = {
+        nodeType: M.Nodes.NodeType.PARENT,
+        parent: {
+            encryptionKey: tree[1].parent.encryptionKey,
+            parentHash: new Uint8Array(0),
+            unmergedLeaves: [],
+        },
+    };
+    const reshaped = {
+        ...welcome,
+        ratchet_tree: M.Codec.bytesToBase64Url(M.Nodes.ratchetTreeBytes(tree)),
+    };
+    const attempts = [];
+    for (let i = 0; i < 3; i += 1) attempts.push(await deliver(joiner, reshaped, creator.id));
+    assert(attempts.every((err) => err?.mlsControlRejected === true
+        && err.mlsRetryControl !== true
+        && err.message.includes('ratchet-tree:')),
+    'a Welcome tree with a ParentNode at a leaf position is a consumed rejection',
+    attempts[0] instanceof Error ? attempts[0].message : String(attempts[0]));
+    const truncated = { ...welcome, ratchet_tree: M.Codec.bytesToBase64Url(new Uint8Array([0x05, 1])) };
+    const truncatedResult = await deliver(joiner, truncated, creator.id);
+    assert(truncatedResult?.mlsControlRejected === true,
+        'a truncated Welcome tree is a consumed rejection as well');
+    assert(joiner.session.state === 'awaiting-welcome'
+        && await deliver(joiner, welcome, creator.id) === 'ok'
+        && joiner.session.state === 'joined',
+    'the authentic Welcome still joins after the rejected ones');
+
+    // Errors raised below the Group entry points keep a deterministic
+    // class whatever their type or text, a TypeError from malformed input
+    // included.
+    const group = creator.session.group;
+    const typeErrors = [];
+    for (const input of [undefined, new Uint8Array([0, 1, 0, 1, 7])]) {
+        try { await group.verifyUpdateProposal(input); } catch (err) { typeErrors.push(err); }
+    }
+    assert(typeErrors.length === 2
+        && typeErrors.every((err) => err.mlsValidationFailure === true
+            && err.mlsRetryControl !== true),
+    'malformed-input failures of any Error type are deterministic',
+    typeErrors.map((err) => `${err.constructor.name}: ${err.message}`).join(' | '));
 }
 
 // A promise that never settles (for example a mutex deadlock) drains the
