@@ -756,6 +756,23 @@
                     'mls-session: authenticated proposal store invariant exceeded',
                 );
             }
+            // M-04. Each Update passes verifyUpdateProposal on its own, but
+            // two stored Updates carrying the same new encryption_key can
+            // never be folded together: the final tree would hold the key
+            // twice. A member copying another member's fresh key from the
+            // wire would otherwise make every periodic Commit fail. Keep
+            // the first in relay order and refuse the copy, on every member.
+            const newKey = verified.proposal?.leafNode?.encryptionKey;
+            if (newKey instanceof Uint8Array) {
+                for (const other of this._proposalStore.values()) {
+                    if (equalBytes(other.proposal?.leafNode?.encryptionKey, newKey)) {
+                        throw new Error(
+                            'mls-session: Update encryption_key collides with a stored '
+                            + `Proposal from leaf ${other.senderLeafIndex}`,
+                        );
+                    }
+                }
+            }
             if (!senderReferences) {
                 senderReferences = [];
                 this._proposalRefsBySender.set(
@@ -2412,16 +2429,38 @@
             let staged = false;
             let candidateGroup = null;
             try {
+                let folded = updateProposals;
+                let commitMessage;
                 candidateGroup = this.group.forkForPendingCommit();
-                const { commitMessage } = await candidateGroup.commitUpdate({
-                    updateProposals,
-                });
+                try {
+                    ({ commitMessage } = await candidateGroup.commitUpdate({
+                        updateProposals: folded,
+                    }));
+                } catch (foldError) {
+                    if (folded.length === 0) throw foldError;
+                    // M-04. Whatever made the fold fail, the creator's own
+                    // path re-key must not depend on member Proposals: retry
+                    // path-only. The epoch change then retires the queued
+                    // Proposals and members propose again on their timers.
+                    candidateGroup.destroySecrets();
+                    candidateGroup = null;
+                    this.onEvent({
+                        kind: 'error',
+                        reason: 'commitUpdate could not fold member Updates '
+                            + `(${foldError.message}); committing path-only`,
+                    });
+                    folded = [];
+                    candidateGroup = this.group.forkForPendingCommit();
+                    ({ commitMessage } = await candidateGroup.commitUpdate({
+                        updateProposals: folded,
+                    }));
+                }
                 staged = await this._stagePendingCommit({
                     candidateGroup,
                     commitMessage,
                     kind: 'update',
                     queuedProposalEntries,
-                    foldedUpdates: updateProposals.length,
+                    foldedUpdates: folded.length,
                 });
             } catch (err) {
                 if (candidateGroup && !staged) candidateGroup.destroySecrets();

@@ -2765,6 +2765,7 @@ async function main() {
         'alternative-group Add leaves victim unjoined');
 
     await preWelcomeProposalGap();
+    await collidingUpdateProposal();
 
     console.log('');
     console.log(`mls-session-join: ${passed} passed, ${failed} failed`);
@@ -2896,6 +2897,130 @@ async function preWelcomeProposalGap() {
     assert(alice.events.some((event) => event.kind === 'commit-applied'
         && event.selfUpdated === true),
     'the proposer installs its own Update from that Commit');
+}
+
+/** A validly signed Update for `group`'s own leaf with a chosen key. */
+async function craftUpdateWithKey(group, encryptionKey) {
+    const M = global.MLS;
+    const leaf = M.Group.buildSelfLeaf({
+        encryptionKeyBytes: encryptionKey,
+        signatureKeyBytes: group.identity.signaturePublicKeyBytes,
+        credentialIdentity: group.identity.signaturePublicKeyBytes,
+        leafNodeSource: M.Nodes.LeafNodeSource.UPDATE,
+    });
+    leaf.signature = await M.Group.signLeafNodeInCommit(
+        group.identity.signaturePrivateKey, leaf, group.groupId, group.myLeafIndex,
+    );
+    const content = {
+        groupId: group.groupId,
+        epoch: group.epoch,
+        sender: { senderType: M.Framing.SenderType.MEMBER, leafIndex: group.myLeafIndex },
+        authenticatedData: new Uint8Array(0),
+        contentType: M.Framing.ContentType.PROPOSAL,
+        payload: M.Proposal.proposalBytes({
+            proposalType: M.Proposal.ProposalType.UPDATE, leafNode: leaf,
+        }),
+    };
+    const wireFormat = WireFormat.MLS_PUBLIC_MESSAGE;
+    const auth = {
+        signature: await M.PublicMessage.signFramedContent(
+            group.identity.signaturePrivateKey, wireFormat, content,
+            group._buildGroupContextStruct(),
+        ),
+    };
+    const membershipTag = await M.PublicMessage.computeMembershipTag(
+        group.epochSecrets.membershipKey, wireFormat, content, auth,
+        group._buildGroupContextStruct(),
+    );
+    return {
+        type: 'mls',
+        wire_format: wireFormat,
+        payload: M.Codec.bytesToBase64Url(
+            M.PublicMessage.publicMessageBytes({ content, auth, membershipTag }),
+        ),
+    };
+}
+
+/**
+ * M-04: a member copying another member's fresh Update encryption_key into
+ * its own validly signed Update made every periodic Commit fail the final
+ * tree key-uniqueness gate, freezing PCS rotation for the whole epoch. The
+ * copy is now refused by every member, and a Commit whose fold fails for
+ * any reason falls back to the creator's path-only re-key.
+ */
+async function collidingUpdateProposal() {
+    console.log('# MLS session - colliding Update proposals cannot freeze PCS (M-04)');
+    const creator = relayPeer('creator', 'pcs-creator');
+    await creator.session.start();
+    const pins = creator.session.bootstrapPins;
+    const alice = relayPeer('joiner', 'pcs-alice', pins);
+    await relayJoin(creator, alice, []);
+    const mallory = relayPeer('joiner', 'pcs-mallory', pins);
+    await relayJoin(creator, mallory, [alice]);
+
+    await alice.session.proposeUpdate();
+    const aliceUpdate = takeOut(alice, isProposalEnvelope);
+    await deliver(creator, aliceUpdate, alice.id);
+    await deliver(mallory, aliceUpdate, alice.id);
+    const verifiedAlice = await creator.session.group.verifyUpdateProposal(
+        wrapPublicEnvelope(aliceUpdate),
+    );
+    const copied = await craftUpdateWithKey(
+        mallory.session.group, verifiedAlice.proposal.leafNode.encryptionKey,
+    );
+    const creatorResult = await deliver(creator, copied, mallory.id);
+    const aliceResult = await deliver(alice, copied, mallory.id);
+    assert(creatorResult?.mlsControlRejected === true
+        && aliceResult?.mlsControlRejected === true
+        && creator.session._pendingUpdateProposals.size === 1
+        && creator.session._proposalStore.size === 1
+        && alice.session._proposalStore.size === 1,
+    'an Update reusing a stored Update encryption_key is refused by every member',
+    creatorResult instanceof Error ? creatorResult.message : String(creatorResult));
+
+    const epochBefore = creator.session.group.epoch;
+    await creator.session.commitUpdate();
+    const fold = takeOut(creator, isCommitEnvelope);
+    assert(Boolean(fold) && creator.session._pendingCommit?.foldedUpdates === 1,
+        "the periodic Commit still folds the honest member's Update");
+    await deliver(creator, fold, creator.id);
+    await deliver(alice, fold, creator.id);
+    await deliver(mallory, fold, creator.id);
+    assert(creator.session.group.epoch === epochBefore + 1n
+        && alice.session.group.epoch === creator.session.group.epoch
+        && mallory.session.group.epoch === creator.session.group.epoch,
+    'PCS rotation advances the epoch for every member');
+
+    // Any other fold failure: queue two Updates that cannot be combined by
+    // bypassing the store, as a future bug might. The Commit must still be
+    // staged, path-only.
+    await alice.session.proposeUpdate();
+    const second = takeOut(alice, isProposalEnvelope);
+    await deliver(creator, second, alice.id);
+    await deliver(mallory, second, alice.id);
+    const verifiedSecond = await creator.session.group.verifyUpdateProposal(
+        wrapPublicEnvelope(second),
+    );
+    const clash = await creator.session.group.verifyUpdateProposal(
+        wrapPublicEnvelope(await craftUpdateWithKey(
+            mallory.session.group, verifiedSecond.proposal.leafNode.encryptionKey,
+        )),
+    );
+    creator.session._pendingUpdateProposals.set(clash.senderLeafIndex, clash);
+    const epochBeforeFallback = creator.session.group.epoch;
+    await creator.session.commitUpdate();
+    const pathOnly = takeOut(creator, isCommitEnvelope);
+    assert(Boolean(pathOnly) && creator.session._pendingCommit?.foldedUpdates === 0
+        && creator.events.some((event) => event.kind === 'error'
+            && event.reason.includes('committing path-only')),
+    'a fold failure falls back to a path-only Commit');
+    await deliver(creator, pathOnly, creator.id);
+    const aliceFallback = await deliver(alice, pathOnly, creator.id);
+    const malloryFallback = await deliver(mallory, pathOnly, creator.id);
+    assert(aliceFallback === 'ok' && malloryFallback === 'ok'
+        && creator.session.group.epoch === epochBeforeFallback + 1n
+        && alice.session.group.epoch === creator.session.group.epoch,
+    'members apply the path-only fallback Commit');
 }
 
 // A promise that never settles (for example a mutex deadlock) drains the
