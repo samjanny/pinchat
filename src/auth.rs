@@ -208,6 +208,45 @@ mod tests {
         assert!(!verify_csrf_token(&token, &[0u8; 32])); // wrong secret
     }
 
+    /// The browser checks the shape of the token before it uses it, with the
+    /// same regular expression in three scripts. A change of format here
+    /// that they do not follow breaks room creation, login and the WebSocket
+    /// token in every browser, while every server-side test still passes.
+    #[test]
+    fn the_browser_accepts_the_csrf_tokens_this_relay_issues() {
+        const CLIENT_PATTERN: &str = r"/^[a-f0-9]{32}\.[0-9]{1,20}\.[a-f0-9]{64}$/";
+        for (script, source) in [
+            ("homepage.js", include_str!("../static/js/homepage.js")),
+            ("login.js", include_str!("../static/js/login.js")),
+            ("websocket.js", include_str!("../static/js/websocket.js")),
+        ] {
+            assert!(
+                source.contains(CLIENT_PATTERN),
+                "static/js/{script} no longer checks CSRF tokens with {CLIENT_PATTERN}"
+            );
+        }
+
+        // What CLIENT_PATTERN describes, checked on tokens issued here.
+        let is_hex = |part: &str, len: usize| {
+            part.len() == len && part.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        };
+        let secret: [u8; 32] = rand::random();
+        for token in [
+            generate_csrf_token(&secret),
+            generate_csrf_token_at(&secret, 0),
+            generate_csrf_token_at(&secret, u64::MAX),
+        ] {
+            let parts: Vec<&str> = token.split('.').collect();
+            assert_eq!(parts.len(), 3, "{token}");
+            assert!(is_hex(parts[0], 32), "{token}");
+            assert!(
+                (1..=20).contains(&parts[1].len()) && parts[1].bytes().all(|b| b.is_ascii_digit()),
+                "{token}"
+            );
+            assert!(is_hex(parts[2], 64), "{token}");
+        }
+    }
+
     #[test]
     fn csrf_tokens_expire_with_their_cookie() {
         let secret: [u8; 32] = rand::random();

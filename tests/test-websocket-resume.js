@@ -66,7 +66,7 @@ global.ProofOfWork = class {
     async solve() { throw new Error('PoW should not run in this test'); }
 };
 
-const csrfToken = `${'a'.repeat(32)}.${'b'.repeat(64)}`;
+const csrfToken = `${'a'.repeat(32)}.1795561507.${'b'.repeat(64)}`;
 const resumeToken = `${'A'.repeat(32)}.${'B'.repeat(32)}.${'C'.repeat(32)}`;
 
 function response(status, body) {

@@ -12,7 +12,7 @@ async function _fetchCsrfTokenForWs() {
     const r = await fetch('/api/csrf', { credentials: 'same-origin' });
     if (!r.ok) throw new Error(`CSRF token fetch failed: ${r.status}`);
     const data = await r.json();
-    if (!/^[a-f0-9]{32}\.[a-f0-9]{64}$/.test(data.csrf_token)) {
+    if (!/^[a-f0-9]{32}\.[0-9]{1,20}\.[a-f0-9]{64}$/.test(data.csrf_token)) {
         throw new Error('CSRF token format invalid');
     }
     return data.csrf_token;
