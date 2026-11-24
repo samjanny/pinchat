@@ -6822,4 +6822,915 @@ mod tests {
             wait_until("every slot comes back", || state.ws_connections_open() == 0).await;
         });
     }
+
+    // ---- Relay core audit of v0.9.2 ----------------------------------------
+    //
+    // Budgets, the control log, reconnect grace and resume. The first R-01 and
+    // R-02 tests are the audit's proofs of concept, turned round to assert the
+    // fixed behavior.
+
+    mod relay_core_audit {
+        use super::*;
+        use crate::state::app_state::BroadcastPayload;
+        use tokio_tungstenite::tungstenite::Message as ClientMessage;
+
+        const MIB: usize = 1024 * 1024;
+
+        fn grace_config(grace_secs: u64) -> Config {
+            let mut config = test_config();
+            config.ws_reconnect_grace_secs = grace_secs;
+            config
+        }
+
+        /// A group whose creator is admitted, has opened its control stream
+        /// and has acknowledged its own ordered join.
+        fn group_with_creator(state: &AppState) -> (Uuid, Uuid) {
+            let room = Room::new(RoomConfig {
+                room_type: RoomType::Group,
+                ttl_minutes: 60,
+                max_participants: 10,
+            });
+            let creator = room.creator_connection_id().unwrap();
+            let room_id = state.try_create_room(room).unwrap();
+            assert_eq!(
+                state.add_connection(creator, room_id, false),
+                Some(ConnectionAdmission::New)
+            );
+            let (_rx, _stream) = state
+                .open_mls_control_stream(&room_id, creator, None)
+                .unwrap();
+            state
+                .append_and_broadcast_mls_lifecycle(&room_id, |seq| {
+                    serde_json::to_string(&Message::UserJoined {
+                        user_id: creator,
+                        participant_count: 1,
+                        control_seq: Some(seq),
+                    })
+                    .ok()
+                })
+                .unwrap();
+            assert!(state.mark_creator_control_ready(&room_id, creator));
+            assert!(state.acknowledge_mls_control(&room_id, creator, 1));
+            (room_id, creator)
+        }
+
+        fn one_to_one_room(state: &AppState) -> Uuid {
+            state
+                .try_create_room(Room::new(RoomConfig {
+                    room_type: RoomType::OneToOne,
+                    ttl_minutes: 60,
+                    max_participants: 2,
+                }))
+                .unwrap()
+        }
+
+        /// A JSON frame of exactly `len` bytes.
+        fn filler_frame(len: usize) -> String {
+            let frame = format!(r#"{{"type":"filler","pad":"{}"}}"#, "x".repeat(len - 26));
+            assert_eq!(frame.len(), len);
+            frame
+        }
+
+        /// The types of the frames waiting for a receiver, in order.
+        fn frame_types(
+            receiver: &mut tokio::sync::broadcast::Receiver<BroadcastPayload>,
+        ) -> Vec<String> {
+            let mut types = Vec::new();
+            while let Ok(frame) = receiver.try_recv() {
+                let value: serde_json::Value = serde_json::from_str(frame.as_str()).unwrap();
+                types.push(value["type"].as_str().unwrap().to_owned());
+            }
+            types
+        }
+
+        // ---- R-01: a full budget never refuses the relay's own events -----
+
+        #[tokio::test]
+        async fn a_full_room_budget_neither_refuses_a_group_lifecycle_event_nor_closes_the_group() {
+            let state = AppState::new(100, grace_config(1));
+            let (room_id, _creator) = group_with_creator(&state);
+            let member = Uuid::new_v4();
+            assert_eq!(
+                state.add_connection(member, room_id, false),
+                Some(ConnectionAdmission::New)
+            );
+            // A receiver of the room that does not read, as a member whose
+            // TCP window is closed, keeps relayed frames counted.
+            let mut stalled = state.broadcast_channels.get(&room_id).unwrap().subscribe();
+            state
+                .broadcast_room_message(&room_id, filler_frame(4 * MIB - 40))
+                .unwrap();
+
+            let joined = state.append_and_broadcast_mls_lifecycle(&room_id, |seq| {
+                serde_json::to_string(&Message::UserJoined {
+                    user_id: Uuid::new_v4(),
+                    participant_count: 3,
+                    control_seq: Some(seq),
+                })
+                .ok()
+            });
+            assert_eq!(
+                joined,
+                Ok(2),
+                "a join is sequenced while the budget is full"
+            );
+
+            // The member's reconnect grace expires while the budget is full.
+            schedule_connection_departure(&state, member);
+            tokio::time::sleep(Duration::from_millis(1300)).await;
+            assert!(
+                state.rooms.contains_key(&room_id),
+                "an ordinary departure must not close the group"
+            );
+            assert_eq!(
+                frame_types(&mut stalled),
+                ["filler", "userjoined", "userleft"]
+            );
+        }
+
+        #[tokio::test]
+        async fn a_full_global_broadcast_budget_does_not_close_an_unrelated_group() {
+            let state = AppState::new(100, grace_config(1));
+            let (group_id, _creator) = group_with_creator(&state);
+            let member = Uuid::new_v4();
+            assert_eq!(
+                state.add_connection(member, group_id, false),
+                Some(ConnectionAdmission::New)
+            );
+            let mut group_receiver = state.broadcast_channels.get(&group_id).unwrap().subscribe();
+            let mut keep = Vec::new();
+            // Six rooms of large frames take the 24 MiB pictures may use ...
+            for _ in 0..6 {
+                let room_id = one_to_one_room(&state);
+                keep.push(state.broadcast_channels.get(&room_id).unwrap().subscribe());
+                state
+                    .broadcast_room_message(&room_id, "x".repeat(4 * MIB - 64))
+                    .unwrap();
+            }
+            // ... and frames below 64 KiB the rest, in other rooms.
+            'fill: loop {
+                let room_id = one_to_one_room(&state);
+                keep.push(state.broadcast_channels.get(&room_id).unwrap().subscribe());
+                for _ in 0..60 {
+                    if state
+                        .broadcast_room_message(&room_id, "y".repeat(60 * 1024))
+                        .is_err()
+                    {
+                        break 'fill;
+                    }
+                }
+            }
+            let topup_room = one_to_one_room(&state);
+            keep.push(
+                state
+                    .broadcast_channels
+                    .get(&topup_room)
+                    .unwrap()
+                    .subscribe(),
+            );
+            for size in [4096usize, 1024, 256, 64] {
+                for _ in 0..16 {
+                    if state
+                        .broadcast_room_message(&topup_room, "z".repeat(size))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }
+            assert!(state.broadcast_bytes_in_flight() > 32 * MIB - 64);
+
+            schedule_connection_departure(&state, member);
+            tokio::time::sleep(Duration::from_millis(1300)).await;
+            assert!(state.rooms.contains_key(&group_id));
+            assert_eq!(frame_types(&mut group_receiver), ["userleft"]);
+        }
+
+        #[tokio::test]
+        async fn a_full_global_control_log_does_not_close_an_unrelated_group() {
+            let state = AppState::new(200, grace_config(1));
+            // The victim group exists before the log fills up.
+            let (victim, _creator) = group_with_creator(&state);
+            let member = Uuid::new_v4();
+            assert_eq!(
+                state.add_connection(member, victim, false),
+                Some(ConnectionAdmission::New)
+            );
+            let mut victim_receiver = state.broadcast_channels.get(&victim).unwrap().subscribe();
+            let mut filled = 0usize;
+            for _ in 0..60 {
+                let room = Room::new(RoomConfig {
+                    room_type: RoomType::Group,
+                    ttl_minutes: 60,
+                    max_participants: 10,
+                });
+                let creator = room.creator_connection_id().unwrap();
+                let room_id = state.try_create_room(room).unwrap();
+                state.add_connection(creator, room_id, false).unwrap();
+                let _ = state
+                    .open_mls_control_stream(&room_id, creator, None)
+                    .unwrap();
+                let mut wrote = false;
+                for size in [170 * 1024usize, 16 * 1024, 1024, 64, 8, 1] {
+                    loop {
+                        match state.append_and_broadcast_mls_envelope(
+                            &room_id,
+                            MlsControlAdmission::Ordinary,
+                            |_seq| Some("p".repeat(size)),
+                        ) {
+                            Ok(_) => {
+                                filled += size;
+                                wrote = true;
+                            }
+                            Err(MlsControlAppendError::CapacityExceeded) => break,
+                            Err(other) => panic!("unexpected {other:?}"),
+                        }
+                    }
+                }
+                if !wrote {
+                    break;
+                }
+            }
+            assert!(filled > 32 * MIB - 64, "{filled}");
+
+            // The member's grace expires: its UserLeft must still be sequenced.
+            schedule_connection_departure(&state, member);
+            tokio::time::sleep(Duration::from_millis(1300)).await;
+            assert!(state.rooms.contains_key(&victim));
+            assert_eq!(frame_types(&mut victim_receiver), ["userleft"]);
+        }
+
+        #[test]
+        fn a_full_room_budget_does_not_drop_the_join_or_leave_of_a_one_to_one_peer() {
+            run_relay_scenario(std::time::Duration::from_secs(30), || async {
+                let state = AppState::new(1000, grace_config(1));
+                let room_id = one_to_one_room(&state);
+                let addr = spawn_relay(state.clone()).await;
+                let alice = Uuid::new_v4();
+                let mut alice_socket =
+                    try_open_socket(addr, room_id, &fresh_token(&state, room_id, alice))
+                        .await
+                        .expect("first peer is admitted");
+                expect_frame(&mut alice_socket, "connected").await;
+
+                let stalled = state.broadcast_channels.get(&room_id).unwrap().subscribe();
+                state
+                    .broadcast_room_message(&room_id, filler_frame(4 * MIB - 64))
+                    .unwrap();
+                expect_frame(&mut alice_socket, "filler").await;
+
+                let bob = Uuid::new_v4();
+                let mut bob_socket =
+                    try_open_socket(addr, room_id, &fresh_token(&state, room_id, bob))
+                        .await
+                        .expect("second peer is admitted");
+                expect_frame(&mut bob_socket, "connected").await;
+                let joined = expect_frame(&mut alice_socket, "userjoined").await;
+                assert_eq!(joined["user_id"], bob.to_string());
+
+                drop(bob_socket);
+                let left = expect_frame(&mut alice_socket, "userleft").await;
+                assert_eq!(left["user_id"], bob.to_string());
+                drop(stalled);
+            });
+        }
+
+        // ---- R-02: a grace timer ends only its own grace period -----------
+
+        #[tokio::test]
+        async fn an_earlier_grace_timer_does_not_cut_a_later_grace_period_short() {
+            let state = AppState::new(100, grace_config(1));
+            let room_id = one_to_one_room(&state);
+            let a = Uuid::new_v4();
+            assert_eq!(
+                state.add_connection(a, room_id, false),
+                Some(ConnectionAdmission::New)
+            );
+
+            // t=0: first disconnect, its timer is due at t=1.0.
+            schedule_connection_departure(&state, a);
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            // t=0.6: resume.
+            assert_eq!(
+                state.add_connection(a, room_id, true),
+                Some(ConnectionAdmission::Resumed)
+            );
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            // t=0.9: second disconnect, its own timer is due at t=1.9.
+            schedule_connection_departure(&state, a);
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            // t=1.2: 0.3 s into the second grace period of 1 s.
+            assert!(
+                state.rooms.get(&room_id).unwrap().holds_slot_for(&a),
+                "the first timer must not end the second grace period"
+            );
+            assert_eq!(
+                state.add_connection(a, room_id, true),
+                Some(ConnectionAdmission::Resumed),
+                "a resume inside the second grace period is admitted"
+            );
+            assert_eq!(state.get_participant_count(&room_id), 1);
+        }
+
+        #[tokio::test]
+        async fn an_earlier_grace_timer_does_not_close_the_group_of_a_creator_that_reconnected() {
+            let state = AppState::new(100, grace_config(1));
+            let (room_id, creator) = group_with_creator(&state);
+            let member = Uuid::new_v4();
+            assert_eq!(
+                state.add_connection(member, room_id, false),
+                Some(ConnectionAdmission::New)
+            );
+
+            schedule_connection_departure(&state, creator); // due at t=1.0
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            assert_eq!(
+                state.add_connection(creator, room_id, true),
+                Some(ConnectionAdmission::Resumed)
+            );
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            schedule_connection_departure(&state, creator); // due at t=1.9
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert!(
+                state.rooms.contains_key(&room_id),
+                "the group lives 0.3 s into the creator's second grace period"
+            );
+
+            // The second grace period still ends, on its own timer.
+            tokio::time::sleep(Duration::from_millis(1100)).await;
+            assert!(
+                !state.rooms.contains_key(&room_id),
+                "the creator's own grace expiry still closes the group"
+            );
+        }
+
+        // ---- R-03: a busy identity does not cost the resume its token -----
+
+        #[test]
+        fn a_resume_while_the_old_socket_is_still_open_keeps_its_token() {
+            run_relay_scenario(std::time::Duration::from_secs(30), || async {
+                let LiveRoom {
+                    state,
+                    addr,
+                    room_id,
+                    alice,
+                    alice_socket,
+                    bob: _bob,
+                    bob_socket: _bob_socket,
+                } = live_one_to_one_room(test_config()).await;
+
+                // After a change of network the relay still holds the old
+                // socket while the browser already comes back.
+                let claims =
+                    WsTokenClaims::for_resume(room_id, alice, 30, &state.config.jwt_issuer, None);
+                let jti = claims.jti;
+                let token = sign_token(&claims, &state.jwt_secret).unwrap();
+                assert_eq!(
+                    try_open_socket(addr, room_id, &token).await.err(),
+                    Some(409)
+                );
+                assert!(
+                    !state.consumed_tokens.contains_key(&jti),
+                    "a refusal for a busy identity must not spend the token"
+                );
+                assert!(state.connection_is_active(&room_id, &alice));
+
+                // Once the old socket is gone, the same token resumes.
+                drop_transport(&state, room_id, alice, alice_socket).await;
+                let mut resumed = try_open_socket(addr, room_id, &token)
+                    .await
+                    .expect("the unspent token resumes");
+                assert_eq!(
+                    expect_frame(&mut resumed, "connected").await["resumed"],
+                    true
+                );
+            });
+        }
+
+        // ---- Live groups --------------------------------------------------
+
+        struct LiveGroup {
+            state: AppState,
+            addr: SocketAddr,
+            room_id: Uuid,
+            creator_socket: TestSocket,
+        }
+
+        async fn send_json(socket: &mut TestSocket, value: serde_json::Value) {
+            socket
+                .send(ClientMessage::Text(value.to_string()))
+                .await
+                .unwrap();
+        }
+
+        async fn ack(socket: &mut TestSocket, frame: &serde_json::Value) {
+            send_json(
+                socket,
+                serde_json::json!({ "type": "mlsack", "control_seq": frame["control_seq"] }),
+            )
+            .await;
+        }
+
+        /// A group whose creator is connected and has acknowledged its join.
+        async fn live_group(config: Config) -> LiveGroup {
+            let state = AppState::new(1000, config);
+            let room = Room::new(RoomConfig {
+                room_type: RoomType::Group,
+                ttl_minutes: 60,
+                max_participants: 4,
+            });
+            let room_id = room.id;
+            let creator = room.creator_connection_id().unwrap();
+            let generation = room.creator_bootstrap_generation();
+            state.try_create_room(room).unwrap();
+            let addr = spawn_relay(state.clone()).await;
+            let token = sign_token(
+                &WsTokenClaims::for_creator_bootstrap(
+                    room_id,
+                    creator,
+                    30,
+                    &state.config.jwt_issuer,
+                    generation,
+                    false,
+                    None,
+                ),
+                &state.jwt_secret,
+            )
+            .unwrap();
+            let mut creator_socket = try_open_socket(addr, room_id, &token)
+                .await
+                .expect("creator is admitted");
+            expect_frame(&mut creator_socket, "connected").await;
+            expect_frame(&mut creator_socket, "mlssync").await;
+            let joined = expect_frame(&mut creator_socket, "userjoined").await;
+            ack(&mut creator_socket, &joined).await;
+            LiveGroup {
+                state,
+                addr,
+                room_id,
+                creator_socket,
+            }
+        }
+
+        /// Admit a member. It and the creator see its join and acknowledge
+        /// it; members admitted before have to read it themselves.
+        async fn join_member(group: &mut LiveGroup) -> (Uuid, TestSocket) {
+            let member = Uuid::new_v4();
+            let mut socket = try_open_socket(
+                group.addr,
+                group.room_id,
+                &fresh_token(&group.state, group.room_id, member),
+            )
+            .await
+            .expect("member is admitted");
+            expect_frame(&mut socket, "connected").await;
+            expect_frame(&mut socket, "mlssync").await;
+            let own = expect_frame(&mut socket, "userjoined").await;
+            ack(&mut socket, &own).await;
+            let seen = expect_frame(&mut group.creator_socket, "userjoined").await;
+            ack(&mut group.creator_socket, &seen).await;
+            (member, socket)
+        }
+
+        fn public_message(content_type: u8, marker: u8) -> serde_json::Value {
+            let mut body = synthetic_public_message(content_type);
+            body.push(marker);
+            let mut envelope = serde_json::json!({
+                "type": "mls",
+                "wire_format": WIRE_PUBLIC_MESSAGE,
+                "payload": URL_SAFE_NO_PAD.encode(&body),
+            });
+            if content_type == CONTENT_TYPE_COMMIT {
+                envelope["commit_ref"] =
+                    serde_json::json!(URL_SAFE_NO_PAD.encode(Sha256::digest(&body)));
+            }
+            envelope
+        }
+
+        // ---- R-04: an MLS control waits for room like any other frame ----
+
+        #[test]
+        fn an_mls_control_waits_for_room_in_the_broadcast_budget() {
+            run_relay_scenario(std::time::Duration::from_secs(30), || async {
+                let mut group = live_group(test_config()).await;
+                let (member, mut member_socket) = join_member(&mut group).await;
+
+                // A receiver that does not read keeps the room's budget full.
+                let stalled = group
+                    .state
+                    .broadcast_channels
+                    .get(&group.room_id)
+                    .unwrap()
+                    .subscribe();
+                group
+                    .state
+                    .broadcast_room_message(&group.room_id, filler_frame(4 * MIB - 256))
+                    .unwrap();
+                expect_frame(&mut group.creator_socket, "filler").await;
+                expect_frame(&mut member_socket, "filler").await;
+
+                // A KeyPackage larger than what is left.
+                send_json(
+                    &mut member_socket,
+                    serde_json::json!({
+                        "type": "mls",
+                        "wire_format": WIRE_KEY_PACKAGE,
+                        "payload": URL_SAFE_NO_PAD.encode(vec![7u8; 600]),
+                        "bootstrap_proof": mls_key_package_ref(b"proof").unwrap(),
+                    }),
+                )
+                .await;
+                // It waits (up to a second in tests) instead of closing the
+                // member's connection with 1013 at once.
+                expect_silence(&mut member_socket, "a control waiting for room").await;
+
+                drop(stalled);
+                let echoed = expect_frame(&mut member_socket, "mls").await;
+                assert_eq!(echoed["wire_format"], WIRE_KEY_PACKAGE);
+                assert_eq!(echoed["sender_id"], member.to_string());
+                let relayed = expect_frame(&mut group.creator_socket, "mls").await;
+                assert_eq!(relayed["control_seq"], echoed["control_seq"]);
+            });
+        }
+
+        // ---- R-05: controls only the creator may send ---------------------
+
+        #[test]
+        fn controls_only_the_creator_may_send_leave_the_room_budget_to_the_creator() {
+            run_relay_scenario(std::time::Duration::from_secs(30), || async {
+                let mut config = test_config();
+                config.msg_rate_window_secs = 60;
+                config.room_msg_rate_limit = 4;
+                let mut group = live_group(config).await;
+                let (_first, mut first) = join_member(&mut group).await;
+                let (_second, mut second) = join_member(&mut group).await;
+                let seen = expect_frame(&mut first, "userjoined").await;
+                ack(&mut first, &seen).await;
+
+                // Two identities, each sending what only the creator may:
+                // together they used to take the whole room budget.
+                for (socket, base) in [(&mut first, 0u8), (&mut second, 10u8)] {
+                    for marker in base..base + 2 {
+                        send_json(socket, public_message(CONTENT_TYPE_COMMIT, marker)).await;
+                        let rejected = expect_frame(socket, "mlsrejected").await;
+                        assert_eq!(rejected["reason"], "not_group_creator");
+                        assert_eq!(rejected["retry_after_secs"], 0);
+                    }
+                }
+
+                // The creator's own control still fits.
+                send_json(
+                    &mut group.creator_socket,
+                    public_message(CONTENT_TYPE_PROPOSAL, 99),
+                )
+                .await;
+                let echoed = expect_frame(&mut group.creator_socket, "mls").await;
+                assert!(echoed["control_seq"].as_u64().is_some());
+                assert_eq!(
+                    expect_frame(&mut first, "mls").await["control_seq"],
+                    echoed["control_seq"]
+                );
+            });
+        }
+
+        #[test]
+        fn a_member_that_keeps_sending_creator_controls_is_disconnected() {
+            run_relay_scenario(std::time::Duration::from_secs(30), || async {
+                let mut config = test_config();
+                config.protocol_error_limit = 3;
+                let mut group = live_group(config).await;
+                let (_member, mut member_socket) = join_member(&mut group).await;
+                for marker in 0..3 {
+                    send_json(
+                        &mut member_socket,
+                        public_message(CONTENT_TYPE_COMMIT, marker),
+                    )
+                    .await;
+                }
+                let (code, _) = closing_seen_by(member_socket).await;
+                assert_eq!(code, Some(close_code::POLICY));
+            });
+        }
+
+        // ---- R-06: a group that has used every KeyPackage reference -------
+
+        #[test]
+        fn a_group_that_used_every_key_package_reference_answers_the_add_with_a_typed_rejection() {
+            let state = AppState::new(10, test_config());
+            let (room_id, creator) = group_with_creator(&state);
+            let admit = |n: usize| {
+                let key_package_ref = mls_key_package_ref(format!("kp-{n}").as_bytes()).unwrap();
+                state
+                    .append_and_broadcast_mls_envelope(
+                        &room_id,
+                        MlsControlAdmission::KeyPackage {
+                            sender_id: Uuid::new_v4(),
+                            key_package_ref: key_package_ref.clone(),
+                        },
+                        |seq| Some(format!(r#"{{"type":"kp","control_seq":{seq}}}"#)),
+                    )
+                    .expect("KeyPackage");
+                let commit_ref = mls_key_package_ref(format!("commit-{n}").as_bytes()).unwrap();
+                let result = state.append_and_broadcast_mls_envelope(
+                    &room_id,
+                    MlsControlAdmission::AddCommit {
+                        sender_id: creator,
+                        commit_ref: commit_ref.clone(),
+                        key_package_ref,
+                    },
+                    |seq| Some(format!(r#"{{"type":"add","control_seq":{seq}}}"#)),
+                );
+                if let Ok(seq) = result {
+                    // The creator keeps up, so the log does not fill.
+                    assert!(state.acknowledge_mls_control(&room_id, creator, seq));
+                }
+                (result, commit_ref)
+            };
+            for n in 0..1024 {
+                assert!(admit(n).0.is_ok(), "Add {n}");
+            }
+
+            let (result, commit_ref) = admit(1024);
+            let error = result.expect_err("the group cannot consume another KeyPackage");
+            let rejection = permanent_mls_append_rejection(error, Some(commit_ref.clone()))
+                .expect("a typed rejection, not a close the creator comes back from");
+            match rejection {
+                Message::MlsRejected {
+                    commit_ref: rejected,
+                    reason,
+                    retry_after_secs,
+                } => {
+                    assert_eq!(rejected, Some(commit_ref));
+                    // The reason the browser already handles by abandoning
+                    // the Add.
+                    assert_eq!(reason, "unknown_key_package_ref");
+                    assert_eq!(retry_after_secs, 0);
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+
+        // ---- R-07: a refused message is reported -------------------------
+
+        #[test]
+        fn a_message_the_room_limit_refuses_is_reported_to_its_sender() {
+            run_relay_scenario(std::time::Duration::from_secs(30), || async {
+                let mut config = test_config();
+                config.msg_rate_window_secs = 60;
+                config.room_byte_rate_limit = 4096;
+                let LiveRoom {
+                    mut alice_socket,
+                    mut bob_socket,
+                    ..
+                } = live_one_to_one_room(config).await;
+
+                // With a peer present one sender may use half of 4096 bytes:
+                // the first of these pictures fits, the second does not.
+                let first = browser_image_envelope(1000);
+                assert!(first["payload"].as_str().unwrap().len() < 2048);
+                alice_socket
+                    .send(ClientMessage::Text(first.to_string()))
+                    .await
+                    .unwrap();
+                expect_frame(&mut bob_socket, "image").await;
+                expect_frame(&mut alice_socket, "image").await;
+
+                alice_socket
+                    .send(ClientMessage::Text(
+                        browser_image_envelope(1003).to_string(),
+                    ))
+                    .await
+                    .unwrap();
+                let refused = expect_frame(&mut alice_socket, "error").await;
+                assert!(
+                    refused["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains("image was not sent"),
+                    "{refused}"
+                );
+                expect_silence(&mut bob_socket, "peer of a refused picture").await;
+            });
+        }
+
+        // ---- R-08: a member in replay holds no room frames ---------------
+
+        #[test]
+        fn a_member_replaying_its_backlog_does_not_keep_room_frames_in_the_budget() {
+            run_relay_scenario(std::time::Duration::from_secs(30), || async {
+                let mut group = live_group(test_config()).await;
+                let (member, member_socket) = join_member(&mut group).await;
+                let state = group.state.clone();
+                let room_id = group.room_id;
+                drop(member_socket);
+                wait_until("relay notices the dropped transport", || {
+                    !state.connection_is_active(&room_id, &member)
+                })
+                .await;
+
+                // Controls 3 and 4 arrive while the member is away.
+                for _ in 0..2 {
+                    state
+                        .append_and_broadcast_mls_control(&room_id, |seq| {
+                            Some(format!(r#"{{"type":"test","control_seq":{seq}}}"#))
+                        })
+                        .unwrap();
+                    let control = expect_frame(&mut group.creator_socket, "test").await;
+                    ack(&mut group.creator_socket, &control).await;
+                }
+
+                let token = sign_token(
+                    &WsTokenClaims::for_resume(
+                        room_id,
+                        member,
+                        30,
+                        &state.config.jwt_issuer,
+                        Some(2),
+                    ),
+                    &state.jwt_secret,
+                )
+                .unwrap();
+                let mut resumed = try_open_socket(group.addr, room_id, &token)
+                    .await
+                    .expect("member resumes");
+                assert_eq!(
+                    expect_frame(&mut resumed, "connected").await["resumed"],
+                    true
+                );
+                expect_frame(&mut resumed, "test").await;
+                let last = expect_frame(&mut resumed, "test").await;
+
+                // The member has not acknowledged its replay yet. What the
+                // room sends meanwhile leaves the budget once the members
+                // that read have taken it.
+                state
+                    .broadcast_room_message(&room_id, filler_frame(64 * 1024))
+                    .unwrap();
+                expect_frame(&mut group.creator_socket, "filler").await;
+                wait_until("the frame leaves the broadcast budget", || {
+                    state.broadcast_bytes_in_flight() == 0
+                })
+                .await;
+
+                // Acknowledged, the member goes live.
+                ack(&mut resumed, &last).await;
+                assert_eq!(
+                    expect_frame(&mut resumed, "mlssync").await["through_seq"],
+                    4
+                );
+                state
+                    .broadcast_room_message(&room_id, filler_frame(64))
+                    .unwrap();
+                expect_frame(&mut resumed, "filler").await;
+            });
+        }
+
+        // ---- R-09: limiter state recorded after teardown -----------------
+
+        #[tokio::test]
+        async fn what_a_socket_records_after_its_room_closed_is_erased_when_it_ends() {
+            let state = AppState::new(10, test_config());
+            let room_id = one_to_one_room(&state);
+            let peer = Uuid::new_v4();
+            assert_eq!(
+                state.add_connection(peer, room_id, false),
+                Some(ConnectionAdmission::New)
+            );
+            state.remove_room(&room_id);
+            // Its receive loop had found the identity active just before, and
+            // counts the frame it was handling.
+            state
+                .connection_frame_timestamps
+                .entry(peer)
+                .or_default()
+                .push_back(Utc::now());
+            state.connection_protocol_errors.insert(peer, 1);
+
+            // The socket ends.
+            schedule_connection_departure(&state, peer);
+            assert!(!state.connection_frame_timestamps.contains_key(&peer));
+            assert!(!state.connection_protocol_errors.contains_key(&peer));
+
+            // An identity that still holds its slot keeps its limits: a
+            // resume must not get a fresh budget.
+            let other_room = one_to_one_room(&state);
+            let reserved = Uuid::new_v4();
+            assert_eq!(
+                state.add_connection(reserved, other_room, false),
+                Some(ConnectionAdmission::New)
+            );
+            state
+                .connection_frame_timestamps
+                .entry(reserved)
+                .or_default()
+                .push_back(Utc::now());
+            assert_eq!(state.detach_connection(&reserved), Some(other_room));
+            schedule_connection_departure(&state, reserved);
+            assert!(state.connection_frame_timestamps.contains_key(&reserved));
+        }
+
+        // ---- T-06: warnings name nobody ----------------------------------
+
+        #[derive(Clone, Default)]
+        struct CapturedLog(Arc<std::sync::Mutex<Vec<u8>>>);
+
+        impl std::io::Write for CapturedLog {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        #[test]
+        fn warnings_name_no_room_connection_token_or_origin() {
+            let captured = CapturedLog::default();
+            let writer = captured.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(move || writer.clone())
+                .with_max_level(tracing::Level::WARN)
+                .with_ansi(false)
+                .finish();
+            let mut secrets = Vec::new();
+            tracing::subscriber::with_default(subscriber, || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                runtime.block_on(async {
+                    let (addr, state, room_id) = spawn_test_server().await;
+                    let path = format!("/ws/{room_id}");
+                    secrets.push(room_id.to_string());
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+
+                    // An Origin outside the allowlist.
+                    let claims = WsTokenClaims::new(room_id, 30, &state.config.jwt_issuer);
+                    let token = sign_token(&claims, &state.jwt_secret).unwrap();
+                    let offer = format!("pinchat.v1, pinchat.v1.jwt.{token}");
+                    let status = raw_upgrade_with_origin(
+                        addr,
+                        &path,
+                        Some(&offer),
+                        Some("https://evil.example.com"),
+                    )
+                    .await;
+                    assert_eq!(status, 403);
+                    secrets.push("evil.example.com".to_string());
+
+                    // A token for another room.
+                    let other_room = Uuid::new_v4();
+                    let foreign = WsTokenClaims::new(other_room, 30, &state.config.jwt_issuer);
+                    let foreign = sign_token(&foreign, &state.jwt_secret).unwrap();
+                    let status = raw_upgrade(
+                        addr,
+                        &path,
+                        Some(&format!("pinchat.v1, pinchat.v1.jwt.{foreign}")),
+                    )
+                    .await;
+                    assert_eq!(status, 403);
+                    secrets.push(other_room.to_string());
+
+                    // A frame of the wrong protocol from an admitted
+                    // connection, then its token used a second time.
+                    let mut socket = try_open_socket(addr, room_id, &token)
+                        .await
+                        .expect("first use is admitted");
+                    expect_frame(&mut socket, "connected").await;
+                    secrets.push(claims.jti.to_string());
+                    secrets.push(claims.connection_id.to_string());
+                    socket
+                        .send(ClientMessage::Text(
+                            r#"{"type":"mlsack","control_seq":1}"#.into(),
+                        ))
+                        .await
+                        .unwrap();
+                    wait_until("the protocol error is counted", || {
+                        state
+                            .connection_protocol_errors
+                            .contains_key(&claims.connection_id)
+                    })
+                    .await;
+                    drop(socket);
+                    wait_until("the socket is gone", || {
+                        !state.connection_is_active(&room_id, &claims.connection_id)
+                    })
+                    .await;
+                    assert_eq!(
+                        try_open_socket(addr, room_id, &token).await.err(),
+                        Some(403)
+                    );
+                });
+            });
+            let log = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+            assert!(log.contains("Origin not in allowlist"), "{log}");
+            assert!(log.contains("replay attempt"), "{log}");
+            assert!(log.contains("invalid for room type"), "{log}");
+            for secret in &secrets {
+                assert!(!log.contains(secret.as_str()), "{secret} in {log}");
+            }
+        }
+    }
 }
