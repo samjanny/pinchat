@@ -107,17 +107,19 @@ Per RFC 3986, the URL fragment (everything after `#`) is processed client-side o
 
 **Post-load lifecycle.** After the first successful import, the client
 (`crypto.js#extractKeyFromURL`) moves the fragment bytes into tab-scoped
-`sessionStorage` under the key `pinchat_hash:${pathname}` and clears
-`window.location.hash` via `history.replaceState`. The key remains
-recoverable for reload and reconnect within the tab; it is no longer
+`sessionStorage` under the key `pinchat_hash:${pathname}?room=${room_id}`
+and clears `window.location.hash` via `history.replaceState`. The key remains
+recoverable for reload and reconnect of the same room within the tab; a page
+for another room never reads it. It is no longer
 visible in the URL bar, browser history, or to any other same-origin
 code reading `window.location.hash`. The CryptoKey reference itself is
 dropped via `deleteBootstrapKey()` once the Double Ratchet takes over.
 
 If the user is unauthenticated and bounces through `/login`, a small
 head-loaded script (`login-stash.js`) detects the fragment, stashes it
-in `sessionStorage` keyed for the eventual `/static/chat.html` landing
-page, and scrubs the URL bar before the login form renders. This means
+in `sessionStorage` keyed for the eventual `/static/chat.html?room=<room_id>`
+landing page of the room named in the redirect, and scrubs the URL bar before
+the login form renders. This means
 the bootstrap secret never lingers on `/login` either.
 
 **Security Note**: The Bootstrap Key must be shared through a secure channel (encrypted messaging, voice call, in-person). If an attacker obtains both the room URL and the Bootstrap Key, they can join the room and participate in the encrypted conversation.
@@ -204,9 +206,19 @@ key-schedule derivations.
 
 The wire message carries only routing/context fields; all key material and the
 identity signature are inside the AES-GCM envelope encrypted under the bootstrap
-key (from the URL fragment). A passive relay therefore does not receive a stable
-identity public key that can act as a cross-room correlator. This property does
-not hide transport metadata such as IP addresses, timing, or connection data.
+key (from the URL fragment), so the handshake frame itself does not show the
+identity public key to the relay.
+
+This does not hide the identity key from the relay. Every message header
+carries `sig`, an ECDSA signature over cleartext fields (see "DH Header
+Signature"), and ECDSA public-key recovery turns any two headers into the
+sender's identity public key. Within one room the relay can therefore learn
+each participant's identity key and recognise that participant across
+reconnects and new handshakes. What prevents it from linking rooms is that the
+client generates and stores a separate identity keypair per room (one IndexedDB
+entry per room, 24 h at most): the key recovered in one room says nothing about
+the key used in another. Transport metadata such as IP addresses, the login
+session cookie, timing and connection data is not hidden either.
 
 ```
 ecdh_public_key payload (JSON)
@@ -229,7 +241,7 @@ Envelope plaintext (inside AES-GCM), length-prefixed (u16-be):
   u8(version=2)
   || lp(handshakePublicKey)   65B  - derives S, then DESTROYED
   || lp(ratchetPublicKey)     65B  - becomes Double Ratchet DHs
-  || lp(identityPublicKey)    65B  - ECDSA, encrypted (anti-correlation)
+  || lp(identityPublicKey)    65B  - ECDSA, per room, encrypted here
   || lp(signature)            64B  - P1363 ECDSA over transcript below
 
 AAD (unchanged): roomId || senderId || timestamp || nonce  (TLV)
@@ -264,7 +276,8 @@ processes the peer's frame independently.
 ```
   Alice                     Server (blind relay)                  Bob
     |                              |                               |
-    |  1. Generate Identity Keypair (ECDSA, persisted, 24h TTL)    |
+    |  1. Load or generate this room's Identity Keypair            |
+    |     (ECDSA, one per room, persisted, 24h TTL)                |
     |  2. Generate handshake + ratchet ECDH keypairs               |
     |  3. Sign transcript binding both public keys + context       |
     |  4. Encrypt keys + identity + signature with Bootstrap Key   |
@@ -337,10 +350,15 @@ Input: sharedSecret (32 bytes), isInitiator (boolean)
 
 ### DH Ratchet (Receive-Side)
 
-Triggered when receiving a message with a new DH public key:
+Triggered when receiving a message with a new DH public key, after its
+header signature has verified:
 
 ```
-1. Save previous chain state:
+HKDF(ikm, salt, info, L) = HKDF-SHA256 with input key material ikm,
+                           salt salt, info info, L output bytes
+
+1. Store the skipped keys of the current receiving chain up to pn
+   (bounded by MAX_SKIP), then save the previous chain state:
    PN = Ns (previous chain length)
    Ns = 0
    Nr = 0
@@ -348,27 +366,39 @@ Triggered when receiving a message with a new DH public key:
 2. Update peer public key:
    DHr = new_public_key
 
-3. Derive receiving chain:
+3. Derive receiving chain (one 64-byte HKDF output, split in two):
    DH_out = ECDH(DHs.private, DHr)
-   rootKey' = HKDF(rootKey, DH_out, "DoubleRatchet-RootKey", 32)
-   receivingChainKey = HKDF(rootKey', zeros(32), "ChainKey", 32)
+   out    = HKDF(rootKey, DH_out, "DoubleRatchet-RootKey", 64)
+   rootKey'          = out[0..32]
+   receivingChainKey = out[32..64]
 
 4. Generate new keypair:
    DHs = new ECDH keypair
 
 5. Derive sending chain:
-   DH_out = ECDH(DHs.private, DHr)
-   rootKey'' = HKDF(rootKey', DH_out, "DoubleRatchet-RootKey", 32)
-   sendingChainKey = HKDF(rootKey'', zeros(32), "ChainKey", 32)
+   DH_out' = ECDH(DHs.private, DHr)
+   out'    = HKDF(rootKey', DH_out', "DoubleRatchet-RootKey", 64)
+   rootKey''       = out'[0..32]
+   sendingChainKey = out'[32..64]
 
 6. Update root key:
-   rootKey = rootKey''
+   rootKey.fill(0); rootKey = rootKey''
    ratchetCount++
+   drop skipped keys more than one ratchet round old
+   sign the new DHs (see DH Header Signature)
 ```
+
+The root key is the HKDF input key material and the DH output is the salt.
+Chain keys come from the same HKDF output as the next root key, never from a
+second expansion of the retained root key, so the root key kept after a step
+does not reconstruct the chain keys it produced. Releases before v0.5.0 derived
+each chain key as `HKDF(rootKey', zeros(32), "ChainKey", 32)` from the root
+key they kept; that derivation is gone.
 
 ### DH Ratchet (Send-Side)
 
-Triggered before sending when `hasRatchetedSinceReceive == false`:
+Triggered before sending when a peer DH key is known (`DHr` set) and
+`hasRatchetedSinceReceive == false`:
 
 ```
 1. Save previous chain state:
@@ -380,13 +410,15 @@ Triggered before sending when `hasRatchetedSinceReceive == false`:
 
 3. Derive new sending chain:
    DH_out = ECDH(DHs.private, DHr)
-   rootKey' = HKDF(rootKey, DH_out, "DoubleRatchet-RootKey", 32)
-   sendingChainKey = HKDF(rootKey', zeros(32), "ChainKey", 32)
+   out    = HKDF(rootKey, DH_out, "DoubleRatchet-RootKey", 64)
+   rootKey'        = out[0..32]
+   sendingChainKey = out[32..64]
 
 4. Update root key:
-   rootKey = rootKey'
+   rootKey.fill(0); rootKey = rootKey'
    ratchetCount++
    hasRatchetedSinceReceive = true
+   sign the new DHs
 ```
 
 ### Symmetric Ratchet (Chain Ratchet)
@@ -398,7 +430,8 @@ messageKey = HMAC-SHA256(chainKey, "MessageKey-" || counter)
 // Advance chain
 chainKey' = HMAC-SHA256(chainKey, "ChainRatchet")
 
-// Delete old chain key
+// Replace the old chain key (the reference is dropped; the old buffer is
+// not overwritten, see SECURITY.md "JS Memory Zeroization is Best-Effort")
 chainKey = chainKey'
 ```
 
@@ -645,8 +678,11 @@ ephemeral keys that derive the root key), not merely the identity pair,
 and prevents offline precomputation by a malicious relay (audit H1; see
 SECURITY.md for the full rationale). Because the ephemerals are fresh
 per handshake, the displayed code changes on every reconnect: the
-"verify once" UX is carried by identity-key persistence plus
-peer-identity-change detection in the client, not by SAS stability.
+"verify once" UX is carried by identity-key persistence plus a verdict the
+client binds to the verified peer identity key bytes, not by SAS stability.
+A later handshake comes up verified only if the peer presents the same
+identity key; any other key requires a fresh verification that cannot be
+skipped.
 
 Historical: v1 (pre-v0.3.0) used PBKDF2 with per-handshake nonces and
 timestamps in the salt, 48-bit output, 8 emoji. v2 (v0.3.x) switched to
@@ -666,7 +702,7 @@ Alice                                    Bob
   |                                        |
   | [User confirms SAS matches]            |
   |                                        |
-  | [Mark identity as verified]            |
+  | [Record the peer identity key verified]|
   |                                        |
 ```
 
@@ -696,7 +732,7 @@ Alice                                    Bob
 |-----------|-------|
 | Max Skip (DoS protection) | 100 messages |
 | Max Skipped Keys (global, FIFO eviction) | 1000 |
-| Max Message Age | 5 minutes |
+| Max Message Age (sender `ts` to local arrival) | 5 minutes |
 | Future Tolerance (clock skew) | 30 seconds |
 | Handshake Timeout | 30 seconds |
 | Max Room TTL | 1440 minutes |

@@ -290,7 +290,7 @@ class DoubleRatchet {
         // F-10: snapshot ratchet state before any mutation, mirroring the
         // decrypt path. WebCrypto encrypt failure on valid AES-GCM inputs is
         // practically zero, but performSendSideDHRatchet rotates DHs / rootKey
-        // / sendingChain / ratchetCount and the chain ratchet itself zeroes
+        // / sendingChain / ratchetCount and the chain ratchet itself replaces
         // chainKeyMaterial after deriveMessageKey + ratchet. A throw between
         // those mutations and a successful return would leave the session in
         // an inconsistent state where the peer cannot derive matching keys.

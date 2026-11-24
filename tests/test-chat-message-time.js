@@ -19,8 +19,8 @@ const isDate = (value) => Object.prototype.toString.call(value) === '[object Dat
 
 async function run() {
     const { alice, bob, deliver } = await createChatPair();
-    await alice.store.handleSasVerified();
-    await bob.store.handleSasVerified();
+    await alice.store.handleSasVerified(alice.store.sas.hex);
+    await bob.store.handleSasVerified(bob.store.sas.hex);
 
     const before = Date.now();
     alice.store.messageInput = 'what time is it';

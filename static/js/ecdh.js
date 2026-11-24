@@ -172,8 +172,10 @@ class ECDHKeyExchange {
      *
      * HANDSHAKE v2:
      * - Carries two ephemeral keys: handshake (derives S, destroyed) + ratchet (DHs)
-     * - Identity key + signature are ENCRYPTED (anti-correlation: no cleartext
-     *   long-term identity for a passive relay to link across rooms)
+     * - Identity key + signature are ENCRYPTED inside the envelope. This
+     *   alone does not hide the identity key: message-header signatures let
+     *   a relay recover it (audit C-F2). Rooms stay unlinkable because the
+     *   identity keypair is per room (identity.js).
      * - Signature covers both ephemeral keys + room/sender/timestamp/nonce
      *
      * SECURITY: AAD prevents cross-context replay attacks by binding the
@@ -219,8 +221,9 @@ class ECDHKeyExchange {
         const identityPublicKeyRaw = new Uint8Array(await this.identityManager.exportIdentityPublicKey());
 
         // Plaintext envelope. Identity key + signature move INSIDE the AES-GCM
-        // ciphertext (anti-correlation: a passive relay no longer sees the
-        // long-term identity key that would link a user across rooms).
+        // ciphertext. The relay can still recover the identity key from the
+        // per-message header signatures; what keeps rooms unlinkable is the
+        // per-room identity keypair (audit C-F2, identity.js).
         //   u8(version) || lp(handshakePub) || lp(ratchetPub) || lp(identityPub) || lp(signature)
         const envelope = this._concat([
             new Uint8Array([this.HANDSHAKE_VERSION]),
@@ -638,8 +641,9 @@ class ECDHKeyExchange {
      * Stability note: because the transcript includes the per-handshake ephemeral
      * keys, the SAS is fresh on every new handshake (including reconnects). The
      * "verify once" UX is preserved by the identity-key persistence + peer-
-     * identity-change detection in app.js (a stable IDENTITY pair across reconnects
-     * keeps sasVerified set; only an identity-key change forces re-verification).
+     * identity-change detection in app.js (the verdict is bound to the verified
+     * peer identity key, so it carries over only while the peer presents that
+     * key; any other key forces re-verification).
      * The displayed emoji changing on reconnect is expected and is the price of
      * binding the live session; identity continuity, not SAS stability, is what
      * carries the user's trust decision forward.

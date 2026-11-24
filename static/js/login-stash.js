@@ -24,7 +24,7 @@
  *   2. validates that we are en route to a /c/<uuid> chat page,
  *   3. moves the fragment into sessionStorage (tab-scoped, ephemeral) under
  *      a key matching what crypto.js extractKeyFromURL expects on the chat
- *      page,
+ *      page for that room,
  *   4. scrubs the fragment from the URL bar + history,
  *   5. installs a 5-minute safety-net cleanup of the stash key so an
  *      abandoned login doesn't leave the secret behind for the lifetime
@@ -57,11 +57,14 @@
     var match = redirect.match(/^\/c\/([A-Za-z0-9\-_]+)$/);
     if (match) {
         // The crypto.js extractKeyFromURL helper looks up the stash by
-        // `pinchat_hash:${window.location.pathname}`. The eventual chat
-        // page is served at /static/chat.html (the /c/<uuid> route
-        // server-side issues a 302 to that path with ?room=<uuid>), so
-        // that is the path we key under.
-        var stashKey = 'pinchat_hash:/static/chat.html';
+        // bootstrapStashKey(): `pinchat_hash:<pathname>?room=<room id>`.
+        // The eventual chat page is served at /static/chat.html (the
+        // /c/<uuid> route server-side issues a 302 to that path with
+        // ?room=<uuid>), so that is the path and room we key under. The
+        // room ID is part of the key (audit C-F5): the stash is used only
+        // by the room the invite link named.
+        var stashKey = 'pinchat_hash:/static/chat.html?room='
+            + encodeURIComponent(match[1]);
         try {
             sessionStorage.setItem(stashKey, hash);
         } catch (_) {

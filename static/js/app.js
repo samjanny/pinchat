@@ -17,6 +17,38 @@ const MAX_PENDING_IMAGE_DECODE_BYTES = 4 * 1024 * 1024;
 // largest decrypted image this client will take from a peer.
 const MIN_ROOM_IMAGE_BYTES = 1024;
 const MAX_ROOM_IMAGE_BYTES = 2 * 1024 * 1024;
+// Numbers each 1:1 handshake attempt, so that a late callback can tell
+// whether the ECDH manager it belongs to is still the current one.
+let ecdhHandshakeSerial = 0;
+
+// Banners for the `error` frames the relay sends, keyed by the relay's exact
+// text (src/handlers/websocket.rs). The relay's string is a lookup key and is
+// never displayed: a hostile relay could otherwise put any instruction it
+// liked in the page's error banner (audit C-F6). Unknown texts get the
+// generic banner.
+const RELAY_ERROR_BANNERS = new Map([
+    ['Room is full or reconnect is unavailable',
+        'The room is full, or this connection could not be resumed.'],
+    ['Unable to establish reconnect state',
+        'The server could not set up this connection. Refresh to try again.'],
+    ['Secure group replay window is unavailable',
+        'The server no longer has the group history this tab needs. Refresh to rejoin.'],
+    ['Secure group control stream did not advance',
+        'The server could not deliver the group updates in order. Refresh to rejoin.'],
+    ['Unable to establish secure group lifecycle',
+        'The server could not set up the group connection. Refresh to try again.'],
+    ['Unable to establish group creator control boundary',
+        'The server could not set up the group for its creator. Create a new room.'],
+    ['The message was not sent because it exceeds the server size limit.',
+        'The message was not sent because it exceeds the server size limit.'],
+    ['The image was not sent because it exceeds the server size limit.',
+        'The image was not sent because it exceeds the server size limit.'],
+]);
+
+function relayErrorBanner(relayText) {
+    return (typeof relayText === 'string' && RELAY_ERROR_BANNERS.get(relayText))
+        || 'The server reported an error.';
+}
 window.ROOM_CONFIG = {
     roomId: urlParams.get('room')
     // roomType, ttlMinutes, maxParticipants will be set by server via WebSocket
@@ -153,6 +185,10 @@ document.addEventListener('alpine:init', () => {
         // this state - they must either confirm the new code matches
         // (handleSasVerified) or declare mismatch (handleSasMismatch).
         sasReverifyRequired: false,
+        // Audit C-F3: hex of the code awaiting the user's decision, and
+        // whether it replaced another undecided code while the modal was up.
+        sasPendingCode: null,
+        sasCodeChanged: false,
         sasCopied: false,           // For copy button feedback
         pendingECDHKey: null,
 
@@ -697,7 +733,10 @@ document.addEventListener('alpine:init', () => {
                     break;
 
                 case 'error':
-                    this.error = message.message;
+                    // Audit C-F6: the relay writes this frame's text, so it
+                    // is never shown as such. It only selects one of the
+                    // banners this client wrote.
+                    this.error = relayErrorBanner(message.message);
                     break;
 
                 default:
@@ -846,15 +885,23 @@ document.addEventListener('alpine:init', () => {
             await this.processIncomingMessage(message);
         },
 
-        /** Decrypts and renders a message that has passed the SAS gate. */
-        async processIncomingMessage(message) {
+        /**
+         * Decrypts and renders a message that has passed the SAS gate.
+         *
+         * @param {Object} message - relay frame
+         * @param {number} [receivedAt] - local arrival time (ms) of a frame
+         *     released from the SAS quarantine; the message-age check is
+         *     measured at arrival, not at release (audit C-F4)
+         */
+        async processIncomingMessage(message, receivedAt) {
             try {
                 // Pass header to decryption (contains DH public key for ratchet)
                 const { text: plaintext, outOfOrder } = await window.cryptoManager.decryptMessage(
                     message.payload,
                     message.header,  // Signal Protocol header with DH public key
                     this.roomId,
-                    message.sender_id
+                    message.sender_id,
+                    receivedAt
                 );
 
                 const isOwn = message.sender_id === this.userId;
@@ -1557,15 +1604,19 @@ document.addEventListener('alpine:init', () => {
             await this.processIncomingImage(message);
         },
 
-        /** Decrypts and renders an image that has passed the SAS gate. */
-        async processIncomingImage(message) {
+        /**
+         * Decrypts and renders an image that has passed the SAS gate.
+         * `receivedAt` as for processIncomingMessage.
+         */
+        async processIncomingImage(message, receivedAt) {
             try {
                 // Decrypt image data
                 const imageData = await window.cryptoManager.decryptImage(
                     message.payload,
                     message.header,
                     this.roomId,
-                    message.sender_id
+                    message.sender_id,
+                    receivedAt
                 );
                 if (!(imageData.data instanceof Uint8Array)
                     || imageData.data.byteLength > this.maxImageSize) {
@@ -1770,7 +1821,7 @@ document.addEventListener('alpine:init', () => {
                     warningMessage += 'Duplicate message detected (replay attack blocked)';
                     break;
                 case 'REPLAY_TOO_OLD':
-                    warningMessage += 'Message too old (late-join replay attack blocked)';
+                    warningMessage += 'Message rejected: it was sent more than 5 minutes before it reached this device (delayed delivery or replay)';
                     break;
                 case 'REPLAY_FUTURE':
                     warningMessage += 'Message timestamp from future (clock manipulation detected)';
@@ -1806,7 +1857,8 @@ document.addEventListener('alpine:init', () => {
             // C-06: the bootstrap secret was moved from window.location.hash
             // to sessionStorage on page load. window.location.href therefore
             // no longer carries the #key=... fragment that recipients need.
-            // Reconstruct it from the stash. Group links additionally require
+            // Reconstruct it from this room's stash (crypto.js binds it to
+            // the room ID, audit C-F5). Group links additionally require
             // the creator-generated group_id + creator-key pins; never copy a
             // PSK-only group link because it permits alternative-group joins.
             let link = window.location.href;
@@ -1823,14 +1875,6 @@ document.addEventListener('alpine:init', () => {
                     link = window.location.origin + window.location.pathname
                         + window.location.search + fragment;
                 }
-            } else if (!window.location.hash) {
-                try {
-                    const stash = sessionStorage.getItem(`pinchat_hash:${window.location.pathname}`);
-                    if (stash) {
-                        const frag = stash.startsWith('#') ? stash : '#' + stash;
-                        link = window.location.origin + window.location.pathname + window.location.search + frag;
-                    }
-                } catch (_) { /* sessionStorage unavailable: fall back to bare URL */ }
             }
             return link;
         },
@@ -2006,19 +2050,32 @@ document.addEventListener('alpine:init', () => {
                 if (!this.identityManager) {
                     debugLog('[Identity] Initializing identity key manager...');
                     this.identityManager = new IdentityKeyManager();
-                    await this.identityManager.generateIdentityKeypair();
+                    // Per-room identity (audit C-F2): the key a relay can
+                    // recover from header signatures must not link rooms.
+                    await this.identityManager.generateIdentityKeypair(this.roomId);
                     debugLog('[Identity] ✅ Identity keypair generated');
                 } else {
                     debugLog('[Identity] Reusing existing identity manager (SAS verified:', this.identityManager.isSASVerified(), ')');
                 }
 
-                // Initialize ECDH manager with identity manager
-                this.ecdhManager = new ECDHKeyExchange(window.cryptoManager.key, this.identityManager);
+                // Initialize ECDH manager with identity manager. The local
+                // reference and its numeric id (audit C-F1) let this attempt
+                // and its timer tell whether they are still the current
+                // handshake: the store is reactive, so comparing the objects
+                // themselves would compare proxies.
+                const manager = new ECDHKeyExchange(window.cryptoManager.key, this.identityManager);
+                const handshakeId = ++ecdhHandshakeSerial;
+                manager.handshakeId = handshakeId;
+                this.ecdhManager = manager;
+                const superseded = () => !this.ecdhManager
+                    || this.ecdhManager.handshakeId !== handshakeId;
 
-                await this.ecdhManager.generateKeypair();
+                await manager.generateKeypair();
+                if (superseded()) return;
 
                 // SECURITY: Pass roomId and userId for AAD context binding
-                const ecdhResult = await this.ecdhManager.encryptPublicKey(this.roomId, this.userId);
+                const ecdhResult = await manager.encryptPublicKey(this.roomId, this.userId);
+                if (superseded()) return;
 
                 // Serialize AAD context as JSON string (server expects string payload)
                 const payloadJson = JSON.stringify(ecdhResult);
@@ -2037,7 +2094,11 @@ document.addEventListener('alpine:init', () => {
                 // caller (ECDHKeyExchange.startTimeout) is responsible for
                 // handling the returned Promise without leaking unhandled
                 // rejections.
-                this.ecdhManager.startTimeout(async () => {
+                manager.startTimeout(async () => {
+                    // Audit C-F1: a timer left over from a handshake that was
+                    // already discarded must not tear down the session that
+                    // replaced it. Only the attempt it was armed for counts.
+                    if (superseded()) return;
                     console.warn('[ECDH] ⏱️ Handshake timeout - other participant did not respond');
 
                     // Clean up state
@@ -2096,6 +2157,9 @@ document.addEventListener('alpine:init', () => {
             // Don't reset sasVerificationStatus if we had verified identity - will check peer identity later
             if (!hadVerifiedIdentity) {
                 this.sasVerificationStatus = 'none';
+            }
+            if (this.ecdhManager) {
+                this.ecdhManager.clearTimeout();  // audit C-F1, see handleECDHAborted
             }
             this.ecdhManager = null;
 
@@ -2193,8 +2257,9 @@ document.addEventListener('alpine:init', () => {
                 }
 
                 // Extract context from parsed payload (handshake v2 envelope).
-                // Identity key + signature are now INSIDE the encrypted envelope
-                // (anti-correlation), not on the wire.
+                // Identity key + signature are now INSIDE the encrypted envelope,
+                // not on the wire (header signatures still reveal the identity
+                // key within the room; it is per room, see identity.js).
                 const { version, encryptedEnvelope, timestamp, nonce } = payloadData;
 
                 // Validate the presence of all fields required for the handshake
@@ -2214,47 +2279,34 @@ document.addEventListener('alpine:init', () => {
                     version             // Handshake protocol version
                 );
 
-                // Check if the peer's identity key changed (possible MITM on reconnect)
-                if (this.identityManager && this.identityManager.previousPeerIdentityRaw) {
-                    if (this.identityManager.hasPeerIdentityChanged()) {
-                        // Policy: if the user had explicitly verified SAS before
-                        // this reconnect, the change of peer identity is suspicious
-                        // (could be MITM, could be a legitimate peer page-refresh
-                        // since identity is in-memory only). We can't distinguish
-                        // the two automatically, so we:
-                        //   - keep the WebSocket open (a peer refresh is benign)
-                        //   - invalidate the SAS-verified flag and require fresh
-                        //     re-verification of the new SAS code
-                        //   - lock the composer until the user explicitly confirms
-                        //     the new code matches out-of-band (sasReverifyRequired)
-                        // Skipping is disabled in this state: the user already
-                        // committed to verifying, they can't silently downgrade.
-                        const wasVerified = this.identityManager.sasVerified === true;
-                        // Clear previous peer identity now (single-shot comparison)
-                        this.identityManager.previousPeerIdentityRaw = null;
-
-                        if (wasVerified) {
-                            console.warn('[SECURITY] ⚠️ Peer identity key changed after SAS verification - forcing re-verify');
-                            this.identityManager.sasVerified = false;
-                            // Force the SAS modal to reopen (set BEFORE the later
-                            // pending/verified branch so it isn't overridden).
-                            this.sasReverifyRequired = true;
-                            this.addSystemMessage('⚠️ Contact\'s identity key changed since verification - please confirm the new security code before continuing');
-                        } else {
-                            // Identity wasn't verified before: warn + force first-time
-                            // verification. No prior commitment to break, so the user
-                            // can still skip if they accept the trust trade-off.
-                            console.warn('[SECURITY] ⚠️ Peer identity key changed (pre-verification) - re-verify required');
-                            this.identityManager.sasVerified = false;
-                            this.addSystemMessage('⚠️ WARNING: Contact\'s identity key changed! Please re-verify the security code.');
-                        }
-                        // Both branches: status will be set to 'pending' below
-                        // because isSASVerified() is now false.
-                    } else {
-                        debugLog('[SECURITY] ✅ Peer identity key unchanged - SAS verification persists');
-                        // Clear previous peer identity after successful comparison
-                        this.identityManager.previousPeerIdentityRaw = null;
-                    }
+                // Peer identity decision (audit C-F1). The SAS verdict is
+                // bound to the identity key bytes the user verified, so it is
+                // re-evaluated here against the key this handshake carries,
+                // however the previous session ended. Membership frames,
+                // timers and handshake failures are all relay-influenced; none
+                // of them can carry "verified" over to a different key.
+                //   - verified key again: the verdict carries over.
+                //   - a different key after a verification: a fresh
+                //     verification is required, skipping is refused and the
+                //     composer stays locked (sasReverifyRequired).
+                //   - a different key before any verification: a warning,
+                //     then the ordinary first-time prompt.
+                const identityManager = this.identityManager;
+                const peerIdentityChanged = identityManager.hasPeerIdentityChanged();
+                // Single-shot diff against the identity seen before the last
+                // departure or reconnect.
+                identityManager.previousPeerIdentityRaw = null;
+                const peerIdentityRaw = new Uint8Array(identityManager.peerIdentityPublicKeyRaw);
+                if (identityManager.isSASVerified()) {
+                    debugLog('[SECURITY] Peer presents the verified identity key - SAS verification persists');
+                    this.sasReverifyRequired = false;
+                } else if (identityManager.hasVerifiedPeerIdentity()) {
+                    console.warn('[SECURITY] Peer identity key differs from the verified one - forcing re-verify');
+                    this.sasReverifyRequired = true;
+                    this.addSystemMessage('⚠️ Contact\'s identity key changed since verification - please confirm the new security code before continuing');
+                } else if (peerIdentityChanged) {
+                    console.warn('[SECURITY] Peer identity key changed (pre-verification) - verification required');
+                    this.addSystemMessage('⚠️ WARNING: Contact\'s identity key changed! Please re-verify the security code.');
                 }
 
                 // Deriva raw key material (Uint8Array, non CryptoKey)
@@ -2281,15 +2333,32 @@ document.addEventListener('alpine:init', () => {
                 // Generate the SAS over roomId, both identity keys, and both
                 // handshake+ratchet public-key pairs.
                 // NOTE: Must be called BEFORE destroyEphemeralKeys()
-                this.sas = await this.ecdhManager.generateSAS(this.roomId);
+                // The code carries the peer identity key it was computed for:
+                // confirming it verifies that key and no other (audit C-F1).
+                this.sas = {
+                    ...(await this.ecdhManager.generateSAS(this.roomId)),
+                    peerIdentityRaw,
+                };
                 this.sasBackup = this.sas;  // Backup for reopening verification
 
-                // Show the SAS modal only when verification is still required
-                // If the identity persisted and was verified, skip the modal because the SAS carries over
-                if (this.identityManager && this.identityManager.isSASVerified()) {
-                    debugLog('[SECURITY] ✅ SAS already verified from previous handshake - skipping modal');
+                // Show the SAS modal only when verification is still required.
+                // A verdict carries over only for the very key it was given for.
+                if (identityManager.isVerifiedPeerIdentity(peerIdentityRaw)) {
+                    debugLog('[SECURITY] SAS already verified for this identity key - skipping modal');
                     this.sasVerificationStatus = 'verified';
+                    this.sasPendingCode = null;
+                    this.sasCodeChanged = false;
                 } else {
+                    // Audit C-F3: a decision was still outstanding on another
+                    // code, so the modal the user may be comparing from has
+                    // just changed under them. Say so, in the chat and in the
+                    // modal, and ask again before accepting a confirmation.
+                    const previousCode = this.sasPendingCode;
+                    this.sasCodeChanged = previousCode !== null && previousCode !== this.sas.hex;
+                    this.sasPendingCode = this.sas.hex;
+                    if (this.sasCodeChanged) {
+                        this.addSystemMessage('The security code changed while you were comparing it. Compare the new code from the start before you confirm it.');
+                    }
                     this.sasVerificationStatus = 'pending';  // Show verification modal
                 }
 
@@ -2349,7 +2418,9 @@ document.addEventListener('alpine:init', () => {
          *
          * This mirrors that reconnect handling: stash the peer's identity bytes
          * so the next completed handshake runs hasPeerIdentityChanged(), and
-         * leave sasVerified intact. What the peer's return then produces:
+         * leave the SAS verdict intact. The verdict is bound to the verified
+         * key bytes (audit C-F1), so what the peer's return produces does not
+         * depend on this stash for a verified peer:
          *
          *   - same identity key: SAS carries over, no re-prompt (this is the
          *     ordinary case, since identities persist in IndexedDB for 24h).
@@ -2407,9 +2478,12 @@ document.addEventListener('alpine:init', () => {
 
             this.clearPendingSecureMessages();
 
-            // Cleanup ECDH manager
+            // Cleanup ECDH manager. Its handshake timer goes with it (audit
+            // C-F1): left armed, it would fire up to 30 s later and tear down
+            // whatever session had replaced this one.
             this.pfsActive = false;
             if (this.ecdhManager) {
+                this.ecdhManager.clearTimeout();
                 this.ecdhManager = null;
             }
 
@@ -2419,6 +2493,8 @@ document.addEventListener('alpine:init', () => {
                 this.identityManager.destroy();
                 this.identityManager = null;
                 this.sasVerificationStatus = 'none';
+                this.sasPendingCode = null;
+                this.sasCodeChanged = false;
                 // The re-verify lock is tied to a specific peer identity; once
                 // identity state is destroyed there is nothing left to re-verify
                 // against, so clear the flag (otherwise the composer would stay
@@ -2489,6 +2565,8 @@ document.addEventListener('alpine:init', () => {
             this.sasReverifyRequired = false;
             this.sas = null;
             this.sasVerificationStatus = 'mismatch';
+            this.sasPendingCode = null;
+            this.sasCodeChanged = false;
 
             // Close WebSocket with 1008 Policy Violation; suppress auto-reconnect
             if (this.wsManager) {
@@ -2514,15 +2592,52 @@ document.addEventListener('alpine:init', () => {
         },
 
         /**
-         * Handles SAS verification success (user clicked "Verified")
+         * Handles SAS verification success (user clicked "They match").
+         *
+         * Audit C-F3: the click carries the code the modal was showing
+         * (`confirmedCode`, its hex form) and is accepted only for that code.
+         * If the session, and with it the code, changed while the modal was
+         * open, the user is told so in the modal and asked to confirm that
+         * the comparison was made against the code shown now.
+         *
+         * @param {string} confirmedCode - hex of the code the user confirmed
          */
-        async handleSasVerified() {
+        async handleSasVerified(confirmedCode) {
+            const shown = this.sas;
+            if (!shown || typeof confirmedCode !== 'string' || confirmedCode !== shown.hex) {
+                console.warn('[SECURITY] SAS confirmation ignored: it does not name the code on screen');
+                if (shown) {
+                    this.sasCodeChanged = true;
+                    this.addSystemMessage('The security code changed before your confirmation was recorded. Compare the code shown now and confirm again.');
+                }
+                return;
+            }
+            if (this.sasCodeChanged) {
+                const ok = window.confirm(
+                    'The security code changed while this window was open.\n\n' +
+                    'Confirm only if you compared the code shown now, from the first ' +
+                    'emoji to the last:\n\n' + shown.hex + '\n\n' +
+                    'Press OK to confirm it, or Cancel to compare again.'
+                );
+                if (!ok) {
+                    debugLog('[SECURITY] SAS confirmation cancelled after a code change');
+                    return;
+                }
+            }
             debugLog('[SECURITY] SAS code verified by user - connection is secure');
 
-            // Mark SAS as verified in identity manager (persists for session)
+            // Record the verdict for the identity key this code was computed
+            // for (audit C-F1). It carries over to a later handshake only if
+            // the peer presents those same bytes again.
             if (this.identityManager) {
-                this.identityManager.markSASVerified();
+                if (!(shown.peerIdentityRaw instanceof Uint8Array)) {
+                    console.warn('[SECURITY] SAS confirmation ignored: the code names no identity key');
+                    return;
+                }
+                this.identityManager.markSASVerified(shown.peerIdentityRaw);
             }
+            this.sasPendingCode = null;
+            this.sasCodeChanged = false;
 
             // Clear the re-verify lock (if this verification was triggered by
             // a peer-identity-changed event after a prior verified handshake).
@@ -2588,6 +2703,8 @@ document.addEventListener('alpine:init', () => {
             // Close SAS verification dialog
             this.sas = null;
             this.sasVerificationStatus = 'skipped';
+            this.sasPendingCode = null;
+            this.sasCodeChanged = false;
 
             // Show info message
             this.addSystemMessage('ℹ️ Key verification skipped - connection security not confirmed');
@@ -2602,6 +2719,8 @@ document.addEventListener('alpine:init', () => {
             if (this.sasBackup) {
                 this.sas = this.sasBackup;
                 this.sasVerificationStatus = 'pending';
+                this.sasPendingCode = this.sas.hex;
+                this.sasCodeChanged = false;
                 debugLog('[SECURITY] Reopening SAS verification modal');
             }
         },
@@ -2674,7 +2793,9 @@ document.addEventListener('alpine:init', () => {
                 }
                 return;
             }
-            this.pendingSecureMessages.push({ kind, message });
+            // Record the arrival time: the message-age guard must not count
+            // the time the user spends comparing the code (audit C-F4).
+            this.pendingSecureMessages.push({ kind, message, receivedAt: Date.now() });
         },
 
         /** Releases quarantined ciphertext strictly in arrival order. */
@@ -2689,9 +2810,9 @@ document.addEventListener('alpine:init', () => {
                     && !this.isSasDecisionPending()) {
                     const pending = this.pendingSecureMessages.shift();
                     if (pending.kind === 'message') {
-                        await this.processIncomingMessage(pending.message);
+                        await this.processIncomingMessage(pending.message, pending.receivedAt);
                     } else if (pending.kind === 'image') {
-                        await this.processIncomingImage(pending.message);
+                        await this.processIncomingImage(pending.message, pending.receivedAt);
                     }
                 }
             } finally {

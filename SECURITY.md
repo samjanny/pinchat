@@ -123,8 +123,12 @@ URL format: https://host/c/{room_id}#key={base64url_encoded_key}
 4. Each participant extracts key from fragment
 5. Key used to encrypt/decrypt ECDH handshake
 6. After successful import, the fragment bytes are stashed in
-   sessionStorage (key: `pinchat_hash:/static/chat.html`) and removed
-   from window.location.hash via history.replaceState. Reload survives.
+   sessionStorage (key: `pinchat_hash:/static/chat.html?room=<room_id>`)
+   and removed from window.location.hash via history.replaceState. Reload
+   survives. The stash is bound to the room: a page for another room never
+   reads it (audit C-F5; up to v0.9.2 the key had no room ID, so a keyless
+   link to another room opened in the same tab reused this room's key and
+   "Copy invite link" handed it out under the other room's ID).
 7. Double Ratchet takes over for message encryption
 8. cryptoManager.deleteBootstrapKey() nulls the in-memory CryptoKey
    reference after handshake completion. resetToBootstrapKey() re-reads
@@ -135,9 +139,14 @@ URL format: https://host/c/{room_id}#key={base64url_encoded_key}
 
 ECDSA P-256 keypairs that authenticate each Double Ratchet DH header
 are persisted client-side in IndexedDB under the database name
-`pinchat_identity_v1` (object store `keys`, single entry under key
-`identity`). Entries carry a `version` field and an absolute `expiresAt`
-timestamp (24 h from creation, aligned with the default `session_ttl_secs`).
+`pinchat_identity_v1` (object store `keys`). There is one keypair per
+room, stored under the key `room:` followed by the hex SHA-256 of the room
+ID, so the database does not list room IDs in clear. Entries carry a
+`version` field and an absolute `expiresAt` timestamp (24 h from creation,
+the longest room TTL). Expired entries are deleted the next time a chat
+page asks for an identity. Releases up to v0.9.2 kept a single entry under
+the key `identity` and used it for every room; that entry is deleted on
+first use and never read.
 
 **Properties:**
 - The private side is created `extractable: false` directly from
@@ -156,18 +165,38 @@ timestamp (24 h from creation, aligned with the default `session_ttl_secs`).
   non-extractable across page loads.
 - The public side stays extractable so it can be serialised to raw
   bytes for transmission to the peer.
-- Scope: per-origin, never synced, never sent to the server.
+- Scope: per-origin and per room, never synced. The private key never
+  leaves the browser.
 - Expiry: 24 h, after which `generateIdentityKeypair()` discards the
   stale entry and mints a fresh keypair.
 - Forget gesture: `IdentityKeyManager.clearStoredIdentity()` for an
-  explicit "forget me on this device" reset.
+  explicit "forget me on this device" reset of the current room's entry.
 
-The reason this entry is persisted at all is SAS continuity: pre-C-04
-the identity keypair was regenerated on every page load, which meant
-the SAS code that a user had verified out-of-band stopped matching the
-next time they reopened the chat. The pressure to skip verification
-followed mechanically. Persistence keeps the SAS stable so verification
-becomes a one-time gesture per device-day.
+The reason this entry is persisted at all is identity continuity inside a
+room: pre-C-04 the identity keypair was regenerated on every page load, so
+a peer who reloaded the chat came back with a new identity key and the
+other side had to treat it as an identity change and verify again. With
+persistence a reload or reconnect inside the same room presents the same
+identity key, and a verdict the other side gave for that key still applies
+(see "SAS verdict binding" below).
+
+**What the relay can learn about identity keys.** The handshake carries
+the identity public key inside the AES-GCM envelope, but every 1:1 message
+header carries `sig`, an ECDSA signature over fields that travel in clear
+(`dh`, `pn`, `n`, `rc`). ECDSA public-key recovery (SEC 1, section 4.1.6)
+turns any two such headers into the signer's identity public key. The
+relay, or anyone who can read the relay's traffic, can therefore:
+
+- recover each participant's identity public key in every 1:1 room;
+- recognise the same participant across reconnects, reloads and repeated
+  handshakes in that room, for as long as the room's keypair lives.
+
+It cannot use the identity key to link rooms: a different room gets a
+different keypair, independent of the first. Up to v0.9.2 one keypair was
+shared by every room for 24 h, which let a passive relay link all the
+1:1 rooms one browser opened that day (audit C-F2). Transport metadata
+(IP address, login session cookie, timing) is a separate matter and still
+lets the relay correlate connections across rooms.
 
 ### Symmetric Encryption
 
@@ -185,7 +214,7 @@ becomes a one-time gesture per device-day.
 **Security Properties**:
 - Confidentiality: Plaintext hidden from adversary
 - Integrity: Tampering detected via authentication tag
-- Authenticity: AAD binds ciphertext to context (room ID, sender ID, message number)
+- Authenticity: AAD binds ciphertext to context (room ID, sender ID, message number, message type, ratchet count, previous chain length)
 
 **IV Generation**:
 ```
@@ -218,7 +247,7 @@ IVs are generated using CSPRNG and never reused within a key's lifetime.
 **Algorithm**: ECDSA (Elliptic Curve Digital Signature Algorithm)
 - Curve: P-256 (NIST secp256r1)
 - Hash: SHA-256
-- Signature Size: 64 bytes (DER encoded)
+- Signature Size: 64 bytes, IEEE P1363 encoding (`r || s`, 32 bytes each), which is what WebCrypto produces and verifies; not DER
 
 **Usage**:
 - Identity key authentication
@@ -273,7 +302,7 @@ CK_{n+1} = HMAC-SHA256(CK_n, "ChainRatchet")
 - One-way: Cannot derive CK_n from CK_{n+1}
 - Independence: Compromise of MK_n does not reveal MK_{n+1}
 
-### SAS Generation (v3, current)
+### SAS Generation (v4, current)
 
 **Algorithm**: HKDF-SHA256
 - Output: 96 bits (16 emoji from a 64-character alphabet, 6 bits per emoji)
@@ -316,10 +345,10 @@ this in two ways:
   actually derive the root key, not merely the identity pair.
 - *Fresh per handshake.* Because the transcript includes per-handshake
   ephemerals, the displayed code changes on every reconnect. The
-  "verify once" UX is preserved by identity-key persistence plus
-  peer-identity-change detection: a stable identity pair keeps the
-  verified flag set, and only an identity-key change forces
-  re-verification.
+  "verify once" UX is preserved by identity-key persistence plus a
+  verdict bound to the verified key: confirming a code records the peer
+  identity key it was computed for, a later handshake that presents the
+  same key comes up verified, and any other key forces re-verification.
 - *Domain-separated.* The `"pinchat-sas-v4"` salt tag and the
   `"SAS-display-v4"` info prefix separate this derivation from any
   other use of the same key material.
@@ -379,7 +408,7 @@ two-sided birthday search over attacker-chosen identity keys, fully
 precomputable offline against the v2 inputs (both are known to the
 relay before the handshake). The ECDSA-keygen cost argument above
 mitigates but does not eliminate that search within the 24h identity
-TTL. v3 (see above) therefore binds the live handshake transcript AND
+TTL. v3 (since superseded by v4, see above) therefore binds the live handshake transcript AND
 widens the output to 96 bits. This section is retained as the record
 of the v0.3.x design.
 
@@ -456,8 +485,8 @@ Ratchet design and matches the Signal specification.
 |----------|-----------|
 | Message Content | Never accessible (client-side encryption) |
 | Encryption Keys | Never transmitted (URL fragment) |
-| User Identity | Randomized per-connection UUID |
-| Cross-Room Correlation | Impossible (fresh UUID per room) |
+| User Identity | Randomized per-connection UUID. The 1:1 identity public key is recoverable from header signatures, but it is generated per room |
+| Cross-Room Correlation | Not through PinChat identifiers or keys (fresh UUID and fresh identity key per room). Still possible through transport metadata: IP address, login session cookie, timing |
 | Historical Data | None (RAM-only storage) |
 
 ### Authenticated Encryption
@@ -469,7 +498,8 @@ AAD = TLV_encode([
     SENDER_ID,
     MESSAGE_NUMBER,
     MESSAGE_TYPE,
-    RATCHET_COUNT
+    RATCHET_COUNT,
+    PREVIOUS_CHAIN_LENGTH
 ])
 ```
 
@@ -484,11 +514,26 @@ AAD = TLV_encode([
 
 ### JS Memory Zeroization is Best-Effort
 
-After a message key or chain key is used, PinChat calls `Uint8Array.fill(0)` on the raw key material. This is a best-effort mitigation: JavaScript engines (V8, SpiderMonkey) do not guarantee that the backing buffer is zeroed in native memory or that the GC reclaims it promptly. A memory dump of the browser process may still recover key material.
+PinChat overwrites some raw key material with `Uint8Array.fill(0)` and leaves the rest to the garbage collector. Where `fill(0)` runs it is still a best-effort mitigation: JavaScript engines (V8, SpiderMonkey) do not guarantee that copies made by the engine are zeroed or that the GC reclaims them promptly. A memory dump of the browser process may still recover key material.
+
+**Overwritten with `fill(0)`:**
+- the previous root key, on every DH ratchet step (send side and receive side);
+- the initial ECDH shared secret, once the Double Ratchet is initialised;
+- the root key and both chain keys when the ratchet is destroyed (`DoubleRatchet.destroy()`, which calls `ChainRatchet.reset()`). This runs on every session teardown: peer departure, handshake restart, SAS mismatch;
+- the final temporary chain-key copy used to derive a message key;
+- the MLS PSK derived from the invite key, when the bootstrap key is dropped.
+
+**Not overwritten, only released to the garbage collector:**
+- the previous chain key on each symmetric ratchet step: `ChainRatchet.ratchet()` replaces the reference to the old buffer and does not zero it;
+- the chains a DH ratchet step replaces;
+- the raw message-key bytes, which exist briefly as HMAC output before they are imported as a non-extractable AES-GCM `CryptoKey`;
+- the copies of the root key and chain keys that every encryption and decryption takes as a rollback snapshot;
+- HKDF outputs and the intermediate chain-key copies made when deriving a key several steps ahead;
+- the raw invite-key bytes decoded from the URL fragment (the fragment itself stays in `sessionStorage`, see "Bootstrap Key Temporarily Stored in `sessionStorage`" below).
 
 **What does help:**
-- Identity private keys are imported with `extractable: false` - WebCrypto's opaque `CryptoKey` objects cannot be exported or read by JS, even with a memory dump via `exportKey`.
-- Double Ratchet chain keys are zeroized (`fill(0)`) after ratchet progression; the old material is no longer reachable from JS once the typed array reference is released.
+- Identity private keys are created with `extractable: false` - WebCrypto's opaque `CryptoKey` objects cannot be exported or read by JS via `exportKey`. The same holds for the ECDH private keys and for message keys, which exist as non-extractable `CryptoKey` objects.
+- Old chain keys and message keys stop being reachable from page scripts as soon as the ratchet moves past them, even where their buffers are not overwritten. Skipped message keys are the exception: they stay in the skipped-key store until used or pruned.
 
 **Recommendation:** Use incognito/private mode for sensitive chats. Close the tab immediately after the conversation ends. Do not use PinChat on shared or potentially compromised devices.
 
@@ -510,7 +555,11 @@ Short Authentication String (SAS) verification is the mechanism by which users c
 
 **If SAS is skipped:** the chat is encrypted, but not authenticated against the server operator. The server (or anyone with full relay access) could have substituted both parties' identity public keys with its own at the ECDH exchange step, establishing a session it can decrypt. The ECDSA signatures on the DH ratchet keys only prove self-consistency of those keys - they do not prove ownership by the expected human peer. Only SAS ties the cryptographic identity to a real-world identity.
 
-**Current UX:** while the SAS decision is pending, the composer is locked and inbound application ciphertext is kept in a bounded quarantine without being decrypted or rendered. Verification releases it in arrival order. Explicitly confirming the skip sets `sasVerificationStatus = 'skipped'`, releases the quarantine, and displays a persistent "Key verification skipped - connection security not confirmed" indicator. This is a deliberate usability trade-off: the unsafe state requires an informed user choice rather than occurring silently.
+**SAS verdict binding:** confirming a code records the 65-byte peer identity public key that code was computed for (`IdentityKeyManager.markSASVerified`). The verdict is not a flag: `isSASVerified()` holds only while the peer presents those same bytes. Every completed handshake is judged against them, however the previous session ended (a relay-forged `userleft`/`userjoined`, a handshake timeout, a reconnect or a failed handshake), so none of those can carry "verified" over to a different identity key. A different key after a verification produces an explicit identity-change warning, locks the composer, keeps inbound ciphertext in quarantine as for a first verification, and refuses "skip" until the user confirms the new code or declares a mismatch. Up to v0.9.2 the verdict was a boolean, and a handshake timer left armed by a discarded attempt let a relay that knew the link tear down a verified session without arming the identity comparison; the next handshake, answered with the relay's own identity key, came up "verified" (audit C-F1). Handshake timers are now stopped with the attempt they belong to, and a timer that fires for an attempt that is no longer current does nothing.
+
+**A confirmation names its code:** the "They match" button passes the code the modal is showing, and a confirmation is accepted only for the code on screen. If the session, and with it the code, changes while a decision is outstanding (for example because the relay tore the session down and another handshake replaced it), the modal and the chat both say that the code changed, and the next confirmation asks once more, naming the code now shown. Up to v0.9.2 the click verified whatever session was current when it arrived (audit C-F3).
+
+**Current UX:** while the SAS decision is pending, the composer is locked and inbound application ciphertext is kept in a bounded quarantine without being decrypted or rendered. Verification releases it in arrival order. Each quarantined frame keeps its local arrival time, and the five-minute message-age guard (sender timestamp against arrival) is measured at that time, so the minutes spent comparing the code do not expire the messages; up to v0.9.2 it was measured at release, and every message that had waited more than five minutes was dropped as a "late-join replay" (audit C-F4). A message that is already more than five minutes old when it arrives is still rejected, after the ratchet has consumed its key: it can never become acceptable later, and discarding the key keeps forward secrecy. Explicitly confirming the skip sets `sasVerificationStatus = 'skipped'`, releases the quarantine, and displays a persistent "Key verification skipped - connection security not confirmed" indicator. This is a deliberate usability trade-off: the unsafe state requires an informed user choice rather than occurring silently.
 
 **Recommendation:** Always complete SAS verification for sensitive conversations, especially with new contacts. Never skip SAS if you received the room link from an untrusted channel.
 
@@ -531,8 +580,11 @@ The phrase "the server cannot read your messages" is only true in the first two 
 The bootstrap key is normally kept only in the URL fragment (`#key=<base64url>`), which browsers do not include in HTTP requests (RFC 3986 §3.5), keeping it server-blind. However, if an authenticated session expires mid-navigation (HTTP 401), PinChat stores the fragment in `sessionStorage` so it can be restored after login completes:
 
 ```
-sessionStorage["pinchat_hash:/c/<room_id>"] = "#key=<base64url_key>"
+sessionStorage["pinchat_hash:/static/chat.html?room=<room_id>"] = "#key=<base64url_key>"
 ```
+
+The room ID is part of the key, so the stash is used only by the room the
+invite link named.
 
 **Exposure windows** - there are two paths that put the bootstrap key into `sessionStorage`:
 
