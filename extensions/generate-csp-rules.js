@@ -186,13 +186,20 @@ function hexToSRI(hex) {
     return `sha256-${Buffer.from(hex, 'hex').toString('base64')}`;
 }
 
+/**
+ * 'report-sample' allows no script. It makes a violation report carry the
+ * first 40 characters of what was blocked, which is how the content script
+ * tells the violation of its own policy probe, whose handler begins with a
+ * marker of its own, from the page's (see isProbeViolation in verdict.js).
+ * The catch-all rule keeps a bare 'none', which takes no other keyword.
+ */
 function buildCsp(pagePath, scriptPaths, hashesByPath) {
     const hashSources = scriptPaths.map((scriptPath) => {
         const hash = hashesByPath.get(scriptPath);
         if (!hash) throw new Error(`Signed manifest is missing ${scriptPath}`);
         return `'${hexToSRI(hash)}'`;
     });
-    return [`script-src ${hashSources.join(' ')}`, ...cspBase(pagePath)].join('; ') + ';';
+    return [`script-src 'report-sample' ${hashSources.join(' ')}`, ...cspBase(pagePath)].join('; ') + ';';
 }
 
 // Chrome matches a declarativeNetRequest regexFilter against the full URL,

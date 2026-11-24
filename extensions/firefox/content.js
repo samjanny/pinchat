@@ -46,7 +46,10 @@ let manifestSRIMap = {};
 let inspectionTimer = null;
 let fileCheck = null;          // { checked, failed, issues } once the files were re-fetched
 let checksDone = false;
-let canaryViolationsToSkip = 0;
+// Begins the handler of the policy probe, so that its violation, if the
+// browser reports it, is told from the page's own. See V.isProbeViolation.
+const PROBE_MARKER = Array.from(crypto.getRandomValues(new Uint8Array(V.PROBE_MARKER_LENGTH / 2)))
+    .map((byte) => byte.toString(16).padStart(2, '0')).join('');
 // The policy the packaged rules give this address, from the background
 // script, and the policies the browser named for blocking the probe.
 let expectedPolicy = null;
@@ -94,19 +97,21 @@ function reportedFindings(extra) {
  * synchronously, before the parser has produced a single element of the
  * page. It cannot tell a weakened policy from the intact one, only an absent
  * one from a present one.
+ *
+ * Its violation may or may not be reported: Chromium reports none that an
+ * extension causes. When one is, it is recognised by the marker the handler
+ * begins with, and by nothing else, so that no violation of the page's own
+ * is ever taken for it.
  */
 function policyIsInForce() {
     const probe = document.createElement('div');
-    probe.setAttribute('onclick', 'this.setAttribute("data-ran", "1")');
-    canaryViolationsToSkip += 1;
+    probe.setAttribute('onclick', V.probeHandler(PROBE_MARKER));
     try {
         probe.click();
     } catch {
         /* a throwing dispatch is not an executed handler */
     }
-    const blocked = probe.getAttribute('data-ran') !== '1';
-    if (!blocked) canaryViolationsToSkip = 0;
-    return blocked;
+    return probe.getAttribute('data-ran') !== '1';
 }
 
 /**
@@ -613,10 +618,9 @@ function watchDocument() {
     }
 
     document.addEventListener('securitypolicyviolation', (event) => {
-        if (canaryViolationsToSkip > 0 && event.effectiveDirective === 'script-src-attr') {
+        if (V.isProbeViolation(event, PROBE_MARKER)) {
             // The probe in policyIsInForce, not the page. The policy the
             // browser names says whether it is the packaged one.
-            canaryViolationsToSkip -= 1;
             if (event.originalPolicy && canaryPolicies.length < 8) canaryPolicies.push(String(event.originalPolicy));
             checkPolicyIsPackaged();
             return;

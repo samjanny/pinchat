@@ -490,6 +490,52 @@ test('another policy that also blocks inline handlers is not taken for the packa
     }
 });
 
+test('the probe\'s own violation is told from the page\'s by its marker, and by nothing else', () => {
+    const marker = '0123456789abcdef01234567';
+    assert.strictEqual(marker.length, V.PROBE_MARKER_LENGTH);
+    const handler = V.probeHandler(marker);
+    // A browser reports at most the first 40 characters of the handler.
+    const sample = handler.slice(0, 40);
+    assert(sample.includes(marker), 'the marker is within what a report carries');
+    const probe = { effectiveDirective: 'script-src-attr', blockedURI: 'inline', sourceFile: '', sample };
+    assert.strictEqual(V.isProbeViolation(probe, marker), true);
+
+    const page = 'https://pinchat.im/static/chat.html?room=1';
+    for (const [what, violation] of [
+        ['a handler of the page, which looks like the probe in every other way',
+            { effectiveDirective: 'script-src-attr', blockedURI: 'inline', sourceFile: '', sample: 'this.setAttribute("data-ran", "1")' }],
+        ['a report without a sample', { effectiveDirective: 'script-src-attr', blockedURI: 'inline', sourceFile: '' }],
+        ['another marker', { ...probe, sample: V.probeHandler('fedcba9876543210fedcba98').slice(0, 40) }],
+        ['the marker in another kind of violation', { ...probe, effectiveDirective: 'script-src-elem' }],
+    ]) {
+        assert.strictEqual(V.isProbeViolation(violation, marker), false, what);
+    }
+    for (const weak of ['', '0123', 'not-hex-not-hex-not-hex-', null, undefined]) {
+        assert.strictEqual(V.isProbeViolation(probe, weak), false, `marker ${weak}`);
+    }
+    // What is not the probe's is classified like any violation.
+    assert.strictEqual(V.findingForViolation({
+        effectiveDirective: 'script-src-attr', blockedURI: 'inline', sourceFile: 'https://pinchat.im/static/chat.html',
+    }, page).code, 'page-policy-violation');
+});
+
+test('the page policies ask for the sample that carries the probe\'s marker', () => {
+    const { CATCH_ALL_REGEX } = require('../extensions/generate-csp-rules');
+    for (const browser of ['chrome', 'firefox']) {
+        const rules = JSON.parse(fs.readFileSync(path.join(root, `extensions/${browser}/rules.json`), 'utf8'));
+        for (const rule of rules.filter((entry) => entry.action.type === 'modifyHeaders')) {
+            const scriptSrc = rule.action.responseHeaders[0].value.split(';')[0].trim().split(/\s+/);
+            if (rule.condition.regexFilter === CATCH_ALL_REGEX) {
+                assert.deepStrictEqual(scriptSrc, ['script-src', "'none'"], 'nothing runs where the release has no page');
+            } else {
+                assert(scriptSrc.includes("'report-sample'"), `${browser}: ${rule.condition.regexFilter}`);
+                assert(scriptSrc.slice(1).every((token) => token === "'report-sample'" || token.startsWith("'sha256-")),
+                    'report-sample allows nothing; the rest are hashes');
+            }
+        }
+    }
+});
+
 test('an error answer from the server is unverifiable, never a mismatch', () => {
     assert.strictEqual(V.FINDINGS['error-response'][0], V.CLASS.LIMIT);
     const record = {
@@ -647,8 +693,132 @@ function loadBackground({ canAttest = false, hostAccess = true, manifestFiles = 
     return { send, contentSender, popupSender, listener, streams, settle, plain, rules };
 }
 
+/**
+ * Runs extensions/chrome/content.js at document_start of a chat page, against
+ * a document and an extension API reduced to what it touches. Returns the
+ * means to deliver policy violations to it and to read what it reports.
+ */
+function loadContent({ expectedPolicy }) {
+    const url = 'https://pinchat.im/static/chat.html?room=1';
+    const listeners = {};
+    const element = (tagName) => {
+        const attributes = new Map();
+        return {
+            tagName, nodeType: 1, id: '',
+            setAttribute(name, value) { attributes.set(name, String(value)); },
+            getAttribute(name) { return attributes.has(name) ? attributes.get(name) : null; },
+            hasAttribute(name) { return attributes.has(name); },
+            removeAttribute(name) { attributes.delete(name); },
+            querySelectorAll() { return []; },
+            // The packaged policy is in force: a handler never runs.
+            click() {},
+            // What the overlay needs.
+            attachShadow() { return element('#shadow-root'); },
+            appendChild(child) { return child; },
+            addEventListener() {},
+            remove() {},
+        };
+    };
+    const created = [];
+    const document = {
+        readyState: 'loading',
+        documentElement: element('HTML'),
+        body: null,
+        createElement(tagName) {
+            const made = element(tagName.toUpperCase());
+            created.push(made);
+            return made;
+        },
+        addEventListener(type, listener) { (listeners[type] = listeners[type] || []).push(listener); },
+        contains() { return false; },
+    };
+    const messages = [];
+    const browser = {
+        runtime: {
+            id: 'test-extension',
+            getURL: (file) => `chrome-extension://test-extension/${file}`,
+            onMessage: { addListener() {} },
+            sendMessage: async (message) => {
+                messages.push(JSON.parse(JSON.stringify(message)));
+                const verdict = { integrity: INTEGRITY.PARTIAL, attention: false, reasons: [], attested: false };
+                if (message.type === 'DOCUMENT_OPENED') {
+                    return { manifestStatus: 'valid', manifest: { files: [] }, canAttest: false, expectedPolicy, verdict };
+                }
+                return { verdict };
+            },
+        },
+    };
+    const context = vm.createContext({
+        browser, PinChatVerdict: V, document, crypto: nodeCrypto.webcrypto, btoa, URL, console: { log() {}, warn() {}, error() {} },
+        navigator: {}, Node: { ELEMENT_NODE: 1 }, MutationObserver: class { observe() {} },
+        // The overlay's watchdog is not under test, and would keep the run alive.
+        setTimeout, clearTimeout, setInterval: () => 0, clearInterval: () => {},
+    });
+    context.window = context;
+    context.location = new URL(url);
+    context.top = context;
+    context.addEventListener = () => {};
+    context.stop = () => {};
+    vm.runInContext(fs.readFileSync(path.join(root, 'extensions/chrome/content.js'), 'utf8'), context,
+        { filename: 'content.js' });
+    const fire = (type, event = {}) => (listeners[type] || []).forEach((listener) => listener(event));
+    return {
+        url,
+        // The handler the probe gave its element, as a browser would report it.
+        probeSample: () => created.find((made) => made.getAttribute('onclick')).getAttribute('onclick').slice(0, 40),
+        parsed: () => { document.readyState = 'interactive'; fire('DOMContentLoaded'); },
+        violation: (event) => fire('securitypolicyviolation', event),
+        lastReport: () => [...messages].reverse().find((message) => message.type === 'DOCUMENT_REPORT'),
+        settle: () => new Promise((resolve) => setTimeout(resolve, 450)),
+    };
+}
+
 const asyncTests = [];
 const asyncTest = (name, body) => asyncTests.push([name, body]);
+
+asyncTest('the page\'s first inline handler violation is counted, reported probe or not', async () => {
+    const rules = JSON.parse(fs.readFileSync(path.join(root, 'extensions/chrome/rules.json'), 'utf8'));
+    const expectedPolicy = V.packagedPolicy(rules, 'https://pinchat.im/static/chat.html?room=1');
+    const pageHandler = (sourceFile) => ({
+        effectiveDirective: 'script-src-attr', violatedDirective: 'script-src-attr', blockedURI: 'inline',
+        sourceFile, sample: 'document.documentElement.setAttribute(', originalPolicy: expectedPolicy,
+    });
+    const codes = (report) => [...report.findings, ...report.environment].map((entry) => entry.code);
+
+    // Chromium: the probe's violation is never reported. The page's first
+    // one used to be taken for it and dropped. This is how Chromium reports
+    // a handler of served markup that it blocks: with no source file.
+    const chromium = loadContent({ expectedPolicy });
+    await new Promise((resolve) => setImmediate(resolve));
+    chromium.parsed();
+    chromium.violation(pageHandler(''));
+    await chromium.settle();
+    assert.deepStrictEqual(codes(chromium.lastReport()), ['unattributed-policy-violation']);
+
+    // A browser that reports the probe's violation: that one, and only that
+    // one, is left out, whenever it arrives.
+    const reporting = loadContent({ expectedPolicy });
+    await new Promise((resolve) => setImmediate(resolve));
+    reporting.parsed();
+    reporting.violation(pageHandler('https://pinchat.im/static/chat.html'));
+    reporting.violation({
+        effectiveDirective: 'script-src-attr', violatedDirective: 'script-src-attr', blockedURI: 'inline',
+        sourceFile: '', sample: reporting.probeSample(), originalPolicy: expectedPolicy,
+    });
+    await reporting.settle();
+    assert.deepStrictEqual(codes(reporting.lastReport()), ['page-policy-violation']);
+
+    // And when it names another policy than the packaged one, the page fails.
+    const replaced = loadContent({ expectedPolicy });
+    await new Promise((resolve) => setImmediate(resolve));
+    replaced.parsed();
+    replaced.violation({
+        effectiveDirective: 'script-src-attr', violatedDirective: 'script-src-attr', blockedURI: 'inline',
+        sourceFile: '', sample: replaced.probeSample(), originalPolicy: "script-src 'self'; default-src 'self'",
+    });
+    await replaced.settle();
+    assert.deepStrictEqual(codes(replaced.lastReport()), ['policy-not-in-force']);
+});
 
 asyncTest('without standing access to the site no positive state is shown', async () => {
     const url = 'https://pinchat.im/static/chat.html?room=1';

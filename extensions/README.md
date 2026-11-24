@@ -273,7 +273,12 @@ scripts.
    when the packaged rules did not apply is the check of the extension's
    access to the site (point 1). If any of this fails, the document is
    stopped and marked failed. Service workers registered for the site are
-   removed; the site uses none.
+   removed; the site uses none. The probe's own violation, where a browser
+   reports it, is recognised by a marker drawn at random for the document
+   at the start of its handler, which the browser returns in the
+   violation's sample (the page policies carry `'report-sample'`, which
+   allows nothing). Every other violation is recorded, the page's first
+   one included.
 3. **Redirect guard** (both). An invite link carries its key after the `#`,
    and browsers carry that fragment across redirects, to another origin too.
    A document navigation on the site whose address carries a fragment may
