@@ -14,6 +14,7 @@ use tokio::sync::broadcast::error::RecvError;
 use tokio::time::{Duration, Instant, interval};
 use uuid::Uuid;
 
+use crate::config::max_image_payload_size;
 use crate::ip_hash::extract_client_ip_with_proxy;
 
 use crate::jwt::{WsResumeTokenClaims, WsTokenClaims, sign_resume_token, verify_token};
@@ -384,16 +385,6 @@ fn room_accepts_client_message(room_type: RoomType, msg_type: &str) -> bool {
 /// Minimum WebSocket message/frame size (512KB)
 /// Used as floor even for small image configs to support text messages and handshakes
 const MIN_WS_SIZE: usize = 524288;
-
-/// Images are Base64 inside an image JSON string, wrapped in the ratchet's
-/// plaintext JSON, encrypted, then Base64url encoded again. Reserve 1 KiB
-/// for both JSON envelopes (including escaping), the IV and the GCM tag.
-/// Integer ceilings cover padding at each encoding boundary. Configuration
-/// caps raw images at 2 MiB, so these operations are bounded.
-fn max_image_payload_size(max_image_size: usize) -> usize {
-    let inner_base64_size = max_image_size.div_ceil(3) * 4;
-    (inner_base64_size + 1024).div_ceil(3) * 4
-}
 
 /// Calculates maximum WebSocket message/frame size based on max_image_size
 /// Ensures sufficient headroom for the largest possible image payload
@@ -821,6 +812,22 @@ fn bump_protocol_error(state: &AppState, connection_id: Uuid) -> bool {
         true
     } else {
         false
+    }
+}
+
+/// Tell a sender that the room's traffic limit refused its message or
+/// image. A WebSocket write only says that a frame was buffered, so without
+/// this the sender cannot tell a refused message from a delivered one. Best
+/// effort: when the queue of direct answers is full the notice is dropped
+/// and the connection stays, since a busy room is not the sender's fault.
+fn notify_traffic_refused(direct_tx: &tokio::sync::mpsc::Sender<String>, kind: &str) {
+    let notice = Message::Error {
+        message: format!(
+            "The {kind} was not sent because the room is over its traffic limit; send it again in a moment."
+        ),
+    };
+    if let Ok(json) = serde_json::to_string(&notice) {
+        let _ = direct_tx.try_send(json);
     }
 }
 
@@ -2133,7 +2140,9 @@ async fn handle_socket(
                                     continue;
                                 }
                                 if wire_format == WIRE_PRIVATE_MESSAGE {
-                                    // Private messages are ephemeral.
+                                    // Private messages are ephemeral: the
+                                    // sender is told and may send it again.
+                                    notify_traffic_refused(&recv_direct_tx, "message");
                                     continue;
                                 }
                                 // WebSocketManager retains ordered controls
@@ -2436,14 +2445,14 @@ async fn handle_socket(
                                     payload.len(),
                                 ) {
                                     tracing::warn!(
-                                        "Room {} rejected traffic from {} at aggregate/sender budget",
-                                        room_id,
-                                        connection_id,
+                                        "Room rejected traffic at aggregate/sender budget"
                                     );
                                     // Aggregate pressure is not evidence that
                                     // this sender caused it. Drop this
                                     // ephemeral frame without severing the
-                                    // authenticated relay identity.
+                                    // authenticated relay identity, and say
+                                    // so: it used to vanish without a word.
+                                    notify_traffic_refused(&recv_direct_tx, &incoming.msg_type);
                                     continue;
                                 }
 

@@ -52,6 +52,16 @@ pub const DEFAULT_MAX_WS_CONNECTIONS: usize = 400;
 /// an office behind one address can still keep many rooms open.
 pub const DEFAULT_MAX_WS_CONNECTIONS_PER_ADDRESS: usize = DEFAULT_MAX_WS_CONNECTIONS / 8;
 
+/// Images are Base64 inside an image JSON string, wrapped in the ratchet's
+/// plaintext JSON, encrypted, then Base64url encoded again. Reserve 1 KiB
+/// for both JSON envelopes (including escaping), the IV and the GCM tag.
+/// Integer ceilings cover padding at each encoding boundary. Configuration
+/// caps raw images at 2 MiB, so these operations are bounded.
+pub(crate) fn max_image_payload_size(max_image_size: usize) -> usize {
+    let inner_base64_size = max_image_size.div_ceil(3) * 4;
+    (inner_base64_size + 1024).div_ceil(3) * 4
+}
+
 /// Application configuration loaded from environment variables
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -651,8 +661,19 @@ impl Config {
         if self.max_image_size > 2 * 1024 * 1024 {
             panic!("MAX_IMAGE_SIZE cannot exceed 2MB");
         }
-        if self.room_byte_rate_limit < self.max_image_size.saturating_mul(2) {
-            panic!("ROOM_BYTE_RATE_LIMIT must be at least twice MAX_IMAGE_SIZE");
+        // The room limit counts a picture as it travels, which is about 1.8
+        // times its raw size, and one member may take only half of it while
+        // another is present. Measured against twice the raw size, the
+        // limit could be set so low that the largest allowed picture never
+        // fit and was refused every time.
+        let encoded_image = max_image_payload_size(self.max_image_size);
+        if self.room_byte_rate_limit < encoded_image.saturating_mul(2) {
+            panic!(
+                "ROOM_BYTE_RATE_LIMIT must be at least {} bytes for MAX_IMAGE_SIZE={}: twice the size of the largest image as it is sent ({} bytes)",
+                encoded_image.saturating_mul(2),
+                self.max_image_size,
+                encoded_image
+            );
         }
     }
 
@@ -771,6 +792,26 @@ mod tests {
     fn unparsable_trusted_proxy_entry_is_refused_at_startup() {
         let mut c = base();
         c.trusted_proxies = vec!["172.18.0.1".to_string(), "nginx".to_string()];
+        c.validate();
+    }
+
+    #[test]
+    fn the_default_room_limit_carries_the_largest_image_allowed() {
+        let mut c = base();
+        c.max_image_size = 2 * 1024 * 1024;
+        c.validate();
+        assert!(c.room_byte_rate_limit >= 2 * max_image_payload_size(c.max_image_size));
+    }
+
+    #[test]
+    #[should_panic(expected = "ROOM_BYTE_RATE_LIMIT must be at least")]
+    fn a_room_limit_too_small_for_an_encoded_image_is_refused_at_startup() {
+        // Twice the raw size used to pass, but one member may take only half
+        // of the room limit and a 2 MiB image travels as about 3.6 MiB: such
+        // a room refused the largest image every time.
+        let mut c = base();
+        c.max_image_size = 2 * 1024 * 1024;
+        c.room_byte_rate_limit = 4 * 1024 * 1024;
         c.validate();
     }
 
