@@ -20,6 +20,26 @@ pub const CSRF_COOKIE_NAME: &str = "csrf_token";
 /// Header name CSRF-protected JSON APIs read the token from.
 pub const CSRF_HEADER_NAME: &str = "x-csrf-token";
 
+/// The value of the first cookie called `name`, looked up in every `Cookie`
+/// header line of the request, in order.
+///
+/// HTTP/2 lets a client send each cookie in a header field of its own
+/// (RFC 9113, section 8.2.3), and an HTTP/1.1 intermediary may do the same.
+/// Reading only the first line made a cookie on any later line invisible:
+/// the CSRF check then refused a request that carried a valid pair. Every
+/// cookie the relay reads goes through here.
+pub fn cookie_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    headers
+        .get_all(header::COOKIE)
+        .iter()
+        .filter_map(|line| line.to_str().ok())
+        .flat_map(|line| line.split(';'))
+        .find_map(|pair| {
+            let (key, value) = pair.trim().split_once('=')?;
+            (key == name).then_some(value)
+        })
+}
+
 /// Verify the double-submit CSRF token for a JSON API endpoint:
 ///   1. Read the `csrf_token` cookie. Must be present and HMAC-valid.
 ///   2. Read the `X-CSRF-Token` header. Must equal the cookie value.
@@ -28,20 +48,7 @@ pub const CSRF_HEADER_NAME: &str = "x-csrf-token";
 /// Same gating as `login_submit` so any state-changing API picks up the
 /// same protection without re-implementing the cookie parser.
 pub fn verify_csrf_for_api(headers: &HeaderMap, csrf_secret: &[u8; 32]) -> Result<(), Response> {
-    let cookie_header = headers.get(header::COOKIE).and_then(|h| h.to_str().ok());
-    let cookie_token = cookie_header.and_then(|cookies| {
-        cookies.split(';').find_map(|c| {
-            let c = c.trim();
-            if c.starts_with(&format!("{}=", CSRF_COOKIE_NAME)) {
-                Some(
-                    c.trim_start_matches(&format!("{}=", CSRF_COOKIE_NAME))
-                        .to_string(),
-                )
-            } else {
-                None
-            }
-        })
-    });
+    let cookie_token = cookie_value(headers, CSRF_COOKIE_NAME).map(str::to_owned);
 
     let cookie_token = match cookie_token {
         Some(t) => t,
@@ -253,28 +260,14 @@ pub async fn login_submit(
     }
 
     // Verify CSRF token from cookie matches form field
-    let all_cookies = headers.get(header::COOKIE).and_then(|h| h.to_str().ok());
-
     tracing::debug!("Processing login submission");
 
-    let csrf_cookie = all_cookies.and_then(|cookies| {
-        cookies.split(';').find_map(|c| {
-            let c = c.trim();
-            if c.starts_with(&format!("{}=", CSRF_COOKIE_NAME)) {
-                Some(
-                    c.trim_start_matches(&format!("{}=", CSRF_COOKIE_NAME))
-                        .to_string(),
-                )
-            } else {
-                None
-            }
-        })
-    });
+    let csrf_cookie = cookie_value(&headers, CSRF_COOKIE_NAME);
 
     match csrf_cookie {
         Some(cookie_token) => {
             // Verify both tokens are valid and match
-            if !verify_csrf_token(&cookie_token, &state.csrf_secret) {
+            if !verify_csrf_token(cookie_token, &state.csrf_secret) {
                 tracing::warn!("Invalid CSRF cookie token");
                 return login_error_response(
                     "Invalid security token. Please refresh the page.",
@@ -416,31 +409,12 @@ pub async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Respon
 
 /// Whether the request presented a session cookie at all, valid or not.
 fn request_carries_session_cookie(headers: &HeaderMap) -> bool {
-    let prefix = format!("{}=", SESSION_COOKIE_NAME);
-    headers
-        .get_all(header::COOKIE)
-        .iter()
-        .filter_map(|value| value.to_str().ok())
-        .flat_map(|cookies| cookies.split(';'))
-        .any(|cookie| cookie.trim().starts_with(&prefix))
+    cookie_value(headers, SESSION_COOKIE_NAME).is_some()
 }
 
 /// Helper to extract session ID from cookies
 pub fn extract_session_id(headers: &HeaderMap) -> Option<uuid::Uuid> {
-    headers
-        .get(header::COOKIE)
-        .and_then(|h| h.to_str().ok())
-        .and_then(|cookies| {
-            cookies.split(';').find_map(|c| {
-                let c = c.trim();
-                if c.starts_with(&format!("{}=", SESSION_COOKIE_NAME)) {
-                    let id_str = c.trim_start_matches(&format!("{}=", SESSION_COOKIE_NAME));
-                    uuid::Uuid::parse_str(id_str).ok()
-                } else {
-                    None
-                }
-            })
-        })
+    cookie_value(headers, SESSION_COOKIE_NAME).and_then(|id| uuid::Uuid::parse_str(id).ok())
 }
 
 /// Helper to create an error response for login failures
@@ -619,5 +593,38 @@ mod tests {
             "xpinchat_session=x"
         )));
         assert!(!request_carries_session_cookie(&HeaderMap::new()));
+    }
+
+    /// Cookies spread over several header lines, as HTTP/2 allows.
+    fn split_cookies(lines: &[&str]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        for line in lines {
+            headers.append(header::COOKIE, line.parse().unwrap());
+        }
+        headers
+    }
+
+    #[test]
+    fn cookies_are_read_from_every_cookie_line() {
+        use super::{CSRF_COOKIE_NAME, CSRF_HEADER_NAME, extract_session_id, verify_csrf_for_api};
+
+        let secret = [3u8; 32];
+        let token = crate::auth::generate_csrf_token(&secret);
+        let session = uuid::Uuid::new_v4();
+        let mut headers = split_cookies(&[
+            "pc_pow=x",
+            &format!("{CSRF_COOKIE_NAME}={token}"),
+            &format!("{SESSION_COOKIE_NAME}={session}"),
+        ]);
+        headers.insert(CSRF_HEADER_NAME, token.parse().unwrap());
+
+        assert!(verify_csrf_for_api(&headers, &secret).is_ok());
+        assert_eq!(extract_session_id(&headers), Some(session));
+        assert!(request_carries_session_cookie(&headers));
+        // The first occurrence still wins, whichever line it is on.
+        let headers = split_cookies(&["a=1", "a=2; b=3"]);
+        assert_eq!(super::cookie_value(&headers, "a"), Some("1"));
+        assert_eq!(super::cookie_value(&headers, "b"), Some("3"));
+        assert_eq!(super::cookie_value(&headers, "c"), None);
     }
 }
