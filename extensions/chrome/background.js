@@ -12,7 +12,8 @@
  * 3. Where the browser lets an extension hold a response body (Firefox),
  *    compares the bytes of every document navigation on the site with the
  *    signed hash before the parser sees them, and replaces anything else
- *    with a block page.
+ *    with a block page. The data files a page fetches (operator.json) are
+ *    held the same way and withheld unless they match.
  * 4. Refuses redirects that would take a document navigation off the site:
  *    an invite link carries its key in the URL fragment, and browsers carry
  *    the fragment across redirects.
@@ -132,6 +133,32 @@ const SITE_PATTERNS = OFFICIAL_ORIGINS.map((origin) => `${origin}/*`);
 // No signed page is anywhere near this size. A response that exceeds it is
 // not buffered further and is replaced by the block page.
 const MAX_DOCUMENT_BYTES = 2 * 1024 * 1024;
+
+// The redirects Firefox follows. A response with any other 3xx status is
+// shown as a page, its body included, Location header or not.
+const FOLLOWED_REDIRECTS = new Set([301, 302, 303, 307, 308]);
+
+// The packaged rules, read from the extension's own files, so that the
+// content script can tell the packaged policy from another one.
+let packagedRules = null;
+const packagedRulesLoaded = fetch(ext.runtime.getURL('rules.json'))
+    .then((response) => response.json())
+    .then((rules) => { packagedRules = rules; })
+    .catch(() => { /* the content script then compares nothing */ });
+
+/**
+ * Whether the extension may act on the site right now. Without it the
+ * browser applies none of the packaged rules to the site's responses, so no
+ * positive state can be based on them. A user can withhold it, or grant it
+ * only on request, in the browser's settings for the extension.
+ */
+async function hasHostAccess(url) {
+    try {
+        return await ext.permissions.contains({ origins: [`${new URL(url).origin}/*`] }) === true;
+    } catch {
+        return false;
+    }
+}
 
 // State of the signed manifest. One per extension, not per tab: it says
 // whether the yardstick is available, never whether a page measured up.
@@ -647,7 +674,7 @@ function forgetTab(tabId) {
  * A content script announces its document. Creates the record, attaching the
  * receipt of the response body check if this browser produced one.
  */
-function openDocument(sender, message) {
+function openDocument(sender, message, hostAccess) {
     const tabId = sender.tab.id;
     const url = V.documentUrl(sender.url || sender.tab.url);
     const record = {
@@ -668,6 +695,7 @@ function openDocument(sender, message) {
     record.own = [];
     if (record.policyInForce !== true) record.own.push(V.finding('policy-not-in-force'));
     if (record.workerControlled) record.own.push(V.finding('service-worker-controlled'));
+    if (hostAccess !== true) record.own.push(V.finding('no-host-access'));
 
     if (CAN_ATTEST) {
         const receipt = receipts.get(`${tabId}:0`);
@@ -833,7 +861,12 @@ function onDocumentHeaders(details) {
                 showBlockedPage(details, 'redirect-off-site');
                 return { cancel: true };
             }
-            return {};
+            // Only a redirect the browser follows has no body to check. A
+            // 300, a 304 or a 399 with a Location header is displayed, and
+            // goes through the same check as any other answer below.
+            if (FOLLOWED_REDIRECTS.has(details.statusCode) && String(location.value || '').trim() !== '') {
+                return {};
+            }
         }
 
         // The body of this response is about to arrive. If the filter is not
@@ -926,6 +959,87 @@ async function finishDocument(track) {
     inflight.delete(track.requestId);
 }
 
+/**
+ * Files of the signed release that a page reads as data: the legal pages
+ * fetch /static/operator.json for the operator's name and contacts. A script
+ * is held to its signed hash by the packaged policy and a stylesheet by the
+ * integrity attribute of an attested page, but nothing holds a fetched
+ * file, and a re-download by the content script proves nothing about the
+ * bytes the page was given. Where a response body can be held, a page is
+ * given such a file only if it matches the signed hash, and nothing
+ * otherwise. Keep in step with DATA_FILES in generate-hashes.js.
+ */
+const DATA_FILES = ['/static/operator.json'];
+
+/** requestId -> HTTP status of a data file response. */
+const dataFileStatus = new Map();
+
+function onDataFileRequest(details) {
+    try {
+        if (!isPinChatUrl(details.url)) return {};
+        const stream = ext.webRequest.filterResponseData(details.requestId);
+        const chunks = [];
+        let size = 0;
+        stream.ondata = (event) => {
+            size += event.data.byteLength;
+            if (size <= MAX_DOCUMENT_BYTES) chunks.push(new Uint8Array(event.data));
+        };
+        stream.onstop = () => { finishDataFile(details, stream, chunks, size); };
+        stream.onerror = () => { dataFileStatus.delete(details.requestId); };
+        return {};
+    } catch (error) {
+        console.error('[PinChat Verify] Could not hold a data file:', error);
+        return { cancel: true };
+    }
+}
+
+async function finishDataFile(details, stream, chunks, size) {
+    const path = new URL(details.url).pathname;
+    const status = dataFileStatus.get(details.requestId);
+    dataFileStatus.delete(details.requestId);
+    let released = new Uint8Array(0);
+    let differs = false;
+    try {
+        await ensureManifest();
+        const entry = manifestVerdict() === 'valid'
+            ? (verificationState.manifest.files || []).find((file) => file.path === path) : null;
+        if (entry && size <= MAX_DOCUMENT_BYTES) {
+            const body = new Uint8Array(size);
+            let offset = 0;
+            for (const chunk of chunks) {
+                body.set(chunk, offset);
+                offset += chunk.byteLength;
+            }
+            if (toHex(await crypto.subtle.digest('SHA-256', body)) === String(entry.hash).toLowerCase()) {
+                released = body;
+            } else {
+                // An error answer is not the file; it is withheld, not failed.
+                differs = !(status >= 400);
+            }
+        }
+    } catch (error) {
+        console.error('[PinChat Verify] Data file check failed:', error);
+    }
+    try { stream.write(released); } catch { /* the request is gone */ }
+    try { stream.close(); } catch { /* already closed */ }
+    if (differs) failDocumentForDataFile(details, path);
+}
+
+/** The page shown in the tab was handed a data file that is not the signed one. */
+function failDocumentForDataFile(details, path) {
+    restoreSessionState().then(() => {
+        const record = documents.get(details.tabId);
+        if (!record || record.url !== V.documentUrl(details.documentUrl || details.originUrl || '')) return;
+        const entry = V.finding('file-hash-mismatch', `${path}: the page was given other bytes, which were withheld`);
+        if (record.own.some((own) => own.code === entry.code && own.detail === entry.detail)) return;
+        record.own.push(entry);
+        record.findings = [...record.own, ...record.reported];
+        evaluate(record);
+        persistSessionState();
+        pushVerdict(record);
+    });
+}
+
 if (CAN_ATTEST) {
     // Registered synchronously at start-up so that a navigation which wakes
     // the event page is already covered.
@@ -934,6 +1048,14 @@ if (CAN_ATTEST) {
     ext.webRequest.onHeadersReceived.addListener(
         onDocumentHeaders, documentRequests, ['blocking', 'responseHeaders'],
     );
+    const dataFileRequests = {
+        urls: OFFICIAL_ORIGINS.flatMap((origin) => DATA_FILES.map((file) => `${origin}${file}*`)),
+        types: ['xmlhttprequest'],
+    };
+    ext.webRequest.onBeforeRequest.addListener(onDataFileRequest, dataFileRequests, ['blocking']);
+    ext.webRequest.onHeadersReceived.addListener((details) => {
+        dataFileStatus.set(details.requestId, details.statusCode);
+    }, dataFileRequests);
     const forget = (details) => {
         const track = inflight.get(details.requestId);
         if (track && (track.filterFailed || !track.stream || track.stream.status !== 'transferringdata')) {
@@ -1002,9 +1124,15 @@ ext.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
     if (message.type === 'DOCUMENT_OPENED') {
         if (!isSenderTrusted(sender, 'content')) return false;
-        Promise.all([restoreSessionState(), ensureManifest()]).then(() => {
-            const record = openDocument(sender, message);
-            sendResponse({ ...manifestForContent(), verdict: publicView(record) });
+        Promise.all([
+            restoreSessionState(), ensureManifest(), hasHostAccess(sender.url), packagedRulesLoaded,
+        ]).then(([, , hostAccess]) => {
+            const record = openDocument(sender, message, hostAccess);
+            sendResponse({
+                ...manifestForContent(),
+                expectedPolicy: V.packagedPolicy(packagedRules, record.url),
+                verdict: publicView(record),
+            });
         });
         return true;
     }
