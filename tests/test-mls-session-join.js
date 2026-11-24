@@ -2289,9 +2289,14 @@ async function main() {
             if (!synchronousEchoSent
                 && envelope.wire_format === WireFormat.MLS_PUBLIC_MESSAGE) {
                 synchronousEchoSent = true;
+                // The echo must carry the creator's own relay sender_id:
+                // only an own exact echo may bypass the operation queue.
+                // Any other sender_id queues behind the send that is
+                // waiting for it, and the test used to deadlock here,
+                // which let Node exit 0 with the rest of the suite unrun.
                 return creator.onRelayEnvelope({
                     ...envelope,
-                    sender_id: 'creator-synchronous-self',
+                    sender_id: 'creator-self',
                 });
             }
             return true;
@@ -2754,6 +2759,14 @@ async function main() {
     console.log(`mls-session-join: ${passed} passed, ${failed} failed`);
     process.exit(failed === 0 ? 0 : 1);
 }
+
+// A promise that never settles (for example a mutex deadlock) drains the
+// event loop, and Node then exits 0 although main() never finished. Treat
+// that as a failure instead of a silent pass.
+process.on('beforeExit', () => {
+    console.error(`fatal: main() stalled after ${passed} passed, ${failed} failed`);
+    process.exit(3);
+});
 
 main().catch((err) => {
     console.error('fatal:', err);
