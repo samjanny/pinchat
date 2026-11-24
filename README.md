@@ -1,5 +1,14 @@
 # PinChat
 
+[![CI](https://github.com/samjanny/pinchat/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/samjanny/pinchat/actions/workflows/ci.yml)
+[![Security audit](https://github.com/samjanny/pinchat/actions/workflows/audit.yml/badge.svg?branch=main)](https://github.com/samjanny/pinchat/actions/workflows/audit.yml)
+[![SRI consistency](https://github.com/samjanny/pinchat/actions/workflows/sri-check.yml/badge.svg?branch=main)](https://github.com/samjanny/pinchat/actions/workflows/sri-check.yml)
+[![Docker build](https://github.com/samjanny/pinchat/actions/workflows/docker.yml/badge.svg?branch=main)](https://github.com/samjanny/pinchat/actions/workflows/docker.yml)
+[![Release](https://img.shields.io/github/v/release/samjanny/pinchat)](https://github.com/samjanny/pinchat/releases/latest)
+[![License](https://img.shields.io/github/license/samjanny/pinchat)](LICENSE)
+[![Firefox add-on](https://img.shields.io/amo/v/pinchat-integrity-verifier?label=Firefox%20add-on)](https://addons.mozilla.org/firefox/addon/pinchat-integrity-verifier/)
+[![Status: experimental, not audited](https://img.shields.io/badge/status-experimental%2C%20not%20audited-red)](#audit-status)
+
 > ## EXPERIMENTAL TEST PROJECT, NOT FOR HIGH-SECURITY USE
 >
 > **PinChat is an experimental test and research project.** It has **not** been
@@ -40,7 +49,10 @@ replacement for Signal, WhatsApp, Matrix, Session, or SimpleX.
   before reaching the relay.
 - **Ephemeral rooms.** Rooms expire after a configurable TTL, 1 to 1440
   minutes. Application state is kept in RAM.
-- **No accounts by default.** Anonymous rooms require no registration.
+- **No accounts.** Nobody registers. A deployment is either gated by a shared
+  site password (`PINCHAT_PASSWORD_HASHES`) or explicitly open
+  (`ALLOW_ANONYMOUS=true`); with neither, the server refuses to start outside
+  `PRIVACY_MODE=development`.
 - **Encrypted media.** Images use the same client-side encryption path as text.
 - **SAS verification.** A Short Authentication String lets participants
   authenticate the session out of band and detect an active MITM.
@@ -87,7 +99,7 @@ what software sits between them and the network.
 
 | Configuration | What you actually get |
 |---|---|
-| **SAS verified, integrity extension installed** | Client-side AEAD with the Double Ratchet. The extension blocks scripts outside a packaged per-page hash allowlist and checks assets against a signed manifest. Peer identity confirmed out of band. **No external audit**, best-effort assurance only. |
+| **SAS verified, integrity extension installed** | Client-side AEAD with the Double Ratchet. The extension blocks scripts outside a packaged per-page hash allowlist and checks assets against a signed manifest. In Firefox it also checks the page HTML before it is parsed; Chromium gives an extension no way to do that (see [Browser extensions](#browser-extensions)). Peer identity confirmed out of band. **No external audit**, best-effort assurance only. |
 | **SAS verified, no extension** | Client-side AEAD with the Double Ratchet. Peer identity confirmed out of band. The server can still serve modified JavaScript on the next reload and you have no automatic way to notice. |
 | **SAS skipped** | Client-side AEAD with the Double Ratchet. Traffic is encrypted and a passive observer cannot read it. But the server operator, or anyone with active relay access, could have substituted both parties' identity keys during the ECDH exchange and now sits in the middle as an authenticated peer to each side. Encryption without peer authentication. |
 
@@ -154,9 +166,12 @@ specified in [PROTOCOL.md](PROTOCOL.md).
 
 ## Architecture
 
-**Backend.** Rust with Tokio, Axum, WebSocket over TLS or behind a
-TLS-terminating reverse proxy, application state in memory, rate limiting via
-tower-governor with HMAC-hashed IPs, proof-of-work anti-spam.
+**Backend.** Rust with Tokio and Axum, over TLS or behind a TLS-terminating
+reverse proxy. The WebSocket transport is the relay's own
+(`src/ws_transport.rs`), fuzzed in `fuzz/` and run against the Autobahn
+conformance suite in `tests/autobahn/`. Application state lives in memory.
+Rate limiting uses tower-governor with HMAC-hashed IPs, alongside
+proof-of-work anti-spam and a cap on open WebSocket connections.
 
 **Frontend.** Vanilla JavaScript with Alpine.js (CSP build), WebCrypto,
 responsive CSS. No build step. The application markup lives in signed
@@ -169,10 +184,13 @@ they are sent (`static/js/image-metadata.js`).
 
 ### Prerequisites
 
-- Rust 1.75 or later
+- Rust 1.88 or later (the Docker image builds with 1.90)
+- A Unix-like system such as Linux for a native build. The server uses Unix
+  socket APIs and does not compile on Windows; there, use WSL or Docker
 - OpenSSL, for local certificate generation
 - A modern browser with WebCrypto support
-- Node.js 18+ to run the JS test suites; the client itself is build-less
+- Node.js 20 or later to run the JS test suites (CI runs 20); the client
+  itself is build-less
 
 ### Install and run
 
@@ -180,12 +198,12 @@ they are sent (`static/js/image-metadata.js`).
 git clone https://github.com/samjanny/pinchat.git
 cd pinchat
 
-mkdir -p certs
-openssl req -x509 -newkey rsa:4096 \
-    -keyout certs/key.pem \
-    -out certs/cert.pem \
-    -days 365 -nodes \
-    -subj "/CN=localhost"
+./generate-certs.sh   # self-signed certificate for localhost in certs/
+
+cp .env.example .env
+# edit .env: set ALLOW_ANONYMOUS=true for an open local instance, or put an
+# Argon2id hash in PINCHAT_PASSWORD_HASHES, made with
+#   cargo run --release --bin generate_hash   (asks for the password)
 
 cp static/operator.example.json static/operator.json
 # edit static/operator.json with your real contact, hosting provider, etc.
@@ -196,6 +214,11 @@ cargo run --release
 Then open `https://localhost:3000`. The browser will warn about the
 self-signed certificate in local development.
 
+The server reads `.env` at startup and fails closed: with no password hash
+and without `ALLOW_ANONYMOUS=true` it exits with "Authentication is not
+configured". `PRIVACY_MODE=development` lifts that check too, for local work
+only.
+
 `static/operator.json` fills in operator-specific values on the legal pages
 (support email, DPA information, hosting note, last-updated date). It is
 gitignored and deployment-specific, typically served from `WEBSITE_DIR` in
@@ -205,8 +228,12 @@ production. If it is missing the legal pages still render, with placeholders.
 
 ```bash
 ./generate-certs.sh
+cp .env.example .env   # then set HOST=0.0.0.0 and an access mode, as above
 docker compose up --build
 ```
+
+Inside the container the server has to listen on `0.0.0.0`: bound to the
+`127.0.0.1` of `.env.example`, it never answers the published port.
 
 When upgrading a running deployment, build first and dry-run the new image
 against the real `.env` before switching, since the server refuses to start
@@ -235,11 +262,14 @@ cargo test                  # Rust server-side tests
 node tests/run-all-tests.js # JavaScript crypto suites
 ```
 
-The JS runner has ten suites. Nine (`chain`, `double`, `security`, `sasgate`,
-`correctness`, `pfs`, `kat`, `wycheproof`, `fuzz`) run without external
-dependencies. Only `properties` needs `npm ci` for `fast-check`. Without the
-dev dependencies the runner reports that suite as `[SKIP]` and still exits 0,
-so a fresh clone with no npm access still gets the primitives coverage.
+The JS runner has 47 suites: the 1:1 ratchet and SAS gate, known-answer and
+Wycheproof vectors, the MLS group code, the extension's verdict logic, and the
+client's handling of served markup, images and reconnects. A suite name runs
+that suite only, for example `node tests/run-all-tests.js double`. All of
+them run without external dependencies except `properties`, which needs
+`npm ci` for `fast-check`. Without the dev dependencies the runner reports
+that suite as `[SKIP]` and still exits 0, so a fresh clone with no npm access
+still gets the rest of the coverage.
 
 Longer fuzz campaigns, the default smoke run being 5 seconds:
 
@@ -247,6 +277,12 @@ Longer fuzz campaigns, the default smoke run being 5 seconds:
 node tests/run-fuzz.js 3600   # 1 hour
 node tests/run-fuzz.js 86400  # 24 hours
 ```
+
+Not part of CI, each with its requirements at the top of its file or README:
+`tests/extension-browser/run.js` drives the extension in headless Chromium
+and Firefox against a hostile origin, `tests/layout-browser/run.js` checks
+the pages at phone widths, `fuzz/` fuzzes the WebSocket transport with
+cargo-fuzz, and `tests/autobahn/` runs it against the Autobahn suite.
 
 ## Configuration
 
@@ -260,10 +296,11 @@ hosting-provider logs.
 | `HOST` | `127.0.0.1` | Server bind address |
 | `PORT` | `3000` | Server port |
 | `PRIVACY_MODE` | `strict` | Logging profile: `strict`, `minimal`, `development` |
-| `FORCE_HTTP` | `false` | Allow HTTP for reverse-proxy deployments |
+| `FORCE_HTTP` | `false` | Allow HTTP for reverse-proxy deployments. Outside `development` it also needs `FORCE_SECURE_COOKIES=true` and a non-empty `TRUSTED_PROXIES`, or the server refuses to start |
 | `FORCE_SECURE_COOKIES` | `false` | Force the Secure cookie flag |
 | `CORS_ALLOWED_ORIGINS` | `https://localhost:3000` | Comma-separated origins for CORS and the WebSocket Origin check. Required in production: must include your public origin or the WebSocket upgrade fails with 403 |
 | `MAX_TOTAL_ROOMS` | `500` | Maximum concurrent rooms, sized for a 512 MiB memory limit (see "Relay Memory" in SECURITY.md); raise it only with more memory |
+| `GROUP_CHAT_ENABLED` | `false` | MLS group rooms of up to 20 members. Off, group-room creation answers 404 |
 | `MAX_WS_CONNECTIONS` | `400` | WebSocket connections open at once. An upgrade beyond it is refused with 503 and `Retry-After`, before anything is allocated for it; the token and room endpoints refuse with the same answer before the proof of work. Sized for a 512 MiB container |
 | `MAX_WS_CONNECTIONS_PER_ADDRESS` | `50` | WebSocket connections open at once from one client address (an IPv6 /64; an IPv6 /48 may hold four times as many). Beyond it: 429 and `Retry-After` |
 | `CSP_WS_HOST` | `'self'` | Extra WebSocket origins allowed by the CSP |
@@ -272,20 +309,34 @@ hosting-provider logs.
 | `ROOM_TOKEN_BURST_SIZE` | `100` | Room and token requests per window, per client address, counted after the session check |
 | `ROOM_TOKEN_PERIOD_SECS` | `600` | Window over which the room and token budget refills evenly |
 | `MSG_RATE_LIMIT` | `30` | Messages per connection per window |
-| `MSG_RATE_WINDOW_SECS` | `1` | Window for per-connection message rate limiting |
+| `MSG_RATE_WINDOW_SECS` | `1` | Window for per-connection message rate limiting, also used by the per-room and frame limits below |
+| `ROOM_MSG_RATE_LIMIT` | `120` | Messages per room per window, all members together |
+| `ROOM_BYTE_RATE_LIMIT` | `8MB` | Payload bytes per room per window, MLS traffic counted after Base64url decoding. 64KB to 64MB, and at least twice `MAX_IMAGE_SIZE` |
+| `FRAME_RATE_LIMIT` | `120` | Frames of any type per connection per window, malformed ones included; beyond it the connection is closed. At least `MSG_RATE_LIMIT` |
+| `PROTOCOL_ERROR_LIMIT` | `10` | A connection is closed once it has sent this many malformed or unknown frames |
+| `ECDH_BURST_LIMIT` | `8` | Key-exchange frames per connection per `ECDH_BURST_WINDOW_SECS`; beyond it the connection is closed |
+| `ECDH_BURST_WINDOW_SECS` | `60` | Window for the key-exchange limit |
+| `COMMIT_RATE_LIMIT` | `24` | MLS Commits per connection per `COMMIT_RATE_WINDOW_SECS`. 24 lets a creator fill a 20-member room in one burst |
+| `COMMIT_RATE_WINDOW_SECS` | `60` | Window for the Commit limit |
+| `PROPOSAL_RATE_LIMIT` | `8` | Standalone MLS Update proposals per connection per `PROPOSAL_RATE_WINDOW_SECS` |
+| `PROPOSAL_RATE_WINDOW_SECS` | `60` | Window for the proposal limit |
 | `POW_MIN_DIFFICULTY` | `12` | Minimum proof-of-work difficulty, in bits |
 | `POW_MAX_DIFFICULTY` | `18` | Maximum proof-of-work difficulty, in bits |
 | `CHALLENGE_TTL_SECS` | `300` | Proof-of-work challenge TTL |
-| `JWT_TOKEN_TTL_SECS` | `30` | WebSocket JWT TTL |
+| `JWT_TOKEN_TTL_SECS` | `30` | WebSocket JWT TTL, 1 to 300 |
+| `JWT_ISSUER` | `pinchat` | Issuer the WebSocket JWT must carry. Set it explicitly when several instances share one signing key |
+| `MAX_WS_CONNECTION_AGE_SECS` | `1800` | Lifetime of a WebSocket connection. The client then reconnects through proof of work, a new token and the handshake |
+| `WS_RECONNECT_GRACE_SECS` | `20` | How long a disconnected participant's place is held for its resume credential, 1 to 120 |
 | `ROOM_CLEANUP_INTERVAL_SECS` | `60` | Room cleanup interval |
 | `CHALLENGE_CLEANUP_INTERVAL_SECS` | `60` | Proof-of-work cache cleanup interval |
-| `PINCHAT_PASSWORD_HASHES` | empty | Semicolon-separated Argon2id hashes. Empty disables password auth |
+| `PINCHAT_PASSWORD_HASHES` | empty | Semicolon-separated Argon2id hashes. Empty disables password auth, and the server then needs `ALLOW_ANONYMOUS=true` to start |
+| `ALLOW_ANONYMOUS` | `false` | Open access with no password. Required when `PINCHAT_PASSWORD_HASHES` is empty, outside `development` |
 | `SESSION_TTL_SECS` | `86400` | Session lifetime |
 | `LOGIN_BURST_SIZE` | `5` | Login attempts per window, per client address |
 | `LOGIN_PERIOD_SECS` | `720` | Window over which the login budget refills evenly. Windows that would keep a hashed client address for more than 15 minutes are shortened at startup; see `.env.example` |
 | `TRUSTED_PROXIES` | empty | Comma-separated proxy IPs or CIDRs trusted for `X-Forwarded-For`. Set this behind a reverse proxy, or every client shares one rate-limit bucket |
-| `REPLAY_CACHE_MAX_PER_ROOM` | `1000` | Anti-replay entries per room. Advisory only; the authoritative check is the client-side Double Ratchet counter |
-| `MAX_IMAGE_SIZE` | `300KB` | Maximum image size, bytes or with a `KB` or `MB` suffix |
+| `REPLAY_CACHE_MAX_PER_ROOM` | `1000` | Anti-replay entries per room, at most 10000. Advisory only; the authoritative check is the client-side Double Ratchet counter |
+| `MAX_IMAGE_SIZE` | `300KB` | Maximum image size, bytes or with a `KB` or `MB` suffix, 1KB to 2MB |
 | `WEBSITE_DIR` | empty | Custom static directory, falling back to `/static` |
 
 ### Privacy modes
@@ -308,17 +359,28 @@ Before a page is parsed the extension replaces the response CSP with a
 packaged per-page script-hash allowlist, so the origin is not trusted for
 scripts at all and unknown paths get `script-src 'none'`. It then verifies the
 signed manifest, checks the `integrity` attributes present in the DOM, and
-re-fetches every listed asset to compare its SHA-256. A mismatch raises a
-full-page warning.
+re-fetches every listed asset to compare its SHA-256. It also refuses
+redirects that would carry an invite link's key off the site. A mismatch
+raises a full-page warning.
+
+The two browsers do not give the same guarantee. Firefox lets the extension
+hold the page HTML as it arrives and compare it with the signed hash before it
+is parsed, so a page the server altered is replaced by a block page. Chromium
+gives a Manifest V3 extension no way to do that: there the best state is
+"partially verified", meaning only signed scripts can run but the page itself
+is not attested. Use Firefox when the server must not be trusted with the
+page.
 
 This blocks newly injected scripts and detects broader static-file tampering.
-It does not make the delivered HTML immutable and it does not protect against
-bugs in already-trusted client code. It is not a substitute for native
+It does not protect against bugs in already-trusted client code, and without
+the extension none of it applies. It is not a substitute for native
 application distribution, reproducible builds, independent audits, endpoint
 security, or careful operational practice.
 
-See [extensions/README.md](extensions/README.md) for setup, installation, and
-packaging.
+See [extensions/README.md](extensions/README.md) for every verifier state,
+the per-browser table of attacks, setup, installation, and packaging. The
+Firefox build is published on
+[addons.mozilla.org](https://addons.mozilla.org/firefox/addon/pinchat-integrity-verifier/).
 
 ## Recommended practices
 
@@ -334,6 +396,15 @@ updated, and do not rely on PinChat for high-risk communications.
 - [SECURITY.md](SECURITY.md), threat model and cryptographic specifications
 - [PROTOCOL.md](PROTOCOL.md), protocol specification and message formats
 - [extensions/README.md](extensions/README.md), integrity verifier extensions
+- [static/js/mls/README.md](static/js/mls/README.md), the MLS group
+  implementation and its limits
+- [docs/reverse-proxy.md](docs/reverse-proxy.md), running the relay behind
+  nginx on a small host
+- [docs/design-decisions.md](docs/design-decisions.md), design decisions and
+  their reasons
+- [docs/accountability-log-policy.md](docs/accountability-log-policy.md), log
+  policy and accountability record
+- [tests/README.md](tests/README.md), the JavaScript test suites
 - [CHANGELOG.md](CHANGELOG.md), version history, following Keep a Changelog
 - `NOTICE`, third-party asset attribution
 
