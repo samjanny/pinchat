@@ -332,10 +332,9 @@ pub async fn room_page(
             room.created_at,
         ),
         None => {
-            tracing::warn!(
-                "Room page access failed - Room {}... not found",
-                short_room_id(&room_id)
-            );
+            // No part of the room id in warnings: minimal privacy mode
+            // keeps them, and they must not record which rooms existed.
+            tracing::warn!("Room page access failed - room not found");
             return Err((StatusCode::NOT_FOUND, "Room not found").into_response());
         }
     };
@@ -362,8 +361,7 @@ pub async fn room_page(
     // still removed eagerly rather than waiting for the cleanup tick.
     if room_is_expired {
         tracing::warn!(
-            "Room page access failed - Room {}... has expired (ttl_minutes: {})",
-            short_room_id(&room_id),
+            "Room page access failed - room has expired (ttl_minutes: {})",
             ttl_minutes
         );
         state.remove_room(&room_id);
@@ -376,10 +374,7 @@ pub async fn room_page(
     // existence to callers probing random UUIDs. UUIDv4 (122 bits) makes blind
     // enumeration infeasible, but unified responses remove a metadata side-channel.
     if room_is_full {
-        tracing::warn!(
-            "Room page access failed - Room {}... is full",
-            short_room_id(&room_id)
-        );
+        tracing::warn!("Room page access failed - room is full");
         return Err((StatusCode::NOT_FOUND, "Room not found").into_response());
     }
 

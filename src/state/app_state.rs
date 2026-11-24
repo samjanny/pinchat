@@ -423,6 +423,18 @@ pub enum BroadcastError {
     GlobalByteCapacity,
 }
 
+/// Which limits a frame meets in the broadcast budgets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BroadcastPriority {
+    /// A frame a client sent, or one a test stands in for: refused when a
+    /// budget is full.
+    Ordinary,
+    /// A join or leave the relay announces itself. Never refused: it is
+    /// counted like any frame, so clients see the room it takes, but a full
+    /// budget must neither drop it nor close the room it belongs to.
+    RelayEvent,
+}
+
 /// Outcome of recording a relay replay identity for a room.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReplayAdmission {
@@ -646,6 +658,9 @@ pub enum MlsControlAppendError {
     WelcomeNotCorrelated,
     UnknownKeyPackageRef,
     DuplicateKeyPackageRef,
+    /// The group has consumed `MAX_CONSUMED_MLS_KEY_PACKAGE_REFS`
+    /// KeyPackages and can admit nobody more. Final: retrying cannot help.
+    KeyPackageRefsExhausted,
 }
 
 /// Relay-visible admission metadata for an ordered MLS envelope. The relay
@@ -1022,12 +1037,7 @@ impl AppState {
         );
         for connection_id in connection_ids {
             self.connections.remove(&connection_id);
-            self.connection_message_timestamps.remove(&connection_id);
-            self.connection_commit_timestamps.remove(&connection_id);
-            self.connection_proposal_timestamps.remove(&connection_id);
-            self.connection_frame_timestamps.remove(&connection_id);
-            self.connection_protocol_errors.remove(&connection_id);
-            self.connection_ecdh_timestamps.remove(&connection_id);
+            self.remove_connection_limits(&connection_id);
         }
 
         // Remove the broadcast channel
@@ -1151,14 +1161,28 @@ impl AppState {
     /// transport. Membership and limiter state are removed together after the
     /// reconnect grace period.
     pub fn detach_connection(&self, connection_id: &Uuid) -> Option<Uuid> {
-        if let Some((_, room_id)) = self.connections.remove(connection_id) {
-            if let Some(mut room) = self.rooms.get_mut(&room_id) {
-                room.update_activity();
-            }
-            Some(room_id)
-        } else {
-            None
-        }
+        self.detach_connection_counted(connection_id)
+            .map(|(room_id, _)| room_id)
+    }
+
+    /// [`Self::detach_connection`], also returning the count of this detach
+    /// (`Room::record_detach`). The grace timer passes it to
+    /// [`Self::finalize_disconnection_at`].
+    ///
+    /// The socket's entry is held while the detach is counted, so that a
+    /// resume and a further detach cannot both fall between the two and
+    /// leave this detach with the count of the later one.
+    pub fn detach_connection_counted(&self, connection_id: &Uuid) -> Option<(Uuid, u64)> {
+        let Entry::Occupied(active) = self.connections.entry(*connection_id) else {
+            return None;
+        };
+        let room_id = *active.get();
+        let detach_count = self.rooms.get_mut(&room_id).map(|mut room| {
+            room.update_activity();
+            room.record_detach(*connection_id)
+        });
+        active.remove();
+        Some((room_id, detach_count.unwrap_or(0)))
     }
 
     /// Remove a grace-reserved participant only if no newer active socket has
@@ -1169,10 +1193,27 @@ impl AppState {
         connection_id: &Uuid,
         expected_room_id: Uuid,
     ) -> Option<usize> {
+        self.finalize_disconnection_at(connection_id, expected_room_id, None)
+    }
+
+    /// [`Self::finalize_disconnection`] for the grace timer of one detach.
+    /// With `Some(count)`, nothing happens unless that detach is still the
+    /// participant's latest: a socket that resumed and was detached again
+    /// started a grace period of its own, and only that period's timer may
+    /// end it.
+    pub fn finalize_disconnection_at(
+        &self,
+        connection_id: &Uuid,
+        expected_room_id: Uuid,
+        detach_count: Option<u64>,
+    ) -> Option<usize> {
         match self.connections.entry(*connection_id) {
             Entry::Occupied(_) => None,
             Entry::Vacant(_reservation) => {
                 let mut room = self.rooms.get_mut(&expected_room_id)?;
+                if detach_count.is_some_and(|count| room.detach_count(connection_id) != count) {
+                    return None;
+                }
                 if !room.remove_participant(connection_id) {
                     return None;
                 }
@@ -1180,17 +1221,50 @@ impl AppState {
                 let participant_count = room.participant_count();
                 drop(room);
 
-                self.connection_message_timestamps.remove(connection_id);
-                self.connection_commit_timestamps.remove(connection_id);
-                self.connection_proposal_timestamps.remove(connection_id);
-                self.connection_frame_timestamps.remove(connection_id);
-                self.connection_protocol_errors.remove(connection_id);
-                self.connection_ecdh_timestamps.remove(connection_id);
+                self.remove_connection_limits(connection_id);
                 self.forget_mls_control_participant(expected_room_id, connection_id);
 
                 Some(participant_count)
             }
         }
+    }
+
+    /// The rate-limit and protocol-error state of one relay identity.
+    fn remove_connection_limits(&self, connection_id: &Uuid) {
+        self.connection_message_timestamps.remove(connection_id);
+        self.connection_commit_timestamps.remove(connection_id);
+        self.connection_proposal_timestamps.remove(connection_id);
+        self.connection_frame_timestamps.remove(connection_id);
+        self.connection_protocol_errors.remove(connection_id);
+        self.connection_ecdh_timestamps.remove(connection_id);
+    }
+
+    /// Erase the rate-limit state of an identity that has no active socket
+    /// and holds no slot in any room.
+    ///
+    /// Room teardown, an eviction and the end of a grace period erase that
+    /// state, but the receive loop of a socket that is still running can
+    /// record one more frame after them: it checks that its identity is
+    /// active, then counts the frame, and the teardown can fall in between.
+    /// Nothing else would ever remove what it recorded. Called once such a
+    /// socket has ended, when nothing can record anything for it any more.
+    ///
+    /// Rare (a socket whose identity was taken away while it ran), so it
+    /// may look through every room. The vacant entry is held throughout:
+    /// an admission of the identity cannot fall between the check and the
+    /// removal.
+    pub fn forget_departed_identity(&self, connection_id: &Uuid) {
+        let Entry::Vacant(_not_admitted) = self.connections.entry(*connection_id) else {
+            return;
+        };
+        if self
+            .rooms
+            .iter()
+            .any(|room| room.participant_ids.contains(connection_id))
+        {
+            return;
+        }
+        self.remove_connection_limits(connection_id);
     }
 
     /// Immediate removal for setup failures and explicit administrative
@@ -1235,12 +1309,7 @@ impl AppState {
         let participant_count = room.participant_count();
         drop(room);
 
-        self.connection_message_timestamps.remove(connection_id);
-        self.connection_commit_timestamps.remove(connection_id);
-        self.connection_proposal_timestamps.remove(connection_id);
-        self.connection_frame_timestamps.remove(connection_id);
-        self.connection_protocol_errors.remove(connection_id);
-        self.connection_ecdh_timestamps.remove(connection_id);
+        self.remove_connection_limits(connection_id);
         self.forget_mls_control_participant(expected_room_id, connection_id);
 
         Some(participant_count)
@@ -1491,17 +1560,32 @@ impl AppState {
 
     /// Count `retained_bytes` against the room, the sender's address and the
     /// relay as a whole, or against none of them.
+    ///
+    /// A relay event is counted against the room and the relay without a
+    /// limit. Those are the joins and leaves the relay announces, about 130
+    /// bytes each, and there are few of them in flight: one for each slot
+    /// of a room's ring at most, plus the one each receiver is writing, so
+    /// about 11 KiB a room. Refusing one dropped it in a one-to-one room and
+    /// closed a group, because the group's order of controls could no longer
+    /// say who was a member.
     fn reserve_broadcast_bytes(
         &self,
         room_id: &Uuid,
         retained_bytes: usize,
         sender: Option<&ClientBroadcastLease>,
+        priority: BroadcastPriority,
     ) -> Result<(Arc<AtomicUsize>, Option<Arc<AtomicUsize>>), BroadcastError> {
         let room_bytes = self
             .broadcast_room_bytes
             .get(room_id)
             .map(|entry| entry.value().clone())
             .ok_or(BroadcastError::MissingRoom)?;
+        if priority == BroadcastPriority::RelayEvent {
+            room_bytes.fetch_add(retained_bytes, Ordering::SeqCst);
+            self.broadcast_global_bytes
+                .fetch_add(retained_bytes, Ordering::SeqCst);
+            return Ok((room_bytes, None));
+        }
         if !Self::reserve_bytes(
             room_bytes.as_ref(),
             retained_bytes,
@@ -1544,10 +1628,11 @@ impl AppState {
         room_id: &Uuid,
         json: String,
         sender: Option<&ClientBroadcastLease>,
+        priority: BroadcastPriority,
     ) -> Result<BroadcastPayload, BroadcastError> {
         let retained_bytes = json.len();
         let (room_bytes, client_bytes) =
-            self.reserve_broadcast_bytes(room_id, retained_bytes, sender)?;
+            self.reserve_broadcast_bytes(room_id, retained_bytes, sender, priority)?;
         Ok(BroadcastPayload(Arc::new(BroadcastPayloadInner {
             json,
             retained_bytes,
@@ -1558,9 +1643,10 @@ impl AppState {
         })))
     }
 
-    /// Broadcast one ephemeral room frame that the relay produced itself,
-    /// under the per-room and global byte budgets. The returned value is the
-    /// number of active receivers.
+    /// Broadcast one ephemeral frame of no address under the per-room and
+    /// global byte budgets, refused like a client's frame when one is full.
+    /// The returned value is the number of active receivers.
+    #[cfg(test)]
     pub fn broadcast_room_message(
         &self,
         room_id: &Uuid,
@@ -1569,8 +1655,31 @@ impl AppState {
         self.broadcast_room_message_from(room_id, json, None)
     }
 
+    /// Broadcast a join or leave of a one-to-one room. It is counted in the
+    /// broadcast budgets but never refused by them (see
+    /// [`BroadcastPriority::RelayEvent`]); the only error is a room that is
+    /// gone. Group rooms sequence theirs through
+    /// [`Self::append_and_broadcast_mls_lifecycle`] instead.
+    pub fn broadcast_relay_event(
+        &self,
+        room_id: &Uuid,
+        json: String,
+    ) -> Result<usize, BroadcastError> {
+        let tx = self
+            .broadcast_channels
+            .get(room_id)
+            .map(|entry| entry.value().clone())
+            .ok_or(BroadcastError::MissingRoom)?;
+        let payload =
+            self.tracked_broadcast_payload(room_id, json, None, BroadcastPriority::RelayEvent)?;
+        Ok(tx.send(payload).unwrap_or(0))
+    }
+
     /// Broadcast one ephemeral room frame that a client sent. With a lease,
     /// the frame also counts against the share of the sender's address.
+    /// The relay itself sends client frames through
+    /// [`Self::broadcast_room_message_when_room`].
+    #[cfg(test)]
     pub fn broadcast_room_message_from(
         &self,
         room_id: &Uuid,
@@ -1582,7 +1691,8 @@ impl AppState {
             .get(room_id)
             .map(|entry| entry.value().clone())
             .ok_or(BroadcastError::MissingRoom)?;
-        let payload = self.tracked_broadcast_payload(room_id, json, sender)?;
+        let payload =
+            self.tracked_broadcast_payload(room_id, json, sender, BroadcastPriority::Ordinary)?;
         Ok(tx.send(payload).unwrap_or(0))
     }
 
@@ -1620,7 +1730,12 @@ impl AppState {
                 .get(room_id)
                 .map(|entry| entry.value().clone())
                 .ok_or(BroadcastError::MissingRoom)?;
-            let full = match self.reserve_broadcast_bytes(room_id, retained_bytes, sender) {
+            let full = match self.reserve_broadcast_bytes(
+                room_id,
+                retained_bytes,
+                sender,
+                BroadcastPriority::Ordinary,
+            ) {
                 Ok((room_bytes, client_bytes)) => {
                     let payload = BroadcastPayload(Arc::new(BroadcastPayloadInner {
                         json,
@@ -1848,8 +1963,9 @@ impl AppState {
     }
 
     /// Append a lifecycle event using the capacity reserved from ordinary MLS
-    /// envelopes. Callers must still fail the room closed if even this
-    /// reserved path cannot durably sequence the event.
+    /// envelopes. The broadcast budgets and the global log never refuse it;
+    /// callers must still fail the room closed if the room's own log cannot
+    /// durably sequence the event.
     pub fn append_and_broadcast_mls_lifecycle<F>(
         &self,
         room_id: &Uuid,
@@ -1883,6 +1999,9 @@ impl AppState {
 
     /// Append an MLS envelope that a client sent. With a lease, its live
     /// broadcast also counts against the share of the sender's address.
+    /// The relay itself appends client controls through
+    /// [`Self::append_and_broadcast_mls_envelope_when_room`].
+    #[cfg(test)]
     pub fn append_and_broadcast_mls_envelope_from<F>(
         &self,
         room_id: &Uuid,
@@ -1901,6 +2020,58 @@ impl AppState {
             sender,
             serialize,
         )
+    }
+
+    /// Like [`Self::append_and_broadcast_mls_envelope_from`], for a control
+    /// that may wait for room in the broadcast budgets, as a client's other
+    /// frames do (see [`Self::broadcast_room_message_when_room`]). It used
+    /// to cost its sender the connection (1013) at once.
+    ///
+    /// Only a full broadcast budget is waited out: nothing has been changed
+    /// in the log when it is found full, so the append is tried again from
+    /// the start, `serialize` included. Every other answer, a full log
+    /// among them, is returned as it comes. After `patience` the error is
+    /// [`MlsControlAppendError::BroadcastCapacity`].
+    pub async fn append_and_broadcast_mls_envelope_when_room<F>(
+        &self,
+        room_id: &Uuid,
+        admission: MlsControlAdmission,
+        sender: Option<&ClientBroadcastLease>,
+        patience: Duration,
+        serialize: F,
+    ) -> Result<u64, MlsControlAppendError>
+    where
+        F: Fn(u64) -> Option<String>,
+    {
+        let deadline = tokio::time::Instant::now() + patience;
+        let mut waiter = None;
+        loop {
+            // Registered before the attempt it belongs to, as in
+            // `broadcast_room_message_when_room`.
+            let released = self.broadcast_release.released.notified();
+            tokio::pin!(released);
+            if waiter.is_some() {
+                released.as_mut().enable();
+            }
+            match self.append_and_broadcast_mls_control_at(
+                room_id,
+                Instant::now(),
+                false,
+                admission.clone(),
+                sender,
+                &serialize,
+            ) {
+                Err(MlsControlAppendError::BroadcastCapacity) => {}
+                answer => return answer,
+            }
+            if waiter.is_none() {
+                waiter = Some(BroadcastWaiter::new(&self.broadcast_release));
+                continue;
+            }
+            if tokio::time::timeout_at(deadline, released).await.is_err() {
+                return Err(MlsControlAppendError::BroadcastCapacity);
+            }
+        }
     }
 
     fn append_and_broadcast_mls_control_at<F>(
@@ -1973,7 +2144,10 @@ impl AppState {
                     .get(key_package_ref)
                     .ok_or(MlsControlAppendError::UnknownKeyPackageRef)?;
                 if log.consumed_key_package_refs.len() >= MAX_CONSUMED_MLS_KEY_PACKAGE_REFS {
-                    return Err(MlsControlAppendError::CapacityExceeded);
+                    // Final for this group, unlike a full log: answered with
+                    // a typed rejection, not a close the creator would come
+                    // back from to send the same Add again.
+                    return Err(MlsControlAppendError::KeyPackageRefsExhausted);
                 }
                 if let Some(existing) = log
                     .pending_welcome_by_commit
@@ -2020,8 +2194,17 @@ impl AppState {
         {
             return Err(MlsControlAppendError::CapacityExceeded);
         }
+        // The relay's own joins and leaves are never refused by the broadcast
+        // budgets or the global log (see `BroadcastPriority::RelayEvent`):
+        // refusing one closed the group. The room's own log still bounds
+        // them, with the entries and bytes reserved for them above.
+        let priority = if lifecycle {
+            BroadcastPriority::RelayEvent
+        } else {
+            BroadcastPriority::Ordinary
+        };
         let broadcast_payload = self
-            .tracked_broadcast_payload(room_id, json.clone(), sender)
+            .tracked_broadcast_payload(room_id, json.clone(), sender, priority)
             .map_err(|_| MlsControlAppendError::BroadcastCapacity)?;
         let client_bytes = sender.map(|lease| lease.mls_bytes.clone());
         if let Some(client_bytes) = &client_bytes
@@ -2033,7 +2216,10 @@ impl AppState {
         {
             return Err(MlsControlAppendError::CapacityExceeded);
         }
-        if !Self::reserve_bytes(
+        if lifecycle {
+            self.mls_control_global_bytes
+                .fetch_add(json.len(), Ordering::AcqRel);
+        } else if !Self::reserve_bytes(
             self.mls_control_global_bytes.as_ref(),
             json.len(),
             MAX_MLS_CONTROL_LOG_GLOBAL_BYTES,
