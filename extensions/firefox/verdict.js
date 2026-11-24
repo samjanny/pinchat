@@ -226,6 +226,33 @@
     }
 
     /**
+     * The inline handler of the content script's policy probe, and how to
+     * tell the violation it causes from every other one.
+     *
+     * The handler begins with a marker drawn at random for each document,
+     * and the packaged page policies carry 'report-sample', so a browser
+     * that reports the probe's violation puts the first 40 characters of
+     * the handler, marker included, in its `sample`. Nothing else belongs to
+     * the probe alone: its element is not in the document, so the event is
+     * aimed at the document, and blockedURI and lineNumber are those of any
+     * inline handler. A violation that does not carry the marker is
+     * therefore never taken for the probe's, whatever else it looks like: a
+     * violation the page causes must not go unrecorded, and a rare one of the
+     * probe's that is recorded only lists one change too many.
+     */
+    const PROBE_MARKER_LENGTH = 24;
+
+    function probeHandler(marker) {
+        return `/*${marker}*/this.setAttribute("data-ran", "1")`;
+    }
+
+    function isProbeViolation(violation, marker) {
+        return typeof marker === 'string' && /^[0-9a-f]+$/.test(marker) && marker.length >= PROBE_MARKER_LENGTH
+            && !!violation && violation.effectiveDirective === 'script-src-attr'
+            && String(violation.sample || '').includes(marker);
+    }
+
+    /**
      * Decides the integrity state of one document.
      *
      * record:
@@ -483,6 +510,9 @@
         finding,
         findingForIssue,
         findingForViolation,
+        PROBE_MARKER_LENGTH,
+        probeHandler,
+        isProbeViolation,
         isExtensionUrl,
         decide,
         badge,

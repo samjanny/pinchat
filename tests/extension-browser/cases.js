@@ -136,6 +136,40 @@ module.exports = [
         },
     },
     {
+        id: 'page-handler',
+        title: 'an inline handler in the served HTML: the first violation the page itself causes (navigation only)',
+        async run(t) {
+            const browser = await t.launch();
+            const visit = await t.visit(browser, `${t.urls.CHAT}&poc=handler`, 5000);
+            const state = await t.verifierState(browser, t.urls.CHAT);
+            const firefox = t.browserName === 'firefox';
+            const handlerBlocked = (entries) => (entries || [])
+                .filter((entry) => /violation$/.test(entry.code) && entry.detail.startsWith('script-src-attr'));
+            t.report(summary(visit, t, {
+                'verifier state': stateLabel(state),
+                'recorded as': JSON.stringify(handlerBlocked([...(state?.reasons || []), ...(state?.environment || [])])
+                    .map((entry) => `${entry.code}: ${entry.detail}`)),
+            }), [
+                ['the handler did not run', 'must', !visit.page.attacker],
+                ...(firefox ? [
+                    ['the altered document was replaced by the block page', 'must', !!visit.page.blockPage],
+                ] : [
+                    // It used to be taken for the violation of the extension's
+                    // own probe, which Chromium never reports, and dropped.
+                    ['the blocked handler is recorded', 'must',
+                        handlerBlocked([...(state?.reasons || []), ...(state?.environment || [])]).length > 0],
+                    // Chromium names no source file for a handler it blocks
+                    // outside any script, so the violation cannot be told from
+                    // one caused by markup another extension wrote, and is
+                    // listed as of unknown origin.
+                    ['it is attributed to the page and shown as a notice', 'limit',
+                        !!state && state.attention === true
+                        && handlerBlocked(state.reasons).some((entry) => entry.code === 'page-policy-violation')],
+                ]),
+            ]);
+        },
+    },
+    {
         id: 'split-markup',
         title: 'HTML differs between the navigation and any other request',
         async run(t) {
