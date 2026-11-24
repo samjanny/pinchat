@@ -27,6 +27,7 @@ const Group = require(path.join(__dirname, '..', 'static', 'js', 'mls', 'group.j
 const Signature = require(path.join(__dirname, '..', 'static', 'js', 'mls', 'signature.js'));
 const HPKE = require(path.join(__dirname, '..', 'static', 'js', 'mls', 'hpke.js'));
 const Nodes = require(path.join(__dirname, '..', 'static', 'js', 'mls', 'nodes.js'));
+const RatchetTree = require(path.join(__dirname, '..', 'static', 'js', 'mls', 'ratchet-tree.js'));
 const KeyPackage = require(path.join(__dirname, '..', 'static', 'js', 'mls', 'key-package.js'));
 const Labeled = require(path.join(__dirname, '..', 'static', 'js', 'mls', 'labeled.js'));
 
@@ -121,13 +122,17 @@ async function main() {
     const carol = await buildKeyPackage();
     const r2 = await alice.commitAddMember({ keyPackageBytes: carol.keyPackageBytes });
     assert(alice.epoch === 2n, 'Alice advanced to epoch 2');
-    assert(alice.nLeaves === 3, 'Alice has 3 leaves');
+    // RFC 9420 trees are full: three members live in a 4-leaf tree whose
+    // rightmost leaf stays blank.
+    assert(alice.nLeaves === 4 && alice.ratchetTree.length === 7
+        && RatchetTree.leafFor(alice.ratchetTree, 3) === null,
+    'Alice has a full 4-leaf tree with 3 members');
 
     // Bob processes the Commit broadcast.
     const bobResult = await bobGroup.processCommit(r2.commitMessage);
     assert(bobResult.addedLeafIndex === 2, 'Bob saw addedLeafIndex=2');
     assert(bobGroup.epoch === 2n, 'Bob advanced to epoch 2');
-    assert(bobGroup.nLeaves === 3, 'Bob sees 3 leaves after processCommit');
+    assert(bobGroup.nLeaves === 4, 'Bob sees the full 4-leaf tree after processCommit');
 
     // Carol joins via Welcome.
     const tree2Bytes = Nodes.ratchetTreeBytes(alice.ratchetTree);
@@ -142,8 +147,8 @@ async function main() {
         expectedCommitEpoch: alice.epoch - 1n,
         ...await bootstrapPins(alice),
     });
-    assert(carolGroup.epoch === 2n && carolGroup.nLeaves === 3,
-        'Carol joined into 3-leaf tree at epoch 2');
+    assert(carolGroup.epoch === 2n && carolGroup.nLeaves === 4,
+        'Carol joined into the full 4-leaf tree at epoch 2');
     assert(carolGroup.myLeafIndex === 2, 'Carol is leaf 2');
 
     // All three share the authenticated epoch state at epoch 2.
@@ -370,6 +375,99 @@ async function main() {
         } catch (err) { futureThrew = true; futureErr = err.message; }
         assert(futureThrew && futureErr.includes('not yet valid'),
             'future KeyPackage rejected', futureErr);
+    }
+
+    // M-02: only the creator compares a KeyPackage Lifetime with its clock,
+    // with a skew margin, when it admits the joiner. A member applying the
+    // signed Add, or a later joiner importing the tree, must not re-check
+    // notBefore against its own clock: a joiner whose clock runs ahead (or
+    // who writes notBefore = now) would otherwise desynchronise every
+    // member whose clock is a second behind, through an authenticated
+    // Commit that can never be applied.
+    console.log('# KeyPackage Lifetime is checked only at admission (M-02)');
+    {
+        const withLifetime = async (notBefore) => {
+            const bundle = await buildKeyPackage();
+            bundle.keyPackage.leafNode.lifetime = {
+                notBefore, notAfter: notBefore + 86400n - 60n,
+            };
+            bundle.keyPackage.leafNode.signature = await Group.signLeafNodeForKeyPackage(
+                bundle.identity.signaturePrivateKey, bundle.keyPackage.leafNode,
+            );
+            bundle.keyPackage.signature = await Labeled.signWithLabel(
+                bundle.identity.signaturePrivateKey, 'KeyPackageTBS',
+                KeyPackage.keyPackageTbsBytes(bundle.keyPackage),
+            );
+            bundle.keyPackageBytes = KeyPackage.keyPackageBytes(bundle.keyPackage);
+            return bundle;
+        };
+        const realNow = Date.now;
+        const withClock = async (offsetMs, fn) => {
+            Date.now = () => realNow() + offsetMs;
+            try { return await fn(); } finally { Date.now = realNow; }
+        };
+        const creator = await Group.Group.create({ identity: await freshIdentity() });
+        const pins = await bootstrapPins(creator);
+        const join = (member, result) => Group.Group.joinFromWelcomeWithTree({
+            welcomeMessage: result.welcomeMessage,
+            keyPackageBytes: member.keyPackageBytes,
+            initPrivateKey: member.initKp.privateKey,
+            identity: member.identity,
+            leafEncKeyPair: member.leafEncKp,
+            ratchetTreeBytes: Nodes.ratchetTreeBytes(creator.ratchetTree),
+            expectedSignerLeafIndex: 0,
+            expectedCommitEpoch: creator.epoch - 1n,
+            ...pins,
+        });
+        const bob = await buildKeyPackage();
+        const bobGroup = await join(bob, await creator.commitAddMember({
+            keyPackageBytes: bob.keyPackageBytes,
+        }));
+
+        // Carol's notBefore is the creator's "now": inside the margin.
+        const nowSecs = BigInt(Math.floor(realNow() / 1000));
+        const carol = await withLifetime(nowSecs + 1n);
+        await creator.validateKeyPackageForAdd(carol.keyPackageBytes);
+        const r2 = await creator.commitAddMember({ keyPackageBytes: carol.keyPackageBytes });
+        let bobError = null;
+        await withClock(-3000, async () => {
+            try { await bobGroup.processCommit(r2.commitMessage); } catch (err) { bobError = err; }
+        });
+        assert(bobError === null && bobGroup.epoch === creator.epoch,
+            'a member whose clock is 3 s behind applies the creator Add of a KeyPackage valid from "now"',
+            bobError && bobError.message);
+        const carolGroup = await join(carol, r2);
+        assert(carolGroup.epoch === creator.epoch,
+            'the joiner with the fast clock joins as well');
+
+        // A later joiner with a slow clock imports Carol's historical leaf.
+        const dave = await buildKeyPackage();
+        const r3 = await creator.commitAddMember({ keyPackageBytes: dave.keyPackageBytes });
+        let daveGroup = null;
+        await withClock(-3000, async () => {
+            daveGroup = await join(dave, r3).catch((err) => err);
+        });
+        assert(daveGroup instanceof Group.Group && daveGroup.epoch === creator.epoch,
+            'a joiner whose clock is behind imports a leaf whose notBefore is in its future',
+            daveGroup instanceof Error ? daveGroup.message : '');
+
+        // The creator keeps a bounded margin: a few minutes of skew pass,
+        // hours do not.
+        const nearFuture = await withLifetime(nowSecs + 120n);
+        let nearError = null;
+        try {
+            await creator.validateKeyPackageForAdd(nearFuture.keyPackageBytes);
+        } catch (err) { nearError = err; }
+        assert(nearError === null,
+            'creator admits a KeyPackage whose notBefore is 2 minutes ahead (skew margin)',
+            nearError && nearError.message);
+        const farFuture = await withLifetime(nowSecs + 3600n);
+        let farError = '';
+        try {
+            await creator.validateKeyPackageForAdd(farFuture.keyPackageBytes);
+        } catch (err) { farError = err.message; }
+        assert(farError.includes('not yet valid'),
+            'creator still refuses a KeyPackage valid only from an hour ahead', farError);
     }
 
     // ---- Bootstrap-PSK binding -------------------------------------------

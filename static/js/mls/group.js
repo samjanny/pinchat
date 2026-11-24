@@ -109,10 +109,33 @@
     // honest member an arbitrarily large tree and force unbounded TreeKEM /
     // SecretTree work.
     const MAX_GROUP_LEAVES = 20;
+    // RFC 9420 trees are full, so 20 members need a 32-leaf tree whose
+    // right-edge leaves stay blank. This bounds the tree itself.
+    const MAX_TREE_LEAVES = 32;
+    // PinChat LeafNodes are about 320 bytes and KeyPackages about 450. The
+    // relay accepts a KeyPackage of up to 16 KiB but a Welcome ratchet_tree
+    // of only 64 KiB, so without a tighter bound four inflated KeyPackages
+    // would make every later Welcome too large to deliver (M-05). With
+    // these bounds 20 members fit in about 27 KiB of tree in the worst case.
+    const MAX_LEAF_NODE_BYTES = 1024;
+    const MAX_KEY_PACKAGE_BYTES = 2048;
     const MAX_KEY_PACKAGE_LIFETIME_SECONDS = 24n * 60n * 60n;
+    // Clock skew tolerated between a joiner and the creator when the
+    // creator admits a KeyPackage.
+    const KEY_PACKAGE_CLOCK_SKEW_SECONDS = 5n * 60n;
 
+    /**
+     * Validate a KeyPackage Lifetime. The bounded range is checked
+     * everywhere. Only the creator, when it admits a joiner
+     * (`checkClock`), compares the range with its own clock, with a skew
+     * margin on both ends. Existing members applying the creator's signed
+     * Add, and joiners importing the tree, trust that admission: checking
+     * against their own clocks let a joiner whose clock ran ahead (or who
+     * chose notBefore = now) desynchronise any member whose clock was a
+     * second behind, permanently, through an authenticated Commit.
+     */
     function validateKeyPackageLifetimeProfile(
-        lifetime, errorPrefix, requireCurrentlyValid,
+        lifetime, errorPrefix, checkClock,
     ) {
         if (!lifetime || typeof lifetime.notBefore !== 'bigint'
             || typeof lifetime.notAfter !== 'bigint') {
@@ -127,15 +150,15 @@
                 `${errorPrefix}: Lifetime exceeds the 24-hour profile maximum`,
             );
         }
+        if (!checkClock) return;
         const nowSecs = BigInt(Math.floor(Date.now() / 1000));
-        if (nowSecs < lifetime.notBefore) {
+        if (nowSecs + KEY_PACKAGE_CLOCK_SKEW_SECONDS < lifetime.notBefore) {
             throw new Error(
                 `${errorPrefix}: Lifetime not yet valid `
                 + `(now=${nowSecs} < notBefore=${lifetime.notBefore})`,
             );
         }
-        if (!requireCurrentlyValid) return;
-        if (nowSecs >= lifetime.notAfter) {
+        if (nowSecs - KEY_PACKAGE_CLOCK_SKEW_SECONDS >= lifetime.notAfter) {
             throw new Error(
                 `${errorPrefix}: Lifetime expired `
                 + `(now=${nowSecs} >= notAfter=${lifetime.notAfter})`,
@@ -261,23 +284,23 @@
         for (const value of Object.values(epochSecrets)) wipeBytes(value);
     }
 
-    const DETERMINISTIC_CONTROL_ERROR_PREFIXES = Object.freeze([
-        'group.join:', 'group.join ', 'processCommit:',
-        'validateKeyPackageForAdd:',
-        'verifyUpdateProposal:', 'verifyUpdateLeaf:', 'verifyCommitLeaf:',
-        'verifyKeyPackage', 'imported-tree:', 'parent-hash:',
-        'Decoder:', 'varint:', 'mls_message:', 'public-message:',
-        'authenticated_content:', 'framed_content:', 'sender:',
-        'proposal:', 'proposal_or_ref:', 'commit:', 'welcome:',
-        'group_secrets:', 'group_info:', 'key_package:', 'ratchet_tree:',
-        'leaf_node:', 'node:', 'credential:', 'extensions:',
-        'capabilities:', 'optional:',
-    ]);
-
     /**
      * Separate deterministic wire/authentication rejection from unexpected
      * platform failures. MLSSession consumes the former ordered control, but
      * reconnects and replays the latter from the unchanged cursor.
+     *
+     * The decision is made by type, not by message text (M-06). The Group
+     * control entry points (validateKeyPackageForAdd, verifyUpdateProposal,
+     * processCommit, joinFromWelcomeWithTree) are functions of unchanged
+     * local state and immutable relay bytes: replaying the same control
+     * fails in the same way, whichever module (codec, tree math, HPKE,
+     * WebCrypto) raised the Error. Every Error is therefore a deterministic
+     * rejection. A failure keeps a different class only when the code that
+     * raised it marked it: mlsRetryControl for a known transient condition,
+     * mlsFatalState for a broken local state. A thrown non-Error value is
+     * not one of ours and is retried. A prefix list had missed, among
+     * others, "ratchet-tree:" (the list had "ratchet_tree:"), so a relay
+     * could pin a joiner in a reconnect loop with a reshaped Welcome tree.
      */
     function classifyGroupControlError(error) {
         if (!error || (typeof error !== 'object' && typeof error !== 'function')) {
@@ -290,11 +313,7 @@
             || error.mlsFatalState === true) {
             return error;
         }
-        const message = error instanceof Error ? error.message : String(error);
-        if (error instanceof RangeError
-            || DETERMINISTIC_CONTROL_ERROR_PREFIXES.some(
-                (prefix) => message.startsWith(prefix),
-            )) {
+        if (error instanceof Error) {
             error.mlsValidationFailure = true;
         } else {
             error.mlsRetryControl = true;
@@ -413,14 +432,53 @@
     // and the whole context is zeroed at expiry or on the next Commit.
     const PREV_EPOCH_GRACE_MS = 60 * 1000;
 
+    // Signed generation binding (PinChat profile). Every member holds every
+    // sender's SecretTree chain, and the FramedContent signature does not
+    // cover the sender_data generation, so any member could otherwise
+    // re-encrypt another member's signed message under that sender's next
+    // generations: receivers would accept the copies as fresh and reject
+    // the sender's real messages as replays. The application content
+    // therefore starts with the sender's generation (u32, big-endian),
+    // inside the signed and encrypted payload, and a receiver accepts it
+    // only at that exact generation.
+    const GENERATION_BINDING_BYTES = 4;
+
+    function bindGeneration(generation, payload) {
+        if (!Number.isInteger(generation) || generation < 0
+            || generation > 0xffffffff) {
+            throw new Error(`group: invalid sender generation ${generation}`);
+        }
+        const out = new Uint8Array(GENERATION_BINDING_BYTES + payload.length);
+        new DataView(out.buffer).setUint32(0, generation, false);
+        out.set(payload, GENERATION_BINDING_BYTES);
+        return out;
+    }
+
+    function unbindGeneration(content, generation) {
+        if (!(content instanceof Uint8Array)
+            || content.length < GENERATION_BINDING_BYTES) {
+            throw new Error('group: application content lacks its signed generation');
+        }
+        const signed = new DataView(
+            content.buffer, content.byteOffset, GENERATION_BINDING_BYTES,
+        ).getUint32(0, false);
+        if (signed !== generation) {
+            throw new Error(
+                `group: signed generation ${signed} does not match sender_data `
+                + `generation ${generation} (re-encrypted copy of an earlier message)`,
+            );
+        }
+        return content.slice(GENERATION_BINDING_BYTES);
+    }
+
     // --- Group class ------------------------------------------------------
 
     class Group {
         constructor(state) {
-            if (!state || !Number.isInteger(state.nLeaves)
-                || state.nLeaves < 1 || state.nLeaves > MAX_GROUP_LEAVES) {
+            if (!state || !TreeMath.isFullTreeLeafCount(state.nLeaves)
+                || state.nLeaves > MAX_TREE_LEAVES) {
                 throw new Error(
-                    `group: nLeaves must be in [1,${MAX_GROUP_LEAVES}]`,
+                    `group: nLeaves must be a power of two in [1,${MAX_TREE_LEAVES}]`,
                 );
             }
             Object.assign(this, state);
@@ -428,8 +486,11 @@
             // pairs we have already accepted. Reset on every epoch
             // transition; cap per-leaf to bound memory growth. With the
             // stateful chains below this is defense-in-depth: the chain
-            // state itself rejects replays because consumed keys are
-            // deleted and cannot be re-derived.
+            // state itself rejects a replayed ciphertext because consumed
+            // keys are deleted and cannot be re-derived. That alone does
+            // not stop a member, who holds every sender's chain, from
+            // re-encrypting a signed message at a later generation; the
+            // signed generation binding (bindGeneration) does.
             this.consumedByLeaf = new Map();
             // Stateful per-sender secret-tree chains (intra-epoch forward
             // secrecy). Keyed by `${leafIndex}:${which}`; each entry holds
@@ -1015,9 +1076,10 @@
                 sender: { senderType: Framing.SenderType.MEMBER, leafIndex: this.myLeafIndex },
                 authenticatedData: new Uint8Array(0),
                 contentType: Framing.ContentType.APPLICATION,
-                payload: plaintext instanceof Uint8Array
+                // The signature below covers the generation prefix.
+                payload: bindGeneration(generation, plaintext instanceof Uint8Array
                     ? plaintext
-                    : new TextEncoder().encode(String(plaintext)),
+                    : new TextEncoder().encode(String(plaintext))),
             };
 
             const signature = await PublicMessage.signFramedContent(
@@ -1159,6 +1221,11 @@
                 if (!sigOk) {
                     throw new Error('group: application message signature invalid');
                 }
+                // A member may hold the sender's chain; only the signed
+                // generation proves this is not a re-encrypted copy.
+                const plaintext = unbindGeneration(
+                    out.content.payloadBytes, generation,
+                );
 
                 // No asynchronous or fallible validation follows this point.
                 // Swap the staged chain in one step, then destroy the
@@ -1171,7 +1238,7 @@
                 this._markGenerationConsumed(senderLeafIndex, generation);
 
                 return {
-                    plaintext: out.content.payloadBytes,
+                    plaintext,
                     senderLeafIndex,
                     senderSignatureKey: Uint8Array.from(senderLeaf.signatureKey),
                 };
@@ -1258,6 +1325,9 @@
                 if (!sigOk) {
                     throw new Error('group: application message signature invalid (prev epoch)');
                 }
+                const plaintext = unbindGeneration(
+                    out.content.payloadBytes, generation,
+                );
 
                 if (this._prevEpoch !== pe || pe.chainStates !== baseChainStates) {
                     throw new Error('group: concurrent previous-epoch receive-ratchet mutation');
@@ -1271,7 +1341,7 @@
                 consumedSet.add(generation);
 
                 return {
-                    plaintext: out.content.payloadBytes,
+                    plaintext,
                     senderLeafIndex,
                     senderSignatureKey: Uint8Array.from(senderLeaf.signatureKey),
                 };
@@ -1297,11 +1367,12 @@
     // which decrypts the appropriate path_secret out of the UpdatePath,
     // walks it up to root, and advances the local epoch state.
     //
-    // Tree growth: new members are always appended at the next free leaf
-    // (newLeafIndex = nLeaves). The ratchet tree is padded to the new
-    // node-width on each Add. Parent nodes that are NOT on the
-    // committer's direct path stay blank - TreeKEM resolution recurses
-    // through them automatically.
+    // Tree shape: RFC 9420 full trees. An Add takes the leftmost blank
+    // leaf and doubles the tree only when there is none; a Remove blanks
+    // the leaf and its direct path and halves the tree while its right
+    // subtree has no member (RatchetTree.addLeaf / removeLeaf). Parent
+    // nodes that are NOT on the committer's direct path stay blank -
+    // TreeKEM resolution recurses through them automatically.
     //
     // Every Commit stamps the committer's parent-hash chain (§7.9).
     // Existing members verify that newly applied path; a Welcome joiner
@@ -1320,18 +1391,35 @@
             verifyTreeKeyUniqueness(tree, operation);
         };
 
-    function nextAddPosition(tree, nLeaves, operation) {
-        for (let leafIndex = 0; leafIndex < nLeaves; leafIndex += 1) {
-            if (!RatchetTree.leafFor(tree, leafIndex)) {
-                return { leafIndex, nLeaves };
-            }
-        }
-        if (nLeaves >= MAX_GROUP_LEAVES) {
+    /**
+     * RFC 9420 section 12.1.1 Add under the PinChat profile bounds. A blank leaf
+     * left by Remove is reused (leftmost first) before the full tree is
+     * doubled, so the member cap, not churn, bounds the tree size.
+     * Returns { tree, leafIndex, nLeaves } without mutating `tree`.
+     */
+    function addLeafWithinProfile(tree, leafNode, operation) {
+        if (RatchetTree.liveLeafCount(tree) >= MAX_GROUP_LEAVES) {
             throw new Error(
-                `${operation}: group is at the ${MAX_GROUP_LEAVES}-leaf limit`,
+                `${operation}: group is at the ${MAX_GROUP_LEAVES}-member limit`,
             );
         }
-        return { leafIndex: nLeaves, nLeaves: nLeaves + 1 };
+        const added = RatchetTree.addLeaf(tree, leafNode);
+        if (added.nLeaves > MAX_TREE_LEAVES) {
+            throw new Error(
+                `${operation}: tree would exceed ${MAX_TREE_LEAVES} leaves`,
+            );
+        }
+        return added;
+    }
+
+    /**
+     * Commit secret for a fresh UpdatePath (RFC 9420 section 7.4): one "path" step
+     * beyond the last path secret. When the committer is alone in a 1-leaf
+     * tree its direct path is empty and the step starts from leaf_secret.
+     */
+    function committerCommitSecret(chain, leafSecret) {
+        return TreeKEM.commitSecret(chain.length > 0
+            ? chain[chain.length - 1].pathSecret : leafSecret);
     }
 
     /**
@@ -1345,20 +1433,14 @@
         async function validateKeyPackageForAdd(keyPackageBytes) {
             try {
             const kp = KeyPackage.parseKeyPackage(keyPackageBytes);
-            await verifyKeyPackageBindings(kp, 'validateKeyPackageForAdd');
-            const position = nextAddPosition(
-                this.ratchetTree, this.nLeaves, 'validateKeyPackageForAdd',
+            await verifyKeyPackageBindings(
+                kp, 'validateKeyPackageForAdd', { admission: true },
             );
-            const candidateTree = Nodes.padRatchetTree(
-                this.ratchetTree.slice(),
-                TreeMath.nodeWidth(position.nLeaves),
+            const position = addLeafWithinProfile(
+                this.ratchetTree, kp.leafNode, 'validateKeyPackageForAdd',
             );
-            candidateTree[TreeMath.leafToNode(position.leafIndex)] = {
-                nodeType: Nodes.NodeType.LEAF,
-                leaf: kp.leafNode,
-            };
             verifyTreeKeyUniqueness(
-                candidateTree, 'validateKeyPackageForAdd',
+                position.tree, 'validateKeyPackageForAdd',
             );
             return {
                 keyPackage: kp,
@@ -1477,23 +1559,21 @@
         // an attacker-controlled leaf into the tree. The signing key is
         // taken from kp.leafNode.signatureKey because our credential model
         // ties identity to the signature key directly.
-        await verifyKeyPackageBindings(kp, 'commitAddMember');
+        await verifyKeyPackageBindings(
+            kp, 'commitAddMember', { admission: true },
+        );
 
         // ---- 1. Compute new tree shape, insert new leaf ----
-        // RFC tree slots are stable, but a blank leaf left by Remove is
-        // immediately reusable. Reusing the leftmost blank prevents harmless
-        // membership churn from growing the logical tree toward the profile
-        // cap while preserving every still-live leaf index.
-        const addPosition = nextAddPosition(
-            this.ratchetTree, this.nLeaves, 'commitAddMember',
+        // RFC 9420 section 12.1.1: the leftmost blank leaf (one left by Remove) is
+        // reused before the full tree is doubled, so harmless membership
+        // churn cannot grow the tree toward the profile cap and every
+        // still-live leaf index is preserved.
+        const addPosition = addLeafWithinProfile(
+            this.ratchetTree, kp.leafNode, 'commitAddMember',
         );
         const newLeafIndex = addPosition.leafIndex;
         const newNLeaves = addPosition.nLeaves;
-        const newWidth = TreeMath.nodeWidth(newNLeaves);
-        const newTree = Nodes.padRatchetTree(this.ratchetTree, newWidth);
-        newTree[TreeMath.leafToNode(newLeafIndex)] = {
-            nodeType: Nodes.NodeType.LEAF, leaf: kp.leafNode,
-        };
+        const newTree = addPosition.tree;
 
         let leafSecret = null;
         let leafNodePair = null;
@@ -1665,8 +1745,7 @@
         };
         const epochGroupContextBytes = GroupContext.groupContextBytes(epochGroupContext);
 
-        const rootChainEntry = chain[chain.length - 1];
-        const commitSecretBytes = await TreeKEM.commitSecret(rootChainEntry.pathSecret);
+        const commitSecretBytes = await committerCommitSecret(chain, leafSecret);
         try {
             epochSecrets = await KeySchedule.deriveEpoch({
                 initSecretPrev: this.epochSecrets.initSecret,
@@ -1841,15 +1920,10 @@
             throw new Error(`commitRemoveMember: leaf ${removedLeafIndex} already blank or non-leaf`);
         }
 
-        // ---- 1. Build new tree: blank the removed leaf and its ancestors ----
-        const newNLeaves = this.nLeaves;
-        const newWidth = TreeMath.nodeWidth(newNLeaves);
-        const newTree = Nodes.padRatchetTree(this.ratchetTree.slice(), newWidth);
-        newTree[removedLeafNode] = null;
-        const removedDirectPath = TreeMath.directPathWithRoot(removedLeafNode, newNLeaves);
-        for (const nodeIdx of removedDirectPath) {
-            newTree[nodeIdx] = null;
-        }
+        // ---- 1. Build new tree: blank the removed leaf and its ancestors,
+        // then truncate a right subtree left without members (section 12.1.3) ----
+        const newTree = RatchetTree.removeLeaf(this.ratchetTree, removedLeafIndex);
+        const newNLeaves = TreeMath.numLeaves(newTree.length);
 
         let leafSecret = null;
         let leafNodePair = null;
@@ -2006,8 +2080,7 @@
         };
         const epochGroupContextBytes = GroupContext.groupContextBytes(epochGroupContext);
 
-        const rootChainEntry = chain[chain.length - 1];
-        const commitSecretBytes = await TreeKEM.commitSecret(rootChainEntry.pathSecret);
+        const commitSecretBytes = await committerCommitSecret(chain, leafSecret);
         try {
             epochSecrets = await KeySchedule.deriveEpoch({
                 initSecretPrev: this.epochSecrets.initSecret,
@@ -2045,6 +2118,7 @@
         // window for in-flight messages), then overwrite.
         this._snapshotPrevEpoch([removedLeafIndex]);
         this.ratchetTree = newTree;
+        this.nLeaves = newNLeaves;
         this.epoch = newEpoch;
         this.treeHash = newTreeHash;
         this.confirmedTranscriptHash = newConfirmedTranscriptHash;
@@ -2246,17 +2320,9 @@
             proposal.leafNode, senderLeaf.signatureKey, senderLeaf.encryptionKey,
             this.groupId, senderLeafIndex,
         );
-        const candidateTree = this.ratchetTree.slice();
-        const senderNodeIndex = TreeMath.leafToNode(senderLeafIndex);
-        candidateTree[senderNodeIndex] = {
-            nodeType: Nodes.NodeType.LEAF,
-            leaf: proposal.leafNode,
-        };
-        for (const ancestor of TreeMath.directPathWithRoot(
-            senderNodeIndex, this.nLeaves,
-        )) {
-            candidateTree[ancestor] = null;
-        }
+        const candidateTree = RatchetTree.updateLeaf(
+            this.ratchetTree, senderLeafIndex, proposal.leafNode,
+        );
         verifyTreeKeyUniqueness(candidateTree, 'verifyUpdateProposal');
         const authenticatedContent = Framing.authenticatedContentBytes({
             wireFormat, content, auth: pm.auth,
@@ -2330,8 +2396,7 @@
             );
         }
         const newNLeaves = this.nLeaves;
-        const newWidth = TreeMath.nodeWidth(newNLeaves);
-        const newTree = Nodes.padRatchetTree(this.ratchetTree.slice(), newWidth);
+        let newTree = this.ratchetTree.slice();
 
         const proposalStore = new Map();
         const proposalOrRefs = updateProposals.map((up, index) => {
@@ -2374,12 +2439,7 @@
                 this.groupId,
                 li,
             );
-            newTree[TreeMath.leafToNode(li)] = {
-                nodeType: Nodes.NodeType.LEAF, leaf: entry.proposal.leafNode,
-            };
-            for (const ancestor of TreeMath.directPathWithRoot(TreeMath.leafToNode(li), newNLeaves)) {
-                newTree[ancestor] = null;
-            }
+            newTree = RatchetTree.updateLeaf(newTree, li, entry.proposal.leafNode);
         }
 
         let leafSecret = null;
@@ -2526,8 +2586,7 @@
         };
         const epochGroupContextBytes = GroupContext.groupContextBytes(epochGroupContext);
 
-        const rootChainEntry = chain[chain.length - 1];
-        const commitSecretBytes = await TreeKEM.commitSecret(rootChainEntry.pathSecret);
+        const commitSecretBytes = await committerCommitSecret(chain, leafSecret);
         try {
             epochSecrets = await KeySchedule.deriveEpoch({
                 initSecretPrev: this.epochSecrets.initSecret,
@@ -2727,24 +2786,16 @@
                 this.groupId,
                 updLeafIndex,
             );
-            newTree[TreeMath.leafToNode(updLeafIndex)] = {
-                nodeType: Nodes.NodeType.LEAF, leaf: newLeaf,
-            };
-            for (const ancestor of TreeMath.directPathWithRoot(
-                TreeMath.leafToNode(updLeafIndex), newNLeaves,
-            )) {
-                newTree[ancestor] = null;
-            }
+            newTree = RatchetTree.updateLeaf(newTree, updLeafIndex, newLeaf);
             updatedLeafIndices.push(updLeafIndex);
         }
 
+        // RFC 9420 section 12.1.3: each Remove blanks the leaf and its direct path
+        // and truncates a right subtree left without members.
         for (const entry of proposalPlan.removes) {
             const rmIdx = entry.targetLeafIndex;
-            const rmNode = TreeMath.leafToNode(rmIdx);
-            newTree[rmNode] = null;
-            for (const ancestor of TreeMath.directPathWithRoot(rmNode, newNLeaves)) {
-                newTree[ancestor] = null;
-            }
+            newTree = RatchetTree.removeLeaf(newTree, rmIdx);
+            newNLeaves = TreeMath.numLeaves(newTree.length);
             removedLeafIndices.push(rmIdx);
             lastRemovedLeafIndex = rmIdx;
         }
@@ -2753,17 +2804,12 @@
             await verifyKeyPackageBindings(
                 entry.proposal.keyPackage, 'processCommit',
             );
-            const addPosition = nextAddPosition(
-                newTree, newNLeaves, 'processCommit',
+            const addPosition = addLeafWithinProfile(
+                newTree, entry.proposal.keyPackage.leafNode, 'processCommit',
             );
             const addLeafIndex = addPosition.leafIndex;
             newNLeaves = addPosition.nLeaves;
-            const newWidth = TreeMath.nodeWidth(newNLeaves);
-            newTree = Nodes.padRatchetTree(newTree, newWidth);
-            newTree[TreeMath.leafToNode(addLeafIndex)] = {
-                nodeType: Nodes.NodeType.LEAF,
-                leaf: entry.proposal.keyPackage.leafNode,
-            };
+            newTree = addPosition.tree;
             addedLeafIndices.push(addLeafIndex);
             lastAddedLeafIndex = addLeafIndex;
         }
@@ -3322,23 +3368,30 @@
             );
         }
 
-        // Parse the ratchet tree. The committer always serialises with
-        // node_width(nLeaves) entries (no trailing-blank truncation), so
-        // the wire length tells us nLeaves directly.
+        // Parse the ratchet tree in its RFC 9420 section 12.4.3.3 wire form: the
+        // committer omits trailing blank nodes, the last node must be
+        // non-blank, and we extend it with the fewest blanks that give a
+        // full tree. That full width determines nLeaves.
         const parsedTree = Nodes.parseRatchetTree(ratchetTreeBytes);
-        if (parsedTree.length === 0 || (parsedTree.length & 1) === 0
-            || parsedTree.length > TreeMath.nodeWidth(MAX_GROUP_LEAVES)) {
+        if (parsedTree.length === 0
+            || parsedTree.length > TreeMath.nodeWidth(MAX_TREE_LEAVES)) {
             throw new Error(
-                `group.join: ratchet_tree exceeds the ${MAX_GROUP_LEAVES}-leaf profile limit`,
+                `group.join: ratchet_tree exceeds the ${MAX_TREE_LEAVES}-leaf profile limit`,
             );
         }
-        const nLeaves = TreeMath.numLeaves(parsedTree.length);
-        if (nLeaves > MAX_GROUP_LEAVES) {
+        if (!parsedTree[parsedTree.length - 1]) {
             throw new Error(
-                `group.join: ratchet_tree has ${nLeaves} leaves; maximum is ${MAX_GROUP_LEAVES}`,
+                'group.join: ratchet_tree must not end with a blank node',
             );
         }
-        const tree = Nodes.padRatchetTree(parsedTree, TreeMath.nodeWidth(nLeaves));
+        const tree = RatchetTree.fromWireNodes(parsedTree);
+        const nLeaves = TreeMath.numLeaves(tree.length);
+        if (nLeaves > MAX_TREE_LEAVES
+            || RatchetTree.liveLeafCount(tree) > MAX_GROUP_LEAVES) {
+            throw new Error(
+                `group.join: ratchet_tree exceeds the ${MAX_GROUP_LEAVES}-member profile limit`,
+            );
+        }
 
         // Verify GroupInfo signature with the signer's signature_key.
         const signerLeafIndex = groupInfo.signer;
@@ -3618,13 +3671,13 @@
                 credentials: [Nodes.CredentialType.BASIC],
             },
             leafNodeSource,
-            // KEY_PACKAGE variant needs a Lifetime per RFC §7.2.3.
+            // KEY_PACKAGE variant needs a Lifetime (RFC 9420 section 7.2).
             // We bind it to a 24-hour window around publication; the
-            // recipient validates `now ∈ [notBefore, notAfter)` so an
-            // old or replayed KeyPackage is rejected even if its
-            // signature is intact. Rooms have a hard TTL ≤ 24h so
-            // this matches the operational lifetime of any valid
-            // KeyPackage in flight.
+            // creator, when it admits the joiner, checks that now lies in
+            // [notBefore, notAfter) up to a clock-skew margin, so an old
+            // or replayed KeyPackage is rejected even if its signature is
+            // intact. Rooms have a hard TTL of at most 24h so this matches
+            // the operational lifetime of any valid KeyPackage in flight.
             lifetime: leafNodeSource === Nodes.LeafNodeSource.KEY_PACKAGE
                 ? (() => {
                     const nowSecs = BigInt(Math.floor(Date.now() / 1000));
@@ -3648,9 +3701,14 @@
      * our credential model identifies a member by their signature key,
      * so a forgery would have to forge ECDSA-P-256.
      *
+     * `admission` is true only where the creator admits a joiner; it adds
+     * the clock check of the Lifetime (validateKeyPackageLifetimeProfile).
+     *
      * Throws on any mismatch; returns void on success.
      */
-    async function verifyKeyPackageBindings(kp, errorPrefix = 'verifyKeyPackage') {
+    async function verifyKeyPackageBindings(
+        kp, errorPrefix = 'verifyKeyPackage', { admission = false } = {},
+    ) {
         if (kp.version !== PROTOCOL_VERSION) {
             throw new Error(
                 `${errorPrefix}: protocol version ${kp.version} does not match MLS 1.0`,
@@ -3666,11 +3724,19 @@
                 `${errorPrefix}: expected source=KEY_PACKAGE, got ${kp.leafNode.leafNodeSource}`,
             );
         }
-        // RFC §7.2.3: enforce now ∈ [notBefore, notAfter). Rejects
-        // replayed KeyPackages from a former member trying to rejoin
-        // off a captured invite.
+        const keyPackageSize = KeyPackage.keyPackageBytes(kp).length;
+        if (keyPackageSize > MAX_KEY_PACKAGE_BYTES) {
+            throw new Error(
+                `${errorPrefix}: KeyPackage is ${keyPackageSize} bytes; `
+                + `the profile maximum is ${MAX_KEY_PACKAGE_BYTES}`,
+            );
+        }
+        // RFC 9420 section 7.2: the creator, admitting a joiner, enforces
+        // now in [notBefore, notAfter) with a clock-skew margin; this
+        // rejects a replayed KeyPackage from a former member. Members
+        // applying the signed Add check only the bounded range.
         validateKeyPackageLifetimeProfile(
-            kp.leafNode.lifetime, errorPrefix, true,
+            kp.leafNode.lifetime, errorPrefix, admission,
         );
         const sigPub = await validateLeafNodeProfile(
             kp.leafNode, 'KeyPackage leaf', errorPrefix,
@@ -4183,6 +4249,13 @@
      * of accepting an arbitrary self-asserted identity blob.
      */
     async function validateLeafNodeProfile(leaf, leafDescription, errorPrefix) {
+        const leafBytes = Nodes.leafNodeBytes(leaf).length;
+        if (leafBytes > MAX_LEAF_NODE_BYTES) {
+            throw new Error(
+                `${errorPrefix}: ${leafDescription} is ${leafBytes} bytes; `
+                + `the profile maximum is ${MAX_LEAF_NODE_BYTES}`,
+            );
+        }
         validateLeafCapabilities(leaf, leafDescription, errorPrefix);
         if (!equalBytes(leaf.credential.identity, leaf.signatureKey)) {
             throw new Error(
@@ -4225,7 +4298,8 @@
             // Historical KeyPackage-source leaves remain part of the
             // authenticated tree after their admission Lifetime expires.
             // Enforce the same bounded profile as a fresh Add without
-            // incorrectly requiring the old interval to include "now".
+            // comparing the interval with this joiner's clock: the creator
+            // checked it when it admitted the leaf.
             validateKeyPackageLifetimeProfile(
                 leaf.lifetime, `imported-tree: leaf ${leafIndex}`, false,
             );
@@ -4556,6 +4630,9 @@
         PROTOCOL_VERSION,
         CIPHERSUITE,
         MAX_GROUP_LEAVES,
+        MAX_TREE_LEAVES,
+        MAX_LEAF_NODE_BYTES,
+        MAX_KEY_PACKAGE_BYTES,
         // Exposed for tests / future add-member path
         buildSelfLeaf,
         signLeafNodeForKeyPackage,

@@ -71,12 +71,12 @@
     const PAYLOAD_LIVENESS_PONG = 0x04;
     const LIVENESS_NONCE_BYTES = 16;
     const DEFAULT_LIVENESS_GRACE_MS = 20 * 1000;
-    const MAX_LIVENESS_PING_ATTEMPTS = 2;
     const CREATOR_LEAF_INDEX = 0;
     const BOOTSTRAP_PIN_BYTES = 32;
     const BOOTSTRAP_PROOF_BYTES = 32;
     const CORRELATION_REF_BYTES = 32;
     const MAX_GROUP_LEAVES = MLS.Group.MAX_GROUP_LEAVES || 20;
+    const MAX_TREE_LEAVES = MLS.Group.MAX_TREE_LEAVES || 32;
     const MAX_PENDING_WELCOME_SENDERS = MAX_GROUP_LEAVES;
     const MAX_PROPOSALS_PER_SENDER = 2;
     const MAX_PROPOSALS_PER_EPOCH =
@@ -84,6 +84,15 @@
     const MAX_DEFERRED_PRIVATE_MESSAGES = 32;
     const MAX_DEFERRED_PRIVATE_BYTES = 4 * 1024 * 1024;
     const MAX_DEFERRED_KEYPACKAGE_BYTES = 512 * 1024;
+    // Proposals for the epoch a pending Welcome will introduce, kept by a
+    // joiner until it can verify them (see _bufferPreWelcomeProposal).
+    const MAX_PRE_WELCOME_PROPOSAL_BYTES = 256 * 1024;
+    // Decoded-byte ceilings the relay applies to MLS envelopes
+    // (MAX_MLS_CONTROL_BYTES and MAX_RATCHET_TREE_BYTES in
+    // src/handlers/websocket.rs). The relay drops a larger Welcome, so an
+    // Add whose Welcome would not fit is refused before it is staged.
+    const RELAY_MAX_CONTROL_BYTES = 128 * 1024;
+    const RELAY_MAX_RATCHET_TREE_BYTES = 64 * 1024;
     const MAX_CONSUMED_KEY_PACKAGE_REFS = 4096;
     // The visible label carries 80 bits of the SHA-256 fingerprint. The full
     // 256-bit value is always emitted alongside it for tooltips/comparison.
@@ -422,6 +431,12 @@
             this._keyPackageRef = null;
             this._pendingWelcomeCommits = new Map();
             this._pendingWelcomeCommitBySender = new Map();
+            // Standalone Proposals that a joiner receives between its Add
+            // Commit and its Welcome. They belong to the epoch the Welcome
+            // introduces, so the joiner keeps a bounded number and verifies
+            // them once it has joined (M-03).
+            this._preWelcomeProposals = [];
+            this._preWelcomeProposalBytes = 0;
             // Accepted Adds whose Welcome still awaits relay acceptance.
             // The MLS epoch cannot be rolled back after the Commit echo; a
             // permanent Welcome rejection therefore triggers a compensating
@@ -720,7 +735,7 @@
             }
             const senderLeafIndex = verified.senderLeafIndex;
             if (!Number.isInteger(senderLeafIndex)
-                || senderLeafIndex < 0 || senderLeafIndex >= MAX_GROUP_LEAVES) {
+                || senderLeafIndex < 0 || senderLeafIndex >= MAX_TREE_LEAVES) {
                 throw new Error(
                     'mls-session: proposal store entry has invalid sender leaf',
                 );
@@ -746,6 +761,23 @@
                 throw new Error(
                     'mls-session: authenticated proposal store invariant exceeded',
                 );
+            }
+            // M-04. Each Update passes verifyUpdateProposal on its own, but
+            // two stored Updates carrying the same new encryption_key can
+            // never be folded together: the final tree would hold the key
+            // twice. A member copying another member's fresh key from the
+            // wire would otherwise make every periodic Commit fail. Keep
+            // the first in relay order and refuse the copy, on every member.
+            const newKey = verified.proposal?.leafNode?.encryptionKey;
+            if (newKey instanceof Uint8Array) {
+                for (const other of this._proposalStore.values()) {
+                    if (equalBytes(other.proposal?.leafNode?.encryptionKey, newKey)) {
+                        throw new Error(
+                            'mls-session: Update encryption_key collides with a stored '
+                            + `Proposal from leaf ${other.senderLeafIndex}`,
+                        );
+                    }
+                }
             }
             if (!senderReferences) {
                 senderReferences = [];
@@ -789,6 +821,7 @@
             this._clearEpochProposalState();
             this._pendingWelcomeCommits.clear();
             this._pendingWelcomeCommitBySender.clear();
+            this._clearPreWelcomeProposals();
             this._acceptedWelcomeByCommit.clear();
             this._deferredEnvelopes.length = 0;
             this._deferredEnvelopeBytes = 0;
@@ -846,6 +879,7 @@
             this._clearEpochProposalState();
             this._pendingWelcomeCommits.clear();
             this._pendingWelcomeCommitBySender.clear();
+            this._clearPreWelcomeProposals();
             this._acceptedWelcomeByCommit.clear();
             this._deferredEnvelopes.length = 0;
             this._deferredEnvelopeBytes = 0;
@@ -1618,11 +1652,15 @@
                             reason: 'Welcome envelope missing ratchet_tree side-channel' });
                         return;
                     }
-                    await this._handleWelcome(
-                        payload,
-                        base64UrlDecode(envelope.ratchet_tree),
-                        candidate,
-                    );
+                    let ratchetTreeBytes;
+                    try {
+                        ratchetTreeBytes = base64UrlDecode(envelope.ratchet_tree);
+                    } catch (err) {
+                        throw validationMlsControlError(
+                            `mls-session: malformed Welcome ratchet_tree: ${err.message}`,
+                        );
+                    }
+                    await this._handleWelcome(payload, ratchetTreeBytes, candidate);
                     this._pendingWelcomeCommits.clear();
                     this._pendingWelcomeCommitBySender.clear();
                     return;
@@ -1705,9 +1743,14 @@
                 );
             }
 
-            // Standalone proposals and ordinary membership/path commits do
-            // not carry a KeyPackageRef for this joiner; ignore them while
-            // waiting for the Add that actually addresses us.
+            if (pm.content.contentType === MLS.Framing.ContentType.PROPOSAL) {
+                return this._bufferPreWelcomeProposal(
+                    mlsMessageBytes, pm, envelope,
+                );
+            }
+            // Ordinary membership/path commits do not carry a KeyPackageRef
+            // for this joiner; ignore them while waiting for the Add that
+            // actually addresses us.
             if (pm.content.contentType !== MLS.Framing.ContentType.COMMIT
                 || !envelope.key_package_ref) return false;
 
@@ -1814,6 +1857,97 @@
         }
 
         /**
+         * M-03. The relay may sequence a member's Update Proposal for epoch
+         * n+1 between the Add Commit that admits us (epoch n -> n+1) and
+         * our Welcome. That Proposal is a valid message of epoch n+1, of
+         * which we are a member: RFC 9420 section 12.4 requires the
+         * committer to include every valid proposal received in the epoch,
+         * so the creator may fold it by ProposalRef, and we must be able to
+         * resolve it. We cannot verify it yet (no membership_key, no tree),
+         * so keep a bounded number of Proposals whose cleartext group_id
+         * and epoch match an Add Commit we are waiting on, and verify them
+         * after the Welcome (_adoptPreWelcomeProposals). The bounds mirror
+         * the authenticated store: MAX_PROPOSALS_PER_SENDER per relay
+         * sender and MAX_PROPOSALS_PER_EPOCH in total.
+         */
+        _bufferPreWelcomeProposal(mlsMessageBytes, pm, envelope) {
+            const content = pm.content;
+            if (!content || !this.expectedGroupId
+                || !equalBytes(content.groupId, this.expectedGroupId)
+                || !content.sender
+                || content.sender.senderType !== MLS.Framing.SenderType.MEMBER
+                || typeof envelope.sender_id !== 'string'
+                || envelope.sender_id.length === 0) {
+                return false;
+            }
+            let forPendingEpoch = false;
+            for (const candidate of this._pendingWelcomeCommits.values()) {
+                if (candidate.epoch + 1n === content.epoch) {
+                    forPendingEpoch = true;
+                    break;
+                }
+            }
+            if (!forPendingEpoch) return false;
+            const encodedBytes = mlsMessageBytes.length;
+            const fromSender = this._preWelcomeProposals.filter(
+                (entry) => entry.senderId === envelope.sender_id,
+            ).length;
+            if (fromSender >= MAX_PROPOSALS_PER_SENDER
+                || this._preWelcomeProposals.length >= MAX_PROPOSALS_PER_EPOCH
+                || this._preWelcomeProposalBytes + encodedBytes
+                    > MAX_PRE_WELCOME_PROPOSAL_BYTES) {
+                return false;
+            }
+            this._preWelcomeProposals.push({
+                bytes: MLS.MLSMessage.serializeMLSMessage(
+                    MLS.MLSMessage.WireFormat.MLS_PUBLIC_MESSAGE,
+                    mlsMessageBytes,
+                ),
+                epoch: content.epoch,
+                senderId: envelope.sender_id,
+                encodedBytes,
+            });
+            this._preWelcomeProposalBytes += encodedBytes;
+            return true;
+        }
+
+        _clearPreWelcomeProposals() {
+            this._preWelcomeProposals.length = 0;
+            this._preWelcomeProposalBytes = 0;
+        }
+
+        /**
+         * After joining, authenticate the Proposals kept by
+         * _bufferPreWelcomeProposal exactly as if they had arrived now, in
+         * relay order. Anything that fails verification (another epoch, a
+         * forged tag, a quota) is dropped: it was never accepted.
+         */
+        async _adoptPreWelcomeProposals() {
+            const kept = this._preWelcomeProposals.splice(0);
+            this._preWelcomeProposalBytes = 0;
+            for (const entry of kept) {
+                if (!this.group || entry.epoch !== this.group.epoch) continue;
+                try {
+                    const verified = await this.group.verifyUpdateProposal(
+                        entry.bytes,
+                    );
+                    const stored = this._storeAuthenticatedProposal(verified);
+                    if (stored.isNew) {
+                        this.onEvent({
+                            kind: 'update-proposal-received',
+                            senderLeafIndex: stored.entry.senderLeafIndex,
+                        });
+                    }
+                } catch (err) {
+                    this.onEvent({
+                        kind: 'error',
+                        reason: `pre-Welcome Update proposal dropped: ${err.message}`,
+                    });
+                }
+            }
+        }
+
+        /**
          * Return the exact buffered Commit named by an incoming Welcome, or
          * null when the Welcome is addressed to another KeyPackage. Invalid
          * targeted Welcomes fail closed without deleting any candidate, so a
@@ -1901,6 +2035,19 @@
                 const ratchetTreeBytes = MLS.Nodes.ratchetTreeBytes(
                     candidateGroup.ratchetTree,
                 );
+                // M-05: never stage an Add whose Commit or Welcome the
+                // relay would refuse to carry. The KeyPackage is rejected
+                // deterministically instead, and later joins stay possible.
+                if (ratchetTreeBytes.length > RELAY_MAX_RATCHET_TREE_BYTES
+                    || welcomeMessage.length - 4 > RELAY_MAX_CONTROL_BYTES
+                    || commitMessage.length - 4 > RELAY_MAX_CONTROL_BYTES) {
+                    throw validationMlsControlError(
+                        'mls-session: Add would exceed the relay size limits '
+                        + `(ratchet_tree ${ratchetTreeBytes.length} bytes, `
+                        + `Welcome ${welcomeMessage.length - 4} bytes, `
+                        + `Commit ${commitMessage.length - 4} bytes)`,
+                    );
+                }
                 const commitRef = base64UrlEncode(
                     await MLS.Labeled.sha256(stripMlsWrapper(commitMessage)),
                 );
@@ -2004,6 +2151,7 @@
             this._senderIdByLeaf.set(CREATOR_LEAF_INDEX, candidate.senderId);
             this.onEvent(rosterEvent);
             this.onEvent({ kind: 'joined' });
+            await this._adoptPreWelcomeProposals();
         }
 
         async _handleApplication(mlsMessageBytes, senderId) {
@@ -2038,10 +2186,6 @@
                 attributionWarning = true;
             }
 
-            // Any authenticated message from a leaf is proof it is alive, so a
-            // pending challenge for it is answered by ordinary traffic too.
-            this._noteLeafAlive(senderLeafIndex);
-
             if (pt.length === 0) {
                 this.onEvent({ kind: 'error', reason: 'empty application payload' });
                 return;
@@ -2052,9 +2196,11 @@
                 return;
             }
             if (tag === PAYLOAD_LIVENESS_PONG) {
-                // Liveness was already credited above from the authenticated
-                // sender leaf; the nonce only says which challenge it answers,
-                // and a stale or foreign nonce is simply ignored.
+                // Only an authenticated pong from the challenged leaf that
+                // carries the challenge's fresh nonce proves presence. Other
+                // traffic from that leaf is not a proof: it may have been
+                // written before the departure and delivered late.
+                this._acceptLivenessPong(pt, senderLeafIndex);
                 return;
             }
             if (tag === PAYLOAD_TEXT) {
@@ -2306,16 +2452,38 @@
             let staged = false;
             let candidateGroup = null;
             try {
+                let folded = updateProposals;
+                let commitMessage;
                 candidateGroup = this.group.forkForPendingCommit();
-                const { commitMessage } = await candidateGroup.commitUpdate({
-                    updateProposals,
-                });
+                try {
+                    ({ commitMessage } = await candidateGroup.commitUpdate({
+                        updateProposals: folded,
+                    }));
+                } catch (foldError) {
+                    if (folded.length === 0) throw foldError;
+                    // M-04. Whatever made the fold fail, the creator's own
+                    // path re-key must not depend on member Proposals: retry
+                    // path-only. The epoch change then retires the queued
+                    // Proposals and members propose again on their timers.
+                    candidateGroup.destroySecrets();
+                    candidateGroup = null;
+                    this.onEvent({
+                        kind: 'error',
+                        reason: 'commitUpdate could not fold member Updates '
+                            + `(${foldError.message}); committing path-only`,
+                    });
+                    folded = [];
+                    candidateGroup = this.group.forkForPendingCommit();
+                    ({ commitMessage } = await candidateGroup.commitUpdate({
+                        updateProposals: folded,
+                    }));
+                }
                 staged = await this._stagePendingCommit({
                     candidateGroup,
                     commitMessage,
                     kind: 'update',
                     queuedProposalEntries,
-                    foldedUpdates: updateProposals.length,
+                    foldedUpdates: folded.length,
                 });
             } catch (err) {
                 if (candidateGroup && !staged) candidateGroup.destroySecrets();
@@ -2436,10 +2604,13 @@
         /**
          * Transport-driven removal (issue #1). The relay says `senderId` has
          * left. Instead of committing a Remove on that word alone, challenge
-         * the member over MLS and remove only if it stays silent for the
-         * grace window. A relay that forged the departure must now suppress
-         * the member's authenticated reply for the whole window, and the
-         * creator is told when a "departed" member answers.
+         * the member over MLS and remove only if no authenticated pong
+         * carrying this challenge's fresh nonce arrives within the grace
+         * window that follows a ping actually sent. A relay that forged the
+         * departure must now suppress the member's reply for the whole
+         * window, and the creator is told when a "departed" member answers.
+         * Other traffic from that leaf is not a presence proof: it may have
+         * been written before the departure and delivered late.
          *
          * Falls straight through to removeMemberBySenderId when there is no
          * live leaf to challenge (deferred KeyPackage, pending Add, tombstone
@@ -2510,9 +2681,11 @@
                 this._livenessChallenges.delete(senderId);
                 return;
             }
-            // Never remove on a challenge the member could not have seen: if
-            // the ping was blocked by a pending Commit, try once more first.
-            if (!challenge.pingSent && challenge.attempts < MAX_LIVENESS_PING_ATTEMPTS) {
+            // Never remove on a challenge the member could not have seen. A
+            // ping blocked by a pending Commit (or a failed send) is retried,
+            // and the full grace window starts again from the attempt; only
+            // silence after a ping that actually left this tab removes.
+            if (!challenge.pingSent) {
                 await this._sendLivenessPing(senderId, challenge);
                 this._armLivenessTimer(senderId, challenge);
                 return;
@@ -2546,11 +2719,17 @@
             }
         }
 
-        _noteLeafAlive(leafIndex) {
+        _acceptLivenessPong(pt, senderLeafIndex) {
+            if (pt.length !== 1 + LIVENESS_NONCE_BYTES) return;
+            const nonce = pt.subarray(1);
             for (const [senderId, challenge] of this._livenessChallenges) {
-                if (challenge.leafIndex !== leafIndex) continue;
+                if (challenge.leafIndex !== senderLeafIndex
+                    || !challenge.pingSent
+                    || !equalBytes(challenge.nonce, nonce)) continue;
                 this._cancelLivenessChallenge(senderId);
-                this.onEvent({ kind: 'liveness-confirmed', senderId, leafIndex });
+                this.onEvent({
+                    kind: 'liveness-confirmed', senderId, leafIndex: senderLeafIndex,
+                });
             }
         }
 
