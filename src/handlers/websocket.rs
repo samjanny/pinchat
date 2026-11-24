@@ -1197,7 +1197,7 @@ async fn handle_socket(
     // strictly after the cursor signed into their one-shot upgrade JWT.
     // Fresh participants start at the current head and do not consume
     // pre-admission MLS history.
-    let (mut broadcast_rx, mls_control_stream) = if room_type == RoomType::Group {
+    let (broadcast_rx, mls_control_stream) = if room_type == RoomType::Group {
         let resume_cursor = if admission == ConnectionAdmission::Resumed {
             mls_control_cursor
         } else {
@@ -1339,8 +1339,19 @@ async fn handle_socket(
     // that exact cursor. Controls accepted while replay was in progress are
     // therefore recovered from the durable log even if the transient
     // broadcast ring wrapped meanwhile.
+    //
+    // The live subscription of a non-empty snapshot is dropped before the
+    // replay starts: it is replaced by that next one, and nothing reads it
+    // in between. Kept, it held every frame the room sent meanwhile in the
+    // broadcast budgets until the browser had acknowledged the whole replay,
+    // up to a minute for each window, where any other receiver holds a frame
+    // for 30 seconds at most.
+    let mut broadcast_rx = Some(broadcast_rx);
     if let Some(mut stream) = mls_control_stream {
         loop {
+            if !stream.replay.is_empty() {
+                broadcast_rx = None;
+            }
             for window in stream.replay.chunks(MLS_REPLAY_WINDOW_ENTRIES) {
                 for entry in window {
                     if !send_within_deadline(&mut sender, Outgoing::Text(entry.json.as_str())).await
@@ -1471,15 +1482,11 @@ async fn handle_socket(
 
             match state.open_mls_control_stream(&room_id, connection_id, Some(stream.through_seq)) {
                 Ok((next_receiver, next_stream)) => {
-                    broadcast_rx = next_receiver;
+                    broadcast_rx = Some(next_receiver);
                     stream = next_stream;
                 }
                 Err(error) => {
-                    tracing::warn!(
-                        "Unable to continue MLS control replay for connection {}: {:?}",
-                        connection_id,
-                        error
-                    );
+                    tracing::warn!("Unable to continue MLS control replay: {:?}", error);
                     let _ = evict_group_participant(
                         &state,
                         room_id,
@@ -1497,6 +1504,11 @@ async fn handle_socket(
             }
         }
     }
+    // The replay ends with an empty snapshot, which keeps its subscription.
+    let Some(mut broadcast_rx) = broadcast_rx else {
+        schedule_connection_departure(&state, connection_id);
+        return;
+    };
 
     // Direct responses (currently Commit rate-limit rejections) share the
     // single socket writer with room broadcasts.
@@ -2208,26 +2220,34 @@ async fn handle_socket(
                                     }
                                     _ => MlsControlAdmission::Ordinary,
                                 };
+                                // Only the strings are kept while the control
+                                // waits for room in the broadcast budgets.
+                                drop(validated);
                                 let submitted_commit_ref = commit_ref.clone();
+                                // A full broadcast budget is waited out, as
+                                // for every other frame a client sends; it
+                                // used to close the connection at once.
                                 let append_result = state_clone
-                                    .append_and_broadcast_mls_envelope_from(
+                                    .append_and_broadcast_mls_envelope_when_room(
                                         &room_id,
                                         admission,
                                         recv_client_share.as_deref(),
+                                        BROADCAST_ADMISSION_WAIT,
                                         |control_seq| {
                                             serde_json::to_string(&Message::Mls {
-                                                payload,
+                                                payload: payload.clone(),
                                                 wire_format,
-                                                ratchet_tree,
-                                                key_package_ref,
-                                                commit_ref,
-                                                bootstrap_proof,
+                                                ratchet_tree: ratchet_tree.clone(),
+                                                key_package_ref: key_package_ref.clone(),
+                                                commit_ref: commit_ref.clone(),
+                                                bootstrap_proof: bootstrap_proof.clone(),
                                                 control_seq: Some(control_seq),
                                                 sender_id: connection_id,
                                             })
                                             .ok()
                                         },
-                                    );
+                                    )
+                                    .await;
                                 if let Err(error) = append_result {
                                     state_clone.forget_replay_hash(&room_id, &payload_hash);
                                     // No room identifier in error output

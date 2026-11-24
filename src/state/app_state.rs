@@ -1996,6 +1996,9 @@ impl AppState {
 
     /// Append an MLS envelope that a client sent. With a lease, its live
     /// broadcast also counts against the share of the sender's address.
+    /// The relay itself appends client controls through
+    /// [`Self::append_and_broadcast_mls_envelope_when_room`].
+    #[cfg(test)]
     pub fn append_and_broadcast_mls_envelope_from<F>(
         &self,
         room_id: &Uuid,
@@ -2014,6 +2017,58 @@ impl AppState {
             sender,
             serialize,
         )
+    }
+
+    /// Like [`Self::append_and_broadcast_mls_envelope_from`], for a control
+    /// that may wait for room in the broadcast budgets, as a client's other
+    /// frames do (see [`Self::broadcast_room_message_when_room`]). It used
+    /// to cost its sender the connection (1013) at once.
+    ///
+    /// Only a full broadcast budget is waited out: nothing has been changed
+    /// in the log when it is found full, so the append is tried again from
+    /// the start, `serialize` included. Every other answer, a full log
+    /// among them, is returned as it comes. After `patience` the error is
+    /// [`MlsControlAppendError::BroadcastCapacity`].
+    pub async fn append_and_broadcast_mls_envelope_when_room<F>(
+        &self,
+        room_id: &Uuid,
+        admission: MlsControlAdmission,
+        sender: Option<&ClientBroadcastLease>,
+        patience: Duration,
+        serialize: F,
+    ) -> Result<u64, MlsControlAppendError>
+    where
+        F: Fn(u64) -> Option<String>,
+    {
+        let deadline = tokio::time::Instant::now() + patience;
+        let mut waiter = None;
+        loop {
+            // Registered before the attempt it belongs to, as in
+            // `broadcast_room_message_when_room`.
+            let released = self.broadcast_release.released.notified();
+            tokio::pin!(released);
+            if waiter.is_some() {
+                released.as_mut().enable();
+            }
+            match self.append_and_broadcast_mls_control_at(
+                room_id,
+                Instant::now(),
+                false,
+                admission.clone(),
+                sender,
+                &serialize,
+            ) {
+                Err(MlsControlAppendError::BroadcastCapacity) => {}
+                answer => return answer,
+            }
+            if waiter.is_none() {
+                waiter = Some(BroadcastWaiter::new(&self.broadcast_release));
+                continue;
+            }
+            if tokio::time::timeout_at(deadline, released).await.is_err() {
+                return Err(MlsControlAppendError::BroadcastCapacity);
+            }
+        }
     }
 
     fn append_and_broadcast_mls_control_at<F>(
