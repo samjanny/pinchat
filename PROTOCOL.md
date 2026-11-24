@@ -170,7 +170,8 @@ Client                                    Server
   or **429**, with `Retry-After: 30`
 - Room missing, expired, or full for an identity that holds no slot in it
   -> **404** (one answer for the three)
-- The token's identity still has an open socket -> **409 Conflict**
+- The token's identity still has an open socket -> **409 Conflict**; the
+  relay then probes that socket (see "Tokens and Reconnects")
 - Replayed jti -> **403**
 
 Every rejection but the last leaves the single-use token unspent: the client
@@ -631,9 +632,16 @@ period: one that the participant resumed from ends nothing later.
 The resume credential is a bearer token. It is sent only in the
 participant's own `connected` frame, is valid for the room's TTL from that
 admission, and is kept in page memory only. While the relay still holds an
-earlier socket of the identity, for instance after a change of network until
-that socket times out, an upgrade with a resume token is refused with 409
-and its token is not spent; the old socket is not taken over.
+earlier socket of the identity, for instance after a change of network, an
+upgrade with a resume token is refused with 409 and its token is not spent.
+The old socket is not taken over; it is probed. The first such refusal
+sends it a Ping and gives it 5 seconds to send anything at all, a pong or
+part of a message. A socket that sends nothing is closed then, exactly as
+at its idle timeout (1001); its identity detaches and its grace period
+starts, so a resume from then on succeeds, with the same token if it is
+still valid. A socket that answers stays, and the upgrade keeps being
+refused. While a probe is pending, further refusals neither extend nor
+repeat it. A socket still replaying its backlog is not probed.
 
 ### Client Messages
 
@@ -779,7 +787,7 @@ control.
 
 | Code | When |
 |------|------|
-| 1001 | The room expired or was closed; the connection reached `MAX_WS_CONNECTION_AGE_SECS` (30 minutes); nothing arrived for 90 seconds |
+| 1001 | The room expired or was closed; the connection reached `MAX_WS_CONNECTION_AGE_SECS` (30 minutes); nothing arrived for 90 seconds, or within 5 seconds of a liveness probe |
 | 1002, 1007, 1009 | The client broke RFC 6455; sent text that is not UTF-8; sent a frame or message above the size limit |
 | 1008 | A rate or protocol-error limit; the participant was evicted, or its identity is no longer in the room; it fell more than 64 frames behind its room; a message took more than 90 seconds to arrive; the replay rules above; admission refused after the upgrade |
 | 1011 | The relay could not set up the connection |

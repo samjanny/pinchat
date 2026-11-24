@@ -403,6 +403,82 @@ impl Drop for PrefixLease {
     }
 }
 
+/// A liveness probe of one socket.
+///
+/// After a change of network the browser comes back at once, while its old
+/// socket stays open on the relay until its idle timeout notices that
+/// nothing arrives any more, and admission refuses a second socket of the
+/// identity meanwhile. An upgrade refused that way arms this probe of the
+/// old socket: its sending side sends a Ping at once, and its receiving side
+/// gives the client until the deadline to send anything at all, a pong
+/// included. A socket that sends nothing is then closed exactly as at the
+/// idle timeout, and its identity detaches through its own close; one that
+/// answers stays. Whoever holds a resume credential can thus make a dead
+/// socket go away sooner, never end a live one.
+///
+/// At most one probe is pending: arming it again before it is answered or
+/// has expired changes nothing, so repeated refusals neither extend nor
+/// stack it.
+#[derive(Debug)]
+pub struct SocketProbe {
+    deadline: tokio::sync::watch::Sender<Option<tokio::time::Instant>>,
+}
+
+impl SocketProbe {
+    fn new() -> Self {
+        Self {
+            deadline: tokio::sync::watch::Sender::new(None),
+        }
+    }
+
+    /// Arm the probe for `within` from now, unless it is armed already.
+    /// Returns whether this call armed it.
+    pub fn arm(&self, within: Duration) -> bool {
+        self.deadline.send_if_modified(|deadline| {
+            if deadline.is_some() {
+                return false;
+            }
+            *deadline = Some(tokio::time::Instant::now() + within);
+            true
+        })
+    }
+
+    /// The socket showed that it is alive.
+    pub fn clear(&self) {
+        self.deadline
+            .send_if_modified(|deadline| deadline.take().is_some());
+    }
+
+    /// The deadline of the pending probe, as it changes.
+    pub fn watch(&self) -> tokio::sync::watch::Receiver<Option<tokio::time::Instant>> {
+        self.deadline.subscribe()
+    }
+}
+
+/// The probe of a socket, findable by its identity for as long as this is
+/// held. A later socket of the same identity registers its own; this one
+/// then removes only itself.
+#[derive(Debug)]
+pub struct SocketProbeRegistration {
+    connection_id: Uuid,
+    probe: Arc<SocketProbe>,
+    probes: Arc<DashMap<Uuid, Arc<SocketProbe>>>,
+}
+
+impl SocketProbeRegistration {
+    pub fn probe(&self) -> &SocketProbe {
+        &self.probe
+    }
+}
+
+impl Drop for SocketProbeRegistration {
+    fn drop(&mut self) {
+        self.probes.remove_if(&self.connection_id, |_, registered| {
+            Arc::ptr_eq(registered, &self.probe)
+        });
+    }
+}
+
 /// One shared room-broadcast value. The channel ring and every receiver clone
 /// share the same JSON allocation; aggregate byte counters are released only
 /// when the final clone disappears.
@@ -699,6 +775,10 @@ pub struct AppState {
     /// Used to know which room a connection belongs to
     pub connections: Arc<DashMap<Uuid, Uuid>>,
 
+    /// The liveness probe of each socket that is relaying (see
+    /// [`SocketProbe`]), by its identity.
+    socket_probes: Arc<DashMap<Uuid, Arc<SocketProbe>>>,
+
     /// Broadcast channels for each room: room_id -> Sender
     /// Uses tokio::sync::broadcast to distribute messages
     pub broadcast_channels: Arc<DashMap<Uuid, tokio::sync::broadcast::Sender<BroadcastPayload>>>,
@@ -823,6 +903,7 @@ impl AppState {
         Self {
             rooms: Arc::new(DashMap::new()),
             connections: Arc::new(DashMap::new()),
+            socket_probes: Arc::new(DashMap::new()),
             broadcast_channels: Arc::new(DashMap::new()),
             broadcast_room_bytes: Arc::new(DashMap::new()),
             broadcast_client_shares: Arc::new(DashMap::new()),
@@ -2471,6 +2552,32 @@ impl AppState {
         now: Instant,
     ) -> Vec<Uuid> {
         self.lagging_mls_control_participants_at(room_id, max_unacknowledged, max_stall, now)
+    }
+
+    /// Make the liveness probe of a socket of `connection_id` findable by
+    /// [`Self::probe_socket`] while the returned registration is held.
+    pub fn register_socket_probe(&self, connection_id: Uuid) -> SocketProbeRegistration {
+        let probe = Arc::new(SocketProbe::new());
+        self.socket_probes.insert(connection_id, probe.clone());
+        SocketProbeRegistration {
+            connection_id,
+            probe,
+            probes: self.socket_probes.clone(),
+        }
+    }
+
+    /// Arm the liveness probe of the socket that `connection_id` has, if it
+    /// has one that is relaying. Returns whether a probe was armed by this
+    /// call; `false` also when one was pending already.
+    pub fn probe_socket(&self, connection_id: &Uuid, within: Duration) -> bool {
+        let Some(probe) = self
+            .socket_probes
+            .get(connection_id)
+            .map(|entry| entry.value().clone())
+        else {
+            return false;
+        };
+        probe.arm(within)
     }
 
     /// True only while this exact stable participant currently owns the
