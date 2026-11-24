@@ -682,6 +682,29 @@ pub async fn ws_handler(
         }
     }
 
+    // An identity has one socket at a time. After a change of network the
+    // browser reconnects at once, while the relay may still hold the old
+    // socket open until its idle timeout (90 seconds) notices that nothing
+    // comes from it any more. Admission refuses the second socket; this
+    // refusal comes before the token is spent, so the client may try again
+    // with the same token instead of paying for a new one with proof of
+    // work. Advisory, like the room checks above: admission decides.
+    //
+    // The old socket is not taken over. A resume credential is a bearer
+    // token, and taking over would let whoever holds one end the live
+    // socket at any time rather than only reclaim one that has gone; it
+    // would also need every eviction made by the old socket's replay loop
+    // to know that its identity has moved on.
+    if state.connections.contains_key(&claims.connection_id) {
+        #[cfg(debug_assertions)]
+        tracing::debug!("WebSocket upgrade rejected: identity still has a socket");
+        return (
+            StatusCode::CONFLICT,
+            "This relay identity is still connected; try again shortly",
+        )
+            .into_response();
+    }
+
     // SECURITY: Single-use token enforcement (prevents replay attacks).
     // C-07: this is the LAST gate before upgrade. Every check above has
     // already passed by the time we mutate state, so a failed upgrade attempt
@@ -5186,42 +5209,56 @@ mod tests {
                 try_open_socket(addr, room_id, &first_token),
                 try_open_socket(addr, room_id, &second_token),
             );
-            let mut first = first.expect("both upgrades pass the gate");
-            let mut second = second.expect("both upgrades pass the gate");
-            let first_frame = next_frame(&mut first).await.expect("first frame");
-            let second_frame = next_frame(&mut second).await.expect("first frame");
-            let mut kinds = [
-                first_frame["type"].as_str().unwrap().to_owned(),
-                second_frame["type"].as_str().unwrap().to_owned(),
-            ];
-            kinds.sort();
-            assert_eq!(
-                kinds,
-                ["connected", "error"],
-                "exactly one socket may own a relay identity"
-            );
-            let (mut winner, mut loser) = if first_frame["type"] == "connected" {
-                (first, second)
-            } else {
-                (second, first)
-            };
-            assert!(
-                next_frame(&mut loser).await.is_none(),
-                "the loser is closed"
-            );
+            // Exactly one socket may own a relay identity. The other is
+            // refused: before its token is spent (409) when the winner was
+            // already admitted at its upgrade, or by admission, with an
+            // error and a close, when both passed the upgrade together.
+            let mut winner = None;
+            let mut refused = 0;
+            for attempt in [first, second] {
+                match attempt {
+                    Err(409) => refused += 1,
+                    Ok(mut socket) => {
+                        let frame = next_frame(&mut socket).await.expect("first frame");
+                        if frame["type"] == "connected" {
+                            assert!(winner.is_none(), "two sockets own one identity");
+                            winner = Some(socket);
+                        } else {
+                            assert_eq!(frame["type"], "error", "{frame}");
+                            assert!(
+                                next_frame(&mut socket).await.is_none(),
+                                "the loser is closed"
+                            );
+                            refused += 1;
+                        }
+                    }
+                    Err(status) => panic!("unexpected refusal {status}"),
+                }
+            }
+            assert_eq!(refused, 1);
+            let mut winner = winner.expect("one resume is admitted");
 
             assert_eq!(state.get_participant_count(&room_id), 2);
             assert!(state.connection_is_active(&room_id, &bob));
             expect_silence(&mut bob_socket, "peer during concurrent resumes").await;
             assert_relays(&mut winner, alice, &mut bob_socket, 1).await;
 
-            // A further resume while the identity is active is refused and
-            // leaves the live socket in place.
-            let mut late = try_open_socket(addr, room_id, &resume_token(&state, room_id, alice))
+            // A further resume while the identity is active is refused before
+            // its token is spent, and leaves the live socket in place.
+            let late =
+                WsTokenClaims::for_resume(room_id, alice, 30, &state.config.jwt_issuer, None);
+            let late_jti = late.jti;
+            assert_eq!(
+                try_open_socket(
+                    addr,
+                    room_id,
+                    &sign_token(&late, &state.jwt_secret).unwrap()
+                )
                 .await
-                .expect("upgrade completes, admission decides");
-            expect_frame(&mut late, "error").await;
-            assert!(next_frame(&mut late).await.is_none());
+                .err(),
+                Some(409)
+            );
+            assert!(!state.consumed_tokens.contains_key(&late_jti));
             assert!(state.connection_is_active(&room_id, &alice));
             assert_relays(&mut bob_socket, bob, &mut winner, 2).await;
         });
@@ -6595,13 +6632,18 @@ mod tests {
                 upgrade_head(addr, missing, &fresh_token(&state, missing, peer), None).await;
             assert!(head.starts_with("http/1.1 404"), "{head}");
             assert_eq!(state.ws_connections_open(), 0);
+            // An identity that still has its socket, then a token already
+            // spent.
             let token = fresh_token(&state, rooms[0], peer);
             let socket = try_open_socket(addr, rooms[0], &token).await.unwrap();
             let (head, _) = upgrade_head(addr, rooms[0], &token, None).await;
-            assert!(head.starts_with("http/1.1 403"), "{head}");
+            assert!(head.starts_with("http/1.1 409"), "{head}");
             assert_eq!(state.ws_connections_open(), 1);
             drop(socket);
             wait_until("a closed connection", || state.ws_connections_open() == 0).await;
+            let (head, _) = upgrade_head(addr, rooms[0], &token, None).await;
+            assert!(head.starts_with("http/1.1 403"), "{head}");
+            assert_eq!(state.ws_connections_open(), 0);
 
             // The client goes away after its request, before reading the
             // answer, and after the 101 without a word.
