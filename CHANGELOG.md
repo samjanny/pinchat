@@ -117,7 +117,10 @@ changed too.
   which made the real messages that followed be dropped as replays.
   Application messages now carry a signed generation.
 - A presence check is answered only by a fresh pong to a ping that was
-  actually sent. A member is never removed on a ping that was not sent.
+  actually sent. A member is removed only after a whole grace window of
+  silence that follows that ping: never on a ping that was not sent, nor on
+  a timer left from an earlier attempt or an earlier check of the same
+  member.
 - Clock skew between members, a proposal that arrives just before a joiner's
   Welcome, a copied Update key and oversized KeyPackages can no longer
   desynchronise members, freeze periodic re-keying or block later joins.

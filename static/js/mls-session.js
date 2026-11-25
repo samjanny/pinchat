@@ -2666,17 +2666,24 @@
 
         _armLivenessTimer(senderId, challenge) {
             if (challenge.timer) clearTimeout(challenge.timer);
+            // One token per arming. A timer that has fired cannot be called
+            // back: its operation waits in the queue behind the others, and
+            // by the time it runs the challenge may have been answered and
+            // replaced by a new one for the same member, or re-armed by a
+            // retry. The token lets it act only for the arming that set it.
+            const armToken = {};
+            challenge.armToken = armToken;
             challenge.timer = setTimeout(() => {
                 challenge.timer = null;
                 void this._serializeOperation(
-                    () => this._expireLivenessChallenge(senderId),
+                    () => this._expireLivenessChallenge(senderId, armToken),
                 );
             }, this._livenessGraceMs);
         }
 
-        async _expireLivenessChallenge(senderId) {
+        async _expireLivenessChallenge(senderId, armToken) {
             const challenge = this._livenessChallenges.get(senderId);
-            if (!challenge) return;
+            if (!challenge || !armToken || challenge.armToken !== armToken) return;
             if (this._state === 'removed' || this._state === 'desynced') {
                 this._livenessChallenges.delete(senderId);
                 return;

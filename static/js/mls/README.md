@@ -264,7 +264,9 @@ AuthenticatedContent before applying the referenced leaf update.
   removes only if no authenticated pong from that leaf carrying that nonce
   arrives within the grace window (20 s by default) that follows a ping
   actually sent. A ping blocked by a pending Commit is retried, never
-  counted as an unanswered challenge. Other messages from the leaf are
+  counted as an unanswered challenge, and a timer left from an earlier
+  attempt, or from an earlier challenge to the same member, ends nothing:
+  each timer acts only for the arming that set it. Other messages from the leaf are
   not a presence proof, because they may have been written before the
   departure and delivered late. A relay can still suppress the pong
   for the whole window, which is indistinguishable from a real departure

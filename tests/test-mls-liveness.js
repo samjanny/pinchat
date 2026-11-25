@@ -50,6 +50,11 @@ const PSK = new Uint8Array(32).fill(0x5a);
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+async function waitFor(condition, timeoutMs) {
+    const deadline = Date.now() + timeoutMs;
+    while (!condition() && Date.now() < deadline) await sleep(5);
+}
+
 /** Creator + one joined member, with the relay played by hand. */
 async function makeGroup({ livenessGraceMs } = {}) {
     const creatorOut = [];
@@ -226,17 +231,33 @@ async function main() {
             && g.creator._livenessChallenges.get('joiner-1')?.pingSent === false
             && privateMessages(g.creatorOut.slice(outBefore)).length === 0);
         g.creator._localCommitBusy = false;
-        // Run the next retry now, with a long window so the answer below
-        // cannot race the timer.
+        // The retry armed while blocked fires on its own, sends the ping and
+        // arms the next window at this length, long enough that the answer
+        // below cannot race it.
         g.creator._livenessGraceMs = 10000;
-        await g.creator._serializeOperation(
-            () => g.creator._expireLivenessChallenge('joiner-1'),
+        const blockedToken = g.creator._livenessChallenges.get('joiner-1')?.armToken;
+        await waitFor(
+            () => g.creator._livenessChallenges.get('joiner-1')?.pingSent === true,
+            5000,
         );
+        await g.creator._serializeOperation(async () => {});
         const pings = privateMessages(g.creatorOut.slice(outBefore));
         check('the ping is sent once the creator is free again',
             pings.length === 1
             && g.creator._livenessChallenges.get('joiner-1')?.pingSent === true
             && commitsAfter(g.creatorOut, outBefore).length === 0);
+        // A timer that fired before the retry re-armed cannot be called back:
+        // its operation still runs, after the ping. It must not take the
+        // ping for one the member had a whole window to answer.
+        await g.creator._serializeOperation(
+            () => g.creator._expireLivenessChallenge('joiner-1', blockedToken),
+        );
+        check('a timer left from the blocked attempts ends nothing',
+            blockedToken !== undefined
+            && g.creator._livenessChallenges.get('joiner-1')?.pingSent === true
+            && !g.creatorEvents.some((e) => e.kind === 'liveness-timeout')
+            && commitsAfter(g.creatorOut, outBefore).length === 0);
+        const answeredToken = g.creator._livenessChallenges.get('joiner-1')?.armToken;
         const jb = g.joinerOut.length;
         await g.joiner.onRelayEnvelope({ ...pings[0], sender_id: 'creator-self' });
         const pong = privateMessages(g.joinerOut.slice(jb))[0];
@@ -244,6 +265,19 @@ async function main() {
         check('the answer to that ping keeps the member',
             g.creator._livenessChallenges.size === 0
             && g.creator._leafBySenderId.get('joiner-1') === 1
+            && g.creator._pendingCommit === null);
+        // Nor does a timer left from the answered challenge end the next
+        // challenge for the same member.
+        await g.creator.requestRemovalAfterLivenessCheck('joiner-1');
+        const next = g.creator._livenessChallenges.get('joiner-1');
+        await g.creator._serializeOperation(
+            () => g.creator._expireLivenessChallenge('joiner-1', answeredToken),
+        );
+        check('a timer left from an answered challenge does not end the next one',
+            answeredToken !== undefined
+            && next?.pingSent === true
+            && g.creator._livenessChallenges.get('joiner-1') === next
+            && !g.creatorEvents.some((e) => e.kind === 'liveness-timeout')
             && g.creator._pendingCommit === null);
         g.creator._clearLivenessChallenges();
     }
