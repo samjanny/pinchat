@@ -360,13 +360,13 @@ async function runTests() {
             return match[1];
         };
 
-        const pinsOk = chromeTag === 'v0.9.2'
+        const pinsOk = chromeTag === 'v0.9.3'
             && firefoxTag === chromeTag
             && Number.isSafeInteger(chromeFloor)
             && chromeFloor > 0
             && chromeFloor <= signed.data.sequence
             && firefoxFloor === chromeFloor
-            && chromeManifest.version === '1.6.0'
+            && chromeManifest.version === '1.7.0'
             && firefoxManifest.version === chromeManifest.version
             && readPublicKey(chromeBackground) === readPublicKey(firefoxBackground);
         if (!pinsOk) {

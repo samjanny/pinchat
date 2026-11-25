@@ -4,16 +4,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Dates are the repository-local commit dates; entries are curated for user-visible impact
 rather than being a 1:1 mirror of `git log`.
 
-## [Unreleased] - v0.9.3
+## [2026-11-25] - v0.9.3
 
 Fixes for the findings of an internal audit of v0.9.2 across five areas: the
 1:1 cryptography, the integrity extensions and page security, the relay's
 HTTP surface, the relay core and the MLS group chat. Every fix comes with a
 regression test that fails on v0.9.2.
 
-Before release the manifest has to be re-signed, since static files changed,
-and both extensions need a new version: their content and background scripts
-changed too.
+The manifest is re-signed at sequence 59, since static files changed, and
+both extensions move to 1.7.0 with their pin on v0.9.3 and their floor raised
+to 59: their content and background scripts changed too. A manifest signed
+at sequence 58 during the release, before the last group chat fix, was never
+published, and the floor keeps 1.7.0 from accepting it. The crate moves to
+0.9.3.
 
 ### Security - 1:1 chat
 
