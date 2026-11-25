@@ -136,6 +136,17 @@ const EXIF_HEADER = [0x45, 0x78, 0x69, 0x66, 0x00, 0x00]; // "Exif\0\0"
 // JPEG
 // -----------------------------------------------------------------------------
 
+// "JFIF\0", version, density unit, X and Y density, thumbnail width and height.
+const JFIF_FIXED_LENGTH = 14;
+
+/** An APP0 segment with the given JFIF fields and a thumbnail of 0 by 0. */
+function jfifWithoutThumbnail(fields) {
+    const segment = new Uint8Array(4 + JFIF_FIXED_LENGTH);
+    segment.set([0xff, 0xe0, 0x00, 2 + JFIF_FIXED_LENGTH]);
+    segment.set(fields.subarray(0, JFIF_FIXED_LENGTH - 2), 4);
+    return segment; // the last two bytes, the thumbnail size, stay 0
+}
+
 function stripJpeg(bytes) {
     const parts = [bytes.subarray(0, 2)];
     let orientation = null;
@@ -164,6 +175,7 @@ function stripJpeg(bytes) {
         if (marker === 0xda) break; // start of scan: handled below
 
         let keep = true;
+        let kept = segment;
         if (marker === 0xe1) {
             // APP1: Exif or XMP. Only the orientation survives, re-encoded.
             keep = false;
@@ -171,8 +183,12 @@ function stripJpeg(bytes) {
                 orientation = readTiffOrientation(bytes.subarray(payload + 6, offset + 2 + length));
             }
         } else if (marker === 0xe0) {
-            // APP0: the JFIF header. Its extension (JFXX) is a thumbnail.
-            keep = startsWithBytes(bytes, payload, asciiBytes('JFIF\0'));
+            // APP0: the JFIF header. Its extension (JFXX) is a thumbnail, and
+            // so is whatever follows the header's own fixed fields: it can
+            // carry an uncompressed thumbnail of its own. The header is
+            // written again without one.
+            keep = startsWithBytes(bytes, payload, asciiBytes('JFIF\0')) && length >= 2 + JFIF_FIXED_LENGTH;
+            if (keep) kept = jfifWithoutThumbnail(bytes.subarray(payload, payload + JFIF_FIXED_LENGTH));
             if (keep && parts.length === 1) insertExifAt = 2;
         } else if (marker === 0xe2) {
             keep = startsWithBytes(bytes, payload, asciiBytes('ICC_PROFILE\0'));
@@ -181,7 +197,7 @@ function stripJpeg(bytes) {
         } else if ((marker >= 0xe3 && marker <= 0xef) || marker === 0xfe) {
             keep = false; // other application segments, comments
         }
-        if (keep) parts.push(segment);
+        if (keep) parts.push(kept);
         offset += 2 + length;
     }
 
@@ -373,9 +389,50 @@ function stripGif(bytes) {
 // WebP
 // -----------------------------------------------------------------------------
 
-const WEBP_KEPT_CHUNKS = new Set(['VP8 ', 'VP8L', 'VP8X', 'ALPH', 'ANIM', 'ANMF', 'ICCP']);
+const WEBP_KEPT_CHUNKS = new Set(['VP8 ', 'VP8L', 'VP8X', 'ALPH', 'ANIM', 'ICCP']);
+// What an animation frame may carry after its own header: the picture.
+const WEBP_FRAME_CHUNKS = new Set(['ALPH', 'VP8 ', 'VP8L']);
+const WEBP_FRAME_HEADER = 16;
 const WEBP_FLAG_EXIF = 0x08;
 const WEBP_FLAG_XMP = 0x04;
+
+function webpChunk(type, data) {
+    const chunk = new Uint8Array(8 + data.length + (data.length & 1));
+    chunk.set(asciiBytes(type));
+    chunk[4] = data.length & 0xff;
+    chunk[5] = (data.length >> 8) & 0xff;
+    chunk[6] = (data.length >> 16) & 0xff;
+    chunk[7] = (data.length >>> 24) & 0xff;
+    chunk.set(data, 8);
+    return chunk;
+}
+
+/**
+ * An ANMF chunk built again from the frame at bytes[start, end): its header,
+ * then only the chunks that make up its picture. A frame is a container of
+ * its own, and whatever else it holds would otherwise travel inside it.
+ */
+function webpFrame(bytes, start, end) {
+    if (end - start < WEBP_FRAME_HEADER) imageMetadataFail('WebP animation frame is shorter than its header');
+    const u32 = (offset) => (bytes[offset] | (bytes[offset + 1] << 8)
+        | (bytes[offset + 2] << 16) | (bytes[offset + 3] << 24)) >>> 0;
+    const parts = [bytes.subarray(start, start + WEBP_FRAME_HEADER)];
+    let picture = false;
+    let offset = start + WEBP_FRAME_HEADER;
+    while (offset < end) {
+        if (offset + 8 > end) imageMetadataFail('WebP animation frame ends inside a chunk header');
+        const type = String.fromCharCode(bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3]);
+        const size = u32(offset + 4);
+        if (offset + 8 + size > end) imageMetadataFail('WebP animation frame chunk runs past the frame');
+        if (WEBP_FRAME_CHUNKS.has(type)) {
+            parts.push(webpChunk(type, bytes.subarray(offset + 8, offset + 8 + size)));
+            if (type !== 'ALPH') picture = true;
+        }
+        offset = Math.min(offset + 8 + size + (size & 1), end);
+    }
+    if (!picture) imageMetadataFail('WebP animation frame has no image data');
+    return webpChunk('ANMF', concatBytes(parts));
+}
 
 function stripWebp(bytes) {
     if (bytes.length < 12) imageMetadataFail('WebP is shorter than its header');
@@ -402,6 +459,8 @@ function stripWebp(bytes) {
                 if (startsWithBytes(tiff, 0, EXIF_HEADER)) tiff = tiff.subarray(6);
                 orientation = readTiffOrientation(tiff);
             }
+        } else if (type === 'ANMF') {
+            chunks.push(webpFrame(bytes, offset + 8, offset + 8 + size));
         } else if (WEBP_KEPT_CHUNKS.has(type)) {
             const chunk = new Uint8Array(8 + padded);
             chunk.set(bytes.subarray(offset, offset + 8 + size));

@@ -1,5 +1,4 @@
 use sha2::{Digest, Sha256};
-use uuid::Uuid;
 
 /// Proof-of-Work challenge with configurable difficulty
 #[derive(Debug, Clone)]
@@ -43,8 +42,12 @@ impl PowChallenge {
     /// ```
     /// let challenge = PowChallenge::new(12); // 12-bit difficulty (~30ms to solve)
     /// ```
+    ///
+    /// Test fixture only: the challenges the server hands out are signed and
+    /// carry their expiry (`ChallengeCache::issue`).
+    #[cfg(test)]
     pub fn new(difficulty: u8) -> Self {
-        let id = Uuid::new_v4();
+        let id = uuid::Uuid::new_v4();
         // Embed difficulty in the challenge bytes (audit H-1). The verifier
         // re-derives the mask from `self.difficulty`; the `mask` field is
         // a wire-protocol convenience for the client and is never trusted

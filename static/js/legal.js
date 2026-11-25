@@ -2,14 +2,20 @@
  * Operator-data injector for the legal pages (terms, privacy).
  *
  * Security model:
- *   - This JS file, plus the HTML templates it operates on, are covered by
- *     the signed manifest and verified by the PinChat extension via SRI.
- *     Tampering with either is caught by the extension.
+ *   - This JS file and the HTML templates it operates on are covered by the
+ *     signed manifest. With the PinChat extension the browser runs this file
+ *     only with its signed hash. The HTML is compared with the signed page
+ *     only in Firefox; in Chromium the server can change that markup, its
+ *     text and links included.
  *   - The operator-specific values (name, contact email, PEC, hosting, etc.)
  *     live in /static/operator.json. The file is deployment-specific and
- *     untracked in git, but the deployed copy IS listed in the signed
- *     manifest (verify-sri.js checks it when present), so changing it on
- *     the server requires a re-sign like any other static asset.
+ *     untracked in git; the deployed copy is listed in the signed manifest
+ *     (verify-sri.js checks it when present). It is fetched below without an
+ *     integrity value: nothing signed carries its hash to this page. In
+ *     Firefox the extension holds the response and hands this page the file
+ *     only if it matches the signed hash. Elsewhere nothing binds the bytes
+ *     received here to the manifest: the extension's own download of the
+ *     file can match while the server answers this request differently.
  *   - All substitution is done with textContent / href, never innerHTML.
  *     Even if an attacker compromised the server and tampered with
  *     operator.json, they could only change displayed text, not inject

@@ -96,31 +96,64 @@ pub fn generate_session_token() -> Uuid {
     Uuid::new_v4()
 }
 
-/// Generates a CSRF token signed with HMAC
-pub fn generate_csrf_token(secret: &[u8; 32]) -> String {
-    let random_bytes: [u8; 16] = rand::random();
-    let random_hex = hex::encode(random_bytes);
+/// How long a CSRF token is accepted after it was issued: the lifetime of
+/// the cookie that carries it.
+///
+/// The cookie's Max-Age only tells the browser when to drop it. Before the
+/// time of issue was signed into the token, a token that had leaked stayed
+/// valid on the server until the next restart.
+pub const CSRF_TOKEN_TTL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 
-    let mut mac = HmacSha256::new_from_slice(secret).expect("HMAC can take key of any size");
-    mac.update(random_hex.as_bytes());
-    let signature = hex::encode(mac.finalize().into_bytes());
+/// How far in the future a token's time of issue may lie: the clock is read
+/// again when the token is checked, and it may have been stepped back.
+const CSRF_CLOCK_SKEW_SECS: u64 = 60;
 
-    format!("{}.{}", random_hex, signature)
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0)
 }
 
-/// Verifies a CSRF token against the expected secret
+fn csrf_signature(secret: &[u8; 32], signed: &str) -> String {
+    let mut mac = HmacSha256::new_from_slice(secret).expect("HMAC can take key of any size");
+    mac.update(signed.as_bytes());
+    hex::encode(mac.finalize().into_bytes())
+}
+
+/// Generates a CSRF token signed with HMAC: `random.issued_at.signature`,
+/// the signature covering the random part and the time of issue.
+pub fn generate_csrf_token(secret: &[u8; 32]) -> String {
+    generate_csrf_token_at(secret, unix_now())
+}
+
+fn generate_csrf_token_at(secret: &[u8; 32], issued_at: u64) -> String {
+    let random_bytes: [u8; 16] = rand::random();
+    let signed = format!("{}.{}", hex::encode(random_bytes), issued_at);
+    let signature = csrf_signature(secret, &signed);
+    format!("{}.{}", signed, signature)
+}
+
+/// Verifies a CSRF token against the expected secret: a signature made with
+/// it, over a time of issue no older than [`CSRF_TOKEN_TTL`].
 pub fn verify_csrf_token(token: &str, secret: &[u8; 32]) -> bool {
-    let parts: Vec<&str> = token.split('.').collect();
-    if parts.len() != 2 {
+    let Some((signed, provided_signature)) = token.rsplit_once('.') else {
+        return false;
+    };
+    let Some((_random_hex, issued_at)) = signed.split_once('.') else {
+        return false;
+    };
+    let Ok(issued_at) = issued_at.parse::<u64>() else {
+        return false;
+    };
+    let now = unix_now();
+    if issued_at > now + CSRF_CLOCK_SKEW_SECS
+        || now.saturating_sub(issued_at) > CSRF_TOKEN_TTL.as_secs()
+    {
         return false;
     }
 
-    let random_hex = parts[0];
-    let provided_signature = parts[1];
-
-    let mut mac = HmacSha256::new_from_slice(secret).expect("HMAC can take key of any size");
-    mac.update(random_hex.as_bytes());
-    let expected_signature = hex::encode(mac.finalize().into_bytes());
+    let expected_signature = csrf_signature(secret, signed);
 
     // L-01: use a vetted crate for the constant-time compare instead of the
     // hand-rolled XOR-accumulator below. The HMAC tag length is fixed (64
@@ -173,6 +206,77 @@ mod tests {
         assert!(verify_csrf_token(&token, &secret));
         assert!(!verify_csrf_token("invalid.token", &secret));
         assert!(!verify_csrf_token(&token, &[0u8; 32])); // wrong secret
+    }
+
+    /// The browser checks the shape of the token before it uses it, with the
+    /// same regular expression in three scripts. A change of format here
+    /// that they do not follow breaks room creation, login and the WebSocket
+    /// token in every browser, while every server-side test still passes.
+    #[test]
+    fn the_browser_accepts_the_csrf_tokens_this_relay_issues() {
+        const CLIENT_PATTERN: &str = r"/^[a-f0-9]{32}\.[0-9]{1,20}\.[a-f0-9]{64}$/";
+        for (script, source) in [
+            ("homepage.js", include_str!("../static/js/homepage.js")),
+            ("login.js", include_str!("../static/js/login.js")),
+            ("websocket.js", include_str!("../static/js/websocket.js")),
+        ] {
+            assert!(
+                source.contains(CLIENT_PATTERN),
+                "static/js/{script} no longer checks CSRF tokens with {CLIENT_PATTERN}"
+            );
+        }
+
+        // What CLIENT_PATTERN describes, checked on tokens issued here.
+        let is_hex = |part: &str, len: usize| {
+            part.len() == len && part.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        };
+        let secret: [u8; 32] = rand::random();
+        for token in [
+            generate_csrf_token(&secret),
+            generate_csrf_token_at(&secret, 0),
+            generate_csrf_token_at(&secret, u64::MAX),
+        ] {
+            let parts: Vec<&str> = token.split('.').collect();
+            assert_eq!(parts.len(), 3, "{token}");
+            assert!(is_hex(parts[0], 32), "{token}");
+            assert!(
+                (1..=20).contains(&parts[1].len()) && parts[1].bytes().all(|b| b.is_ascii_digit()),
+                "{token}"
+            );
+            assert!(is_hex(parts[2], 64), "{token}");
+        }
+    }
+
+    #[test]
+    fn csrf_tokens_expire_with_their_cookie() {
+        let secret: [u8; 32] = rand::random();
+        let now = unix_now();
+        let ttl = CSRF_TOKEN_TTL.as_secs();
+
+        assert!(verify_csrf_token(
+            &generate_csrf_token_at(&secret, now - ttl + 5),
+            &secret
+        ));
+        assert!(
+            !verify_csrf_token(&generate_csrf_token_at(&secret, now - ttl - 5), &secret),
+            "a token older than its cookie must be refused"
+        );
+        assert!(
+            !verify_csrf_token(&generate_csrf_token_at(&secret, now + 3600), &secret),
+            "a time of issue in the future is not believed"
+        );
+
+        // The time of issue is signed: moving it forward breaks the token.
+        let old = generate_csrf_token_at(&secret, now - ttl - 5);
+        let (random, rest) = old.split_once('.').unwrap();
+        let (_, signature) = rest.split_once('.').unwrap();
+        let moved = format!("{random}.{now}.{signature}");
+        assert!(!verify_csrf_token(&moved, &secret));
+        // Nor does the format without a time of issue pass any more.
+        assert!(!verify_csrf_token(
+            &format!("{random}.{signature}"),
+            &secret
+        ));
     }
 
     #[test]

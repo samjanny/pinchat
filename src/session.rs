@@ -4,26 +4,28 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 /// Represents an authenticated session
+///
+/// A session lasts `SESSION_TTL_SECS` from the login that created it, the
+/// Max-Age of the cookie the browser was given, and activity does not extend
+/// it. The cookie is not issued again on activity, so a browser drops it at
+/// that point anyway. The server used to slide the expiry forward on every
+/// request instead: a session id that had leaked stayed valid for as long
+/// as someone kept using it, with no upper bound.
 #[derive(Clone)]
 pub struct Session {
-    pub last_activity: Instant,
+    pub created_at: Instant,
 }
 
 impl Session {
     pub fn new(_id: Uuid) -> Self {
         Self {
-            last_activity: Instant::now(),
+            created_at: Instant::now(),
         }
     }
 
-    /// Check if the session has expired based on TTL
+    /// Check if the session has expired based on TTL, counted from login
     pub fn is_expired(&self, ttl: Duration) -> bool {
-        self.last_activity.elapsed() > ttl
-    }
-
-    /// Refresh the last activity timestamp to extend sliding expiration
-    pub fn touch(&mut self) {
-        self.last_activity = Instant::now();
+        self.created_at.elapsed() > ttl
     }
 }
 
@@ -58,17 +60,6 @@ impl SessionStore {
                 Some(session.clone())
             }
         })
-    }
-
-    /// Update the last activity timestamp for a session to maintain sliding expiration
-    pub fn touch(&self, session_id: &Uuid) -> bool {
-        if let Some(mut session) = self.sessions.get_mut(session_id) {
-            if !session.is_expired(self.ttl) {
-                session.touch();
-                return true;
-            }
-        }
-        false
     }
 
     /// Delete a session
@@ -138,18 +129,23 @@ mod tests {
     }
 
     #[test]
-    fn test_touch_extends_session() {
+    fn activity_does_not_extend_a_session_past_its_lifetime() {
         let store = SessionStore::new(2); // 2 second TTL
         let session_id = Uuid::new_v4();
 
         store.create(session_id);
 
-        sleep(Duration::from_secs(1));
-        assert!(store.touch(&session_id));
-
-        sleep(Duration::from_secs(1));
-        // Session should still be valid because we touched it
-        assert!(store.get(&session_id).is_some());
+        // Looked up every half second, as the middleware does on every
+        // request (see auth_middleware.rs for the request-level test).
+        for _ in 0..3 {
+            sleep(Duration::from_millis(500));
+            assert!(store.get(&session_id).is_some());
+        }
+        sleep(Duration::from_millis(700));
+        assert!(
+            store.get(&session_id).is_none(),
+            "a session must end SESSION_TTL_SECS after login, however busy"
+        );
     }
 
     #[test]

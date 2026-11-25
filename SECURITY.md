@@ -44,7 +44,7 @@ We consider adversaries with the following capabilities:
 - Can record ciphertext for future analysis
 - Cannot modify traffic in transit
 
-**Mitigation**: TLS 1.3 transport encryption + E2E encryption renders captured traffic undecryptable.
+**Mitigation**: TLS transport encryption + E2E encryption renders captured traffic undecryptable. TLS is 1.2 or 1.3: when the relay terminates TLS itself it uses rustls's defaults, which accept both and offer only forward-secret AEAD cipher suites; behind a reverse proxy the proxy decides (the nginx settings in docs/reverse-proxy.md accept TLS 1.2 clients).
 
 #### Active Network Adversary (MITM)
 - Can intercept and modify network traffic
@@ -123,8 +123,12 @@ URL format: https://host/c/{room_id}#key={base64url_encoded_key}
 4. Each participant extracts key from fragment
 5. Key used to encrypt/decrypt ECDH handshake
 6. After successful import, the fragment bytes are stashed in
-   sessionStorage (key: `pinchat_hash:/static/chat.html`) and removed
-   from window.location.hash via history.replaceState. Reload survives.
+   sessionStorage (key: `pinchat_hash:/static/chat.html?room=<room_id>`)
+   and removed from window.location.hash via history.replaceState. Reload
+   survives. The stash is bound to the room: a page for another room never
+   reads it (audit C-F5; up to v0.9.2 the key had no room ID, so a keyless
+   link to another room opened in the same tab reused this room's key and
+   "Copy invite link" handed it out under the other room's ID).
 7. Double Ratchet takes over for message encryption
 8. cryptoManager.deleteBootstrapKey() nulls the in-memory CryptoKey
    reference after handshake completion. resetToBootstrapKey() re-reads
@@ -135,9 +139,14 @@ URL format: https://host/c/{room_id}#key={base64url_encoded_key}
 
 ECDSA P-256 keypairs that authenticate each Double Ratchet DH header
 are persisted client-side in IndexedDB under the database name
-`pinchat_identity_v1` (object store `keys`, single entry under key
-`identity`). Entries carry a `version` field and an absolute `expiresAt`
-timestamp (24 h from creation, aligned with the default `session_ttl_secs`).
+`pinchat_identity_v1` (object store `keys`). There is one keypair per
+room, stored under the key `room:` followed by the hex SHA-256 of the room
+ID, so the database does not list room IDs in clear. Entries carry a
+`version` field and an absolute `expiresAt` timestamp (24 h from creation,
+the longest room TTL). Expired entries are deleted the next time a chat
+page asks for an identity. Releases up to v0.9.2 kept a single entry under
+the key `identity` and used it for every room; that entry is deleted on
+first use and never read.
 
 **Properties:**
 - The private side is created `extractable: false` directly from
@@ -156,18 +165,38 @@ timestamp (24 h from creation, aligned with the default `session_ttl_secs`).
   non-extractable across page loads.
 - The public side stays extractable so it can be serialised to raw
   bytes for transmission to the peer.
-- Scope: per-origin, never synced, never sent to the server.
+- Scope: per-origin and per room, never synced. The private key never
+  leaves the browser.
 - Expiry: 24 h, after which `generateIdentityKeypair()` discards the
   stale entry and mints a fresh keypair.
 - Forget gesture: `IdentityKeyManager.clearStoredIdentity()` for an
-  explicit "forget me on this device" reset.
+  explicit "forget me on this device" reset of the current room's entry.
 
-The reason this entry is persisted at all is SAS continuity: pre-C-04
-the identity keypair was regenerated on every page load, which meant
-the SAS code that a user had verified out-of-band stopped matching the
-next time they reopened the chat. The pressure to skip verification
-followed mechanically. Persistence keeps the SAS stable so verification
-becomes a one-time gesture per device-day.
+The reason this entry is persisted at all is identity continuity inside a
+room: pre-C-04 the identity keypair was regenerated on every page load, so
+a peer who reloaded the chat came back with a new identity key and the
+other side had to treat it as an identity change and verify again. With
+persistence a reload or reconnect inside the same room presents the same
+identity key, and a verdict the other side gave for that key still applies
+(see "SAS verdict binding" below).
+
+**What the relay can learn about identity keys.** The handshake carries
+the identity public key inside the AES-GCM envelope, but every 1:1 message
+header carries `sig`, an ECDSA signature over fields that travel in clear
+(`dh`, `pn`, `n`, `rc`). ECDSA public-key recovery (SEC 1, section 4.1.6)
+turns any two such headers into the signer's identity public key. The
+relay, or anyone who can read the relay's traffic, can therefore:
+
+- recover each participant's identity public key in every 1:1 room;
+- recognise the same participant across reconnects, reloads and repeated
+  handshakes in that room, for as long as the room's keypair lives.
+
+It cannot use the identity key to link rooms: a different room gets a
+different keypair, independent of the first. Up to v0.9.2 one keypair was
+shared by every room for 24 h, which let a passive relay link all the
+1:1 rooms one browser opened that day (audit C-F2). Transport metadata
+(IP address, login session cookie, timing) is a separate matter and still
+lets the relay correlate connections across rooms.
 
 ### Symmetric Encryption
 
@@ -185,7 +214,7 @@ becomes a one-time gesture per device-day.
 **Security Properties**:
 - Confidentiality: Plaintext hidden from adversary
 - Integrity: Tampering detected via authentication tag
-- Authenticity: AAD binds ciphertext to context (room ID, sender ID, message number)
+- Authenticity: AAD binds ciphertext to context (room ID, sender ID, message number, message type, ratchet count, previous chain length)
 
 **IV Generation**:
 ```
@@ -218,7 +247,7 @@ IVs are generated using CSPRNG and never reused within a key's lifetime.
 **Algorithm**: ECDSA (Elliptic Curve Digital Signature Algorithm)
 - Curve: P-256 (NIST secp256r1)
 - Hash: SHA-256
-- Signature Size: 64 bytes (DER encoded)
+- Signature Size: 64 bytes, IEEE P1363 encoding (`r || s`, 32 bytes each), which is what WebCrypto produces and verifies; not DER
 
 **Usage**:
 - Identity key authentication
@@ -273,7 +302,7 @@ CK_{n+1} = HMAC-SHA256(CK_n, "ChainRatchet")
 - One-way: Cannot derive CK_n from CK_{n+1}
 - Independence: Compromise of MK_n does not reveal MK_{n+1}
 
-### SAS Generation (v3, current)
+### SAS Generation (v4, current)
 
 **Algorithm**: HKDF-SHA256
 - Output: 96 bits (16 emoji from a 64-character alphabet, 6 bits per emoji)
@@ -316,10 +345,10 @@ this in two ways:
   actually derive the root key, not merely the identity pair.
 - *Fresh per handshake.* Because the transcript includes per-handshake
   ephemerals, the displayed code changes on every reconnect. The
-  "verify once" UX is preserved by identity-key persistence plus
-  peer-identity-change detection: a stable identity pair keeps the
-  verified flag set, and only an identity-key change forces
-  re-verification.
+  "verify once" UX is preserved by identity-key persistence plus a
+  verdict bound to the verified key: confirming a code records the peer
+  identity key it was computed for, a later handshake that presents the
+  same key comes up verified, and any other key forces re-verification.
 - *Domain-separated.* The `"pinchat-sas-v4"` salt tag and the
   `"SAS-display-v4"` info prefix separate this derivation from any
   other use of the same key material.
@@ -379,7 +408,7 @@ two-sided birthday search over attacker-chosen identity keys, fully
 precomputable offline against the v2 inputs (both are known to the
 relay before the handshake). The ECDSA-keygen cost argument above
 mitigates but does not eliminate that search within the 24h identity
-TTL. v3 (see above) therefore binds the live handshake transcript AND
+TTL. v3 (since superseded by v4, see above) therefore binds the live handshake transcript AND
 widens the output to 96 bits. This section is retained as the record
 of the v0.3.x design.
 
@@ -456,8 +485,8 @@ Ratchet design and matches the Signal specification.
 |----------|-----------|
 | Message Content | Never accessible (client-side encryption) |
 | Encryption Keys | Never transmitted (URL fragment) |
-| User Identity | Randomized per-connection UUID |
-| Cross-Room Correlation | Impossible (fresh UUID per room) |
+| User Identity | Randomized per-connection UUID. The 1:1 identity public key is recoverable from header signatures, but it is generated per room |
+| Cross-Room Correlation | Not through PinChat identifiers or keys (fresh UUID and fresh identity key per room). Still possible through transport metadata: IP address, login session cookie, timing |
 | Historical Data | None (RAM-only storage) |
 
 ### Authenticated Encryption
@@ -469,7 +498,8 @@ AAD = TLV_encode([
     SENDER_ID,
     MESSAGE_NUMBER,
     MESSAGE_TYPE,
-    RATCHET_COUNT
+    RATCHET_COUNT,
+    PREVIOUS_CHAIN_LENGTH
 ])
 ```
 
@@ -484,11 +514,26 @@ AAD = TLV_encode([
 
 ### JS Memory Zeroization is Best-Effort
 
-After a message key or chain key is used, PinChat calls `Uint8Array.fill(0)` on the raw key material. This is a best-effort mitigation: JavaScript engines (V8, SpiderMonkey) do not guarantee that the backing buffer is zeroed in native memory or that the GC reclaims it promptly. A memory dump of the browser process may still recover key material.
+PinChat overwrites some raw key material with `Uint8Array.fill(0)` and leaves the rest to the garbage collector. Where `fill(0)` runs it is still a best-effort mitigation: JavaScript engines (V8, SpiderMonkey) do not guarantee that copies made by the engine are zeroed or that the GC reclaims them promptly. A memory dump of the browser process may still recover key material.
+
+**Overwritten with `fill(0)`:**
+- the previous root key, on every DH ratchet step (send side and receive side);
+- the initial ECDH shared secret, once the Double Ratchet is initialised;
+- the root key and both chain keys when the ratchet is destroyed (`DoubleRatchet.destroy()`, which calls `ChainRatchet.reset()`). This runs on every session teardown: peer departure, handshake restart, SAS mismatch;
+- the final temporary chain-key copy used to derive a message key;
+- the MLS PSK derived from the invite key, when the bootstrap key is dropped.
+
+**Not overwritten, only released to the garbage collector:**
+- the previous chain key on each symmetric ratchet step: `ChainRatchet.ratchet()` replaces the reference to the old buffer and does not zero it;
+- the chains a DH ratchet step replaces;
+- the raw message-key bytes, which exist briefly as HMAC output before they are imported as a non-extractable AES-GCM `CryptoKey`;
+- the copies of the root key and chain keys that every encryption and decryption takes as a rollback snapshot;
+- HKDF outputs and the intermediate chain-key copies made when deriving a key several steps ahead;
+- the raw invite-key bytes decoded from the URL fragment (the fragment itself stays in `sessionStorage`, see "Bootstrap Key Temporarily Stored in `sessionStorage`" below).
 
 **What does help:**
-- Identity private keys are imported with `extractable: false` - WebCrypto's opaque `CryptoKey` objects cannot be exported or read by JS, even with a memory dump via `exportKey`.
-- Double Ratchet chain keys are zeroized (`fill(0)`) after ratchet progression; the old material is no longer reachable from JS once the typed array reference is released.
+- Identity private keys are created with `extractable: false` - WebCrypto's opaque `CryptoKey` objects cannot be exported or read by JS via `exportKey`. The same holds for the ECDH private keys and for message keys, which exist as non-extractable `CryptoKey` objects.
+- Old chain keys and message keys stop being reachable from page scripts as soon as the ratchet moves past them, even where their buffers are not overwritten. Skipped message keys are the exception: they stay in the skipped-key store until used or pruned.
 
 **Recommendation:** Use incognito/private mode for sensitive chats. Close the tab immediately after the conversation ends. Do not use PinChat on shared or potentially compromised devices.
 
@@ -510,7 +555,11 @@ Short Authentication String (SAS) verification is the mechanism by which users c
 
 **If SAS is skipped:** the chat is encrypted, but not authenticated against the server operator. The server (or anyone with full relay access) could have substituted both parties' identity public keys with its own at the ECDH exchange step, establishing a session it can decrypt. The ECDSA signatures on the DH ratchet keys only prove self-consistency of those keys - they do not prove ownership by the expected human peer. Only SAS ties the cryptographic identity to a real-world identity.
 
-**Current UX:** while the SAS decision is pending, the composer is locked and inbound application ciphertext is kept in a bounded quarantine without being decrypted or rendered. Verification releases it in arrival order. Explicitly confirming the skip sets `sasVerificationStatus = 'skipped'`, releases the quarantine, and displays a persistent "Key verification skipped - connection security not confirmed" indicator. This is a deliberate usability trade-off: the unsafe state requires an informed user choice rather than occurring silently.
+**SAS verdict binding:** confirming a code records the 65-byte peer identity public key that code was computed for (`IdentityKeyManager.markSASVerified`). The verdict is not a flag: `isSASVerified()` holds only while the peer presents those same bytes. Every completed handshake is judged against them, however the previous session ended (a relay-forged `userleft`/`userjoined`, a handshake timeout, a reconnect or a failed handshake), so none of those can carry "verified" over to a different identity key. A different key after a verification produces an explicit identity-change warning, locks the composer, keeps inbound ciphertext in quarantine as for a first verification, and refuses "skip" until the user confirms the new code or declares a mismatch. Up to v0.9.2 the verdict was a boolean, and a handshake timer left armed by a discarded attempt let a relay that knew the link tear down a verified session without arming the identity comparison; the next handshake, answered with the relay's own identity key, came up "verified" (audit C-F1). Handshake timers are now stopped with the attempt they belong to, and a timer that fires for an attempt that is no longer current does nothing.
+
+**A confirmation names its code:** the "They match" button passes the code the modal is showing, and a confirmation is accepted only for the code on screen. If the session, and with it the code, changes while a decision is outstanding (for example because the relay tore the session down and another handshake replaced it), the modal and the chat both say that the code changed, and the next confirmation asks once more, naming the code now shown. Up to v0.9.2 the click verified whatever session was current when it arrived (audit C-F3).
+
+**Current UX:** while the SAS decision is pending, the composer is locked and inbound application ciphertext is kept in a bounded quarantine without being decrypted or rendered. Verification releases it in arrival order. Each quarantined frame keeps its local arrival time, and the five-minute message-age guard (sender timestamp against arrival) is measured at that time, so the minutes spent comparing the code do not expire the messages; up to v0.9.2 it was measured at release, and every message that had waited more than five minutes was dropped as a "late-join replay" (audit C-F4). A message that is already more than five minutes old when it arrives is still rejected, after the ratchet has consumed its key: it can never become acceptable later, and discarding the key keeps forward secrecy. Explicitly confirming the skip sets `sasVerificationStatus = 'skipped'`, releases the quarantine, and displays a persistent "Key verification skipped - connection security not confirmed" indicator. This is a deliberate usability trade-off: the unsafe state requires an informed user choice rather than occurring silently.
 
 **Recommendation:** Always complete SAS verification for sensitive conversations, especially with new contacts. Never skip SAS if you received the room link from an untrusted channel.
 
@@ -531,8 +580,11 @@ The phrase "the server cannot read your messages" is only true in the first two 
 The bootstrap key is normally kept only in the URL fragment (`#key=<base64url>`), which browsers do not include in HTTP requests (RFC 3986 §3.5), keeping it server-blind. However, if an authenticated session expires mid-navigation (HTTP 401), PinChat stores the fragment in `sessionStorage` so it can be restored after login completes:
 
 ```
-sessionStorage["pinchat_hash:/c/<room_id>"] = "#key=<base64url_key>"
+sessionStorage["pinchat_hash:/static/chat.html?room=<room_id>"] = "#key=<base64url_key>"
 ```
+
+The room ID is part of the key, so the stash is used only by the room the
+invite link named.
 
 **Exposure windows** - there are two paths that put the bootstrap key into `sessionStorage`:
 
@@ -572,24 +624,44 @@ one, and share the new link only with the people who should be in it.
 
 ### Relay Memory: Admission, Budgets and What Is Left
 
-The relay admits a bounded number of WebSocket connections, and what it holds
-for messages in transit does not depend on how many connections there are or
-on what they have carried before:
+The relay admits a bounded number of connections, before the WebSocket
+upgrade and after it, and what it holds for messages in transit does not
+depend on how many connections there are or on what they have carried before:
 
 | What | Bound |
 |------|-------|
+| HTTP connections before the upgrade | `MAX_HTTP_CONNECTIONS` (256) in all, `MAX_HTTP_CONNECTIONS_PER_ADDRESS` (32) for one client address, four times that for one IPv6 /48; a trusted proxy's connections count in the total only. Beyond the total the relay accepts nothing until a connection ends, and new connections wait in the kernel's queue; beyond the address limit a new connection is closed at once. 10 seconds for the TLS handshake and for each request head, counted from the moment the connection is idle; a head may take 32 KiB (431 beyond). 60 seconds for the connection, then 30 for the request in progress; a trusted proxy's connection is closed only after 75 seconds without a request. Request bodies up to 16 KiB. HTTP/1.1 only. An upgraded connection gives its slots back and is counted as a WebSocket connection from then on (see `src/http_server.rs`) |
 | WebSocket connections | `MAX_WS_CONNECTIONS` (400) in all, `MAX_WS_CONNECTIONS_PER_ADDRESS` (50) for one client address, four times that for one IPv6 /48. A connection holds its slot from the moment its upgrade is accepted to the end of its closing handshake. An upgrade beyond a limit is refused before anything is allocated for it, with 503 (relay) or 429 (address) and `Retry-After`, and its single-use token is not spent; the token and room endpoints give the same answer before the proof of work |
 | Messages being received, from 64 KiB | 32 MiB in all, 8 MiB for the connections of one client address. A connection that finds no room stops reading its socket until there is some |
 | Messages being received, above 4 KiB and below 64 KiB | 8 MiB in all, 2 MiB for one client address, apart from the large ones so that pictures cannot starve them |
 | Messages being received, up to 4 KiB | 4 KiB a connection, besides its 4 KiB read buffer |
 | A message that is never finished | 90 seconds from its first frame; control frames sent in between do not extend it. Its connection is then closed with 1008 |
-| Frames being relayed | 4 MiB a room, 8 MiB a client address, 32 MiB in all, of which frames of 64 KiB and more may take 24 MiB, counted until the frame has been written to every receiver. A write has 30 seconds. A frame that finds no room waits for up to 30 seconds, then its sender's connection is closed with 1013 |
-| Ordered MLS control log | 2 MiB a room, 8 MiB for the controls of one client address, 32 MiB in all |
+| Frames being relayed | 4 MiB a room, 8 MiB a client address, 32 MiB in all, of which frames of 64 KiB and more may take 24 MiB, counted until the frame has been written to every receiver. A write has 30 seconds. A message, picture or group control that finds no room waits for up to 30 seconds, then its sender's connection is closed with 1013; a handshake frame is dropped instead. The joins and leaves the relay announces itself are counted but never refused (see below) |
+| Ordered MLS control log | 2 MiB a room, 8 MiB for the controls of one client address, 32 MiB in all. Of a room's 2 MiB and 256 entries, 128 KiB and 32 entries are kept for its joins and leaves, which the 32 MiB never refuses |
 | Kernel buffers of a connection | fixed at 64 KiB in each direction, which the kernel counts twice: at most 256 KiB a connection |
 | Password checks | two at a time, about 46 MiB each |
 | A message while it is parsed and written out again | up to two copies of it, on one worker thread at a time |
 | Replay cache of a room | `REPLAY_CACHE_MAX_PER_ROOM` (1000) entries, about 137 KB when full |
 | KeyPackage references a group has consumed | 1024, about 133 KB when all are in |
+
+The joins and leaves of a room are what its members, and in a group the
+order of its controls, rely on to know who is there. A full budget used to
+drop them in a one-to-one room and close a group, because the group's order
+of controls could no longer say who was a member, so a moment of pressure
+anywhere on the relay could end an unrelated group. They are no longer
+refused by the broadcast budgets or by the 32 MiB of the control log; they
+are counted, so client frames find less room while they are there. They are
+small, about 130 bytes, and few: in the broadcast budgets at most one for
+each slot of a room's ring and one for each receiver that is writing one,
+about 11 KiB a room; in the control log at most what a room's own log holds.
+Only a room's own log can refuse one, and the group is then closed.
+
+A member that reconnects first replays the controls it missed, in windows
+it has to acknowledge one by one. It holds nothing of what its room sends
+meanwhile: its live subscription starts once the replay is acknowledged, and
+the controls sent in between reach it from the log. It used to hold every
+frame of the room for as long as it took to acknowledge, up to a minute for
+each window, beyond the 30 seconds a write may take.
 
 Measured on one CPU, in a 512 MiB scope without swap, behind nginx with TLS
 (load generator, proxy and relay on one machine): an idle connection costs
@@ -612,6 +684,24 @@ copies of one worker thread; about 135 MB for 500 rooms at their limits
 their worst. That leaves a margin of about 60 MB. Raising
 `MAX_WS_CONNECTIONS` or `MAX_TOTAL_ROOMS` takes from that margin, at about
 290 KB a connection and 270 KB a group room.
+
+HTTP connections before the upgrade come on top of that. Measured with the
+relay terminating TLS itself, on one machine (RSS of the relay and the
+kernel's queues on its side of the sockets): an idle connection costs about
+30 KB; one whose peer asked for the largest static file and stopped
+reading about 330 KB, and about 490 KB with a further request queued
+behind it, nearly half of it in the kernel. At the defaults that is up to
+about 120 MiB, more than the margin above, held for at most 90 seconds by
+each connection. A relay that terminates TLS itself on a 512 MiB host and
+has to withstand that should lower `MAX_HTTP_CONNECTIONS`. Behind a reverse
+proxy with nginx's defaults the proxy reads the relay's responses into its
+own buffers and passes a request body on only once it is complete, so the
+relay's side of those connections should not fill this way (not
+measured). Before these limits, 300 connections that each
+sent 400 KB of a request head and 300 that sent nothing after their TLS
+handshake took 125 MiB and were all still open 70 seconds later; the same
+from one address now gets at most 32 connections at a time, takes
+about 2 MiB, and nothing of it is left after 15 seconds.
 
 What is not covered by any of these limits:
 
@@ -649,6 +739,12 @@ What remains possible:
   cost of holding them; they do not remove it.
 - **A shared address is shared.** All clients behind one address (a
   household, an office, a carrier's NAT) share its 50 connections.
+- **HTTP connections before the upgrade can be held too.** Eight
+  addresses (or two IPv6 /48s) can hold all of them; new connections then
+  wait in the kernel's queue until one of those ends, at most 90 seconds
+  after it was accepted. The clients behind one address share its 32, and
+  a browser opens up to six while it loads a page and keeps them for 10
+  seconds; one beyond the 32 is closed at once.
 - **A receiver must keep up.** A member who cannot take a frame within 30
   seconds is disconnected, and with the largest image allowed that is a
   link of about 1 Mbit/s. Until then the frame holds its room's budget, so
@@ -676,6 +772,12 @@ What remains possible:
   them, and those waiting are counted against the broadcast budgets above,
   so the length of the ring does not raise the memory bound; its slots
   take about 1 MiB for 500 rooms.
+- **A group closes when its order breaks.** A group is closed, not kept
+  with a membership its members cannot agree on, when its own control log
+  cannot take a join or leave, when its creator is evicted, and when its
+  creator does not come back within the reconnect grace period
+  (`WS_RECONNECT_GRACE_SECS`, 20 seconds). Members that stop acknowledging
+  controls are evicted before they can fill that log.
 - **Reaching the memory ceiling ends every session.** If the relay is
   killed at the ceiling it restarts empty: rooms and connections are gone.
   No message content is exposed by that, and none was stored.
@@ -686,7 +788,7 @@ What remains possible:
 
 | Component | Protection | Attack Vector | Mitigation |
 |-----------|------------|---------------|------------|
-| TLS 1.3 | Transport encryption | Downgrade attacks | HSTS header (1 year) |
+| TLS 1.2 and 1.3 | Transport encryption | Downgrade attacks | HSTS header (1 year) |
 | Certificates | Server authentication | Certificate spoofing | Certificate pinning (recommended) |
 | WebSocket | Persistent connection | Connection hijacking | JWT token authentication |
 
@@ -714,9 +816,9 @@ What remains possible:
 |-----------|------------|---------------|------------|
 | Memory | Data persistence | Memory dumps | No keys stored, auto-cleanup |
 | Swap | Data held in memory reaching a disk | Host swap device | `docker-compose.yml` gives the container a memory ceiling and no swap; the reverse proxy and the rest of the host are for the operator to configure, and nothing here covers them |
-| Relay memory | Availability | Many connections, large frames, receivers that do not read, many uploads at once | Connection limits (relay, address, IPv6 /48) applied before the upgrade, byte budgets for messages coming in and frames going out, fixed socket buffers; see "Relay Memory: Admission, Budgets and What Is Left" |
+| Relay memory | Availability | Many connections, slow or partial requests, large frames, receivers that do not read, many uploads at once | Connection limits (relay, address, IPv6 /48) on HTTP connections and again before the upgrade, timeouts and size limits on requests, byte budgets for messages coming in and frames going out, fixed socket buffers; see "Relay Memory: Admission, Budgets and What Is Left" |
 | Logs | User privacy | Log analysis | PRIVACY_MODE=strict (start-up notices and error messages only, written without addresses, identifiers or request data) |
-| IP Addresses | User tracking | IP logging | HMAC-hashed IPs in the rate limiter and, while a connection is open, in the relay's per-address share of the broadcast budget; memory only |
+| IP Addresses | User tracking | IP logging | HMAC-hashed IPs (for IPv6, of the /64 and the /48) in the rate limiter and, while a connection is open, in the relay's per-address connection counts and share of the broadcast budget; memory only |
 
 ---
 
@@ -850,18 +952,32 @@ describes every state and what each may be based on.
   can do with markup alone is limited by the client, not by the extension:
   the pages that run the application carry no application markup, the
   client-side framework reads directives only from signed templates (it is
-  given a directive prefix that served markup cannot name), and whatever
-  else arrived in the page body is removed before the framework starts. Up
-  to v0.8.6 a single served element with a binding attribute made the
-  signed framework send a value held by the application to the server.
-  What remains: served markup is displayed until the page has been parsed,
-  and a page served without the framework runs no application but can show
-  anything, a form that asks for something included
-- Unsigned same-origin stylesheets in Chromium: detected, shown as a
-  failure, not blocked
+  given a directive prefix that served markup cannot name), and the body the
+  parser built is replaced, before the framework starts, by one that holds
+  only what the signed templates mounted, so that a shadow root declared in
+  the served markup goes with it. Up to v0.8.6 a single served element with
+  a binding attribute made the signed framework send a value held by the
+  application to the server. What remains: served markup, a declared
+  shadow root included, is displayed until the page has been parsed, and a
+  page served without the framework runs no application but can show
+  anything. No page but the login page may submit a form, so a served form
+  cannot post what is typed into it
+- Unsigned same-origin stylesheets in Chromium: detected, in the page and in
+  shadow trees, shown as a failure, not blocked. A shadow tree that existed
+  while the page was parsed makes the page "unverifiable" in Chromium, since
+  nothing in it can be attested
+- A `<meta http-equiv="refresh">` in the page is no HTTP redirect, and no
+  policy blocks it. The extension stops the document when it finds one,
+  which cancels the refresh
+- The data files a page fetches (`operator.json`, for the legal pages) in
+  Chromium: the extension cannot hold them, and its own download of the
+  file proves nothing about the bytes the page was given. In Firefox the
+  page receives them only as signed
 - Anything at all when the extension is not installed, is disabled, or has
   had its host permission revoked. In particular the redirect of an invite
-  link cannot be prevented by the site itself
+  link cannot be prevented by the site itself. A page the extension still
+  sees without standing access to the site (access on request) is never
+  shown as verified or partially verified
 - Compromised signing key (attacker could sign malicious hashes)
 - Malicious browser extension updates, and other extensions: an extension
   with access to the site can read and change everything. Changes to the
@@ -889,14 +1005,18 @@ describes every state and what each may be based on.
 | Policy in force, page not attestable (Chromium) | Partially verified | Yellow check badge; the popup says a complete check is currently possible only in Firefox |
 | Page bytes differ from the signed hash (Firefox) | Failed | Block page, red overlay without dismiss |
 | A file served to the extension differs from its signed hash | Failed | Red overlay without dismiss |
-| Unsigned stylesheet from the site loaded | Failed | Red overlay without dismiss |
-| Script policy not in force, or service worker controls the page | Failed | Document stopped, red overlay |
+| Unsigned stylesheet from the site loaded, in the page or in a shadow tree | Failed | Red overlay without dismiss |
+| Script policy not in force, another policy reported in its place (not in Chromium, which reports no violation an extension causes), or service worker controls the page | Failed | Document stopped, red overlay |
+| Shadow tree present while the page was parsed (Chromium) | Unverifiable | Amber bar |
+| Extension without standing access to the site, where its content script still runs | Unverifiable | Amber bar |
+| Data file given to the page differs from its signed hash (Firefox) | Failed | File withheld, red overlay without dismiss |
+| `<meta http-equiv="refresh">` in the page | Notice | Document stopped, amber bar |
 | Manifest signature invalid or sequence too low | Failed | Red overlay without dismiss |
 | Redirect of a document off the site | Failed | Navigation blocked |
 | Policy violation attributed to the page | Notice | Amber bar, dismissible |
 | Manifest unavailable and nothing stored | Unverifiable | Amber bar (Chromium), block page (Firefox) |
 | Page did not pass through the response filter (Firefox) | Unverifiable | Amber overlay with reload |
-| Inline script element or other extension's resource in the DOM | unchanged | Listed in the popup only |
+| Inline script element, other extension's resource, or shadow tree attached after parsing | unchanged | Listed in the popup only |
 | File hash differs from its SRI attribute | n/a | Browser blocks the file |
 
 #### Limitations

@@ -423,6 +423,119 @@ test('the Chromium redirect rules allow only what the same check allows', () => 
     }
 });
 
+test('only the page that submits a form to the server may do so', () => {
+    const { buildRules, PAGES, pageRegex, CATCH_ALL_REGEX, FORM_ACTIONS } = require('../extensions/generate-csp-rules');
+    const signed = JSON.parse(fs.readFileSync(path.join(root, 'hashes.json.signed'), 'utf8'));
+    const formAction = (rule) => /(?:^|;\s*)form-action ([^;]+)/.exec(rule.action.responseHeaders[0].value)[1];
+    for (const rules of [buildRules(signed, 'chrome'), buildRules(signed, 'firefox')]) {
+        const catchAll = rules.find((rule) => rule.condition.regexFilter === CATCH_ALL_REGEX);
+        assert.strictEqual(formAction(catchAll), "'none'", 'a document the release does not know submits nothing');
+        for (const page of PAGES) {
+            const html = fs.readFileSync(path.join(root, page.slice(1)), 'utf8');
+            // A form that the browser submits: one with an action, in the
+            // page itself. The application's own forms live in the templates
+            // and are handled by script.
+            const submits = /<form\b[^>]*\baction=/i.test(html);
+            const rule = rules.find((candidate) => candidate.condition.regexFilter === pageRegex(page));
+            assert.strictEqual(formAction(rule), submits ? "'self'" : "'none'", page);
+        }
+    }
+    assert.deepStrictEqual(Object.keys(FORM_ACTIONS), ['/static/login.html']);
+    for (const template of ['chat', 'index']) {
+        const markup = fs.readFileSync(path.join(root, `static/js/templates/${template}.js`), 'utf8');
+        const forms = markup.match(/<form\b[^>]*>/g) || [];
+        assert(forms.length > 0, template);
+        for (const form of forms) {
+            assert(/@submit\.prevent=/.test(form) && !/\baction=/.test(form), `${template}: ${form} is submitted`);
+        }
+    }
+});
+
+test('the packaged policy of an address is the one the rules give it', () => {
+    const rules = JSON.parse(fs.readFileSync(path.join(root, 'extensions/chrome/rules.json'), 'utf8'));
+    const { CATCH_ALL_REGEX, pageRegex } = require('../extensions/generate-csp-rules');
+    const policyOf = (filter) => rules.find((rule) => rule.condition.regexFilter === filter)
+        .action.responseHeaders[0].value;
+    assert.strictEqual(V.packagedPolicy(rules, 'https://pinchat.im/static/chat.html?room=1'),
+        policyOf(pageRegex('/static/chat.html')), 'a page rule wins over the catch-all');
+    assert.strictEqual(V.packagedPolicy(rules, 'https://www.pinchat.im/static/login.html'),
+        policyOf(pageRegex('/static/login.html')));
+    for (const url of ['https://pinchat.im/c/1', 'https://pinchat.im:8444/static/chat.html', 'https://pinchat.im/static/x.html']) {
+        assert.strictEqual(V.packagedPolicy(rules, url), policyOf(CATCH_ALL_REGEX), url);
+    }
+    assert.strictEqual(V.packagedPolicy(rules, 'https://attacker.test/static/chat.html'), null);
+    assert.strictEqual(V.packagedPolicy(null, 'https://pinchat.im/'), null);
+});
+
+test('another policy that also blocks inline handlers is not taken for the packaged one', () => {
+    const rules = JSON.parse(fs.readFileSync(path.join(root, 'extensions/chrome/rules.json'), 'utf8'));
+    const expected = V.packagedPolicy(rules, 'https://pinchat.im/static/chat.html?room=1');
+    const directives = expected.split(';').map((part) => part.trim()).filter(Boolean);
+    // The same policy as a browser may report it: other order, other
+    // spacing, keywords in capitals, without the last semicolon.
+    const reserialised = [...directives].reverse().join(' ;  ').replace("'none'", "'NONE'");
+    assert(V.sameScriptPolicy(expected, expected));
+    assert(V.sameScriptPolicy(reserialised, expected));
+    for (const other of [
+        "script-src 'self'; style-src 'self'; default-src 'self'",
+        "default-src 'self'",
+        directives.filter((part) => !part.startsWith('script-src')).join('; '),
+        directives.map((part) => (part.startsWith('script-src') ? part.split(' ').slice(0, -1).join(' ') : part)).join('; '),
+        `${expected} script-src-attr 'unsafe-inline';`,
+        `${expected.replace('script-src', "script-src 'self'")}`,
+        `${expected.replace(/'sha256-([A-Za-z])/, (_, c) => `'sha256-${c === c.toLowerCase() ? c.toUpperCase() : c.toLowerCase()}`)}`,
+        '',
+    ]) {
+        assert(!V.sameScriptPolicy(other, expected), other.slice(0, 80));
+    }
+});
+
+test('the probe\'s own violation is told from the page\'s by its marker, and by nothing else', () => {
+    const marker = '0123456789abcdef01234567';
+    assert.strictEqual(marker.length, V.PROBE_MARKER_LENGTH);
+    const handler = V.probeHandler(marker);
+    // A browser reports at most the first 40 characters of the handler.
+    const sample = handler.slice(0, 40);
+    assert(sample.includes(marker), 'the marker is within what a report carries');
+    const probe = { effectiveDirective: 'script-src-attr', blockedURI: 'inline', sourceFile: '', sample };
+    assert.strictEqual(V.isProbeViolation(probe, marker), true);
+
+    const page = 'https://pinchat.im/static/chat.html?room=1';
+    for (const [what, violation] of [
+        ['a handler of the page, which looks like the probe in every other way',
+            { effectiveDirective: 'script-src-attr', blockedURI: 'inline', sourceFile: '', sample: 'this.setAttribute("data-ran", "1")' }],
+        ['a report without a sample', { effectiveDirective: 'script-src-attr', blockedURI: 'inline', sourceFile: '' }],
+        ['another marker', { ...probe, sample: V.probeHandler('fedcba9876543210fedcba98').slice(0, 40) }],
+        ['the marker in another kind of violation', { ...probe, effectiveDirective: 'script-src-elem' }],
+    ]) {
+        assert.strictEqual(V.isProbeViolation(violation, marker), false, what);
+    }
+    for (const weak of ['', '0123', 'not-hex-not-hex-not-hex-', null, undefined]) {
+        assert.strictEqual(V.isProbeViolation(probe, weak), false, `marker ${weak}`);
+    }
+    // What is not the probe's is classified like any violation.
+    assert.strictEqual(V.findingForViolation({
+        effectiveDirective: 'script-src-attr', blockedURI: 'inline', sourceFile: 'https://pinchat.im/static/chat.html',
+    }, page).code, 'page-policy-violation');
+});
+
+test('the page policies ask for the sample that carries the probe\'s marker', () => {
+    const { CATCH_ALL_REGEX } = require('../extensions/generate-csp-rules');
+    for (const browser of ['chrome', 'firefox']) {
+        const rules = JSON.parse(fs.readFileSync(path.join(root, `extensions/${browser}/rules.json`), 'utf8'));
+        for (const rule of rules.filter((entry) => entry.action.type === 'modifyHeaders')) {
+            const scriptSrc = rule.action.responseHeaders[0].value.split(';')[0].trim().split(/\s+/);
+            if (rule.condition.regexFilter === CATCH_ALL_REGEX) {
+                assert.deepStrictEqual(scriptSrc, ['script-src', "'none'"], 'nothing runs where the release has no page');
+            } else {
+                assert(scriptSrc.includes("'report-sample'"), `${browser}: ${rule.condition.regexFilter}`);
+                assert(scriptSrc.slice(1).every((token) => token === "'report-sample'" || token.startsWith("'sha256-")),
+                    'report-sample allows nothing; the rest are hashes');
+            }
+        }
+    }
+});
+
 test('an error answer from the server is unverifiable, never a mismatch', () => {
     assert.strictEqual(V.FINDINGS['error-response'][0], V.CLASS.LIMIT);
     const record = {
@@ -474,4 +587,347 @@ test('the background script assigns states in one place and never ahead of the f
     }
 });
 
-console.log(`\n${passed} verdict tests passed`);
+// -----------------------------------------------------------------------------
+// The background script itself, with the browser replaced by stand-ins
+// -----------------------------------------------------------------------------
+
+const vm = require('vm');
+const nodeCrypto = require('crypto');
+
+/**
+ * Runs extensions/chrome/background.js against stand-ins for the extension
+ * APIs. `canAttest` gives it a response filter, as in Firefox. With
+ * `manifestFiles`, the manifest it fetches is one signed here with a key of
+ * the test's own instead of the release manifest.
+ */
+function loadBackground({ canAttest = false, hostAccess = true, manifestFiles = null } = {}) {
+    let source = fs.readFileSync(path.join(root, 'extensions/chrome/background.js'), 'utf8');
+    let signed = JSON.parse(fs.readFileSync(path.join(root, 'hashes.json.signed'), 'utf8'));
+    if (manifestFiles) {
+        const { privateKey, publicKey } = nodeCrypto.generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
+        const data = { ...signed.data, files: manifestFiles };
+        signed = {
+            data,
+            signature: nodeCrypto.sign('sha256', Buffer.from(JSON.stringify(data)), privateKey).toString('base64'),
+        };
+        const pem = publicKey.export({ type: 'spki', format: 'pem' }).trim();
+        source = source.replace(/const PINCHAT_PUBLIC_KEY = `[\s\S]*?`;/, `const PINCHAT_PUBLIC_KEY = \`${pem}\`;`);
+    }
+    const rules = JSON.parse(fs.readFileSync(path.join(root, 'extensions/chrome/rules.json'), 'utf8'));
+    const listeners = {};
+    const event = (name) => ({
+        addListener(fn, filter) { (listeners[name] = listeners[name] || []).push({ fn, filter }); },
+    });
+    const storage = () => {
+        const data = {};
+        return {
+            async get(keys) {
+                const wanted = keys === undefined ? Object.keys(data) : [].concat(keys);
+                return Object.fromEntries(wanted.filter((key) => key in data).map((key) => [key, data[key]]));
+            },
+            async set(entries) { Object.assign(data, JSON.parse(JSON.stringify(entries))); },
+            async remove(key) { delete data[key]; },
+        };
+    };
+    const streams = [];
+    const browser = {
+        runtime: {
+            id: 'test-extension',
+            getURL: (file) => `moz-extension://test-extension/${file}`,
+            onMessage: event('message'),
+            onInstalled: event('installed'),
+        },
+        alarms: { create() {}, onAlarm: event('alarm') },
+        tabs: {
+            onRemoved: event('removed'),
+            onUpdated: event('updated'),
+            query: async () => [],
+            sendMessage: async () => null,
+            update: async () => ({}),
+            get: async (id) => ({ id }),
+        },
+        storage: { local: storage(), session: storage() },
+        action: { setBadgeText() {}, setBadgeBackgroundColor() {}, setBadgeTextColor() {} },
+        permissions: { contains: async () => hostAccess },
+    };
+    if (canAttest) {
+        browser.webRequest = {
+            filterResponseData() {
+                const stream = { written: [], closed: false, status: 'transferringdata' };
+                stream.write = (bytes) => { stream.written.push(Buffer.from(bytes)); };
+                stream.close = () => { stream.closed = true; };
+                streams.push(stream);
+                return stream;
+            },
+            onBeforeRequest: event('beforeRequest'),
+            onHeadersReceived: event('headersReceived'),
+            onErrorOccurred: event('errorOccurred'),
+        };
+    }
+    const fetchStandIn = async (url) => {
+        if (url === browser.runtime.getURL('rules.json')) return { ok: true, json: async () => rules };
+        if (String(url).endsWith('/hashes.json.signed')) return { ok: true, json: async () => signed };
+        throw new Error('no network in this test');
+    };
+    const quiet = { log() {}, warn() {}, error() {} };
+    const context = vm.createContext({
+        browser, PinChatVerdict: V, fetch: fetchStandIn, crypto: nodeCrypto.webcrypto, console: quiet,
+        atob, btoa, TextEncoder, TextDecoder, AbortController, URL, setTimeout, clearTimeout,
+        setInterval, clearInterval,
+    });
+    vm.runInContext(source, context, { filename: 'background.js' });
+
+    const send = (message, sender) => new Promise((resolve) => {
+        const answered = listeners.message.some(({ fn }) => fn(message, sender, resolve) === true);
+        if (!answered) resolve(undefined);
+    });
+    const contentSender = (url, tabId = 7) => ({ id: 'test-extension', url, frameId: 0, tab: { id: tabId, url } });
+    const popupSender = { id: 'test-extension', url: browser.runtime.getURL('popup.html') };
+    const listener = (name, types) => listeners[name]
+        .find(({ filter }) => JSON.stringify(filter.types) === JSON.stringify(types)).fn;
+    const settle = async (done) => {
+        for (let i = 0; i < 500 && !done(); i += 1) await new Promise((resolve) => setImmediate(resolve));
+    };
+    // Results cross from the script's own realm: compared as data.
+    const plain = (value) => JSON.parse(JSON.stringify(value));
+    return { send, contentSender, popupSender, listener, streams, settle, plain, rules };
+}
+
+/**
+ * Runs extensions/chrome/content.js at document_start of a chat page, against
+ * a document and an extension API reduced to what it touches. Returns the
+ * means to deliver policy violations to it and to read what it reports.
+ */
+function loadContent({ expectedPolicy }) {
+    const url = 'https://pinchat.im/static/chat.html?room=1';
+    const listeners = {};
+    const element = (tagName) => {
+        const attributes = new Map();
+        return {
+            tagName, nodeType: 1, id: '',
+            setAttribute(name, value) { attributes.set(name, String(value)); },
+            getAttribute(name) { return attributes.has(name) ? attributes.get(name) : null; },
+            hasAttribute(name) { return attributes.has(name); },
+            removeAttribute(name) { attributes.delete(name); },
+            querySelectorAll() { return []; },
+            // The packaged policy is in force: a handler never runs.
+            click() {},
+            // What the overlay needs.
+            attachShadow() { return element('#shadow-root'); },
+            appendChild(child) { return child; },
+            addEventListener() {},
+            remove() {},
+        };
+    };
+    const created = [];
+    const document = {
+        readyState: 'loading',
+        documentElement: element('HTML'),
+        body: null,
+        createElement(tagName) {
+            const made = element(tagName.toUpperCase());
+            created.push(made);
+            return made;
+        },
+        addEventListener(type, listener) { (listeners[type] = listeners[type] || []).push(listener); },
+        contains() { return false; },
+    };
+    const messages = [];
+    const browser = {
+        runtime: {
+            id: 'test-extension',
+            getURL: (file) => `chrome-extension://test-extension/${file}`,
+            onMessage: { addListener() {} },
+            sendMessage: async (message) => {
+                messages.push(JSON.parse(JSON.stringify(message)));
+                const verdict = { integrity: INTEGRITY.PARTIAL, attention: false, reasons: [], attested: false };
+                if (message.type === 'DOCUMENT_OPENED') {
+                    return { manifestStatus: 'valid', manifest: { files: [] }, canAttest: false, expectedPolicy, verdict };
+                }
+                return { verdict };
+            },
+        },
+    };
+    const context = vm.createContext({
+        browser, PinChatVerdict: V, document, crypto: nodeCrypto.webcrypto, btoa, URL, console: { log() {}, warn() {}, error() {} },
+        navigator: {}, Node: { ELEMENT_NODE: 1 }, MutationObserver: class { observe() {} },
+        // The overlay's watchdog is not under test, and would keep the run alive.
+        setTimeout, clearTimeout, setInterval: () => 0, clearInterval: () => {},
+    });
+    context.window = context;
+    context.location = new URL(url);
+    context.top = context;
+    context.addEventListener = () => {};
+    context.stop = () => {};
+    vm.runInContext(fs.readFileSync(path.join(root, 'extensions/chrome/content.js'), 'utf8'), context,
+        { filename: 'content.js' });
+    const fire = (type, event = {}) => (listeners[type] || []).forEach((listener) => listener(event));
+    return {
+        url,
+        // The handler the probe gave its element, as a browser would report it.
+        probeSample: () => created.find((made) => made.getAttribute('onclick')).getAttribute('onclick').slice(0, 40),
+        parsed: () => { document.readyState = 'interactive'; fire('DOMContentLoaded'); },
+        violation: (event) => fire('securitypolicyviolation', event),
+        lastReport: () => [...messages].reverse().find((message) => message.type === 'DOCUMENT_REPORT'),
+        settle: () => new Promise((resolve) => setTimeout(resolve, 450)),
+    };
+}
+
+const asyncTests = [];
+const asyncTest = (name, body) => asyncTests.push([name, body]);
+
+asyncTest('the page\'s first inline handler violation is counted, reported probe or not', async () => {
+    const rules = JSON.parse(fs.readFileSync(path.join(root, 'extensions/chrome/rules.json'), 'utf8'));
+    const expectedPolicy = V.packagedPolicy(rules, 'https://pinchat.im/static/chat.html?room=1');
+    const pageHandler = (sourceFile) => ({
+        effectiveDirective: 'script-src-attr', violatedDirective: 'script-src-attr', blockedURI: 'inline',
+        sourceFile, sample: 'document.documentElement.setAttribute(', originalPolicy: expectedPolicy,
+    });
+    const codes = (report) => [...report.findings, ...report.environment].map((entry) => entry.code);
+
+    // Chromium: the probe's violation is never reported. The page's first
+    // one used to be taken for it and dropped. This is how Chromium reports
+    // a handler of served markup that it blocks: with no source file.
+    const chromium = loadContent({ expectedPolicy });
+    await new Promise((resolve) => setImmediate(resolve));
+    chromium.parsed();
+    chromium.violation(pageHandler(''));
+    await chromium.settle();
+    assert.deepStrictEqual(codes(chromium.lastReport()), ['unattributed-policy-violation']);
+
+    // A browser that reports the probe's violation: that one, and only that
+    // one, is left out, whenever it arrives.
+    const reporting = loadContent({ expectedPolicy });
+    await new Promise((resolve) => setImmediate(resolve));
+    reporting.parsed();
+    reporting.violation(pageHandler('https://pinchat.im/static/chat.html'));
+    reporting.violation({
+        effectiveDirective: 'script-src-attr', violatedDirective: 'script-src-attr', blockedURI: 'inline',
+        sourceFile: '', sample: reporting.probeSample(), originalPolicy: expectedPolicy,
+    });
+    await reporting.settle();
+    assert.deepStrictEqual(codes(reporting.lastReport()), ['page-policy-violation']);
+
+    // And when it names another policy than the packaged one, the page fails.
+    const replaced = loadContent({ expectedPolicy });
+    await new Promise((resolve) => setImmediate(resolve));
+    replaced.parsed();
+    replaced.violation({
+        effectiveDirective: 'script-src-attr', violatedDirective: 'script-src-attr', blockedURI: 'inline',
+        sourceFile: '', sample: replaced.probeSample(), originalPolicy: "script-src 'self'; default-src 'self'",
+    });
+    await replaced.settle();
+    assert.deepStrictEqual(codes(replaced.lastReport()), ['policy-not-in-force']);
+});
+
+asyncTest('without standing access to the site no positive state is shown', async () => {
+    const url = 'https://pinchat.im/static/chat.html?room=1';
+    for (const [hostAccess, expected] of [[false, INTEGRITY.UNVERIFIABLE], [true, INTEGRITY.PARTIAL]]) {
+        const bg = loadBackground({ hostAccess });
+        const sender = bg.contentSender(url);
+        const opened = bg.plain(await bg.send(
+            { type: 'DOCUMENT_OPENED', token: 't1', policyInForce: true, workerControlled: false }, sender,
+        ));
+        assert.strictEqual(opened.verdict.reasons.some((entry) => entry.code === 'no-host-access'), !hostAccess);
+        const reportedState = bg.plain(await bg.send(
+            { type: 'DOCUMENT_REPORT', token: 't1', checksDone: true, findings: [], environment: [] }, sender,
+        ));
+        assert.strictEqual(reportedState.verdict.integrity, expected, `host access ${hostAccess}`);
+    }
+});
+
+asyncTest('the content script is told which policy the packaged rules give its document', async () => {
+    const bg = loadBackground();
+    for (const url of ['https://pinchat.im/static/chat.html?room=1', 'https://pinchat.im/c/1']) {
+        const opened = bg.plain(await bg.send(
+            { type: 'DOCUMENT_OPENED', token: 't2', policyInForce: true, workerControlled: false }, bg.contentSender(url),
+        ));
+        assert.strictEqual(opened.expectedPolicy, V.packagedPolicy(bg.rules, url), url);
+        assert(opened.expectedPolicy.startsWith('script-src '), url);
+    }
+});
+
+asyncTest('a 3xx answer that the browser displays is checked like any other (Firefox)', async () => {
+    const bg = loadBackground({ canAttest: true });
+    const documentTypes = ['main_frame', 'sub_frame'];
+    const beforeRequest = bg.listener('beforeRequest', documentTypes);
+    const headersReceived = bg.listener('headersReceived', documentTypes);
+    const answer = (requestId, statusCode, location) => bg.plain(headersReceived({
+        requestId, url: 'https://pinchat.im/static/chat.html', tabId: 3, frameId: 0, statusCode,
+        responseHeaders: [{ name: 'Location', value: location }, { name: 'Content-Type', value: 'text/plain' }],
+    }));
+    // No response filter on these requests: a body that is displayed would
+    // reach the parser unchecked, so the answer is refused.
+    for (const statusCode of [300, 304, 305, 306, 399]) {
+        assert.deepStrictEqual(answer(`unfiltered-${statusCode}`, statusCode, '/static/index.html'), { cancel: true },
+            `status ${statusCode}`);
+    }
+    assert.deepStrictEqual(answer('empty-location', 302, ' '), { cancel: true }, 'a redirect to nowhere is displayed');
+    // A redirect the browser follows has no body to check.
+    for (const statusCode of [301, 302, 303, 307, 308]) {
+        assert.deepStrictEqual(answer(`followed-${statusCode}`, statusCode, '/static/index.html'), {}, `status ${statusCode}`);
+    }
+    assert.deepStrictEqual(answer('off-site', 302, 'https://attacker.test/'), { cancel: true });
+    // With the filter attached, a displayed 300 is held and checked.
+    beforeRequest({ requestId: 'filtered-300', url: 'https://pinchat.im/static/chat.html', tabId: 3, frameId: 0 });
+    const held = answer('filtered-300', 300, '/static/index.html');
+    assert(Array.isArray(held.responseHeaders), 'released only after the body check');
+});
+
+asyncTest('a data file reaches the page only as signed (Firefox)', async () => {
+    const signedBytes = Buffer.from('{"OPERATOR_NAME":"Example Operator"}');
+    const hash = nodeCrypto.createHash('sha256').update(signedBytes).digest('hex');
+    const terms = 'https://pinchat.im/static/terms.html';
+    const fetchOperator = async (bg, requestId, bytes, statusCode = 200) => {
+        const types = ['xmlhttprequest'];
+        const request = {
+            requestId, url: 'https://pinchat.im/static/operator.json', tabId: 7, frameId: 0, documentUrl: terms,
+        };
+        assert.deepStrictEqual(bg.plain(bg.listener('beforeRequest', types)(request)), {});
+        bg.listener('headersReceived', types)({ ...request, statusCode });
+        const stream = bg.streams[bg.streams.length - 1];
+        stream.ondata({ data: Uint8Array.from(bytes).buffer });
+        stream.onstop();
+        await bg.settle(() => stream.closed);
+        assert(stream.closed, 'the response is released');
+        return Buffer.concat(stream.written);
+    };
+    const stateOf = async (bg) => bg.plain(await bg.send({ type: 'GET_ALL_STATES' }, bg.popupSender))
+        .find((entry) => entry.url === terms);
+
+    const bg = loadBackground({ canAttest: true, manifestFiles: [{ path: '/static/operator.json', hash }] });
+    await bg.send({ type: 'DOCUMENT_OPENED', token: 't3', policyInForce: true, workerControlled: false },
+        bg.contentSender(terms));
+    assert.strictEqual((await fetchOperator(bg, 'd1', signedBytes)).toString(), signedBytes.toString());
+    assert(!(await stateOf(bg)).reasons.some((entry) => entry.code === 'file-hash-mismatch'));
+
+    // An error answer is withheld, and is not a mismatch.
+    assert.strictEqual((await fetchOperator(bg, 'd2', Buffer.from('not found'), 404)).length, 0);
+    assert(!(await stateOf(bg)).reasons.some((entry) => entry.code === 'file-hash-mismatch'));
+
+    const forged = Buffer.from('{"OPERATOR_EMAIL_SUPPORT":"phish@attacker.test"}');
+    assert.strictEqual((await fetchOperator(bg, 'd3', forged)).length, 0, 'other bytes are withheld');
+    await bg.settle(() => false);
+    const state = await stateOf(bg);
+    assert.strictEqual(state.integrity, INTEGRITY.FAILED);
+    assert(state.reasons.some((entry) => entry.code === 'file-hash-mismatch' && entry.detail.includes('operator.json')));
+});
+
+asyncTest('the data files held are the ones the release signs as data', async () => {
+    const generator = fs.readFileSync(path.join(root, 'extensions/generate-hashes.js'), 'utf8');
+    const background = fs.readFileSync(path.join(root, 'extensions/chrome/background.js'), 'utf8');
+    const list = (text) => JSON.parse(/const DATA_FILES = (\[[^\]]*\])/.exec(text)[1].replace(/'/g, '"'));
+    assert.deepStrictEqual(list(background), list(generator));
+});
+
+(async () => {
+    for (const [name, body] of asyncTests) {
+        await body();
+        passed += 1;
+        console.log(`PASSED: ${name}`);
+    }
+    console.log(`\n${passed} verdict tests passed`);
+})().catch((error) => {
+    console.error(`FAILED: ${error.stack}`);
+    process.exit(1);
+});

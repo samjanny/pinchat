@@ -115,7 +115,8 @@ async function main() {
     const { joined: bob } = await addMember(alice, []);
     assert(alice.nLeaves === 2 && bob.nLeaves === 2, 'Add #1 (Bob) round-trips with parent hashes');
     const { joined: carol } = await addMember(alice, [bob]);
-    assert(alice.nLeaves === 3 && carol.nLeaves === 3 && bob.nLeaves === 3,
+    // RFC 9420 full tree: the third member doubles the tree to 4 leaves.
+    assert(alice.nLeaves === 4 && carol.nLeaves === 4 && bob.nLeaves === 4,
         'Add #2 (Carol) round-trips; existing members processCommit OK');
     const { joined: dave } = await addMember(alice, [bob, carol]);
     assert(alice.nLeaves === 4 && dave.nLeaves === 4,

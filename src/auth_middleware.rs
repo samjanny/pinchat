@@ -15,7 +15,7 @@ use crate::state::AppState;
 /// If the user is not authenticated, redirects to /login carrying the
 /// original path as `?redirect=` so login can return the user to where
 /// they came from.
-/// Also updates the session's last_activity for sliding window expiration.
+/// A session ends SESSION_TTL_SECS after login; requests do not extend it.
 pub async fn require_auth(
     State(state): State<AppState>,
     request: Request<Body>,
@@ -32,7 +32,6 @@ pub async fn require_auth(
 
     if let Some(id) = session_id {
         if state.session_store.get(&id).is_some() {
-            state.session_store.touch(&id);
             return next.run(request).await;
         }
         tracing::debug!("Session expired or not found, redirecting to login");
@@ -78,8 +77,6 @@ pub async fn require_auth_api(
         Some(id) => {
             // Validate that the session exists and remains within its TTL
             if let Some(_session) = state.session_store.get(&id) {
-                // Refresh the activity timestamp for sliding expiration
-                state.session_store.touch(&id);
                 // Session is valid; continue to the downstream handler
                 next.run(request).await
             } else {
@@ -179,6 +176,9 @@ mod tests {
             ws_conn_period_secs: 60,
             max_ws_connections: crate::config::DEFAULT_MAX_WS_CONNECTIONS,
             max_ws_connections_per_address: crate::config::DEFAULT_MAX_WS_CONNECTIONS_PER_ADDRESS,
+            max_http_connections: crate::config::DEFAULT_MAX_HTTP_CONNECTIONS,
+            max_http_connections_per_address:
+                crate::config::DEFAULT_MAX_HTTP_CONNECTIONS_PER_ADDRESS,
             room_token_burst_size: 100,
             room_token_period_secs: 600,
             msg_rate_limit: 30,
@@ -294,5 +294,57 @@ mod tests {
             loc.starts_with("/login?redirect=%2Fc%2Fabc%3Fdebug%3D1"),
             "got: {loc}"
         );
+    }
+
+    /// Audit T-09: every authenticated request slid the session's expiry
+    /// forward, so a session id used at least once per SESSION_TTL_SECS,
+    /// such as a stolen cookie replayed by a script, never expired. The
+    /// browser's own cookie expires SESSION_TTL_SECS after login.
+    #[tokio::test]
+    async fn requests_do_not_extend_a_session_past_its_lifetime() {
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode, header};
+        use tower::ServiceExt;
+
+        let mut config = auth_test_config();
+        config.session_ttl_secs = 2;
+        let state = AppState::new(10, config);
+        let app: Router = Router::new()
+            .route("/", get(|| async { "ok" }))
+            .layer(middleware::from_fn_with_state(state.clone(), require_auth))
+            .with_state(state.clone());
+        let api: Router = Router::new()
+            .route("/api", get(|| async { "ok" }))
+            .layer(middleware::from_fn_with_state(
+                state.clone(),
+                require_auth_api,
+            ))
+            .with_state(state.clone());
+        let session = uuid::Uuid::new_v4();
+        state.session_store.create(session);
+        let request = |path: &str| {
+            Request::builder()
+                .uri(path)
+                .header(header::COOKIE, format!("pinchat_session={session}"))
+                .body(Body::empty())
+                .unwrap()
+        };
+
+        for _ in 0..3 {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            let page = app.clone().oneshot(request("/")).await.unwrap();
+            assert_eq!(page.status(), StatusCode::OK);
+            let call = api.clone().oneshot(request("/api")).await.unwrap();
+            assert_eq!(call.status(), StatusCode::OK);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+        let page = app.clone().oneshot(request("/")).await.unwrap();
+        assert_eq!(
+            page.status(),
+            StatusCode::SEE_OTHER,
+            "sent to the login page"
+        );
+        let call = api.clone().oneshot(request("/api")).await.unwrap();
+        assert_eq!(call.status(), StatusCode::UNAUTHORIZED);
     }
 }

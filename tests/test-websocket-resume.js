@@ -66,7 +66,7 @@ global.ProofOfWork = class {
     async solve() { throw new Error('PoW should not run in this test'); }
 };
 
-const csrfToken = `${'a'.repeat(32)}.${'b'.repeat(64)}`;
+const csrfToken = `${'a'.repeat(32)}.1795561507.${'b'.repeat(64)}`;
 const resumeToken = `${'A'.repeat(32)}.${'B'.repeat(32)}.${'C'.repeat(32)}`;
 
 function response(status, body) {
@@ -1243,6 +1243,60 @@ async function main() {
     '1:1 client closes on a relay-delivered MLS frame');
     check(directDispatches === 1,
         'MLS frame in a 1:1 room is rejected before application dispatch');
+
+    // Audit R-03: the relay answers 409 before it spends the token of an
+    // identity whose previous socket is still open. A socket that closes
+    // before it ever opened hands its token to the next attempt, once, so
+    // the retry costs no new proof of work.
+    queuedResponses = [
+        response(200, { csrf_token: csrfToken }),
+        successToken('refused-upgrade-token'),
+    ];
+    fetchCalls = [];
+    const refusedManager = new WebSocketManager('refused-upgrade-room');
+    let refusedReconnects = 0;
+    refusedManager.attemptReconnect = () => { refusedReconnects += 1; };
+    await refusedManager.connect();
+    const refusedSocket = FakeWebSocket.instances.at(-1);
+    check(fetchCalls.length === 2
+        && refusedSocket.protocols[1] === 'pinchat.v1.jwt.refused-upgrade-token',
+    'first attempt pays for its token');
+    refusedSocket.readyState = FakeWebSocket.CLOSED;
+    refusedSocket.onclose({ code: 1006, reason: '' });
+    check(refusedReconnects === 1, 'a close before open still schedules a reconnect');
+
+    fetchCalls = [];
+    await refusedManager.connect();
+    const retrySocket = FakeWebSocket.instances.at(-1);
+    check(retrySocket !== refusedSocket && fetchCalls.length === 0
+        && retrySocket.protocols[1] === 'pinchat.v1.jwt.refused-upgrade-token',
+    'the retry after a close before open reuses the unspent token without a token request');
+
+    retrySocket.readyState = FakeWebSocket.CLOSED;
+    retrySocket.onclose({ code: 1006, reason: '' });
+    queuedResponses = [
+        response(200, { csrf_token: csrfToken }),
+        successToken('fresh-after-reuse-token'),
+    ];
+    fetchCalls = [];
+    await refusedManager.connect();
+    const freshSocket = FakeWebSocket.instances.at(-1);
+    check(fetchCalls.length === 2
+        && freshSocket.protocols[1] === 'pinchat.v1.jwt.fresh-after-reuse-token',
+    'a token that was already offered again is not offered a third time');
+
+    freshSocket.onopen();
+    freshSocket.readyState = FakeWebSocket.CLOSED;
+    freshSocket.onclose({ code: 1006, reason: '' });
+    queuedResponses = [
+        response(200, { csrf_token: csrfToken }),
+        successToken('after-open-token'),
+    ];
+    fetchCalls = [];
+    await refusedManager.connect();
+    check(fetchCalls.length === 2
+        && FakeWebSocket.instances.at(-1).protocols[1] === 'pinchat.v1.jwt.after-open-token',
+    'a token whose socket opened is spent and never reused');
 
     console.log(`\n${passed} assertions passed`);
 }

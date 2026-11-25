@@ -5,7 +5,7 @@
 //!
 //! Flow:
 //! 1. Client requests token with PoW headers
-//! 2. Server validates PoW (reuses existing challenge cache + HMAC(IP))
+//! 2. Server validates PoW (a signed challenge bound to HMAC(IP), used once)
 //! 3. Server verifies room exists and is not full
 //! 4. Server generates JWT with 30s expiration
 //! 5. Client uses JWT in WebSocket upgrade request
@@ -21,12 +21,13 @@ use serde_json::json;
 use std::net::SocketAddr;
 use uuid::Uuid;
 
+use crate::challenge_cache::PowRejection;
 use crate::handlers::auth::verify_csrf_for_api;
 use crate::ip_hash::{extract_client_ip_with_proxy, hash_ip};
 use crate::jwt::{WsTokenClaims, sign_token, verify_resume_token};
 use crate::models::RoomType;
-use crate::pow::{PowChallenge, calculate_difficulty};
-use crate::pow_session::{pow_cache_key, resolve_pow_session, should_use_secure_pow_cookies};
+use crate::pow::calculate_difficulty;
+use crate::pow_session::{build_pow_cookie, presented_challenge, should_use_secure_pow_cookies};
 use crate::state::AppState;
 
 const RESUME_TOKEN_HEADER: &str = "x-pinchat-resume-token";
@@ -80,7 +81,7 @@ pub struct WsTokenResponse {
 /// Handler for WebSocket token generation
 ///
 /// Protected by Proof-of-Work to prevent DoS attacks.
-/// Reuses existing PoW challenge cache and HMAC(IP) infrastructure.
+/// The challenge is signed and bound to HMAC(IP); see challenge_cache.rs.
 ///
 /// # Security
 /// - Requires valid PoW solution
@@ -100,7 +101,7 @@ pub async fn generate_ws_token(
     // that gap on top of SameSite=Strict + session auth.
     verify_csrf_for_api(&headers, &state.csrf_secret)?;
 
-    // Extract and hash client IP for challenge cache lookup
+    // Extract and hash client IP, which the challenge is bound to
     // Considers trusted proxies for X-Forwarded-For when configured
     let client_ip =
         extract_client_ip_with_proxy(&ConnectInfo(addr), &headers, &state.config.trusted_proxies);
@@ -113,13 +114,6 @@ pub async fn generate_ws_token(
         return Err(crate::handlers::websocket::admission_refused(refused, true));
     }
 
-    // Resolve PoW session cookie so clients behind the same NAT do not
-    // collide on the challenge cache.
-    let use_secure = should_use_secure_pow_cookies(state.config.force_secure_cookies);
-    let (pow_cookie, fresh_cookie) =
-        resolve_pow_session(&headers, use_secure, state.config.challenge_ttl_secs);
-    let cache_key = pow_cache_key(&ip_hash, &pow_cookie);
-
     // Calculate current PoW difficulty
     let current_rooms = state.rooms.len();
     let difficulty = calculate_difficulty(
@@ -128,6 +122,27 @@ pub async fn generate_ws_token(
         state.config.pow_min_difficulty,
         state.config.pow_max_difficulty,
     );
+
+    // A new challenge, bound to the client's address hash. Nothing is
+    // stored; the challenge travels in the pc_pow cookie (pow_session.rs).
+    let challenge_required = || {
+        let challenge = state.challenge_cache.issue(&ip_hash, difficulty);
+        let cookie = build_pow_cookie(
+            &challenge.challenge,
+            should_use_secure_pow_cookies(state.config.force_secure_cookies),
+            state.config.challenge_ttl_secs,
+        );
+        pow_error_response(
+            StatusCode::PRECONDITION_REQUIRED,
+            json!({
+                "error": "Proof of work required",
+                "pow_required": true,
+                "challenge": challenge.challenge,
+                "difficulty": challenge.difficulty
+            }),
+            Some(cookie),
+        )
+    };
 
     // Check if client provided PoW solution
     match headers.get("x-pow-nonce") {
@@ -141,78 +156,51 @@ pub async fn generate_ws_token(
                     pow_error_response(
                         StatusCode::BAD_REQUEST,
                         json!({ "error": "Invalid nonce format" }),
-                        fresh_cookie.clone(),
+                        None,
                     )
                 })?;
 
-            // Retrieve the issued challenge from cache to enforce one-time use
-            // This prevents offline challenge fabrication attacks
-            let cached_challenge = state.challenge_cache.take(&cache_key).ok_or_else(|| {
-                // No challenge found for this (IP, cookie) pair - emit a new challenge
-                tracing::info!("No cached challenge for PoW session, emitting new one (ws-token)");
-
-                let challenge = PowChallenge::new(difficulty);
-                state
-                    .challenge_cache
-                    .store(cache_key.clone(), challenge.clone());
-
-                pow_error_response(
-                    StatusCode::PRECONDITION_REQUIRED,
-                    json!({
-                        "error": "Proof of work required",
-                        "pow_required": true,
-                        "challenge": challenge.challenge,
-                        "difficulty": challenge.difficulty
-                    }),
-                    fresh_cookie.clone(),
-                )
-            })?;
-
-            // Verify difficulty matches current requirement
-            if cached_challenge.difficulty < difficulty {
-                return Err(pow_error_response(
-                    StatusCode::FORBIDDEN,
-                    json!({
-                        "error": "Difficulty too low for current server load"
-                    }),
-                    fresh_cookie,
-                ));
+            // The challenge must be one this server issued to this address,
+            // still valid and not used before; accepting the solution uses
+            // it up. This prevents offline challenge fabrication.
+            match state.challenge_cache.accept(
+                &ip_hash,
+                presented_challenge(&headers),
+                nonce,
+                difficulty,
+            ) {
+                Ok(()) => {
+                    tracing::info!("Valid PoW solution verified for ws-token (challenge consumed)");
+                }
+                Err(PowRejection::Unknown) => {
+                    tracing::info!("No valid challenge presented, emitting new one (ws-token)");
+                    return Err(challenge_required());
+                }
+                Err(PowRejection::DifficultyTooLow) => {
+                    return Err(pow_error_response(
+                        StatusCode::FORBIDDEN,
+                        json!({
+                            "error": "Difficulty too low for current server load"
+                        }),
+                        None,
+                    ));
+                }
+                Err(PowRejection::WrongSolution) => {
+                    tracing::warn!("Invalid PoW solution from IP (ws-token)");
+                    return Err(pow_error_response(
+                        StatusCode::FORBIDDEN,
+                        json!({ "error": "Invalid proof of work solution" }),
+                        None,
+                    ));
+                }
             }
-
-            // Verify PoW solution against cached challenge
-            if !cached_challenge.verify(nonce) {
-                tracing::warn!("Invalid PoW solution from IP (ws-token)");
-
-                return Err(pow_error_response(
-                    StatusCode::FORBIDDEN,
-                    json!({ "error": "Invalid proof of work solution" }),
-                    fresh_cookie,
-                ));
-            }
-
-            tracing::info!("Valid PoW solution verified for ws-token (challenge consumed)");
 
             // PoW valid, proceed to generate token
         }
         None => {
             // No PoW provided - emit a new challenge
             tracing::info!("No PoW provided, emitting challenge (ws-token)");
-
-            let challenge = PowChallenge::new(difficulty);
-            state
-                .challenge_cache
-                .store(cache_key.clone(), challenge.clone());
-
-            return Err(pow_error_response(
-                StatusCode::PRECONDITION_REQUIRED,
-                json!({
-                    "error": "Proof of work required",
-                    "pow_required": true,
-                    "challenge": challenge.challenge,
-                    "difficulty": challenge.difficulty
-                }),
-                fresh_cookie,
-            ));
+            return Err(challenge_required());
         }
     }
 

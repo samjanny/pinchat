@@ -45,6 +45,32 @@ function base64urlToBase64(base64url) {
     return base64;
 }
 
+/**
+ * sessionStorage key of the tab's bootstrap-key stash for the room named in
+ * `loc` (default: the current page):
+ *     pinchat_hash:<pathname>?room=<room id>
+ *
+ * Audit C-F5: the stash used to be keyed by pathname alone, and every room
+ * is served at the same /static/chat.html, so a keyless link to another
+ * room opened in the same tab silently adopted the previous room's key, and
+ * "Copy invite link" there handed it out under the new room's ID. The room
+ * ID is part of the key now. Returns null when the URL names no room: then
+ * nothing is read from or written to the stash.
+ *
+ * @param {{pathname: string, search: string}} [loc]
+ * @returns {string|null}
+ */
+function bootstrapStashKey(loc = window.location) {
+    const roomId = new URLSearchParams(loc.search || '').get('room');
+    if (!roomId) return null;
+    return `pinchat_hash:${loc.pathname}?room=${encodeURIComponent(roomId)}`;
+}
+
+/** The unbound stash key written by releases up to v0.9.2 (read never). */
+function legacyBootstrapStashKey(loc = window.location) {
+    return `pinchat_hash:${loc.pathname}`;
+}
+
 const MLS_GROUP_ID_FRAGMENT_PARAM = 'mls_gid';
 const MLS_CREATOR_KEY_FRAGMENT_PARAM = 'mls_creator';
 const MLS_BOOTSTRAP_PIN_BYTES = 32;
@@ -415,7 +441,9 @@ class ChainRatchet {
         // Compute next chain key: HMAC-SHA256(currentChainKey, "ChainRatchet")
         const nextChainKeyRaw = await crypto.subtle.sign('HMAC', hmacKey, info);
 
-        // Overwrite old chain key material to keep the ratchet one-way
+        // Replace the old chain key material to keep the ratchet one-way.
+        // The old buffer is released, not overwritten (SECURITY.md, "JS
+        // Memory Zeroization is Best-Effort").
         this.chainKeyMaterial = new Uint8Array(nextChainKeyRaw);
 
         // NOTE: messageNumber is incremented in deriveMessageKey() to prevent race conditions
@@ -498,9 +526,11 @@ class CryptoManager {
      *
      * Sources, in priority order:
      *   1. window.location.hash - initial page load via the invite link.
-     *   2. sessionStorage[`pinchat_hash:${pathname}`] - post-login restore
-     *      (login-stash.js / websocket.js / homepage.js) AND in-tab re-reads
-     *      after C-06 has already scrubbed the URL on a previous call.
+     *   2. sessionStorage[bootstrapStashKey()] - post-login restore
+     *      (login-stash.js / websocket.js) AND in-tab re-reads after C-06
+     *      has already scrubbed the URL on a previous call. The stash is
+     *      bound to the room ID in the URL (audit C-F5): another room's
+     *      stash is never used.
      *
      * After a successful import the raw fragment bytes are written back to
      * sessionStorage and the URL is rewritten via history.replaceState() to
@@ -513,17 +543,26 @@ class CryptoManager {
      * @returns {Promise<CryptoKey|null>}
      */
     async extractKeyFromURL() {
-        const stashKey = `pinchat_hash:${window.location.pathname}`;
+        const stashKey = bootstrapStashKey();
+
+        // An unbound stash left by an earlier release names no room, so it
+        // cannot be attributed to this one: drop it instead of reading it.
+        try {
+            sessionStorage.removeItem(legacyBootstrapStashKey());
+        } catch (_) {
+            /* sessionStorage unavailable */
+        }
 
         // Priority 1: the URL fragment.
         let fragment = window.location.hash.substring(1);
 
-        // Priority 2: sessionStorage stash (login-stash.js, in-tab re-read,
-        // or websocket.js's 401-bounce path). We intentionally do NOT
-        // remove the stash here - the post-import block below rewrites it
-        // anyway, and leaving it in place during the import phase means a
-        // crash before the rewrite still keeps the secret recoverable.
-        if (!fragment) {
+        // Priority 2: this room's sessionStorage stash (login-stash.js,
+        // in-tab re-read, or websocket.js's 401-bounce path). We
+        // intentionally do NOT remove the stash here - the post-import block
+        // below rewrites it anyway, and leaving it in place during the import
+        // phase means a crash before the rewrite still keeps the secret
+        // recoverable.
+        if (!fragment && stashKey) {
             const saved = sessionStorage.getItem(stashKey);
             if (saved) {
                 fragment = saved.startsWith('#') ? saved.substring(1) : saved;
@@ -592,7 +631,7 @@ class CryptoManager {
             // the URL bar, browser history, or to any code reading
             // window.location.hash.
             try {
-                sessionStorage.setItem(stashKey, '#' + fragment);
+                if (stashKey) sessionStorage.setItem(stashKey, '#' + fragment);
             } catch (_) {
                 // Storage full / disabled: keep the fragment in URL as a
                 // fallback. Functional, just less private.
@@ -635,9 +674,9 @@ class CryptoManager {
         if (!fragment) {
             throw new Error('Cannot attach MLS pins: bootstrap key fragment is unavailable');
         }
-        const stashKey = `pinchat_hash:${window.location.pathname}`;
+        const stashKey = bootstrapStashKey();
         try {
-            sessionStorage.setItem(stashKey, fragment);
+            if (stashKey) sessionStorage.setItem(stashKey, fragment);
         } catch (_) {
             // If storage is disabled, extractKeyFromURL intentionally leaves
             // the original fragment in the URL. getInviteFragment() can still
@@ -652,11 +691,11 @@ class CryptoManager {
      * when requireMlsPins is true and either pin is unavailable.
      */
     getInviteFragment({ requireMlsPins = false } = {}) {
-        const stashKey = `pinchat_hash:${window.location.pathname}`;
+        const stashKey = bootstrapStashKey();
         let fragment = window.location.hash
             ? window.location.hash.substring(1)
             : '';
-        if (!fragment) {
+        if (!fragment && stashKey) {
             try {
                 const saved = sessionStorage.getItem(stashKey);
                 if (saved) fragment = saved.startsWith('#') ? saved.substring(1) : saved;
@@ -742,10 +781,12 @@ class CryptoManager {
      * @param {Object} header - Message header with DH public key
      * @param {string} roomId - Expected room UUID
      * @param {string} expectedSenderId - Expected sender's connection UUID (from server)
+     * @param {number} [receivedAt] - Local time (ms) the frame arrived, when
+     *     it was held before decryption (SAS quarantine). Defaults to now.
      * @returns {Promise<string>} Decrypted plaintext
      * @throws {Error} If authentication fails or replay attack detected
      */
-    async decryptMessage(ciphertextBase64, header, roomId, expectedSenderId) {
+    async decryptMessage(ciphertextBase64, header, roomId, expectedSenderId, receivedAt) {
         // Use the Double Ratchet for decryption (PFS + PCS)
         if (!this.doubleRatchetActive) {
             throw new Error('Double Ratchet not initialized - cannot decrypt');
@@ -753,29 +794,43 @@ class CryptoManager {
 
         debugLog('[CRYPTO] Using Double Ratchet for decryption (PFS + PCS)');
         const envelope = await this.doubleRatchet.decryptMessage(ciphertextBase64, header, roomId, expectedSenderId);
-
-        // Defence-in-depth timestamp window. The Double Ratchet's counter
-        // already rejects in-session replays, but a captured ciphertext that
-        // somehow lands inside a current skipped-key window still must respect
-        // the wall-clock guardrail: a message older than MAX_MESSAGE_AGE or
-        // farther in the future than FUTURE_TOLERANCE indicates either a
-        // stale replay across reconnects or clock manipulation.
-        if (typeof envelope.ts === 'number') {
-            const now = Date.now();
-            const age = now - envelope.ts;
-            if (age > this.MAX_MESSAGE_AGE) {
-                throw new Error('REPLAY_TOO_OLD');
-            }
-            if (age < -this.FUTURE_TOLERANCE) {
-                throw new Error('REPLAY_FUTURE');
-            }
-        }
+        this._checkMessageAge(envelope, receivedAt);
 
         // DoubleRatchet returns {ts, text} plus the receiver-only `_outOfOrder`
         // flag set when (ratchetCount, messageNumber) was below the highest
         // tuple already decrypted. We surface that flag to the app layer so
         // late arrivals can be visually marked.
         return { text: envelope.text, outOfOrder: envelope._outOfOrder === true };
+    }
+
+    /**
+     * Defence-in-depth timestamp window. The Double Ratchet's counter
+     * already rejects in-session replays, but a captured ciphertext that
+     * somehow lands inside a current skipped-key window still must respect
+     * the wall-clock guardrail: a message older than MAX_MESSAGE_AGE or
+     * farther in the future than FUTURE_TOLERANCE indicates either a stale
+     * replay across reconnects or clock manipulation.
+     *
+     * Audit C-F4: the age is measured at the local arrival time. A frame
+     * held in the SAS quarantine is decrypted only once the user decides,
+     * and the minutes spent comparing the code are not the message's age;
+     * measured at release, every message that waited more than five minutes
+     * was rejected, with its key already consumed by the ratchet.
+     *
+     * @private
+     * @param {Object} envelope - decrypted envelope ({ts, ...})
+     * @param {number} [receivedAt] - local arrival time in ms (default: now)
+     */
+    _checkMessageAge(envelope, receivedAt) {
+        if (typeof envelope.ts !== 'number') return;
+        const reference = Number.isFinite(receivedAt) ? receivedAt : Date.now();
+        const age = reference - envelope.ts;
+        if (age > this.MAX_MESSAGE_AGE) {
+            throw new Error('REPLAY_TOO_OLD');
+        }
+        if (age < -this.FUTURE_TOLERANCE) {
+            throw new Error('REPLAY_FUTURE');
+        }
     }
 
     /**
@@ -962,9 +1017,10 @@ class CryptoManager {
      * @param {Object} header - Signal Protocol header
      * @param {string} roomId - Room UUID for AAD verification
      * @param {string} senderId - Sender's connection UUID
+     * @param {number} [receivedAt] - Local arrival time (ms), as for decryptMessage
      * @returns {Promise<Object>} Object with {data: Uint8Array, mimeType: string}
      */
-    async decryptImage(payloadBase64, header, roomId, senderId) {
+    async decryptImage(payloadBase64, header, roomId, senderId, receivedAt) {
         if (!this.doubleRatchetActive) {
             throw new Error('Double Ratchet not initialized - cannot decrypt');
         }
@@ -977,16 +1033,7 @@ class CryptoManager {
         // Apply the same timestamp window as text messages: late replays
         // captured across reconnects must still be rejected even if the
         // Double Ratchet counter slot happens to be available.
-        if (typeof envelope.ts === 'number') {
-            const now = Date.now();
-            const age = now - envelope.ts;
-            if (age > this.MAX_MESSAGE_AGE) {
-                throw new Error('REPLAY_TOO_OLD');
-            }
-            if (age < -this.FUTURE_TOLERANCE) {
-                throw new Error('REPLAY_FUTURE');
-            }
-        }
+        this._checkMessageAge(envelope, receivedAt);
 
         // Parse the envelope (it's the inner JSON with image data)
         // The Double Ratchet returns {ts, text} but for images we encoded the full envelope as 'text'
@@ -1064,6 +1111,7 @@ if (typeof module !== 'undefined' && module.exports) {
         encodeAADWithLengthPrefix,
         base64ToBase64url,
         base64urlToBase64,
+        bootstrapStashKey,
         encodeMlsBootstrapPin,
         parseMlsBootstrapPins,
         MLS_GROUP_ID_FRAGMENT_PARAM,

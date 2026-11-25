@@ -9,12 +9,13 @@ use serde_json::json;
 use std::net::SocketAddr;
 use uuid::Uuid;
 
+use crate::challenge_cache::PowRejection;
 use crate::handlers::auth::verify_csrf_for_api;
 use crate::ip_hash::{extract_client_ip_with_proxy, hash_ip};
 use crate::jwt::{WsTokenClaims, sign_token};
 use crate::models::{CreateRoomResponse, Room, RoomConfig, RoomType};
-use crate::pow::{PowChallenge, calculate_difficulty};
-use crate::pow_session::{pow_cache_key, resolve_pow_session, should_use_secure_pow_cookies};
+use crate::pow::calculate_difficulty;
+use crate::pow_session::{build_pow_cookie, presented_challenge, should_use_secure_pow_cookies};
 use crate::state::AppState;
 
 /// Truncate a Uuid to the first 8 hex chars for non-strict logging. Enough
@@ -70,7 +71,7 @@ pub async fn create_room(
             .into_response());
     }
 
-    // Extract and hash client IP for challenge cache lookup
+    // Extract and hash client IP, which the challenge is bound to
     // Considers trusted proxies for X-Forwarded-For when configured
     let client_ip =
         extract_client_ip_with_proxy(&ConnectInfo(addr), &headers, &state.config.trusted_proxies);
@@ -83,21 +84,13 @@ pub async fn create_room(
         return Err(crate::handlers::websocket::admission_refused(refused, true));
     }
 
-    // Resolve PoW session cookie to disambiguate clients behind shared NAT.
-    // A missing/invalid cookie yields a fresh UUID + a Set-Cookie header to
-    // attach on whichever 428 this request emits.
-    let use_secure = should_use_secure_pow_cookies(state.config.force_secure_cookies);
-    let (pow_cookie, fresh_cookie) =
-        resolve_pow_session(&headers, use_secure, state.config.challenge_ttl_secs);
-    let cache_key = pow_cache_key(&ip_hash, &pow_cookie);
-
     // Validate configuration
     if config.ttl_minutes == 0 || config.ttl_minutes > 1440 {
         // Max 24 hours
         return Err(pow_error_response(
             StatusCode::BAD_REQUEST,
             json!({ "error": "TTL must be between 1 and 1440 minutes" }),
-            fresh_cookie,
+            None,
         ));
     }
 
@@ -109,6 +102,28 @@ pub async fn create_room(
         state.config.pow_min_difficulty,
         state.config.pow_max_difficulty,
     );
+
+    // A new challenge, bound to the client's address hash. Nothing is
+    // stored; the challenge travels in the pc_pow cookie (pow_session.rs).
+    let challenge_required = |error: &str| {
+        let challenge = state.challenge_cache.issue(&ip_hash, difficulty);
+        let cookie = build_pow_cookie(
+            &challenge.challenge,
+            should_use_secure_pow_cookies(state.config.force_secure_cookies),
+            state.config.challenge_ttl_secs,
+        );
+        pow_error_response(
+            StatusCode::PRECONDITION_REQUIRED,
+            json!({
+                "error": error,
+                "pow_required": true,
+                "challenge": challenge.challenge,
+                "mask": challenge.mask,
+                "difficulty": difficulty
+            }),
+            Some(cookie),
+        )
+    };
 
     // Check if client provided PoW solution
     match headers.get("x-pow-nonce") {
@@ -122,89 +137,50 @@ pub async fn create_room(
                     pow_error_response(
                         StatusCode::BAD_REQUEST,
                         json!({ "error": "Invalid nonce format" }),
-                        fresh_cookie.clone(),
+                        None,
                     )
                 })?;
 
-            // Retrieve the issued challenge from cache to enforce one-time use
-            // This prevents offline challenge fabrication attacks
-            let cached_challenge = state.challenge_cache.take(&cache_key).ok_or_else(|| {
-                // No challenge found for this (IP, cookie) pair - issue a new one
-                let new_challenge = PowChallenge::new(difficulty);
-                state
-                    .challenge_cache
-                    .store(cache_key.clone(), new_challenge.clone());
-
-                tracing::warn!("No cached challenge for PoW session, issuing new one");
-
-                pow_error_response(
-                    StatusCode::PRECONDITION_REQUIRED,
-                    json!({
-                        "error": "Challenge not found or expired, new challenge issued",
-                        "pow_required": true,
-                        "challenge": new_challenge.challenge,
-                        "mask": new_challenge.mask,
-                        "difficulty": difficulty
-                    }),
-                    fresh_cookie.clone(),
-                )
-            })?;
-
-            // Verify difficulty matches current requirement (prevent stale challenges)
-            if cached_challenge.difficulty < difficulty {
-                let new_challenge = PowChallenge::new(difficulty);
-                state
-                    .challenge_cache
-                    .store(cache_key.clone(), new_challenge.clone());
-
-                return Err(pow_error_response(
-                    StatusCode::PRECONDITION_REQUIRED,
-                    json!({
-                        "error": "Difficulty increased, new challenge required",
-                        "pow_required": true,
-                        "challenge": new_challenge.challenge,
-                        "mask": new_challenge.mask,
-                        "difficulty": difficulty
-                    }),
-                    fresh_cookie,
-                ));
+            // The challenge must be one this server issued to this address,
+            // still valid and not used before; accepting the solution uses
+            // it up. This prevents offline challenge fabrication.
+            match state.challenge_cache.accept(
+                &ip_hash,
+                presented_challenge(&headers),
+                nonce,
+                difficulty,
+            ) {
+                Ok(()) => {
+                    tracing::info!("Valid PoW solution verified (challenge consumed)");
+                }
+                Err(PowRejection::Unknown) => {
+                    tracing::warn!("No valid challenge presented, issuing new one");
+                    return Err(challenge_required(
+                        "Challenge not found or expired, new challenge issued",
+                    ));
+                }
+                Err(PowRejection::DifficultyTooLow) => {
+                    // Stale challenge from before the load went up.
+                    return Err(challenge_required(
+                        "Difficulty increased, new challenge required",
+                    ));
+                }
+                Err(PowRejection::WrongSolution) => {
+                    tracing::warn!("Invalid PoW solution from IP");
+                    return Err(pow_error_response(
+                        StatusCode::FORBIDDEN,
+                        json!({ "error": "Invalid proof of work solution" }),
+                        None,
+                    ));
+                }
             }
-
-            // Verify PoW solution against cached challenge
-            if !cached_challenge.verify(nonce) {
-                tracing::warn!("Invalid PoW solution from IP");
-
-                return Err(pow_error_response(
-                    StatusCode::FORBIDDEN,
-                    json!({ "error": "Invalid proof of work solution" }),
-                    fresh_cookie,
-                ));
-            }
-
-            tracing::info!("Valid PoW solution verified (challenge consumed)");
 
             // PoW valid, proceed to create room
         }
         None => {
-            // No PoW provided, send challenge to client and store in cache
-            let challenge = PowChallenge::new(difficulty);
-            state
-                .challenge_cache
-                .store(cache_key.clone(), challenge.clone());
-
-            tracing::debug!("PoW challenge issued and cached");
-
-            return Err(pow_error_response(
-                StatusCode::PRECONDITION_REQUIRED,
-                json!({
-                    "error": "Proof of work required",
-                    "pow_required": true,
-                    "challenge": challenge.challenge,
-                    "mask": challenge.mask,
-                    "difficulty": difficulty
-                }),
-                fresh_cookie,
-            ));
+            // No PoW provided, send a challenge to the client
+            tracing::debug!("PoW challenge issued");
+            return Err(challenge_required("Proof of work required"));
         }
     }
 
@@ -332,10 +308,9 @@ pub async fn room_page(
             room.created_at,
         ),
         None => {
-            tracing::warn!(
-                "Room page access failed - Room {}... not found",
-                short_room_id(&room_id)
-            );
+            // No part of the room id in warnings: minimal privacy mode
+            // keeps them, and they must not record which rooms existed.
+            tracing::warn!("Room page access failed - room not found");
             return Err((StatusCode::NOT_FOUND, "Room not found").into_response());
         }
     };
@@ -362,8 +337,7 @@ pub async fn room_page(
     // still removed eagerly rather than waiting for the cleanup tick.
     if room_is_expired {
         tracing::warn!(
-            "Room page access failed - Room {}... has expired (ttl_minutes: {})",
-            short_room_id(&room_id),
+            "Room page access failed - room has expired (ttl_minutes: {})",
             ttl_minutes
         );
         state.remove_room(&room_id);
@@ -376,10 +350,7 @@ pub async fn room_page(
     // existence to callers probing random UUIDs. UUIDv4 (122 bits) makes blind
     // enumeration infeasible, but unified responses remove a metadata side-channel.
     if room_is_full {
-        tracing::warn!(
-            "Room page access failed - Room {}... is full",
-            short_room_id(&room_id)
-        );
+        tracing::warn!("Room page access failed - room is full");
         return Err((StatusCode::NOT_FOUND, "Room not found").into_response());
     }
 
@@ -420,6 +391,9 @@ mod tests {
             ws_conn_period_secs: 60,
             max_ws_connections: crate::config::DEFAULT_MAX_WS_CONNECTIONS,
             max_ws_connections_per_address: crate::config::DEFAULT_MAX_WS_CONNECTIONS_PER_ADDRESS,
+            max_http_connections: crate::config::DEFAULT_MAX_HTTP_CONNECTIONS,
+            max_http_connections_per_address:
+                crate::config::DEFAULT_MAX_HTTP_CONNECTIONS_PER_ADDRESS,
             room_token_burst_size: 100,
             room_token_period_secs: 600,
             msg_rate_limit: 30,
@@ -595,6 +569,102 @@ mod tests {
             "a 1:1 request must reach the PoW challenge"
         );
         assert_eq!(state.total_rooms(), 0);
+    }
+
+    /// The challenge comes back in the pc_pow cookie a 428 sets, and a
+    /// solution creates one room, not two. Audit T-03: issuing a challenge
+    /// keeps nothing on the server, so no number of other requests can
+    /// take it away before it is solved.
+    #[tokio::test]
+    async fn a_solved_challenge_from_the_cookie_creates_one_room() {
+        let mut config = test_config();
+        config.pow_min_difficulty = 10;
+        config.pow_max_difficulty = 10;
+        let state = AppState::new(1000, config);
+        let addr: SocketAddr = "203.0.113.20:9999".parse().unwrap();
+        let body = || {
+            Json(RoomConfig {
+                room_type: RoomType::OneToOne,
+                ttl_minutes: 60,
+                max_participants: 2,
+            })
+        };
+
+        let response = create_room(
+            State(state.clone()),
+            ConnectInfo(addr),
+            csrf_headers(&state),
+            body(),
+        )
+        .await
+        .expect_err("first request gets a challenge");
+        assert_eq!(response.status(), StatusCode::PRECONDITION_REQUIRED);
+        let set_cookie = response
+            .headers()
+            .get(axum::http::header::SET_COOKIE)
+            .expect("the challenge is carried by the pc_pow cookie")
+            .to_str()
+            .unwrap()
+            .to_string();
+        let cookie = set_cookie.split(';').next().unwrap().to_string();
+        let challenge = cookie.strip_prefix("pc_pow=").unwrap().to_string();
+        let solver = crate::pow::PowChallenge {
+            challenge: challenge.clone(),
+            mask: String::new(),
+            difficulty: 10,
+        };
+        let nonce = (0..).find(|n| solver.verify(*n)).unwrap();
+
+        // Other clients asking for challenges in the meantime change nothing.
+        for i in 0..200u8 {
+            let other: SocketAddr = format!("198.51.100.{i}:9999").parse().unwrap();
+            let _ = create_room(
+                State(state.clone()),
+                ConnectInfo(other),
+                csrf_headers(&state),
+                body(),
+            )
+            .await;
+        }
+        assert!(state.challenge_cache.is_empty());
+
+        let solved = || {
+            let mut headers = csrf_headers(&state);
+            let csrf = headers
+                .get(axum::http::header::COOKIE)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string();
+            headers.insert(
+                axum::http::header::COOKIE,
+                format!("{csrf}; {cookie}").parse().unwrap(),
+            );
+            headers.insert("x-pow-nonce", nonce.to_string().parse().unwrap());
+            headers
+        };
+        create_room(State(state.clone()), ConnectInfo(addr), solved(), body())
+            .await
+            .expect("the solution is accepted");
+        assert_eq!(state.total_rooms(), 1);
+
+        let replay = create_room(State(state.clone()), ConnectInfo(addr), solved(), body())
+            .await
+            .expect_err("the same solution is not accepted twice");
+        assert_eq!(replay.status(), StatusCode::PRECONDITION_REQUIRED);
+        assert_eq!(state.total_rooms(), 1);
+
+        // Nor from another address.
+        let elsewhere: SocketAddr = "203.0.113.21:9999".parse().unwrap();
+        let response = create_room(
+            State(state.clone()),
+            ConnectInfo(elsewhere),
+            solved(),
+            body(),
+        )
+        .await
+        .expect_err("a challenge is bound to the address it was issued to");
+        assert_eq!(response.status(), StatusCode::PRECONDITION_REQUIRED);
     }
 
     /// Sanity counterpart: a live, non-full room redirects to the chat page

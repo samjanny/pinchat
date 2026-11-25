@@ -4,6 +4,181 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Dates are the repository-local commit dates; entries are curated for user-visible impact
 rather than being a 1:1 mirror of `git log`.
 
+## [2026-11-25] - v0.9.3
+
+Fixes for the findings of an internal audit of v0.9.2 across five areas: the
+1:1 cryptography, the integrity extensions and page security, the relay's
+HTTP surface, the relay core and the MLS group chat. Every fix comes with a
+regression test that fails on v0.9.2.
+
+The manifest is re-signed at sequence 59, since static files changed, and
+both extensions move to 1.7.0 with their pin on v0.9.3 and their floor raised
+to 59: their content and background scripts changed too. A manifest signed
+at sequence 58 during the release, before the last group chat fix, was never
+published, and the floor keeps 1.7.0 from accepting it. The crate moves to
+0.9.3.
+
+### Security - 1:1 chat
+
+- A relay that knew the invite link could make a different identity key
+  inherit "verified" after both users had compared the SAS. It forged a
+  departure and a return in the middle of a handshake, and a handshake timer
+  left running tore down the live session. The verdict is now bound to the
+  identity key that was compared, and stale handshake timers no longer act on
+  a newer session. A peer that comes back with another key has to be verified
+  again: the composer is locked, incoming messages wait, and the user is told
+  that the key changed.
+- Identity keys are per room. The key a relay can recover from the signatures
+  in message headers no longer links the rooms that one browser opens.
+- "They match" confirms only the code on screen. A code that changes while the
+  dialog is open is announced and has to be confirmed again.
+- Messages that waited for the SAS decision are no longer dropped as replays
+  when the comparison takes more than five minutes: their age is measured
+  from when they arrived.
+- The stashed invite key is bound to its room. A link without a key to
+  another room no longer reuses the previous room's key, nor hands it out in
+  its invite link.
+- The text of a relay `error` frame only selects one of the client's own
+  banners and is never shown.
+
+### Security - integrity extensions and pages
+
+- Chromium: served markup could stay on the page through a declarative
+  shadow root on `<body>`, which loaded an unsigned stylesheet and a fake
+  composer that posted to the server while the state stayed "partially
+  verified", or through an element named `body`. The framework guard now
+  replaces the parsed body before it starts, and reads the document through
+  prototype getters saved at start-up.
+- The extensions inspect open and closed shadow roots. One present while a
+  page is parsed makes it "unverifiable" in Chromium, and an unsigned
+  stylesheet inside one fails the page. A served
+  `<meta http-equiv="refresh">` stops the document.
+- Forms may be submitted only by the login page: `form-action 'none'`
+  everywhere else, in the extension's policy and in the relay's own.
+- No page is shown as verified or partially verified without standing access
+  to the site.
+- The policy probe recognises its own violation by a random marker, so the
+  page's first inline-handler violation is no longer ignored.
+- Firefox: displayed 3xx answers are checked like any other, and the legal
+  pages receive `operator.json` only when it matches the signed manifest.
+- Images: the thumbnail in the JFIF header and the chunks nested in animated
+  WebP frames are removed.
+- CI: the SRI gate reads every script and stylesheet tag whatever the order
+  of its attributes, requires integrity on each, and runs for pull requests on
+  the same paths as for pushes.
+
+### Security - relay HTTP surface
+
+- The relay serves HTTP itself and limits connections before the WebSocket
+  upgrade. Partial request heads and idle connections used to stay open with
+  no deadline, and about 1250 of them were enough to exhaust a 512 MiB
+  container. Now:
+  - `MAX_HTTP_CONNECTIONS` (256) and `MAX_HTTP_CONNECTIONS_PER_ADDRESS` (32);
+  - 10 s for the TLS handshake and for each request head;
+  - 32 KiB heads, 16 KiB bodies;
+  - 60 s per connection that is not upgraded;
+  - HTTP/1.1 only.
+- Every per-address quota (login, rooms and tokens, WebSocket connections)
+  also counts the IPv6 /48, with four times the burst. Before, an attacker
+  with a /48 had 65536 times the login budget.
+- Proof-of-work challenges are signed by the relay and carried by the client
+  instead of being cached. A flood of challenge requests can no longer evict
+  the challenge an honest client is solving. Challenge lifetime and sweep
+  interval are bounded to what the privacy policy states.
+- `X-Forwarded-For` is parsed entry by entry, so one byte outside ASCII no
+  longer moves a client into the proxy's bucket. Cookies are read from every
+  `Cookie` header.
+- Sessions end `SESSION_TTL_SECS` after login instead of sliding forward with
+  activity, and CSRF tokens expire.
+- Password hashes and `CSP_WS_HOST` are checked at startup.
+
+### Security - relay core
+
+- A momentarily full relay budget no longer destroys a group room, nor drops
+  the join and leave notices of a 1:1 room. The relay's own join and leave
+  events are counted but never refused.
+- A participant that resumed and then dropped again keeps its whole
+  reconnect grace period. Before, the timer of an earlier disconnect could
+  end it early and, for a creator, close the group.
+- A resume that finds the identity's old socket still open is refused with
+  409 before its token is spent. The old socket is then probed, and if it
+  stays silent for 5 s it is released, so a resume after a network change
+  succeeds within seconds instead of never. The client reuses the unspent
+  token once.
+- MLS controls wait up to 30 s for room in the broadcast budgets, as other
+  frames do, instead of closing the connection with 1013. A member replaying
+  its backlog no longer holds the room's frames.
+- Commits and Welcomes from members other than the creator are refused before
+  the room traffic limit and count as protocol errors. A group out of
+  KeyPackage references gets a typed rejection instead of a reconnect loop.
+- Messages refused by the room traffic limit are reported to their sender.
+- Warnings no longer name rooms, connections, tokens or Origins.
+
+### Security - group chat (experimental, off by default)
+
+- A member could re-encrypt another member's signed message as a new one,
+  which made the real messages that followed be dropped as replays.
+  Application messages now carry a signed generation.
+- A presence check is answered only by a fresh pong to a ping that was
+  actually sent. A member is removed only after a whole grace window of
+  silence that follows that ping: never on a ping that was not sent, nor on
+  a timer left from an earlier attempt or an earlier check of the same
+  member.
+- Clock skew between members, a proposal that arrives just before a joiner's
+  Welcome, a copied Update key and oversized KeyPackages can no longer
+  desynchronise members, freeze periodic re-keying or block later joins.
+- Invalid controls are rejected by error type instead of by message text, so
+  a malformed Welcome tree can no longer trap a joiner in a reconnect loop.
+- Ratchet trees are full RFC 9420 trees for any member count, checked against
+  the IETF tree-operations and psk_secret vectors. Before, they differed from
+  RFC 9420 when the member count was not a power of 2.
+
+### Changed
+
+- The group wire format changed (signed generation, full trees): clients of
+  v0.9.2 and v0.9.3 cannot share a group.
+- After the update every 1:1 room gets a new identity key, so a peer sees one
+  identity change, and verifies again, in a room that stays open across the
+  update. A tab reloaded after the update asks for the invite link again.
+- The relay refuses to start when:
+  - `ROOM_BYTE_RATE_LIMIT` is below twice the encoded size of a
+    `MAX_IMAGE_SIZE` image (about 3.6 times `MAX_IMAGE_SIZE`; the 8MB default
+    passes);
+  - a password hash is not a valid Argon2id hash;
+  - `CSP_WS_HOST` is anything but `'self'` or `wss://` origins;
+  - `CHALLENGE_TTL_SECS` is outside 10 to 300, or
+    `CHALLENGE_CLEANUP_INTERVAL_SECS` is outside 1 to 60.
+- The relay no longer serves HTTP/2. The reverse-proxy setup in
+  docs/reverse-proxy.md already talks HTTP/1.1 to it.
+
+### Known limits
+
+- Chromium does not report the policy violations that an extension's own code
+  triggers, so comparing the violated policy with the packaged one has no
+  effect there.
+- In Chromium the extension cannot hold back an `operator.json` that does not
+  match the manifest.
+- After a Remove, the group creator still sends its full direct path, where
+  RFC 9420 would skip a node. static/js/mls/README.md says so.
+- With direct TLS, the default `MAX_HTTP_CONNECTIONS` can take about 120 MiB
+  in the worst case, more than the margin of the 512 MiB sizing. Lower it on a
+  small host that is not behind a reverse proxy; SECURITY.md has the numbers.
+
+### Documentation
+
+- SECURITY.md, PROTOCOL.md, extensions/README.md, static/js/mls/README.md,
+  `.env.example` and the privacy policy now describe the code as it is:
+  - correlation between rooms;
+  - SAS v4, P1363 signatures, the AAD fields, key zeroing;
+  - the relay memory budgets and the connections before the upgrade;
+  - TLS 1.2 and 1.3;
+  - shadow roots and redirects;
+  - how long proof-of-work data is kept.
+- The WebSocket section of PROTOCOL.md was rewritten from the code.
+- The MLS session-join suite used to stop halfway and still report success.
+  It now runs to the end. The Chrome harness of the extension now loads the
+  extension in Chrome 137 and later.
+
 ## [2026-11-24] - v0.9.2
 
 The manifest is re-signed at sequence 57 and both extensions move to 1.6.0

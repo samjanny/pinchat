@@ -32,7 +32,12 @@ const path = require('path');
 const { webcrypto } = require('crypto');
 const KS = require(path.join(__dirname, '..', 'static', 'js', 'mls', 'key-schedule.js'));
 
+const HPKE = require(path.join(__dirname, '..', 'static', 'js', 'mls', 'hpke.js'));
+const Codec = require(path.join(__dirname, '..', 'static', 'js', 'mls', 'codec.js'));
+const Welcome = require(path.join(__dirname, '..', 'static', 'js', 'mls', 'welcome.js'));
+
 const VECTORS = require(path.join(__dirname, 'vectors', 'mls', 'key-schedule.json'));
+const PSK_VECTORS = require(path.join(__dirname, 'vectors', 'mls', 'psk_secret.json'));
 
 let passed = 0;
 let failed = 0;
@@ -109,7 +114,57 @@ async function runEpoch(groupIdx, epochIdx, prevInitSecret, epochVector) {
     return out.initSecret;
 }
 
+/**
+ * RFC 9420 section 8.4 psk_secret over a list of external PSKs:
+ *
+ *   psk_extracted_[i] = KDF.Extract(0, psk_[i])
+ *   psk_input_[i]     = ExpandWithLabel(psk_extracted_[i], "derived psk",
+ *                                       PSKLabel{id, index, count}, Nh)
+ *   psk_secret_[0]    = 0
+ *   psk_secret_[i]    = KDF.Extract(psk_input_[i-1], psk_secret_[i-1])
+ *
+ * The PinChat profile carries no PSK identifiers (GroupSecrets.psks is
+ * always empty) and injects its invite-derived 32-byte PSK directly as
+ * psk_secret, so this composition is not on the production path. It still
+ * pins the library's KDF.Extract, ExpandWithLabel and PreSharedKeyID
+ * encoding against the IETF psk_secret vectors, and the empty-list vector
+ * pins the all-zero psk_secret used when no invite PSK is supplied.
+ */
+async function pskSecret(psks) {
+    let secret = new Uint8Array(HPKE.Nh);
+    for (let i = 0; i < psks.length; i += 1) {
+        const extracted = await HPKE.hkdfExtract(
+            new Uint8Array(0), hexDecode(psks[i].psk),
+        );
+        const label = new Codec.Encoder();
+        Welcome.writePreSharedKeyID(label, {
+            psktype: 1,
+            pskId: hexDecode(psks[i].psk_id),
+            pskNonce: hexDecode(psks[i].psk_nonce),
+        });
+        label.writeU16(i);
+        label.writeU16(psks.length);
+        const input = await KS.expandWithLabel(
+            extracted, 'derived psk', label.bytes(), HPKE.Nh,
+        );
+        secret = await HPKE.hkdfExtract(input, secret);
+    }
+    return secret;
+}
+
+async function runPskVectors() {
+    const cs2 = PSK_VECTORS.filter((v) => v.cipher_suite === 2);
+    console.log(`# psk_secret.json - cipher_suite=2 (${cs2.length} PSK lists)`);
+    assert(cs2.length > 0, 'psk_secret vectors present for cipher_suite=2');
+    for (let i = 0; i < cs2.length; i += 1) {
+        eqHex(await pskSecret(cs2[i].psks), cs2[i].psk_secret,
+            `psk_secret vector ${i} (${cs2[i].psks.length} PSKs)`);
+    }
+}
+
 async function main() {
+    await runPskVectors();
+
     // Run cipher_suite = 2 (our target) against all 5 epochs across 1 group.
     const group = VECTORS.find((g) => g.cipher_suite === 2);
     if (!group) {

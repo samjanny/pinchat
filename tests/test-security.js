@@ -298,7 +298,7 @@ async function runTests() {
         const savedWindow = global.window;
         const savedSessionStorage = global.sessionStorage;
         const storage = new Map([
-            ['pinchat_hash:/static/chat.html', '#key=bootstrap-secret'],
+            ['pinchat_hash:/static/chat.html?room=test', '#key=bootstrap-secret'],
         ]);
         global.window = {
             location: {
@@ -360,13 +360,13 @@ async function runTests() {
             return match[1];
         };
 
-        const pinsOk = chromeTag === 'v0.9.2'
+        const pinsOk = chromeTag === 'v0.9.3'
             && firefoxTag === chromeTag
             && Number.isSafeInteger(chromeFloor)
             && chromeFloor > 0
             && chromeFloor <= signed.data.sequence
             && firefoxFloor === chromeFloor
-            && chromeManifest.version === '1.6.0'
+            && chromeManifest.version === '1.7.0'
             && firefoxManifest.version === chromeManifest.version
             && readPublicKey(chromeBackground) === readPublicKey(firefoxBackground);
         if (!pinsOk) {
@@ -534,6 +534,203 @@ async function runTests() {
 
         console.log('  Cached-manifest fallback, fail-closed rejection, gated background fetch');
         console.log('PASSED: verifier degrades safely and stays quiet when idle');
+        passed++;
+    } catch (e) {
+        console.log('FAILED:', e.message);
+        failed++;
+    }
+    console.log('');
+
+    // -------------------------------------------------------------------------
+    // Test 10: audit C-F2 - one identity key per room
+    // -------------------------------------------------------------------------
+    // Every 1:1 header signature is computed over cleartext fields, so the
+    // relay can recover the signer's identity public key from two headers.
+    // With one stored identity shared by all rooms it could link every room
+    // a browser opened; with one per room it learns nothing it cannot
+    // already see inside that room.
+    console.log('--- Test 10: Identity keys are stored per room, never shared (C-F2) ---');
+    {
+        const { createFakeIndexedDB } = require('./helpers/fake-indexeddb');
+        const savedIndexedDB = global.indexedDB;
+        try {
+            const fakeDb = createFakeIndexedDB();
+            global.indexedDB = fakeDb;
+            const raw = async (kp) => Buffer.from(await subtle.exportKey('raw', kp.publicKey)).toString('hex');
+            const fresh = () => new IdentityKeyManager();
+
+            // An identity written by an earlier release under the single
+            // cross-room entry: it must be neither reused nor kept.
+            const legacy = await subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, false, ['sign', 'verify']);
+            await fresh().generateIdentityKeypair('seed-room');
+            const store = fakeDb.store('pinchat_identity_v1', 'keys');
+            const now = Date.now();
+            store.set('identity', {
+                version: 1, privateKey: legacy.privateKey, publicKey: legacy.publicKey,
+                createdAt: now, expiresAt: now + 60 * 60 * 1000,
+            });
+            store.set('room:expired', {
+                version: 1, privateKey: legacy.privateKey, publicKey: legacy.publicKey,
+                createdAt: now - 2000, expiresAt: now - 1000,
+            });
+
+            const roomA = '0a0a0a0a-0000-4000-8000-00000000000a';
+            const roomB = '0b0b0b0b-0000-4000-8000-00000000000b';
+            const a1 = await raw(await fresh().generateIdentityKeypair(roomA));
+            const a2 = await raw(await fresh().generateIdentityKeypair(roomA));
+            const b1 = await raw(await fresh().generateIdentityKeypair(roomB));
+            const legacyRaw = await raw(legacy);
+            const ephemeralBefore = store.size;
+            const unscoped = await raw(await fresh().generateIdentityKeypair());
+
+            assert.strictEqual(a1, a2, 'reopening the same room restores its identity (C-04)');
+            assert.notStrictEqual(a1, b1, 'two rooms must not share an identity key');
+            assert.notStrictEqual(a1, legacyRaw, 'the legacy cross-room identity must not be reused');
+            assert(!store.has('identity'), 'the legacy cross-room entry is deleted');
+            assert(!store.has('room:expired'), 'expired entries are swept');
+            assert(![...store.keys()].some((k) => k.includes(roomA) || k.includes(roomB)),
+                'room IDs are not stored in clear as entry keys');
+            assert.strictEqual(store.size, ephemeralBefore, 'an identity without a room is not persisted');
+            assert.notStrictEqual(unscoped, a1);
+            console.log('PASSED: per-room identity, legacy shared entry removed, expired entries swept');
+            passed++;
+        } catch (e) {
+            console.log('FAILED:', e.message);
+            failed++;
+        } finally {
+            global.indexedDB = savedIndexedDB;
+        }
+    }
+    console.log('');
+
+    // -------------------------------------------------------------------------
+    // Test 11: audit C-F5 - the bootstrap-key stash is bound to its room
+    // -------------------------------------------------------------------------
+    // Every room is served at /static/chat.html, the room ID travels in
+    // ?room=. A stash keyed by pathname alone let a keyless link to room B,
+    // opened in the tab that had room A, silently adopt room A's key, and
+    // "Copy invite link" then produced ?room=B#key=<room A's key>.
+    console.log('--- Test 11: Bootstrap-key stash is bound to the room (C-F5) ---');
+    {
+        const savedWindow = global.window;
+        const savedSessionStorage = global.sessionStorage;
+        const savedHistory = global.history;
+        try {
+            const roomA = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+            const roomB = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+            const keyA = Buffer.alloc(32, 17).toString('base64url');
+            const keyB = Buffer.alloc(32, 34).toString('base64url');
+            const storage = new Map();
+            global.sessionStorage = {
+                getItem: (k) => (storage.has(k) ? storage.get(k) : null),
+                setItem: (k, v) => storage.set(k, String(v)),
+                removeItem: (k) => storage.delete(k),
+            };
+            const location = { pathname: '/static/chat.html', search: '', hash: '' };
+            global.window = { location };
+            global.history = { replaceState() { location.hash = ''; } };
+            const open = async (roomId, hash) => {
+                location.search = `?room=${roomId}`;
+                location.hash = hash;
+                const mgr = new CryptoManager();   // a page load
+                return { mgr, key: await mgr.extractKeyFromURL() };
+            };
+
+            // Room A through its invite link; the URL is scrubbed into the stash.
+            const a = await open(roomA, `#key=${keyA}`);
+            assert(a.key, 'the invite link loads');
+            assert.strictEqual(location.hash, '', 'the fragment leaves the URL bar');
+
+            // Same tab, keyless link to room B (with a pre-fix unbound stash
+            // of room A's key lying around as well).
+            storage.set('pinchat_hash:/static/chat.html', `#key=${keyA}`);
+            const b = await open(roomB, '');
+            assert.strictEqual(b.key, null, 'a keyless link to another room gets no key');
+            assert.strictEqual(b.mgr.getInviteFragment({ requireMlsPins: false }), null,
+                '"Copy invite link" in room B cannot hand out room A\'s key');
+            assert(!storage.has('pinchat_hash:/static/chat.html'), 'the unbound legacy stash is dropped');
+
+            // A reload of room A still restores its own key from the stash.
+            const again = await open(roomA, '');
+            assert(again.key, 'reloading the same room restores its key');
+            assert.strictEqual(again.mgr.getInviteFragment({ requireMlsPins: false }), `#key=${keyA}`);
+
+            // The login bounce stashes for the room the invite link names.
+            const loginSource = fs.readFileSync(path.join(__dirname, '../static/js/login-stash.js'), 'utf8');
+            const loginLocation = {
+                hash: `#key=${keyB}`, search: `?redirect=/c/${roomB}`, pathname: '/static/login.html',
+            };
+            const vm = require('vm');
+            vm.runInNewContext(loginSource, {
+                window: { location: loginLocation },
+                URLSearchParams, sessionStorage: global.sessionStorage,
+                history: { replaceState() {} }, setTimeout() {},
+            });
+            const afterLogin = await open(roomB, '');
+            assert(afterLogin.key, 'the login stash is found by the room it was made for');
+            assert.strictEqual(afterLogin.mgr.getInviteFragment({ requireMlsPins: false }), `#key=${keyB}`);
+            const other = await open(roomA, '');
+            assert.strictEqual(other.mgr.getInviteFragment({ requireMlsPins: false }), `#key=${keyA}`,
+                'and by no other room');
+            console.log('PASSED: the stash is keyed by room; no room can use or leak another room\'s key');
+            passed++;
+        } catch (e) {
+            console.log('FAILED:', e.message);
+            failed++;
+        } finally {
+            global.window = savedWindow;
+            global.sessionStorage = savedSessionStorage;
+            global.history = savedHistory;
+        }
+    }
+    console.log('');
+
+    // -------------------------------------------------------------------------
+    // Test 12: The CI SRI gate reads every script and stylesheet tag
+    // -------------------------------------------------------------------------
+    console.log('--- Test 12: SRI gate covers every tag, whatever its attribute order ---');
+    try {
+        const root = path.join(__dirname, '..');
+        const { sriReferences } = require('../.github/scripts/verify-sri.js');
+        const references = sriReferences([
+            '<script integrity="sha256-AAA=" src="/static/js/first.js"></script>',
+            '<script src="/static/js/second.js" defer integrity="sha256-BBB="></script>',
+            "<script src='/static/js/third.js'></script>",
+            '<link href="/static/css/a.css" crossorigin="anonymous" rel="stylesheet" integrity="sha256-CCC=">',
+            '<link rel="Stylesheet preload" href="/static/css/b.css">',
+            '<link rel="icon" href="/static/icon.png">',
+            '<script>document.title = "inline, not a reference"</script>',
+        ].join('\n'));
+        assert.deepStrictEqual(references.map((entry) => [entry.kind, entry.url, entry.integrity]), [
+            ['script', '/static/js/first.js', 'sha256-AAA='],
+            ['script', '/static/js/second.js', 'sha256-BBB='],
+            ['script', '/static/js/third.js', null],
+            ['link', '/static/css/a.css', 'sha256-CCC='],
+            ['link', '/static/css/b.css', null],
+        ]);
+
+        // Every page of the release: each script and stylesheet tag is a
+        // reference, and each one carries an integrity attribute.
+        for (const page of ['index', 'login', 'chat', 'terms', 'privacy']) {
+            const html = fs.readFileSync(path.join(root, 'static', `${page}.html`), 'utf8');
+            const tags = (html.match(/<script\b[^>]*\ssrc=/g) || []).length
+                + (html.match(/<link\b[^>]*rel="stylesheet"/g) || []).length;
+            const found = sriReferences(html);
+            assert.strictEqual(found.length, tags, `${page}.html: every tag is read`);
+            assert(found.every((entry) => entry.integrity !== null), `${page}.html: a tag without integrity`);
+        }
+
+        // The workflow runs the gate for a pull request on the same paths
+        // as for a push.
+        const workflow = fs.readFileSync(path.join(root, '.github/workflows/sri-check.yml'), 'utf8');
+        const pathsOf = (trigger) => {
+            const block = workflow.split(new RegExp(`\\n  ${trigger}:\\n`))[1].split(/\n  [a-z_]+:\n|\njobs:/)[0];
+            return [...block.matchAll(/^\s+- '([^']+)'$/gm)].map((match) => match[1]).sort();
+        };
+        assert.deepStrictEqual(pathsOf('pull_request'), pathsOf('push'));
+        assert(pathsOf('pull_request').includes('.github/workflows/sri-check.yml'));
+
+        console.log('PASSED: the SRI gate reads tags by attribute name and runs for every change it reads');
         passed++;
     } catch (e) {
         console.log('FAILED:', e.message);

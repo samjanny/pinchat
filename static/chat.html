@@ -5,21 +5,21 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>PinChat - Secure Chat</title>
     <link rel="stylesheet" href="/static/css/style.css" integrity="sha256-/Y82gWIvpfVeXIydAjzIdXTasKHWpm8BQrqkwWiiy1k=" crossorigin="anonymous" >
-    <script src="/static/js/alpine-csp.min.js" integrity="sha256-WQoxODC+4ajg+rpyPHNbe3GMVH4lMhlhRElpRpKBJSk=" crossorigin="anonymous" ></script>
+    <script src="/static/js/alpine-csp.min.js" integrity="sha256-iOQIHq3PJ9qu++syb/9YhseDQrS1Y6gwF2dOn/F9oBs=" crossorigin="anonymous" ></script>
     <script src="/static/js/theme.js" integrity="sha256-IFPp16c490XqfYw01UQmSLORmfv7DKKWOXNpQOdw2X0=" crossorigin="anonymous" ></script>
     <script src="/static/js/pow.js" integrity="sha256-dPmlfH5GU0VsCkR6UpDNPzSRAjhm+xm7SNCDyNSnUqQ=" crossorigin="anonymous" ></script>
     <script src="/static/js/nicknames.js" integrity="sha256-FFlmH12HLY/cK10Uu5ALIabktzw+KiCJdF2p60qlSuc=" crossorigin="anonymous" ></script>
 </head>
 <body class="chat-page">
     <noscript><p>PinChat runs in the browser and needs JavaScript.</p></noscript>
-    <script src="/static/js/templates/chat.js" integrity="sha256-UjB0nL+uctFKJlf4bQO/9Jx+IrASRPftA2tz3nQxgXU=" crossorigin="anonymous" ></script>
+    <script src="/static/js/templates/chat.js" integrity="sha256-ASUMHDJy/8o20iwh/L7n6aEg18r4h/fRS/3FoGDeKXY=" crossorigin="anonymous" ></script>
     <script src="/static/js/debug.js" integrity="sha256-nY3zkFVKF7x6KVbWq1mwcHq4Y/g8O10iOmLAFfiDsJ8=" crossorigin="anonymous" ></script>
-    <script src="/static/js/crypto.js" integrity="sha256-cMnEaRPD3PKWlcGP/U9WBixeJxjQ7J1l1ZjNc11atgs=" crossorigin="anonymous" ></script>
-    <script src="/static/js/identity.js" integrity="sha256-pGHsPP2igLAVOebsIbbOTrxQgUsGCz8ejzU0yQBjUiE=" crossorigin="anonymous" ></script>
-    <script src="/static/js/double-ratchet.js" integrity="sha256-0WWGASRwfR87dRsOpbVxQpo5/wnQim/+7Fib3h73yQE=" crossorigin="anonymous" ></script>
-    <script src="/static/js/ecdh.js" integrity="sha256-M8sKqyVMg5ezm73wSQcnusiqf26YPnDo8l+NS9D4QsQ=" crossorigin="anonymous" ></script>
+    <script src="/static/js/crypto.js" integrity="sha256-hZI/if7hK54DrIYXRTee/e/1sN3GehGVFo0V3cXCD0s=" crossorigin="anonymous" ></script>
+    <script src="/static/js/identity.js" integrity="sha256-cPNOcLn8qwqLfIUMIq+pAMQWMecHK5MjRI1EyUxD9w8=" crossorigin="anonymous" ></script>
+    <script src="/static/js/double-ratchet.js" integrity="sha256-S0HMAAaQXvYpQpnFPDGsDfqTv56x/WTxIESZMv5dpoc=" crossorigin="anonymous" ></script>
+    <script src="/static/js/ecdh.js" integrity="sha256-o6VZgbPvirnp6VUrRjwVGPlo7t7s1LFqEVwZMO0/7D0=" crossorigin="anonymous" ></script>
     <script src="/static/js/mls/codec.js" integrity="sha256-m0OdgMRcOCOEKbBp/7VVvtSVeL8cnvPBGrW07IsOO+o=" crossorigin="anonymous" ></script>
-    <script src="/static/js/mls/tree-math.js" integrity="sha256-WluTsV4UIIPvitdg023iK4CLbJijBUbhxuWKAIiDI04=" crossorigin="anonymous" ></script>
+    <script src="/static/js/mls/tree-math.js" integrity="sha256-5mt/acoul7B3LlsuGEbOA4aChMX+u5FF8UH6jFZL9Pk=" crossorigin="anonymous" ></script>
     <script src="/static/js/mls/p256.js" integrity="sha256-BWcruqQBVKt9bOmKm7XqbGXXmDAchkrIgXUVrVtgw/U=" crossorigin="anonymous" ></script>
     <script src="/static/js/mls/ciphersuite.js" integrity="sha256-y4OEceiTipBpMqJdlrdVTVWEui1lcE9yDkPRTcxc8sA=" crossorigin="anonymous" ></script>
     <script src="/static/js/mls/hpke.js" integrity="sha256-Imo8YtiINLfHIiP7bk4ZJuQSB3DmGpn1wGzZCVvB5j0=" crossorigin="anonymous" ></script>
@@ -27,10 +27,10 @@
     <script src="/static/js/mls/labeled.js" integrity="sha256-1GtpqEULMR5AOoyyLgfFmbl54EHaX7xlkeBvzcDJuyQ=" crossorigin="anonymous" ></script>
     <script src="/static/js/mls/key-schedule.js" integrity="sha256-oQUK/57A4nDxRsCcNjl1g7fg7wgvhssq5+TDLbzNTOc=" crossorigin="anonymous" ></script>
     <script src="/static/js/mls/transcript-hashes.js" integrity="sha256-jgxHOdXgjTcaAA/wZ7O53X1KewuLXs4+1fjWKhIYbw0=" crossorigin="anonymous" ></script>
-    <script src="/static/js/mls/nodes.js" integrity="sha256-riqTVRdF5hCtIzc1BL35NdI6gd0r+4L0eJ9m16lVEhA=" crossorigin="anonymous" ></script>
+    <script src="/static/js/mls/nodes.js" integrity="sha256-NeFrSl0eu4RG5AWfnpiBKdZYEFvjTMBkQoQHwILr1tM=" crossorigin="anonymous" ></script>
     <script src="/static/js/mls/tree-hash.js" integrity="sha256-cBc4/DxwBU1NmrXq36zTyNHWMQKlgABymuPI83HwtgU=" crossorigin="anonymous" ></script>
     <script src="/static/js/mls/parent-hash.js" integrity="sha256-L502mAD06beXqoR6vSjObv2xU2fiB9IGG2wDIYzFDtw=" crossorigin="anonymous" ></script>
-    <script src="/static/js/mls/ratchet-tree.js" integrity="sha256-5L2mDJ65NEotXuqXpFE5WFntyUziU/WdidM3P2vkngw=" crossorigin="anonymous" ></script>
+    <script src="/static/js/mls/ratchet-tree.js" integrity="sha256-Ngf3YLhQfKQHAc+A/iag5Kf0bBpYHWelf50ewaPqtMg=" crossorigin="anonymous" ></script>
     <script src="/static/js/mls/tree-kem.js" integrity="sha256-H1QSDYjBX5Pc9jFbVUVegR+nFETizoVDVYc0RStkTg8=" crossorigin="anonymous" ></script>
     <script src="/static/js/mls/group-context.js" integrity="sha256-jFAqOF2IUfbB9Up7u/cjJs+ZtknvjDPYQjb5gL6okyU=" crossorigin="anonymous" ></script>
     <script src="/static/js/mls/key-package.js" integrity="sha256-Go/AnXf1VYb8Bm3O0XFFcmCcE5TE4m//cnjlFVSHmhA=" crossorigin="anonymous" ></script>
@@ -43,12 +43,12 @@
     <script src="/static/js/mls/public-message.js" integrity="sha256-lWfq3/8O0dqEtZTOnXSSxllmsxHe1j3N+48TAmmtMeQ=" crossorigin="anonymous" ></script>
     <script src="/static/js/mls/secret-tree.js" integrity="sha256-60NtGduXj91OJXuES7by5Ly91G+BWC69fgJtPU+N9lQ=" crossorigin="anonymous" ></script>
     <script src="/static/js/mls/private-message.js" integrity="sha256-9x7GKV808NId+80QDDFlD52VV4YRTuN4EoZZxsl6Gkw=" crossorigin="anonymous" ></script>
-    <script src="/static/js/mls/group.js" integrity="sha256-IDkTa9ZeR7RtsJhSMxRzBB+KNJ9mVIKHtABYNEQ1BQM=" crossorigin="anonymous" ></script>
-    <script src="/static/js/mls-session.js" integrity="sha256-vDpB+gKrLv/6y1NPLLb1ZO/XjNrPr/IjHQFoJQNAaHg=" crossorigin="anonymous" ></script>
-    <script src="/static/js/websocket.js" integrity="sha256-eGxesUz6eyUCNUX1gvPfdcqbeE6Eui0+zYKvzCdbtVw=" crossorigin="anonymous" ></script>
+    <script src="/static/js/mls/group.js" integrity="sha256-s0oMqPr2nBlI8cw1kygz7ZZ3zUVJS4ijvAwYH453cpY=" crossorigin="anonymous" ></script>
+    <script src="/static/js/mls-session.js" integrity="sha256-RXnt4GgJ/59bntZI/g11xXogVT+qdzxLL5WeLdm+pVM=" crossorigin="anonymous" ></script>
+    <script src="/static/js/websocket.js" integrity="sha256-PCfyDumLYuTaKQxH1zl8uPPje9C4zPZ6HB3QTkikQIM=" crossorigin="anonymous" ></script>
     <script src="/static/js/emoji.js" integrity="sha256-egqIwLEXWc2dlgP6N1sF7CLYLyMe01fSUy9dO/uLPmg=" crossorigin="anonymous" ></script>
-    <script src="/static/js/image-metadata.js" integrity="sha256-PyjenAPDI/63A84E1y4JCvfxvTSUtl7jmAHHsIeuxJU=" crossorigin="anonymous" ></script>
-    <script src="/static/js/app.js" integrity="sha256-hQahf/umsPlDTfcUEO/2iPL9EjokGuvdO+16rVs7Icc=" crossorigin="anonymous" ></script>
+    <script src="/static/js/image-metadata.js" integrity="sha256-o5cKsCvU6j5upOL5qeS3pVAEoexudFTST9kLtgacu2M=" crossorigin="anonymous" ></script>
+    <script src="/static/js/app.js" integrity="sha256-AqCHxYb/r8XZV3FGd60mqxD/PGAsbzdlh6Ol7TQt6QI=" crossorigin="anonymous" ></script>
     <script src="/static/js/cookie-notice.js" integrity="sha256-JefnNU1ms64X4lDQibD4l8z4rVAi+15sb4hle0uE0yM=" crossorigin="anonymous" ></script>
 </body>
 </html>

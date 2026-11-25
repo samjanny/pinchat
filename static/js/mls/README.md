@@ -66,10 +66,24 @@ are intentionally not interoperable.
 
 The codec matches RFC 9000 QUIC varint vectors; HKDF-SHA256 matches the
 RFC 5869 §A.1 vector; DHKEM is validated by Encap/Decap symmetry plus HPKE
-Seal/Open AEAD tamper tests. Tree math, key schedule, RefHash, and the
-confirmed/interim transcript-hash chain are all verified byte-for-byte
-against the IETF reference vectors in
+Seal/Open AEAD tamper tests. Key schedule, psk_secret, RefHash, and the
+confirmed/interim transcript-hash chain are verified byte-for-byte against
+the IETF reference vectors in
 [`tests/vectors/mls/`](../../../tests/vectors/mls/) for ciphersuite 0x0002.
+
+Ratchet trees are RFC 9420 full trees: the leaf count is always a power of
+two, an Add takes the leftmost blank leaf or doubles the tree, and a Remove
+halves it while the right subtree has no member. `tree-math.js` refuses any
+other leaf count instead of computing the left-balanced shape of early MLS
+drafts (PinChat 0.9.2 and earlier used that shape, which gave non-RFC trees,
+tree hashes and secret trees whenever the member count was not a power of
+two). The IETF `tree-math.json` vectors only contain power-of-two trees, so
+they could not detect that; the shape is now also checked against RFC 9420
+Appendix C and against `tree-operations.json` (Add, Update and Remove on
+trees whose wire length is not a full width, compared by tree bytes and tree
+hash). `psk_secret.json` is checked by composing the RFC 9420 section 8.4
+derivation from the library primitives; PinChat itself never sends PSK
+identifiers (see the PSK bullet below).
 
 ## End-to-end status
 
@@ -107,17 +121,41 @@ The browser-facing flow runs entirely over MLS for group rooms:
   their exact server-sequenced echo arrives. Controls created during a
   transient socket gap are retried after `mlssync`; in particular, an Add
   Welcome cannot be lost if the connection drops immediately after the Add
-  Commit's acceptance echo.
+  Commit's acceptance echo. A control that fails validation is consumed and
+  never replayed; one that fails for a transient local reason is replayed
+  from the unchanged cursor. The split is by type, not by error text: any
+  Error raised while a Group entry point processes the control's bytes is a
+  deterministic rejection, and only failures explicitly marked transient by
+  the code that raised them (for example a failed roster digest or a
+  transport hand-off) are replayed.
+- **Joining between a Commit and its Welcome.** The relay may sequence a
+  member's Update proposal for the new epoch between the Add Commit that
+  admits a joiner and that joiner's Welcome. The joiner keeps a bounded
+  number of such proposals (2 per relay sender, 40 in total) whose
+  cleartext group_id and epoch match its pending Add, and authenticates
+  them into its proposal store right after joining, so it can resolve a
+  later Commit that folds them by reference.
 - **Forward secrecy within the epoch.** Application AEAD keys come from
   stateful per-sender chains (`Group._chainKeyNonce`): only the current
   chain position's secret is kept (overwritten as the chain advances),
   consumed keys are deleted, and keys for skipped generations live in a
   bounded single-use cache (256 per chain, FIFO-evicted and zeroed on
-  eviction). Replays are rejected because the key for a consumed
-  generation no longer exists; the per-epoch `(leaf, generation)` set is
-  retained as defense-in-depth. Out-of-order tolerance: up to 256
+  eviction). A replayed ciphertext is rejected because the key for a
+  consumed generation no longer exists; the per-epoch `(leaf, generation)`
+  set is retained as defense-in-depth. Out-of-order tolerance: up to 256
   generations of forward jump per message. This also makes decryption
   O(1) per message instead of O(generation).
+- **Signed generation binding.** Key deletion does not stop a member:
+  every member holds every sender's SecretTree chain, and the FramedContent
+  signature does not cover the sender_data generation, so a member could
+  re-encrypt another member's signed message at that sender's next
+  generations, have it accepted as fresh, and make the sender's real
+  messages look like replays. The application content therefore starts
+  with the sender's generation (u32, big-endian), inside the signed and
+  encrypted payload, and a receiver accepts it only at that exact
+  generation. A refused copy does not advance the receive chain. This is a
+  PinChat profile rule on top of RFC 9420 and changes the group application
+  wire format.
 - **E2E sender attribution and visual identity.**
   `decryptApplicationMessage` returns both the signature-verified sender
   leaf index and the exact LeafNode signature key that authenticated the
@@ -139,7 +177,13 @@ The browser-facing flow runs entirely over MLS for group rooms:
   creator broadcasts a path-only Commit (empty proposal list plus
   UpdatePath, RFC 9420 compliant) re-keying its own leaf and direct
   path, and folds in any pending member Update proposals. This heals
-  leaked epoch-level secrets in membership-stable groups.
+  leaked epoch-level secrets in membership-stable groups. A member cannot
+  switch the rotation off: an Update whose new encryption_key equals that
+  of an Update already stored for the epoch is refused by every member (so
+  copying another member's fresh key from the wire no longer makes every
+  fold fail), and if folding the queued Updates fails for any other reason
+  the creator commits path-only. Up to 0.9.2 one member could freeze the
+  rotation for the rest of the epoch this way.
 - **Parent-hash chaining and imported-tree validation (§§7.3, 7.9).**
   Every Commit computes the top-down parent-hash chain over the
   committer's direct path (`parent-hash.js`), stamps each parent node's
@@ -165,6 +209,15 @@ The browser-facing flow runs entirely over MLS for group rooms:
   not hold, so post-rotation traffic is unrecoverable to the attacker.
   Single-committer is preserved (only the creator commits), so there
   are no concurrent-commit forks.
+- **KeyPackage admission.** Only the creator compares a KeyPackage
+  Lifetime with its clock, when it admits the joiner, with a 5-minute skew
+  margin; members applying the signed Add and joiners importing the tree
+  check only the bounded 24-hour range, so one member's clock running
+  behind can no longer desynchronise it. LeafNodes are bounded to 1 KiB and
+  KeyPackages to 2 KiB, and an Add whose Welcome ratchet_tree or Commit
+  would exceed the relay limits (64 KiB and 128 KiB) is refused before it
+  is staged, so inflated KeyPackages cannot make later Welcomes
+  undeliverable.
 - The Rust server stays cryptographically blind: it allowlists MLS wire
   formats, enforces canonical bounded Base64url transport fields, restricts
   the `ratchet_tree` side-channel to Welcome, and shallowly reads the signed
@@ -207,9 +260,15 @@ AuthenticatedContent before applying the referenced leaf update.
 - **Relay-reported departures are challenged, not trusted.** `userleft`
   comes from the relay and is unauthenticated. The creator no longer
   commits a Remove on it directly: it sends the reported member a liveness
-  ping as an MLS application message, and removes only if no authenticated
-  reply (or any other authenticated message from that leaf) arrives within
-  the grace window (20 s by default). A relay can still suppress the reply
+  ping carrying a fresh random nonce as an MLS application message, and
+  removes only if no authenticated pong from that leaf carrying that nonce
+  arrives within the grace window (20 s by default) that follows a ping
+  actually sent. A ping blocked by a pending Commit is retried, never
+  counted as an unanswered challenge, and a timer left from an earlier
+  attempt, or from an earlier challenge to the same member, ends nothing:
+  each timer acts only for the arming that set it. Other messages from the leaf are
+  not a presence proof, because they may have been written before the
+  departure and delivered late. A relay can still suppress the pong
   for the whole window, which is indistinguishable from a real departure
   and is the irreducible residual with an untrusted relay; what it can no
   longer do is land a permanent eviction with one forged frame, and the
@@ -227,15 +286,18 @@ AuthenticatedContent before applying the referenced leaf update.
   chat page says so: once the group is established it shows an
   "Identities not verified" notice pointing at the fingerprints, so the
   padlock badges never imply a check that did not happen.
-- **Filtered direct path on the wire (§7.6).** `commitAddMember` emits
-  the *full* direct path with empty `encrypted_path_secret` lists where
-  the copath sibling resolution is empty, instead of dropping those
-  entries entirely. Our `processCommit` accepts that shape symmetrically.
-  The IETF reference ships filtered paths, so we'd diverge if we ever
-  interop with another MLS implementation. For our creator-only-add
-  scenario the filter collapses to the full path (every parent on the
-  creator's direct path has at least one non-blank receiver subtree),
-  so the wire bytes are byte-identical in practice.
+- **Filtered direct path on the wire (section 7.6).** Every Commit emits and
+  re-keys the creator's *full* direct path, with an empty
+  `encrypted_path_secret` list where the copath sibling resolution is
+  empty, instead of skipping those nodes as RFC 9420 does with the filtered
+  direct path. Our `processCommit` accepts that shape symmetrically. The
+  two agree only while every copath subtree of the creator holds a member.
+  That stops being true after a Remove leaves a copath subtree empty (for
+  example the creator's sibling leaf): RFC 9420 would leave that parent
+  blank and omit its UpdatePathNode, while PinChat populates it, so the
+  UpdatePath bytes, the tree, its tree hash and the parent hashes all
+  differ. PinChat is therefore not wire-compatible with another MLS
+  implementation here.
 - **Update proposal identity rotation.** Member Update proposals
   re-key the leaf ENCRYPTION key but must keep the same signature key
   (`verifyUpdateLeafBinding` rejects signature-key rotation). Rotating
@@ -266,16 +328,17 @@ AuthenticatedContent before applying the referenced leaf update.
   (the encryption_secret has changed). Replay across reload is moot
   in our architecture because we don't survive reloads, we re-join.
 - **Tree capacity.** After `Remove`, the target leaf and its direct
-  path remain blank at the same indices. A subsequent `Add` reuses the
-  leftmost blank leaf before growing the tree. The PinChat group profile
-  enforces a maximum of 20 logical leaves in creation, Commit processing,
-  and Welcome import.
+  path are blanked at the same indices, and the tree is halved while its
+  right subtree has no member (RFC 9420 section 12.1.3). A subsequent `Add`
+  reuses the leftmost blank leaf before doubling the tree. The PinChat
+  group profile enforces a maximum of 20 members, in a full tree of at most
+  32 leaves, in creation, Commit processing, and Welcome import.
 - **`ratchet_tree` GroupInfo extension.** The new joiner currently
   receives the serialised tree as a side-channel field on the Welcome
-  envelope; the standardised extension path is unimplemented. This custom
-  side-channel deliberately carries the complete logical node width,
-  including trailing blanks, because no separate tree-size field exists.
-  It must not be presented as the canonical RFC extension encoding.
+  envelope; the standardised extension path is unimplemented. The
+  side channel uses the RFC 9420 section 12.4.3.3 encoding of that
+  extension: trailing blank nodes are omitted, the joiner refuses a tree
+  that ends with a blank node and pads it to the next full-tree width.
 - **`hashes.json.signed`.** The operator re-signs locally with their
   ECDSA key whenever a protected static asset changes.
 

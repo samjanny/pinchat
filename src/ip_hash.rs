@@ -33,6 +33,13 @@ type HmacSha256 = Hmac<Sha256>;
 /// - Stops at the first entry that is not an IP address. Everything to its
 ///   left was written by something this server has no reason to trust, so
 ///   skipping it and carrying on would let a client pick its own identity.
+/// - Splits each line on the raw bytes, before any entry is decoded. A
+///   proxy that appends to the client's own line (nginx's
+///   `$proxy_add_x_forwarded_for`) puts the address it saw after whatever
+///   the client sent; a byte outside visible ASCII in the client's part
+///   must only spoil that entry, not the proxy's. Decoding the whole line
+///   first turned it into one unparsable entry, and the client was counted
+///   as the proxy.
 /// - Compares addresses in canonical form, so an IPv4 peer reported as
 ///   `::ffff:a.b.c.d` matches an IPv4 TRUSTED_PROXIES entry.
 pub fn extract_client_ip_with_proxy(
@@ -57,14 +64,16 @@ pub fn extract_client_ip_with_proxy(
     // "client, proxy1, proxy2, ...", possibly spread over several header
     // lines; walk it from the right and return the first address that is
     // not a trusted proxy.
-    let forwarded: Vec<&str> = headers
+    let forwarded: Vec<&[u8]> = headers
         .get_all("x-forwarded-for")
         .iter()
-        .flat_map(|value| value.to_str().unwrap_or("?").split(','))
-        .map(str::trim)
+        .flat_map(|value| value.as_bytes().split(|byte| *byte == b','))
         .collect();
     for entry in forwarded.iter().rev() {
-        let Ok(ip) = entry.parse::<IpAddr>() else {
+        let Some(ip) = std::str::from_utf8(entry)
+            .ok()
+            .and_then(|entry| entry.trim().parse::<IpAddr>().ok())
+        else {
             break;
         };
         let ip = ip.to_canonical();
@@ -97,7 +106,7 @@ pub fn is_valid_trusted_proxy_entry(entry: &str) -> bool {
 /// Check if an IP address is in the trusted proxy list
 ///
 /// Supports both exact IP matches and CIDR notation (e.g., "10.0.0.0/8")
-fn is_trusted_proxy(ip: &IpAddr, trusted_proxies: &[String]) -> bool {
+pub fn is_trusted_proxy(ip: &IpAddr, trusted_proxies: &[String]) -> bool {
     let ip = &ip.to_canonical();
     for proxy in trusted_proxies {
         // Check for CIDR notation
@@ -628,6 +637,37 @@ mod tests {
                 &trusted
             ),
             "198.51.100.7"
+        );
+    }
+
+    #[test]
+    fn a_byte_outside_ascii_spoils_only_its_own_entry() {
+        let trusted = vec!["172.18.0.1".to_string()];
+        // nginx appends the address it saw to the line the client sent, so
+        // the client controls everything before the last comma.
+        for client_part in [&b"\xff"[..], b"1.2.3.4\xfe", b"\x80, 5.6.7.8"] {
+            let mut line = client_part.to_vec();
+            line.extend_from_slice(b", 198.51.100.7");
+            let mut headers = HeaderMap::new();
+            headers.append(
+                "x-forwarded-for",
+                axum::http::HeaderValue::from_bytes(&line).unwrap(),
+            );
+            assert_eq!(
+                extract_client_ip_with_proxy(&peer("172.18.0.1"), &headers, &trusted),
+                "198.51.100.7",
+                "{line:?} must still yield the address the proxy appended"
+            );
+        }
+        // Walking left stops at the spoiled entry, as at any other garbage.
+        let mut headers = HeaderMap::new();
+        headers.append(
+            "x-forwarded-for",
+            axum::http::HeaderValue::from_bytes(b"1.2.3.4, \xff, 172.18.0.1").unwrap(),
+        );
+        assert_eq!(
+            extract_client_ip_with_proxy(&peer("172.18.0.1"), &headers, &trusted),
+            "172.18.0.1"
         );
     }
 

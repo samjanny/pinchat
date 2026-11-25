@@ -802,10 +802,13 @@ async function main() {
         const result = await alice.commitAddMember({
             keyPackageBytes: carol.keyPackageBytes,
         });
-        await expectJoinReject(
-            await joinArguments(alice, result, carol),
-            'Lifetime not yet valid',
-            'future-dated historical KeyPackage Lifetime is rejected on import',
+        // M-02: the creator checked the Lifetime against its clock when it
+        // admitted the leaf. A joiner whose clock is behind must not
+        // re-check notBefore, or it could never join.
+        const joined = await joinFrom(alice, result, carol);
+        assert(
+            joined.epoch === alice.epoch,
+            'historical KeyPackage Lifetime starting after the joiner clock is accepted on import',
         );
     }
 

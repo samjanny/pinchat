@@ -63,8 +63,8 @@ async function announce(client, maxImageSize) {
 
 async function run() {
     const { alice, bob, deliver } = await createChatPair();
-    await alice.store.handleSasVerified();
-    await bob.store.handleSasVerified();
+    await alice.store.handleSasVerified(alice.store.sas.hex);
+    await bob.store.handleSasVerified(bob.store.sas.hex);
 
     // --- the limit announced by the relay ---------------------------------
     assert.strictEqual(alice.store.maxImageSize, 300 * KIB, 'default before the relay says anything');

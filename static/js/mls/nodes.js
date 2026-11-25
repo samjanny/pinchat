@@ -347,9 +347,21 @@
         return decoder.readVector(readOptionalNode);
     }
 
+    /**
+     * Serialize a ratchet tree in its RFC 9420 section 12.4.3.3 wire form: the
+     * sender MUST NOT include blank nodes after the last non-blank node, so
+     * trailing blanks of the full in-memory tree are omitted here. The
+     * receiver restores them by padding to the next full-tree width.
+     */
     function ratchetTreeBytes(tree) {
+        let length = tree.length;
+        while (length > 0 && (tree[length - 1] === null
+            || tree[length - 1] === undefined)) {
+            length -= 1;
+        }
         const encoder = new Codec.Encoder();
-        writeRatchetTree(encoder, tree);
+        writeRatchetTree(encoder, length === tree.length
+            ? tree : tree.slice(0, length));
         return encoder.bytes();
     }
 

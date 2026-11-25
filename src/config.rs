@@ -33,6 +33,98 @@ fn parse_size_with_suffix(value: &str) -> Option<usize> {
     }
 }
 
+/// Why a `PINCHAT_PASSWORD_HASHES` entry cannot be used, if it cannot: it
+/// must be an Argon2id hash in PHC string form, with parameters the
+/// verifier accepts.
+fn check_password_hash(hash: &str) -> Result<(), &'static str> {
+    let parsed = argon2::PasswordHash::new(hash).map_err(|_| "not a PHC string ($argon2id$...)")?;
+    if parsed.algorithm != argon2::Algorithm::Argon2id.ident() {
+        return Err("not an Argon2id hash");
+    }
+    if parsed.hash.is_none() || parsed.salt.is_none() {
+        return Err("salt or hash missing");
+    }
+    argon2::Params::try_from(&parsed).map_err(|_| "Argon2 parameters out of range")?;
+    Ok(())
+}
+
+/// The WebSocket sources `CSP_WS_HOST` adds to the Content Security Policy,
+/// checked. `None` (the variable is not set) or an empty value means
+/// `'self'`.
+///
+/// The value is written into the policy as it is, so it must not carry
+/// anything else: a `;` ended `connect-src` and let the variable add
+/// directives, or override `frame-ancestors`, `base-uri` and `form-action`,
+/// which come after it and lose to an earlier copy; a wildcard or a bare
+/// scheme let scripts connect anywhere. Accepted: `'self'` and `wss://`
+/// origins (a host, an optional port, nothing after them); with
+/// `development` also `ws://` ones.
+pub fn csp_ws_hosts(value: Option<&str>, development: bool) -> Result<String, String> {
+    let sources: Vec<&str> = value.unwrap_or("").split_ascii_whitespace().collect();
+    if sources.is_empty() {
+        return Ok("'self'".to_string());
+    }
+    if let Some(source) = sources
+        .iter()
+        .find(|source| !is_websocket_source(source, development))
+    {
+        return Err(format!(
+            "CSP_WS_HOST entry {:?} is not 'self' or a wss:// origin (scheme, host and optional port only){}",
+            source,
+            if development {
+                ""
+            } else {
+                "; ws:// is accepted with PRIVACY_MODE=development only"
+            }
+        ));
+    }
+    Ok(sources.join(" "))
+}
+
+fn is_websocket_source(source: &str, development: bool) -> bool {
+    if source == "'self'" {
+        return true;
+    }
+    let rest = match (source.strip_prefix("wss://"), source.strip_prefix("ws://")) {
+        (Some(rest), _) => rest,
+        (None, Some(rest)) if development => rest,
+        _ => return false,
+    };
+    // host[:port], the host a DNS name, an IPv4 address or a bracketed IPv6
+    // address.
+    let (host, port) = if rest.starts_with('[') {
+        match rest.find(']') {
+            Some(end) => rest.split_at(end + 1),
+            None => return false,
+        }
+    } else {
+        match rest.find(':') {
+            Some(colon) => rest.split_at(colon),
+            None => (rest, ""),
+        }
+    };
+    let port_ok = port.is_empty()
+        || port.strip_prefix(':').is_some_and(|digits| {
+            (1..=5).contains(&digits.len()) && digits.bytes().all(|b| b.is_ascii_digit())
+        });
+    if !port_ok {
+        return false;
+    }
+    if let Some(literal) = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
+        return literal.parse::<std::net::Ipv6Addr>().is_ok();
+    }
+    host.len() <= 253
+        && host.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+        })
+}
+
 /// Default of `MAX_TOTAL_ROOMS`. The memory sizing below and in "Relay
 /// Memory" in SECURITY.md assumes it: 500 rooms at their limits take about
 /// 135 MB of a 512 MiB container. A larger host raises it.
@@ -51,6 +143,33 @@ pub const DEFAULT_MAX_WS_CONNECTIONS: usize = 400;
 /// that it takes at least eight addresses to fill it, while a household or
 /// an office behind one address can still keep many rooms open.
 pub const DEFAULT_MAX_WS_CONNECTIONS_PER_ADDRESS: usize = DEFAULT_MAX_WS_CONNECTIONS / 8;
+
+/// Images are Base64 inside an image JSON string, wrapped in the ratchet's
+/// plaintext JSON, encrypted, then Base64url encoded again. Reserve 1 KiB
+/// for both JSON envelopes (including escaping), the IV and the GCM tag.
+/// Integer ceilings cover padding at each encoding boundary. Configuration
+/// caps raw images at 2 MiB, so these operations are bounded.
+pub(crate) fn max_image_payload_size(max_image_size: usize) -> usize {
+    let inner_base64_size = max_image_size.div_ceil(3) * 4;
+    (inner_base64_size + 1024).div_ceil(3) * 4
+}
+
+/// Default of `MAX_HTTP_CONNECTIONS`: HTTP connections the relay serves at
+/// once before they are upgraded to WebSocket (an upgraded connection is
+/// counted by `MAX_WS_CONNECTIONS` instead). See `http_server.rs` for what
+/// one costs and how long it may stay.
+pub const DEFAULT_MAX_HTTP_CONNECTIONS: usize = 256;
+/// Default of `MAX_HTTP_CONNECTIONS_PER_ADDRESS`: an eighth of them, as for
+/// WebSocket connections. A browser opens up to six at once.
+pub const DEFAULT_MAX_HTTP_CONNECTIONS_PER_ADDRESS: usize = DEFAULT_MAX_HTTP_CONNECTIONS / 8;
+
+/// Longest proof-of-work challenge lifetime. The privacy policy states that
+/// a challenge and its cookie last at most 5 minutes.
+pub const MAX_CHALLENGE_TTL_SECS: u64 = 300;
+/// Longest interval between two sweeps of solved challenges. The privacy
+/// policy states that the identifier of a solved challenge is deleted within
+/// a minute of its expiry.
+pub const MAX_CHALLENGE_CLEANUP_INTERVAL_SECS: u64 = 60;
 
 /// Application configuration loaded from environment variables
 #[derive(Debug, Clone)]
@@ -71,6 +190,14 @@ pub struct Config {
     // is allocated for it (503 for the relay, 429 for the address).
     pub max_ws_connections: usize,
     pub max_ws_connections_per_address: usize,
+
+    // HTTP connections served at once before an upgrade, in all and for one
+    // client address (an IPv6 /64; an IPv6 /48 may hold four times as many).
+    // A connection from a trusted proxy counts only in the total. Beyond the
+    // total the relay accepts nothing until a connection ends; beyond the
+    // address limit it closes the new connection at once.
+    pub max_http_connections: usize,
+    pub max_http_connections_per_address: usize,
 
     // Room/Token creation rate limiting
     pub room_token_burst_size: u32,
@@ -235,6 +362,14 @@ impl Config {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(DEFAULT_MAX_WS_CONNECTIONS_PER_ADDRESS),
+            max_http_connections: env::var("MAX_HTTP_CONNECTIONS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(DEFAULT_MAX_HTTP_CONNECTIONS),
+            max_http_connections_per_address: env::var("MAX_HTTP_CONNECTIONS_PER_ADDRESS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(DEFAULT_MAX_HTTP_CONNECTIONS_PER_ADDRESS),
 
             // Room/Token creation rate limiting (default: 100 requests per 10 minutes)
             room_token_burst_size: env::var("ROOM_TOKEN_BURST_SIZE")
@@ -559,6 +694,12 @@ impl Config {
         if !(1..=self.max_ws_connections).contains(&self.max_ws_connections_per_address) {
             panic!("MAX_WS_CONNECTIONS_PER_ADDRESS must be between 1 and MAX_WS_CONNECTIONS");
         }
+        if !(1..=100_000).contains(&self.max_http_connections) {
+            panic!("MAX_HTTP_CONNECTIONS must be between 1 and 100000");
+        }
+        if !(1..=self.max_http_connections).contains(&self.max_http_connections_per_address) {
+            panic!("MAX_HTTP_CONNECTIONS_PER_ADDRESS must be between 1 and MAX_HTTP_CONNECTIONS");
+        }
 
         // Validate periods are non-zero
         if self.ws_conn_period_secs == 0 {
@@ -577,9 +718,14 @@ impl Config {
             panic!("PROPOSAL_RATE_WINDOW_SECS must be greater than 0");
         }
 
-        // Validate TTLs are non-zero
-        if self.challenge_ttl_secs == 0 {
-            panic!("CHALLENGE_TTL_SECS must be greater than 0");
+        // Validate TTLs. The challenge bounds are what the privacy policy
+        // states (see MAX_CHALLENGE_TTL_SECS); the lower one leaves time to
+        // solve a challenge on a slow device.
+        if !(10..=MAX_CHALLENGE_TTL_SECS).contains(&self.challenge_ttl_secs) {
+            panic!(
+                "CHALLENGE_TTL_SECS must be between 10 and {}",
+                MAX_CHALLENGE_TTL_SECS
+            );
         }
         if !(1..=300).contains(&self.jwt_token_ttl_secs) {
             panic!("JWT_TOKEN_TTL_SECS must be between 1 and 300");
@@ -601,13 +747,35 @@ impl Config {
         if self.room_cleanup_interval_secs == 0 {
             panic!("ROOM_CLEANUP_INTERVAL_SECS must be greater than 0");
         }
-        if self.challenge_cleanup_interval_secs == 0 {
-            panic!("CHALLENGE_CLEANUP_INTERVAL_SECS must be greater than 0");
+        if !(1..=MAX_CHALLENGE_CLEANUP_INTERVAL_SECS)
+            .contains(&self.challenge_cleanup_interval_secs)
+        {
+            panic!(
+                "CHALLENGE_CLEANUP_INTERVAL_SECS must be between 1 and {}",
+                MAX_CHALLENGE_CLEANUP_INTERVAL_SECS
+            );
         }
 
         // Validate session TTL is non-zero
         if self.session_ttl_secs == 0 {
             panic!("SESSION_TTL_SECS must be greater than 0");
+        }
+
+        // Every configured hash must be one the login check can use. A
+        // value that does not parse (often one mangled by `$` interpolation
+        // in a shell or in a .env file without single quotes) used to be
+        // skipped at every login, so the server started with a password
+        // that could never be accepted. The position is reported, not the
+        // value.
+        for (index, hash) in self.password_hashes.iter().enumerate() {
+            if let Err(problem) = check_password_hash(hash) {
+                panic!(
+                    "PINCHAT_PASSWORD_HASHES entry {} of {} is not usable: {}",
+                    index + 1,
+                    self.password_hashes.len(),
+                    problem
+                );
+            }
         }
 
         // An entry that is neither an address nor a CIDR range never
@@ -651,8 +819,19 @@ impl Config {
         if self.max_image_size > 2 * 1024 * 1024 {
             panic!("MAX_IMAGE_SIZE cannot exceed 2MB");
         }
-        if self.room_byte_rate_limit < self.max_image_size.saturating_mul(2) {
-            panic!("ROOM_BYTE_RATE_LIMIT must be at least twice MAX_IMAGE_SIZE");
+        // The room limit counts a picture as it travels, which is about 1.8
+        // times its raw size, and one member may take only half of it while
+        // another is present. Measured against twice the raw size, the
+        // limit could be set so low that the largest allowed picture never
+        // fit and was refused every time.
+        let encoded_image = max_image_payload_size(self.max_image_size);
+        if self.room_byte_rate_limit < encoded_image.saturating_mul(2) {
+            panic!(
+                "ROOM_BYTE_RATE_LIMIT must be at least {} bytes for MAX_IMAGE_SIZE={}: twice the size of the largest image as it is sent ({} bytes)",
+                encoded_image.saturating_mul(2),
+                self.max_image_size,
+                encoded_image
+            );
         }
     }
 
@@ -709,6 +888,8 @@ impl Config {
             ws_conn_period_secs: 60,
             max_ws_connections: DEFAULT_MAX_WS_CONNECTIONS,
             max_ws_connections_per_address: DEFAULT_MAX_WS_CONNECTIONS_PER_ADDRESS,
+            max_http_connections: DEFAULT_MAX_HTTP_CONNECTIONS,
+            max_http_connections_per_address: DEFAULT_MAX_HTTP_CONNECTIONS_PER_ADDRESS,
             room_token_burst_size: 100,
             room_token_period_secs: 600,
             msg_rate_limit: 30,
@@ -775,6 +956,26 @@ mod tests {
     }
 
     #[test]
+    fn the_default_room_limit_carries_the_largest_image_allowed() {
+        let mut c = base();
+        c.max_image_size = 2 * 1024 * 1024;
+        c.validate();
+        assert!(c.room_byte_rate_limit >= 2 * max_image_payload_size(c.max_image_size));
+    }
+
+    #[test]
+    #[should_panic(expected = "ROOM_BYTE_RATE_LIMIT must be at least")]
+    fn a_room_limit_too_small_for_an_encoded_image_is_refused_at_startup() {
+        // Twice the raw size used to pass, but one member may take only half
+        // of the room limit and a 2 MiB image travels as about 3.6 MiB: such
+        // a room refused the largest image every time.
+        let mut c = base();
+        c.max_image_size = 2 * 1024 * 1024;
+        c.room_byte_rate_limit = 4 * 1024 * 1024;
+        c.validate();
+    }
+
+    #[test]
     fn direct_tls_mode_has_no_proxy_preconditions() {
         // Without FORCE_HTTP there is no proxy, so an empty TRUSTED_PROXIES
         // and non-forced cookies are both fine.
@@ -803,6 +1004,117 @@ mod tests {
             msg.contains("172.18.0.1"),
             "must name the docker-compose value: {msg}"
         );
+    }
+
+    #[test]
+    fn password_hashes_are_checked_at_startup() {
+        let mut c = base();
+        c.password_hashes = vec![crate::auth::hash_password("correct horse").unwrap()];
+        c.validate();
+
+        for (broken, expected) in [
+            // What `$` interpolation leaves of `$argon2id$v=19$m=...$salt$hash`.
+            ("=19=47104,t=1,p=1", "not a PHC string"),
+            ("placeholder", "not a PHC string"),
+            (
+                "$argon2i$v=19$m=47104,t=1,p=1$c29tZXNhbHQ$iWh06vD8Fy27wf9npn6FXWiCX4K6pW6Ue1Bnzz07Z8A",
+                "not an Argon2id hash",
+            ),
+            ("$argon2id$v=19$m=47104,t=1,p=1", "salt or hash missing"),
+            (
+                "$argon2id$v=19$m=1,t=1,p=1$c29tZXNhbHQ$iWh06vD8Fy27wf9npn6FXWiCX4K6pW6Ue1Bnzz07Z8A",
+                "parameters out of range",
+            ),
+        ] {
+            let mut c = base();
+            c.password_hashes = vec![
+                crate::auth::hash_password("correct horse").unwrap(),
+                broken.to_string(),
+            ];
+            let message = std::panic::catch_unwind(|| c.validate())
+                .expect_err(broken)
+                .downcast::<String>()
+                .unwrap();
+            assert!(
+                message.contains("entry 2 of 2") && message.contains(expected),
+                "{broken}: {message}"
+            );
+            assert!(!message.contains(broken), "the value is not echoed");
+        }
+    }
+
+    #[test]
+    fn csp_ws_host_accepts_only_websocket_origins() {
+        assert_eq!(csp_ws_hosts(None, false).unwrap(), "'self'");
+        assert_eq!(csp_ws_hosts(Some(""), false).unwrap(), "'self'");
+        assert_eq!(csp_ws_hosts(Some("   "), false).unwrap(), "'self'");
+        for (value, expected) in [
+            ("wss://chat.example.com", "wss://chat.example.com"),
+            (
+                "  wss://a.example:8443 'self'\twss://[2001:db8::1]:443 ",
+                "wss://a.example:8443 'self' wss://[2001:db8::1]:443",
+            ),
+            ("wss://192.0.2.7", "wss://192.0.2.7"),
+        ] {
+            assert_eq!(csp_ws_hosts(Some(value), false).unwrap(), expected);
+        }
+        for value in [
+            // Ends connect-src and adds a directive that wins over the
+            // policy's own, which comes later.
+            "wss://a.example; frame-ancestors *",
+            "wss://a.example;",
+            "*",
+            "wss:",
+            "wss://*",
+            "wss://*.example.com",
+            "https://a.example",
+            "wss://a.example/path",
+            "wss://a.example:",
+            "wss://a.example:123456",
+            "wss://a.example:80x",
+            "wss://user@a.example",
+            "wss://-a.example",
+            "wss://[not-an-address]",
+            "'unsafe-inline'",
+            "'none'",
+            "ws://a.example",
+            "wss://a.example,wss://b.example",
+            "wss://a.example\nX: y",
+        ] {
+            assert!(csp_ws_hosts(Some(value), false).is_err(), "{value:?}");
+        }
+        // Plain ws:// only in development.
+        assert_eq!(
+            csp_ws_hosts(Some("ws://192.168.1.5:3000"), true).unwrap(),
+            "ws://192.168.1.5:3000"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "CHALLENGE_TTL_SECS must be between 10 and 300")]
+    fn a_challenge_may_not_outlive_the_published_five_minutes() {
+        let mut c = base();
+        c.challenge_ttl_secs = 301;
+        c.validate();
+    }
+
+    #[test]
+    #[should_panic(expected = "CHALLENGE_CLEANUP_INTERVAL_SECS must be between 1 and 60")]
+    fn solved_challenges_are_swept_at_least_every_minute() {
+        let mut c = base();
+        c.challenge_cleanup_interval_secs = 61;
+        c.validate();
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "MAX_HTTP_CONNECTIONS_PER_ADDRESS must be between 1 and MAX_HTTP_CONNECTIONS"
+    )]
+    fn http_connection_limits_are_validated() {
+        let mut c = base();
+        c.max_http_connections = 10;
+        c.max_http_connections_per_address = 11;
+        c.validate();
     }
 
     #[test]

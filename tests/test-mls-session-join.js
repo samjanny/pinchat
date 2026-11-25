@@ -1938,12 +1938,21 @@ async function main() {
     // An outer signature and membership_tag are necessary but not sufficient
     // for terminal teardown. The removed member must first validate all public
     // UpdatePath/tree structure that it can check without the new path secret.
+    // Removing the only other member truncates the full tree to the
+    // creator's single leaf (RFC 9420 section 12.1.3), whose direct path is empty:
+    // the valid UpdatePath has no nodes, so one extra node is malformed.
     const malformedRemove = await rewriteCommitEnvelope(
         exchange.creator,
         removeCommit,
         (commit) => ({
             ...commit,
-            path: { ...commit.path, nodes: [] },
+            path: {
+                ...commit.path,
+                nodes: [...commit.path.nodes, {
+                    encryptionKey: commit.path.leafNode.encryptionKey,
+                    encryptedPathSecret: [],
+                }],
+            },
         }),
     );
     const joinerBeforeMalformedRemove = captureLiveGroup(exchange.joiner);
@@ -2289,9 +2298,14 @@ async function main() {
             if (!synchronousEchoSent
                 && envelope.wire_format === WireFormat.MLS_PUBLIC_MESSAGE) {
                 synchronousEchoSent = true;
+                // The echo must carry the creator's own relay sender_id:
+                // only an own exact echo may bypass the operation queue.
+                // Any other sender_id queues behind the send that is
+                // waiting for it, and the test used to deadlock here,
+                // which let Node exit 0 with the rest of the suite unrun.
                 return creator.onRelayEnvelope({
                     ...envelope,
-                    sender_id: 'creator-synchronous-self',
+                    sender_id: 'creator-self',
                 });
             }
             return true;
@@ -2750,10 +2764,437 @@ async function main() {
     assert(victim.state === 'awaiting-welcome' && victim.group === null,
         'alternative-group Add leaves victim unjoined');
 
+    await preWelcomeProposalGap();
+    await collidingUpdateProposal();
+    await oversizedKeyPackages();
+    await deterministicRejectionsByType();
+
     console.log('');
     console.log(`mls-session-join: ${passed} passed, ${failed} failed`);
     process.exit(failed === 0 ? 0 : 1);
 }
+
+// ---------------------------------------------------------------------------
+// A small in-memory relay for multi-member scenarios: deliver() stamps the
+// relay sender_id and drops own echoes unless the session asks for them.
+// ---------------------------------------------------------------------------
+function relayPeer(role, id, pins) {
+    const out = [];
+    const events = [];
+    const session = new MLSSession({
+        role,
+        send: (envelope) => { out.push(envelope); return true; },
+        cancelPendingControl: () => true,
+        onEvent: (event) => events.push(event),
+        pskSecret: DEFAULT_PSK,
+        expectedGroupId: pins ? pins.groupId : undefined,
+        expectedCreatorKeyHash: pins ? pins.creatorKeyHash : undefined,
+        relaySenderId: id,
+    });
+    return { session, out, events, id };
+}
+
+async function deliver(to, envelope, fromId) {
+    const message = { ...envelope, sender_id: fromId };
+    if (fromId === to.id && !to.session.shouldHandleOwnEnvelope(message)) {
+        return 'own-echo-dropped';
+    }
+    try {
+        await to.session.onRelayEnvelope(message);
+        return 'ok';
+    } catch (err) {
+        return err;
+    }
+}
+
+function takeOut(peer, predicate) {
+    const index = peer.out.findIndex(predicate);
+    return index < 0 ? null : peer.out.splice(index, 1)[0];
+}
+
+const isKeyPackageEnvelope = (e) => e.wire_format === WireFormat.MLS_KEY_PACKAGE;
+const isWelcomeEnvelope = (e) => e.wire_format === WireFormat.MLS_WELCOME;
+const isCommitEnvelope = (e) => e.wire_format === WireFormat.MLS_PUBLIC_MESSAGE
+    && typeof e.commit_ref === 'string';
+const isProposalEnvelope = (e) => e.wire_format === WireFormat.MLS_PUBLIC_MESSAGE
+    && !e.commit_ref;
+
+/** Honest join of `joiner` by `creator`, with `others` already members. */
+async function relayJoin(creator, joiner, others) {
+    await joiner.session.start();
+    await deliver(creator, takeOut(joiner, isKeyPackageEnvelope), joiner.id);
+    const commit = takeOut(creator, isCommitEnvelope);
+    for (const other of others) await deliver(other, commit, creator.id);
+    await deliver(joiner, commit, creator.id);
+    await deliver(creator, commit, creator.id);
+    const welcome = takeOut(creator, isWelcomeEnvelope);
+    await deliver(joiner, welcome, creator.id);
+    await deliver(creator, welcome, creator.id);
+}
+
+/**
+ * M-03: a member's Update Proposal sequenced between the Add Commit that
+ * admits a joiner and that joiner's Welcome belongs to the new epoch. The
+ * creator may fold it by ProposalRef, so the joiner keeps it (bounded) while
+ * it waits and verifies it after joining; otherwise the folding Commit
+ * leaves the joiner unable to resolve the reference, a terminal desync.
+ */
+async function preWelcomeProposalGap() {
+    console.log('# MLS session - Proposal between an Add Commit and its Welcome (M-03)');
+    const creator = relayPeer('creator', 'gap-creator');
+    await creator.session.start();
+    const pins = creator.session.bootstrapPins;
+    const alice = relayPeer('joiner', 'gap-alice', pins);
+    await relayJoin(creator, alice, []);
+
+    const bob = relayPeer('joiner', 'gap-bob', pins);
+    await bob.session.start();
+    await deliver(creator, takeOut(bob, isKeyPackageEnvelope), bob.id);
+    const addBob = takeOut(creator, isCommitEnvelope);
+    await deliver(alice, addBob, creator.id);
+    await deliver(bob, addBob, creator.id);
+    await deliver(creator, addBob, creator.id);
+    const welcomeBob = takeOut(creator, isWelcomeEnvelope);
+
+    // Relay order: Add(Bob), Alice's Update for the new epoch, Welcome(Bob).
+    await alice.session.proposeUpdate();
+    const update = takeOut(alice, isProposalEnvelope);
+    await deliver(creator, update, alice.id);
+    const bufferedResult = await deliver(bob, update, alice.id);
+    assert(bufferedResult === 'ok' && bob.session.state === 'awaiting-welcome'
+        && bob.session._preWelcomeProposals.length === 1,
+    'joiner awaiting its Welcome keeps the new-epoch Proposal');
+
+    // An unrelated Proposal (wrong epoch) and a third one from the same
+    // relay sender are not kept.
+    const wrongEpoch = mutateProposalEnvelope(update, (pm) => {
+        pm.content.epoch += 5n;
+    });
+    await deliver(bob, wrongEpoch, 'gap-other');
+    await deliver(bob, update, alice.id);
+    await deliver(bob, update, alice.id);
+    assert(bob.session._preWelcomeProposals.length === 2,
+        'pre-Welcome Proposals are bounded per sender and by epoch');
+
+    await deliver(bob, welcomeBob, creator.id);
+    await deliver(creator, welcomeBob, creator.id);
+    assert(bob.session.state === 'joined'
+        && bob.session._proposalStore.size === 1
+        && bob.session._preWelcomeProposals.length === 0,
+    'after joining, the kept Proposal is authenticated into the store once');
+
+    await creator.session.commitUpdate();
+    const fold = takeOut(creator, isCommitEnvelope);
+    await deliver(creator, fold, creator.id);
+    await deliver(alice, fold, creator.id);
+    const bobResult = await deliver(bob, fold, creator.id);
+    assert(bobResult === 'ok' && bob.session.state === 'joined'
+        && bob.session.group.epoch === creator.session.group.epoch
+        && equalBytes(
+            bob.session.group.epochSecrets.epochAuthenticator,
+            creator.session.group.epochSecrets.epochAuthenticator,
+        ),
+    'the new member applies the Commit that folds that Proposal by reference',
+    bobResult instanceof Error ? bobResult.message : '');
+    assert(alice.events.some((event) => event.kind === 'commit-applied'
+        && event.selfUpdated === true),
+    'the proposer installs its own Update from that Commit');
+}
+
+/** A validly signed Update for `group`'s own leaf with a chosen key. */
+async function craftUpdateWithKey(group, encryptionKey) {
+    const M = global.MLS;
+    const leaf = M.Group.buildSelfLeaf({
+        encryptionKeyBytes: encryptionKey,
+        signatureKeyBytes: group.identity.signaturePublicKeyBytes,
+        credentialIdentity: group.identity.signaturePublicKeyBytes,
+        leafNodeSource: M.Nodes.LeafNodeSource.UPDATE,
+    });
+    leaf.signature = await M.Group.signLeafNodeInCommit(
+        group.identity.signaturePrivateKey, leaf, group.groupId, group.myLeafIndex,
+    );
+    const content = {
+        groupId: group.groupId,
+        epoch: group.epoch,
+        sender: { senderType: M.Framing.SenderType.MEMBER, leafIndex: group.myLeafIndex },
+        authenticatedData: new Uint8Array(0),
+        contentType: M.Framing.ContentType.PROPOSAL,
+        payload: M.Proposal.proposalBytes({
+            proposalType: M.Proposal.ProposalType.UPDATE, leafNode: leaf,
+        }),
+    };
+    const wireFormat = WireFormat.MLS_PUBLIC_MESSAGE;
+    const auth = {
+        signature: await M.PublicMessage.signFramedContent(
+            group.identity.signaturePrivateKey, wireFormat, content,
+            group._buildGroupContextStruct(),
+        ),
+    };
+    const membershipTag = await M.PublicMessage.computeMembershipTag(
+        group.epochSecrets.membershipKey, wireFormat, content, auth,
+        group._buildGroupContextStruct(),
+    );
+    return {
+        type: 'mls',
+        wire_format: wireFormat,
+        payload: M.Codec.bytesToBase64Url(
+            M.PublicMessage.publicMessageBytes({ content, auth, membershipTag }),
+        ),
+    };
+}
+
+/**
+ * M-04: a member copying another member's fresh Update encryption_key into
+ * its own validly signed Update made every periodic Commit fail the final
+ * tree key-uniqueness gate, freezing PCS rotation for the whole epoch. The
+ * copy is now refused by every member, and a Commit whose fold fails for
+ * any reason falls back to the creator's path-only re-key.
+ */
+async function collidingUpdateProposal() {
+    console.log('# MLS session - colliding Update proposals cannot freeze PCS (M-04)');
+    const creator = relayPeer('creator', 'pcs-creator');
+    await creator.session.start();
+    const pins = creator.session.bootstrapPins;
+    const alice = relayPeer('joiner', 'pcs-alice', pins);
+    await relayJoin(creator, alice, []);
+    const mallory = relayPeer('joiner', 'pcs-mallory', pins);
+    await relayJoin(creator, mallory, [alice]);
+
+    await alice.session.proposeUpdate();
+    const aliceUpdate = takeOut(alice, isProposalEnvelope);
+    await deliver(creator, aliceUpdate, alice.id);
+    await deliver(mallory, aliceUpdate, alice.id);
+    const verifiedAlice = await creator.session.group.verifyUpdateProposal(
+        wrapPublicEnvelope(aliceUpdate),
+    );
+    const copied = await craftUpdateWithKey(
+        mallory.session.group, verifiedAlice.proposal.leafNode.encryptionKey,
+    );
+    const creatorResult = await deliver(creator, copied, mallory.id);
+    const aliceResult = await deliver(alice, copied, mallory.id);
+    assert(creatorResult?.mlsControlRejected === true
+        && aliceResult?.mlsControlRejected === true
+        && creator.session._pendingUpdateProposals.size === 1
+        && creator.session._proposalStore.size === 1
+        && alice.session._proposalStore.size === 1,
+    'an Update reusing a stored Update encryption_key is refused by every member',
+    creatorResult instanceof Error ? creatorResult.message : String(creatorResult));
+
+    const epochBefore = creator.session.group.epoch;
+    await creator.session.commitUpdate();
+    const fold = takeOut(creator, isCommitEnvelope);
+    assert(Boolean(fold) && creator.session._pendingCommit?.foldedUpdates === 1,
+        "the periodic Commit still folds the honest member's Update");
+    await deliver(creator, fold, creator.id);
+    await deliver(alice, fold, creator.id);
+    await deliver(mallory, fold, creator.id);
+    assert(creator.session.group.epoch === epochBefore + 1n
+        && alice.session.group.epoch === creator.session.group.epoch
+        && mallory.session.group.epoch === creator.session.group.epoch,
+    'PCS rotation advances the epoch for every member');
+
+    // Any other fold failure: queue two Updates that cannot be combined by
+    // bypassing the store, as a future bug might. The Commit must still be
+    // staged, path-only.
+    await alice.session.proposeUpdate();
+    const second = takeOut(alice, isProposalEnvelope);
+    await deliver(creator, second, alice.id);
+    await deliver(mallory, second, alice.id);
+    const verifiedSecond = await creator.session.group.verifyUpdateProposal(
+        wrapPublicEnvelope(second),
+    );
+    const clash = await creator.session.group.verifyUpdateProposal(
+        wrapPublicEnvelope(await craftUpdateWithKey(
+            mallory.session.group, verifiedSecond.proposal.leafNode.encryptionKey,
+        )),
+    );
+    creator.session._pendingUpdateProposals.set(clash.senderLeafIndex, clash);
+    const epochBeforeFallback = creator.session.group.epoch;
+    await creator.session.commitUpdate();
+    const pathOnly = takeOut(creator, isCommitEnvelope);
+    assert(Boolean(pathOnly) && creator.session._pendingCommit?.foldedUpdates === 0
+        && creator.events.some((event) => event.kind === 'error'
+            && event.reason.includes('committing path-only')),
+    'a fold failure falls back to a path-only Commit');
+    await deliver(creator, pathOnly, creator.id);
+    const aliceFallback = await deliver(alice, pathOnly, creator.id);
+    const malloryFallback = await deliver(mallory, pathOnly, creator.id);
+    assert(aliceFallback === 'ok' && malloryFallback === 'ok'
+        && creator.session.group.epoch === epochBeforeFallback + 1n
+        && alice.session.group.epoch === creator.session.group.epoch,
+    'members apply the path-only fallback Commit');
+}
+
+/** A fully signed KeyPackage whose LeafNode carries `padBytes` of extension. */
+async function paddedKeyPackage(padBytes) {
+    const M = global.MLS;
+    const sig = await M.Signature.generateKeyPair();
+    const init = await M.HPKE.generateKeyPair();
+    const enc = await M.HPKE.generateKeyPair();
+    const leaf = M.Group.buildSelfLeaf({
+        encryptionKeyBytes: enc.publicKeyBytes,
+        signatureKeyBytes: sig.publicKeyBytes,
+        credentialIdentity: sig.publicKeyBytes,
+        leafNodeSource: M.Nodes.LeafNodeSource.KEY_PACKAGE,
+    });
+    leaf.capabilities.extensions = [0xff00];
+    leaf.extensions = [{ extensionType: 0xff00, extensionData: new Uint8Array(padBytes) }];
+    leaf.signature = await M.Group.signLeafNodeForKeyPackage(sig.privateKey, leaf);
+    const kp = {
+        version: 1, cipherSuite: 2, initKey: init.publicKeyBytes,
+        leafNode: leaf, extensions: [], signature: new Uint8Array(0),
+    };
+    kp.signature = await M.Labeled.signWithLabel(
+        sig.privateKey, 'KeyPackageTBS', M.KeyPackage.keyPackageTbsBytes(kp),
+    );
+    return M.KeyPackage.keyPackageBytes(kp);
+}
+
+/**
+ * M-05: link holders could publish KeyPackages padded to the relay's
+ * 16 KiB KeyPackage cap. After four such leaves every later Welcome
+ * carried a ratchet_tree over the relay's 64 KiB limit and was silently
+ * dropped, so nobody could join any more. LeafNodes and KeyPackages are now
+ * bounded by the profile, and an Add whose Welcome or Commit would not fit
+ * the relay limits is refused before it is staged.
+ */
+async function oversizedKeyPackages() {
+    console.log('# MLS session - inflated KeyPackages cannot block later joins (M-05)');
+    const creator = relayPeer('creator', 'size-creator');
+    await creator.session.start();
+    const pins = creator.session.bootstrapPins;
+    const offer = async (keyPackageBytes, senderId) => deliver(creator, {
+        type: 'mls',
+        wire_format: WireFormat.MLS_KEY_PACKAGE,
+        payload: global.MLS.Codec.bytesToBase64Url(keyPackageBytes),
+        bootstrap_proof: await bootstrapProofForSender({
+            pskSecret: DEFAULT_PSK,
+            groupId: pins.groupId,
+            creatorKeyHash: pins.creatorKeyHash,
+            senderId,
+            keyPackageBytes,
+        }),
+    }, senderId);
+
+    const results = [];
+    for (let i = 0; i < 5; i += 1) {
+        results.push(await offer(await paddedKeyPackage(16 * 1024 - 470), `size-pad-${i}`));
+    }
+    assert(results.every((result) => result?.mlsControlRejected === true
+        && result.message.includes('profile maximum'))
+        && creator.session._pendingCommit === null
+        && creator.session.group.epoch === 0n,
+    'KeyPackages padded toward the relay cap are refused at admission',
+    results[0] instanceof Error ? results[0].message : String(results[0]));
+    const nearLimit = await offer(
+        await paddedKeyPackage(global.MLS.Group.MAX_LEAF_NODE_BYTES), 'size-near',
+    );
+    assert(nearLimit?.mlsControlRejected === true,
+        'a LeafNode just over the profile maximum is refused');
+
+    const honest = relayPeer('joiner', 'size-honest', pins);
+    await relayJoin(creator, honest, []);
+    assert(honest.session.state === 'joined' && creator.session.group.epoch === 1n,
+        'an honest joiner is still admitted afterwards');
+
+    // Defense in depth: an Add whose Welcome would exceed the relay limits
+    // is not staged even if a larger tree slipped past the leaf bounds.
+    const late = relayPeer('joiner', 'size-late', pins);
+    await late.session.start();
+    const realFork = creator.session.group.forkForPendingCommit.bind(creator.session.group);
+    creator.session.group.forkForPendingCommit = () => {
+        const candidate = realFork();
+        const realAdd = candidate.commitAddMember.bind(candidate);
+        candidate.commitAddMember = async (args) => {
+            const out = await realAdd(args);
+            const huge = new Uint8Array(129 * 1024);
+            huge.set(out.welcomeMessage.subarray(0, 4));
+            return { ...out, welcomeMessage: huge };
+        };
+        return candidate;
+    };
+    const oversized = await deliver(creator, takeOut(late, isKeyPackageEnvelope), late.id);
+    creator.session.group.forkForPendingCommit = realFork;
+    assert(oversized?.mlsControlRejected === true
+        && oversized.message.includes('relay size limits')
+        && creator.session._pendingCommit === null
+        && !creator.out.some(isCommitEnvelope),
+    'an Add whose Welcome exceeds the relay limit is refused, not staged',
+    oversized instanceof Error ? oversized.message : String(oversized));
+}
+
+/**
+ * M-06: failures were classified by message prefix, and the list said
+ * "ratchet_tree:" where the code throws "ratchet-tree:". A relay that
+ * rewrote the Welcome's unauthenticated ratchet_tree so node 0 is a
+ * ParentNode therefore got a retryable error: the ordered control was
+ * never consumed and the joiner reconnected and replayed it forever.
+ * Group control failures are now deterministic by type.
+ */
+async function deterministicRejectionsByType() {
+    console.log('# MLS session - deterministic rejections are classified by type (M-06)');
+    const M = global.MLS;
+    const creator = relayPeer('creator', 'class-creator');
+    await creator.session.start();
+    const joiner = relayPeer('joiner', 'class-joiner', creator.session.bootstrapPins);
+    await joiner.session.start();
+    await deliver(creator, takeOut(joiner, isKeyPackageEnvelope), joiner.id);
+    const commit = takeOut(creator, isCommitEnvelope);
+    await deliver(joiner, commit, creator.id);
+    await deliver(creator, commit, creator.id);
+    const welcome = takeOut(creator, isWelcomeEnvelope);
+
+    const tree = M.Nodes.parseRatchetTree(M.Codec.base64UrlToBytes(welcome.ratchet_tree));
+    tree[0] = {
+        nodeType: M.Nodes.NodeType.PARENT,
+        parent: {
+            encryptionKey: tree[1].parent.encryptionKey,
+            parentHash: new Uint8Array(0),
+            unmergedLeaves: [],
+        },
+    };
+    const reshaped = {
+        ...welcome,
+        ratchet_tree: M.Codec.bytesToBase64Url(M.Nodes.ratchetTreeBytes(tree)),
+    };
+    const attempts = [];
+    for (let i = 0; i < 3; i += 1) attempts.push(await deliver(joiner, reshaped, creator.id));
+    assert(attempts.every((err) => err?.mlsControlRejected === true
+        && err.mlsRetryControl !== true
+        && err.message.includes('ratchet-tree:')),
+    'a Welcome tree with a ParentNode at a leaf position is a consumed rejection',
+    attempts[0] instanceof Error ? attempts[0].message : String(attempts[0]));
+    const truncated = { ...welcome, ratchet_tree: M.Codec.bytesToBase64Url(new Uint8Array([0x05, 1])) };
+    const truncatedResult = await deliver(joiner, truncated, creator.id);
+    assert(truncatedResult?.mlsControlRejected === true,
+        'a truncated Welcome tree is a consumed rejection as well');
+    assert(joiner.session.state === 'awaiting-welcome'
+        && await deliver(joiner, welcome, creator.id) === 'ok'
+        && joiner.session.state === 'joined',
+    'the authentic Welcome still joins after the rejected ones');
+
+    // Errors raised below the Group entry points keep a deterministic
+    // class whatever their type or text, a TypeError from malformed input
+    // included.
+    const group = creator.session.group;
+    const typeErrors = [];
+    for (const input of [undefined, new Uint8Array([0, 1, 0, 1, 7])]) {
+        try { await group.verifyUpdateProposal(input); } catch (err) { typeErrors.push(err); }
+    }
+    assert(typeErrors.length === 2
+        && typeErrors.every((err) => err.mlsValidationFailure === true
+            && err.mlsRetryControl !== true),
+    'malformed-input failures of any Error type are deterministic',
+    typeErrors.map((err) => `${err.constructor.name}: ${err.message}`).join(' | '));
+}
+
+// A promise that never settles (for example a mutex deadlock) drains the
+// event loop, and Node then exits 0 although main() never finished. Treat
+// that as a failure instead of a silent pass.
+process.on('beforeExit', () => {
+    console.error(`fatal: main() stalled after ${passed} passed, ${failed} failed`);
+    process.exit(3);
+});
 
 main().catch((err) => {
     console.error('fatal:', err);

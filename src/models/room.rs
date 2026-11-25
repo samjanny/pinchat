@@ -3,7 +3,7 @@ use chrono::{DateTime, Duration, Utc};
 use rand::{RngCore, rngs::OsRng};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use subtle::ConstantTimeEq;
 use uuid::Uuid;
 
@@ -43,6 +43,11 @@ pub struct Room {
     pub last_activity: DateTime<Utc>,
     pub max_participants: usize,
     pub participant_ids: HashSet<Uuid>,
+    /// How many times the socket of each participant has been detached.
+    /// The reconnect grace timer started by a detach acts only while this
+    /// count is still the one it started with: the timer of an earlier
+    /// disconnect must not end the grace period of a later one.
+    detach_counts: HashMap<Uuid, u64>,
     /// Stable relay identity reserved for the creator of an MLS group room.
     ///
     /// This is an availability/anti-DoS guard for the current creator-centric
@@ -115,6 +120,7 @@ impl Room {
                 last_activity: now,
                 max_participants,
                 participant_ids: HashSet::new(),
+                detach_counts: HashMap::new(),
                 creator_connection_id,
                 creator_bootstrap_hash,
                 creator_bootstrap_generation: 1,
@@ -253,7 +259,22 @@ impl Room {
 
     /// Removes a participant from the room
     pub fn remove_participant(&mut self, participant_id: &Uuid) -> bool {
+        self.detach_counts.remove(participant_id);
         self.participant_ids.remove(participant_id)
+    }
+
+    /// Count one more detach of a participant's socket and return the new
+    /// count, which identifies this detach.
+    pub fn record_detach(&mut self, participant_id: Uuid) -> u64 {
+        let count = self.detach_counts.entry(participant_id).or_insert(0);
+        *count = count.wrapping_add(1);
+        *count
+    }
+
+    /// The count of the latest detach of a participant's socket, 0 if it
+    /// was never detached.
+    pub fn detach_count(&self, participant_id: &Uuid) -> u64 {
+        self.detach_counts.get(participant_id).copied().unwrap_or(0)
     }
 
     /// Counts active participants

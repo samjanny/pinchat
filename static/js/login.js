@@ -30,8 +30,9 @@
             return response.json();
         })
         .then(data => {
-            // Validate CSRF token format: 32 hex chars + dot + 64 hex chars
-            if (!/^[a-f0-9]{32}\.[a-f0-9]{64}$/.test(data.csrf_token)) {
+            // Validate CSRF token format: 32 hex chars, the time of issue in seconds,
+            // and 64 hex chars of signature, separated by dots (src/auth.rs)
+            if (!/^[a-f0-9]{32}\.[0-9]{1,20}\.[a-f0-9]{64}$/.test(data.csrf_token)) {
                 throw new Error('Invalid token format');
             }
             document.getElementById('csrf_token').value = data.csrf_token;

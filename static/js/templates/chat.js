@@ -429,6 +429,15 @@ window.PinChatUI.mount(String.raw`
                 <!-- Body -->
                 <div class="sas-body">
 
+                    <!-- The peer now presents a different identity key from the one verified (audit C-F1) -->
+                    <div x-show="sasReverifyRequired" class="status-banner warning" role="alert">
+                        Your contact's identity key changed since you verified it. Compare this code over a channel you trust before you continue; skipping is not possible.
+                    </div>
+                    <!-- The code changed while this window was open (audit C-F3) -->
+                    <div x-show="sasCodeChanged" class="status-banner warning" role="alert">
+                        This code changed while this window was open. If you were comparing the previous code, start again with this one.
+                    </div>
+
                     <!-- Peer row -->
                     <div class="sas-peer-row">
                         <span class="sas-peer-avatar" x-text="(peerNickname || 'P').charAt(0).toUpperCase()">P</span>
@@ -471,7 +480,7 @@ window.PinChatUI.mount(String.raw`
                         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg>
                         Codes don't match
                     </button>
-                    <button @click="handleSasVerified()" class="btn btn-primary sas-btn-match">
+                    <button @click="handleSasVerified(sas ? sas.hex : '')" class="btn btn-primary sas-btn-match">
                         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="20 6 9 17 4 12"/></svg>
                         They match
                     </button>

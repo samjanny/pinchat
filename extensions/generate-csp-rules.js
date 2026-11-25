@@ -90,20 +90,33 @@ function pageScripts(pagePath, hashesByPath) {
     return scripts;
 }
 
-const CSP_BASE = [
-    "default-src 'none'",
-    "style-src 'self'",
-    "img-src 'self' blob:",
-    "font-src 'self'",
-    "connect-src 'self' wss://pinchat.im wss://www.pinchat.im",
-    "object-src 'none'",
-    // The site uses no worker of any kind. Stated explicitly so that it does
-    // not depend on worker-src falling back to script-src.
-    "worker-src 'none'",
-    "base-uri 'none'",
-    "form-action 'self'",
-    "frame-ancestors 'none'"
-];
+/**
+ * Where each page may submit a form. Only the login page posts one to the
+ * server. The forms of the chat and the home page are handled by the
+ * application (@submit.prevent) and never submitted, and the legal pages
+ * have none. Everywhere else a form, a served one included, whether in the
+ * page or in a shadow tree, has nowhere to send what is typed into it.
+ */
+const FORM_ACTIONS = {
+    '/static/login.html': "'self'",
+};
+
+function cspBase(pagePath) {
+    return [
+        "default-src 'none'",
+        "style-src 'self'",
+        "img-src 'self' blob:",
+        "font-src 'self'",
+        "connect-src 'self' wss://pinchat.im wss://www.pinchat.im",
+        "object-src 'none'",
+        // The site uses no worker of any kind. Stated explicitly so that it
+        // does not depend on worker-src falling back to script-src.
+        "worker-src 'none'",
+        "base-uri 'none'",
+        `form-action ${FORM_ACTIONS[pagePath] || "'none'"}`,
+        "frame-ancestors 'none'"
+    ];
+}
 
 /**
  * Header changes applied to every document response on the site.
@@ -173,13 +186,20 @@ function hexToSRI(hex) {
     return `sha256-${Buffer.from(hex, 'hex').toString('base64')}`;
 }
 
-function buildCsp(scriptPaths, hashesByPath) {
+/**
+ * 'report-sample' allows no script. It makes a violation report carry the
+ * first 40 characters of what was blocked, which is how the content script
+ * tells the violation of its own policy probe, whose handler begins with a
+ * marker of its own, from the page's (see isProbeViolation in verdict.js).
+ * The catch-all rule keeps a bare 'none', which takes no other keyword.
+ */
+function buildCsp(pagePath, scriptPaths, hashesByPath) {
     const hashSources = scriptPaths.map((scriptPath) => {
         const hash = hashesByPath.get(scriptPath);
         if (!hash) throw new Error(`Signed manifest is missing ${scriptPath}`);
         return `'${hexToSRI(hash)}'`;
     });
-    return [`script-src ${hashSources.join(' ')}`, ...CSP_BASE].join('; ') + ';';
+    return [`script-src 'report-sample' ${hashSources.join(' ')}`, ...cspBase(pagePath)].join('; ') + ';';
 }
 
 // Chrome matches a declarativeNetRequest regexFilter against the full URL,
@@ -220,7 +240,7 @@ function buildRules(manifestDocument, browser = 'chrome') {
             priority: 1,
             action: {
                 type: 'modifyHeaders',
-                responseHeaders: documentHeaders(["script-src 'none'", ...CSP_BASE].join('; ') + ';')
+                responseHeaders: documentHeaders(["script-src 'none'", ...cspBase(null)].join('; ') + ';')
             },
             condition: {
                 // Every document on the site's host names, on any port and
@@ -244,7 +264,7 @@ function buildRules(manifestDocument, browser = 'chrome') {
             priority: 2,
             action: {
                 type: 'modifyHeaders',
-                responseHeaders: documentHeaders(buildCsp(scripts, hashesByPath))
+                responseHeaders: documentHeaders(buildCsp(pagePath, scripts, hashesByPath))
             },
             condition: {
                 regexFilter: pageRegex(pagePath),
@@ -297,6 +317,7 @@ if (require.main === module) {
 
 module.exports = {
     PAGES,
+    FORM_ACTIONS,
     CATCH_ALL_REGEX,
     FRAGMENT_REGEX,
     ALLOWED_REDIRECT_LOCATIONS,

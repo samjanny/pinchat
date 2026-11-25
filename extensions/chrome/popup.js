@@ -112,6 +112,8 @@ function render(state) {
     const has = (code) => reasons.some((entry) => entry.code === code);
     if (has('policy-not-in-force') || has('service-worker-controlled')) {
         setCheck('policy-status', 'NOT in force', 'failed');
+    } else if (has('no-host-access')) {
+        setCheck('policy-status', 'may not apply: the extension has no standing access to this site', 'missing');
     } else {
         setCheck('policy-status', 'in force: only signed scripts can run', 'ok');
     }

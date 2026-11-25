@@ -28,6 +28,34 @@ function summary(visit, t, extra = {}) {
     };
 }
 
+/**
+ * Click at a point of the page, type there and press Enter, the way a user
+ * writes a message. Chromium only: the Firefox driver has no input events.
+ * `where` is evaluated in the page and returns { x, y }.
+ */
+async function typeInto(tab, where, text) {
+    if (!tab.send) return false;
+    const { x, y } = await tab.eval(where);
+    for (const type of ['mousePressed', 'mouseReleased']) {
+        await tab.send('Input.dispatchMouseEvent', { type, x, y, button: 'left', clickCount: 1 });
+    }
+    await tab.send('Input.insertText', { text });
+    await tab.send('Input.dispatchKeyEvent', {
+        type: 'keyDown', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, text: '\r',
+    });
+    await tab.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 });
+    return true;
+}
+
+/** What a served form posted to the server, if anything. */
+const collected = (log) => {
+    const entry = log.find((item) => item.note.startsWith('collect '));
+    return entry ? entry.note.slice('collect '.length) : null;
+};
+
+const positive = (state) => !!state && ['verified', 'partial'].includes(state.integrity);
+const reported = (state, code) => !!state && (state.reasons || []).some((entry) => entry.code === code);
+
 const stateLabel = (state) => {
     if (!state) return 'no record';
     const reasons = (state.reasons || []).map((entry) => entry.code);
@@ -78,6 +106,8 @@ module.exports = [
                     !!state && state.integrity === (firefox ? 'verified' : 'partial')],
                 ['the additions are listed as unattested page modifications', 'must',
                     !!state && Array.isArray(state.environment) && state.environment.length > 0],
+                ['its shadow root, attached after the page was parsed, is listed the same way', 'must',
+                    !!state && (state.environment || []).some((entry) => entry.code === 'shadow-root-added')],
             ]);
         },
     },
@@ -102,6 +132,40 @@ module.exports = [
                     : ['the blocked attempt is attributed to the page and shown as a notice, not as proof', 'must',
                         !!state && state.attention === true && visit.page.overlay === 'notice'
                         && state.reasons.some((entry) => entry.code === 'page-policy-violation')],
+            ]);
+        },
+    },
+    {
+        id: 'page-handler',
+        title: 'an inline handler in the served HTML: the first violation the page itself causes (navigation only)',
+        async run(t) {
+            const browser = await t.launch();
+            const visit = await t.visit(browser, `${t.urls.CHAT}&poc=handler`, 5000);
+            const state = await t.verifierState(browser, t.urls.CHAT);
+            const firefox = t.browserName === 'firefox';
+            const handlerBlocked = (entries) => (entries || [])
+                .filter((entry) => /violation$/.test(entry.code) && entry.detail.startsWith('script-src-attr'));
+            t.report(summary(visit, t, {
+                'verifier state': stateLabel(state),
+                'recorded as': JSON.stringify(handlerBlocked([...(state?.reasons || []), ...(state?.environment || [])])
+                    .map((entry) => `${entry.code}: ${entry.detail}`)),
+            }), [
+                ['the handler did not run', 'must', !visit.page.attacker],
+                ...(firefox ? [
+                    ['the altered document was replaced by the block page', 'must', !!visit.page.blockPage],
+                ] : [
+                    // It used to be taken for the violation of the extension's
+                    // own probe, which Chromium never reports, and dropped.
+                    ['the blocked handler is recorded', 'must',
+                        handlerBlocked([...(state?.reasons || []), ...(state?.environment || [])]).length > 0],
+                    // Chromium names no source file for a handler it blocks
+                    // outside any script, so the violation cannot be told from
+                    // one caused by markup another extension wrote, and is
+                    // listed as of unknown origin.
+                    ['it is attributed to the page and shown as a notice', 'limit',
+                        !!state && state.attention === true
+                        && handlerBlocked(state.reasons).some((entry) => entry.code === 'page-policy-violation')],
+                ]),
             ]);
         },
     },
@@ -168,6 +232,164 @@ module.exports = [
             ]);
         },
     })),
+    {
+        id: 'shadow-root-closed',
+        title: 'a closed declarative shadow root on the body, with an unsigned stylesheet and a form (navigation only)',
+        async run(t) {
+            const browser = await t.launch();
+            const visit = await t.visit(browser, `${t.urls.CHAT}&poc=shadow-closed`, 6000);
+            // Somebody writes a message at the bottom of the chat, where the
+            // message field is, and presses Enter.
+            const typed = await typeInto(visit.tab, '() => ({ x: Math.round(innerWidth / 2), y: innerHeight - 30 })',
+                'meet at 9, the code is 4471');
+            await t.sleep(1500);
+            const sent = collected(await t.control('/log'));
+            const state = await t.verifierState(browser, t.urls.CHAT);
+            const firefox = t.browserName === 'firefox';
+            t.report(summary(visit, t, {
+                'stylesheet of the shadow root applied after load': visit.page.shadowCss,
+                'typed into the page': typed,
+                'what the server received': sent === null ? 'nothing' : sent,
+                'verifier state': stateLabel(state),
+            }), [
+                ['the shadow root and what it holds are gone once the page has loaded', 'must', !visit.page.shadowCss],
+                ['what was typed did not reach the server', 'must', sent === null],
+                ['the state is neither verified nor partial', 'must', !positive(state)],
+                firefox
+                    ? ['the altered document was replaced by the block page', 'must', !!visit.page.blockPage]
+                    : ['the unsigned stylesheet inside the shadow root is reported', 'must',
+                        reported(state, 'unsigned-stylesheet')],
+                ...(firefox ? [] : [['the application still loads', 'must', visit.page.appLoaded === true]]),
+            ]);
+        },
+    },
+    {
+        id: 'shadow-root-signed',
+        title: 'a declarative shadow root on the body that loads signed styles only (navigation only)',
+        async run(t) {
+            const browser = await t.launch();
+            const visit = await t.visit(browser, `${t.urls.CHAT}&poc=shadow-signed`, 6000);
+            const state = await t.verifierState(browser, t.urls.CHAT);
+            const firefox = t.browserName === 'firefox';
+            t.report(summary(visit, t, {
+                'shadow root on the body after load': visit.page.bodyShadowRoot,
+                'verifier state': stateLabel(state),
+            }), [
+                ['the shadow root is gone once the page has loaded', 'must', !visit.page.bodyShadowRoot],
+                ['the state is neither verified nor partial', 'must', !positive(state)],
+                firefox
+                    ? ['the altered document was replaced by the block page', 'must', !!visit.page.blockPage]
+                    : ['the shadow root is reported as a part of the page that could not be attested', 'must',
+                        reported(state, 'shadow-root')],
+                ...(firefox ? [] : [['the application still loads', 'must', visit.page.appLoaded === true]]),
+            ]);
+        },
+    },
+    {
+        id: 'name-body',
+        title: 'served markup with an element named "body", which stands in for document.body (navigation only)',
+        async run(t) {
+            const browser = await t.launch();
+            const visit = await t.visit(browser, `${t.urls.CHAT}&poc=name-body`, 6000);
+            const state = await t.verifierState(browser, t.urls.CHAT);
+            const firefox = t.browserName === 'firefox';
+            t.report(summary(visit, t, { 'verifier state': stateLabel(state) }), [
+                ['the served markup is gone once the page has loaded', 'must', !visit.page.serverAdded],
+                ['the state is not verified', 'must', !state || state.integrity !== 'verified'],
+                firefox
+                    ? ['the altered document was replaced by the block page', 'must', !!visit.page.blockPage]
+                    : ['the application still loads', 'must', visit.page.appLoaded === true],
+            ]);
+        },
+    },
+    {
+        id: 'form-action',
+        title: 'a page served without the framework, with a form that posts to the server (navigation only)',
+        async run(t) {
+            const browser = await t.launch();
+            const visit = await t.visit(browser, `${t.urls.CHAT}&poc=no-engine-form`, 5000);
+            const typed = visit.page.serverAdded && await typeInto(visit.tab, `() => {
+                const box = document.querySelector('#server-added input').getBoundingClientRect();
+                return { x: Math.round(box.x + box.width / 2), y: Math.round(box.y + box.height / 2) };
+            }`, 'the code is 4471');
+            await t.sleep(1500);
+            const sent = collected(await t.control('/log'));
+            const state = await t.verifierState(browser, t.urls.CHAT);
+            const firefox = t.browserName === 'firefox';
+            t.report(summary(visit, t, {
+                'typed into the served form': typed,
+                'what the server received': sent === null ? 'nothing' : sent,
+                'verifier state': stateLabel(state),
+            }), [
+                ['the form could not send anything to the server', 'must', sent === null],
+                ['the state is not verified', 'must', !state || state.integrity !== 'verified'],
+                firefox
+                    ? ['the altered document was replaced by the block page', 'must', !!visit.page.blockPage]
+                    : ['the served form was there to be used', 'must', typed === true],
+            ]);
+        },
+    },
+    {
+        id: 'meta-refresh',
+        title: 'a served <meta http-equiv="refresh"> to another origin (navigation only)',
+        async run(t) {
+            const browser = await t.launch();
+            const visit = await t.visit(browser, `${t.urls.CHAT}&poc=meta-refresh`, 4000);
+            const seen = t.digest(visit.log);
+            const state = await t.verifierState(browser, t.urls.CHAT);
+            const firefox = t.browserName === 'firefox';
+            t.report(summary(visit, t, { 'verifier state': stateLabel(state) }), [
+                ['the page did not leave the site', 'must', (visit.page.url || '').startsWith(t.urls.SITE)],
+                ['the attacker origin received no request', 'must', seen.attackerRequests === 0],
+                firefox
+                    ? ['the altered document was replaced by the block page', 'must', !!visit.page.blockPage]
+                    : ['the attempt is reported', 'must', reported(state, 'page-refresh') && state.attention === true],
+            ]);
+        },
+    },
+    {
+        id: 'policy-replaced',
+        title: 'the packaged policy did not apply, and the server sent its own, which blocks inline handlers too',
+        async run(t) {
+            await t.control('/mode?set=own-csp');
+            const browser = await t.launch();
+            // What a browser does when the extension may not act on the
+            // site: the packaged rules are not applied to its responses.
+            const page = await browser.newTab();
+            await page.goto(browser.extensionUrl('popup.html?debug=states'), 300);
+            const disabled = await page.eval(`async () => {
+                const ext = globalThis.browser || globalThis.chrome;
+                await ext.declarativeNetRequest.updateEnabledRulesets({ disableRulesetIds: ['pinchat_preventive_csp'] });
+                return (await ext.declarativeNetRequest.getEnabledRulesets()).length === 0;
+            }`);
+            await page.close().catch(() => {});
+            const visit = await t.visit(browser, `${t.urls.CHAT}&poc=own-script`, 5000);
+            const state = await t.verifierState(browser, t.urls.CHAT);
+            const ran = visit.log.some((entry) => entry.note === 'leak unsigned-script-ran');
+            const firefox = t.browserName === 'firefox';
+            // The content script compares the policy the browser names for
+            // blocking its probe with the packaged one. Chromium reports no
+            // violation that an extension's own code causes, so there the
+            // two cannot be told apart while the extension has access to the
+            // site. Without that access no positive state is shown at all
+            // (unit-tested in tests/test-verifier-verdict.js), which is how
+            // the packaged rules come not to apply in practice.
+            t.report(summary(visit, t, {
+                'packaged rules disabled': disabled,
+                'unsigned script of the site ran': ran,
+                'verifier state': stateLabel(state),
+            }), [
+                ['the packaged rules were disabled for the test', 'must', disabled === true],
+                ...(firefox ? [
+                    ['the state is neither verified nor partial', 'must', !positive(state)],
+                    ['the altered document was replaced by the block page', 'must', !!visit.page.blockPage],
+                ] : [
+                    ['another policy in force is told from the packaged one', 'limit',
+                        !!state && state.integrity === 'failed' && reported(state, 'policy-not-in-force')],
+                ]),
+            ]);
+        },
+    },
     ...REDIRECT_CODES.map((code) => ({
         id: `redirect-${code}`,
         title: `invite link answered with a ${code} to another origin`,
@@ -512,6 +734,20 @@ module.exports = [
                 ['the state is not verified or partial', 'must',
                     !state || !['verified', 'partial'].includes(state.integrity)],
                 ['the extension made no verification fetches there', 'must', t.digest(visit.log).verifierFetches === 0],
+            ]);
+        },
+    },
+    {
+        id: 'stylesheet-after-flood',
+        title: 'an unsigned stylesheet after 250 blocked scripts that would crowd it out of the findings',
+        async run(t) {
+            const browser = await t.launch();
+            const visit = await t.visit(browser, `${t.urls.CHAT}&poc=flood-style`, 6000);
+            const state = await t.verifierState(browser, t.urls.CHAT);
+            t.report(summary(visit, t, { 'verifier state': stateLabel(state).slice(0, 200) }), [
+                ['the state is failed', 'must', !!state && state.integrity === 'failed'],
+                ...(t.browserName === 'firefox' ? [] : [['the unsigned stylesheet is among the findings', 'must',
+                    reported(state, 'unsigned-stylesheet')]]),
             ]);
         },
     },

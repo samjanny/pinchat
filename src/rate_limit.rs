@@ -19,9 +19,11 @@
 //! # Keying
 //!
 //! Buckets are keyed by HMAC(client IP) and are shared by everyone behind
-//! that address. That is deliberate: with a shared site password a session
-//! is free to mint, so a per-session bucket would hand an abuser a fresh
-//! budget on every login. The consequence is that users behind one NAT, VPN
+//! that address; an IPv6 address counts as its /64, and its /48 has a
+//! second bucket of [`PREFIX_SHARE`] times the burst (see
+//! [`Quota::for_prefix48`]). Sharing is deliberate: with a shared site
+//! password a session is free to mint, so a per-session bucket would hand
+//! an abuser a fresh budget on every login. The consequence is that users behind one NAT, VPN
 //! or Tor exit share one budget. To keep that from being exploitable without
 //! credentials, the API quotas run *behind* the session check and the
 //! connection quota *behind* the check of the WebSocket token (see
@@ -100,6 +102,41 @@ impl Quota {
     pub fn retention(&self) -> Duration {
         self.window + self.replenish_interval() + SWEEP_INTERVAL
     }
+
+    /// The quota of an IPv6 /48 for this per-address quota: [`PREFIX_SHARE`]
+    /// times the burst over the same window. Its retention is shorter than
+    /// the address quota's, so the published bound holds for it too.
+    pub fn for_prefix48(&self) -> Self {
+        Self {
+            burst: self.burst.saturating_mul(PREFIX_SHARE),
+            window: self.window,
+        }
+    }
+}
+
+/// How many addresses' worth of a quota one IPv6 /48 may spend.
+///
+/// An IPv6 client is counted by its /64, and a tunnel broker hands out a
+/// whole /48, 65536 /64s, for free. Counted by /64 only, 1000 login attempts
+/// from 200 /64s of one /48 were never limited. Every per-address quota
+/// therefore has a second bucket per /48, as WebSocket admission does
+/// (`PREFIX_SHARE_FACTOR` in app_state.rs, the same factor): a household or
+/// an office has one /48 at most, and often a /56 or a /64. IPv4 clients
+/// have no such bucket.
+pub const PREFIX_SHARE: u32 = 4;
+
+/// The response of a /48 bucket that is empty, in the form the address
+/// buckets answer with.
+pub fn prefix_quota_exceeded(quota: &Quota) -> axum::response::Response {
+    let wait = quota.replenish_interval().as_secs_f64().ceil() as u64;
+    let mut response = axum::response::IntoResponse::into_response((
+        axum::http::StatusCode::TOO_MANY_REQUESTS,
+        format!("Too Many Requests! Wait for {}s", wait),
+    ));
+    response
+        .headers_mut()
+        .insert("x-ratelimit-after", axum::http::HeaderValue::from(wait));
+    response
 }
 
 /// Deletes rate-limit buckets that are full again.
@@ -137,8 +174,14 @@ impl RetentionSweeper {
     }
 }
 
-/// Build the rate-limit layer for one quota, keyed by HMAC(client IP), and
-/// register its store with a [`RetentionSweeper`].
+/// Build the rate-limit layer for one quota and register its stores with a
+/// [`RetentionSweeper`]: one bucket per client address, keyed by
+/// HMAC(client IP), and for IPv6 a second one per /48 with
+/// [`Quota::for_prefix48`]. A request must find room in both.
+///
+/// The address bucket is checked first, so a /64 that has spent its own
+/// budget is refused without taking anything from its /48: one client over
+/// its limit cannot use up the budget of its neighbours.
 ///
 /// A macro and not a function because the layer's middleware type parameter
 /// comes from a crate this one does not depend on directly, so it cannot be
@@ -146,23 +189,51 @@ impl RetentionSweeper {
 macro_rules! ip_quota_layer {
     ($state:expr, $quota:expr, $sweeper:expr) => {{
         let quota: $crate::rate_limit::Quota = $quota;
-        let config = ::std::sync::Arc::new(
+        let state = ::std::sync::Arc::new($state.clone());
+        let limiter_config = |quota: $crate::rate_limit::Quota| {
             ::tower_governor::governor::GovernorConfigBuilder::default()
                 .key_extractor($crate::rate_limit_extractor::HmacIpKeyExtractor::new(
-                    ::std::sync::Arc::new($state.clone()),
+                    state.clone(),
                 ))
                 .period(quota.replenish_interval())
                 .burst_size(quota.burst)
                 .finish()
-                .expect("quota burst and window are validated as non-zero"),
-        );
+                .expect("quota burst and window are validated as non-zero")
+        };
+        let config = ::std::sync::Arc::new(limiter_config(quota));
         let limiter = config.limiter().clone();
         $sweeper.register(move || {
             limiter.retain_recent();
             limiter.shrink_to_fit();
             limiter.len()
         });
-        ::tower_governor::GovernorLayer { config }
+
+        let prefix_quota = quota.for_prefix48();
+        let prefix_limiter = limiter_config(prefix_quota).limiter().clone();
+        let swept = prefix_limiter.clone();
+        $sweeper.register(move || {
+            swept.retain_recent();
+            swept.shrink_to_fit();
+            swept.len()
+        });
+        let prefix_layer = ::axum::middleware::from_fn(
+            move |request: ::axum::extract::Request, next: ::axum::middleware::Next| {
+                let limiter = prefix_limiter.clone();
+                let state = state.clone();
+                async move {
+                    if let Some(key) = $crate::rate_limit_extractor::prefix48_key(&request, &state)
+                        && limiter.check_key(&key).is_err()
+                    {
+                        return $crate::rate_limit::prefix_quota_exceeded(&prefix_quota);
+                    }
+                    next.run(request).await
+                }
+            },
+        );
+
+        ::tower::ServiceBuilder::new()
+            .layer(::tower_governor::GovernorLayer { config })
+            .layer(prefix_layer)
     }};
 }
 pub(crate) use ip_quota_layer;
@@ -348,6 +419,86 @@ mod tests {
 
         // Forgetting a full bucket changes nothing for the client.
         assert_eq!(hit(&app, [198, 51, 100, 1]).await, StatusCode::OK);
+    }
+
+    async fn hit_v6(app: &Router, client: &str) -> StatusCode {
+        let mut request = Request::builder().uri("/").body(Body::empty()).unwrap();
+        request
+            .extensions_mut()
+            .insert(ConnectInfo(SocketAddr::new(client.parse().unwrap(), 40000)));
+        app.clone().oneshot(request).await.unwrap().status()
+    }
+
+    /// Audit T-02: counted by /64 alone, the 65536 /64s of one /48 had
+    /// 65536 budgets.
+    #[tokio::test]
+    async fn the_slash_48_has_a_budget_of_its_own() {
+        let quota = Quota {
+            burst: 2,
+            window: Duration::from_secs(600),
+        };
+        let (app, sweeper) = limited_app(quota);
+        let prefix_budget = (quota.burst * PREFIX_SHARE) as usize;
+
+        let mut accepted = 0;
+        for i in 0..200 {
+            let client = format!("2001:db8:77:{:x}::1", 0x100 + i);
+            for _ in 0..2 {
+                if hit_v6(&app, &client).await == StatusCode::OK {
+                    accepted += 1;
+                }
+            }
+        }
+        assert_eq!(
+            accepted, prefix_budget,
+            "200 /64s of one /48 share its budget"
+        );
+
+        // Another /48 is not affected, nor is an IPv4 client.
+        assert_eq!(hit_v6(&app, "2001:db8:78::1").await, StatusCode::OK);
+        assert_eq!(hit(&app, [203, 0, 113, 40]).await, StatusCode::OK);
+        // A bucket for each of the 201 /64s (a /64 is counted before its
+        // /48), one for each /48, and one for the IPv4 client, which has no
+        // second bucket.
+        assert_eq!(sweeper.sweep_all(), 201 + 2 + 1);
+    }
+
+    #[tokio::test]
+    async fn a_slash_64_over_its_own_limit_does_not_spend_its_neighbours_budget() {
+        let quota = Quota {
+            burst: 2,
+            window: Duration::from_secs(600),
+        };
+        let (app, _sweeper) = limited_app(quota);
+        let noisy = "2001:db8:5:1::1";
+        for _ in 0..2 {
+            assert_eq!(hit_v6(&app, noisy).await, StatusCode::OK);
+        }
+        for _ in 0..20 {
+            assert_eq!(hit_v6(&app, noisy).await, StatusCode::TOO_MANY_REQUESTS);
+        }
+        // What the /48 has left after the noisy /64's own two requests.
+        let mut accepted = 0;
+        for i in 2..20 {
+            if hit_v6(&app, &format!("2001:db8:5:{i:x}::1")).await == StatusCode::OK {
+                accepted += 1;
+            }
+        }
+        assert_eq!(
+            accepted,
+            (quota.burst * PREFIX_SHARE - quota.burst) as usize
+        );
+    }
+
+    #[test]
+    fn the_prefix_bucket_keeps_the_published_retention_bound() {
+        for burst in [1, 5, 30, 100, u32::MAX] {
+            for window_secs in [1, 60, 600, 720, 86_400] {
+                let (quota, _) = Quota::new(burst, window_secs);
+                assert!(quota.for_prefix48().retention() <= quota.retention());
+                assert!(quota.for_prefix48().retention() <= MAX_RETENTION);
+            }
+        }
     }
 
     #[tokio::test]

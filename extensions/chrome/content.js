@@ -46,19 +46,41 @@ let manifestSRIMap = {};
 let inspectionTimer = null;
 let fileCheck = null;          // { checked, failed, issues } once the files were re-fetched
 let checksDone = false;
-let canaryViolationsToSkip = 0;
+// Begins the handler of the policy probe, so that its violation, if the
+// browser reports it, is told from the page's own. See V.isProbeViolation.
+const PROBE_MARKER = Array.from(crypto.getRandomValues(new Uint8Array(V.PROBE_MARKER_LENGTH / 2)))
+    .map((byte) => byte.toString(16).padStart(2, '0')).join('');
+// The policy the packaged rules give this address, from the background
+// script, and the policies the browser named for blocking the probe.
+let expectedPolicy = null;
+const canaryPolicies = [];
+// Whether the background script compared the bytes of this document with
+// the signed page before the parser saw them (Firefox).
+let documentAttested = false;
 
 // code + detail -> finding. Kept for the life of the document: an element
 // that was added and removed again is still something that happened.
 const findings = new Map();
 const environment = new Map();
 
+// What decides a state is kept even when a page has produced many lesser
+// findings to crowd it out.
+const DECISIVE = [V.CLASS.CONFIRMED, V.CLASS.LIMIT];
+
 function note(entry) {
     const target = entry.class === V.CLASS.ENVIRONMENT ? environment : findings;
     const key = `${entry.code}\n${entry.detail}`;
-    if (target.size >= 200 || target.has(key)) return false;
+    const limit = DECISIVE.includes(entry.class) ? 400 : 200;
+    if (target.size >= limit || target.has(key)) return false;
     target.set(key, entry);
     return true;
+}
+
+/** Findings for a report, the decisive ones first. */
+function reportedFindings(extra) {
+    const all = [...findings.values(), ...extra];
+    return [...all.filter((entry) => DECISIVE.includes(entry.class)),
+        ...all.filter((entry) => !DECISIVE.includes(entry.class))];
 }
 
 // =============================================================================
@@ -75,19 +97,49 @@ function note(entry) {
  * synchronously, before the parser has produced a single element of the
  * page. It cannot tell a weakened policy from the intact one, only an absent
  * one from a present one.
+ *
+ * Its violation may or may not be reported: Chromium reports none that an
+ * extension causes. When one is, it is recognised by the marker the handler
+ * begins with, and by nothing else, so that no violation of the page's own
+ * is ever taken for it.
  */
 function policyIsInForce() {
     const probe = document.createElement('div');
-    probe.setAttribute('onclick', 'this.setAttribute("data-ran", "1")');
-    canaryViolationsToSkip += 1;
+    probe.setAttribute('onclick', V.probeHandler(PROBE_MARKER));
     try {
         probe.click();
     } catch {
         /* a throwing dispatch is not an executed handler */
     }
-    const blocked = probe.getAttribute('data-ran') !== '1';
-    if (!blocked) canaryViolationsToSkip = 0;
-    return blocked;
+    return probe.getAttribute('data-ran') !== '1';
+}
+
+/**
+ * The probe only learns that an inline handler was blocked, and a policy of
+ * the server's own blocks one too: script-src 'self' does, while it runs any
+ * script the server cares to serve. That is exactly the situation when the
+ * packaged rules were not applied, for instance because the extension may
+ * act on the site only on request. The browser names the policy it applied
+ * in the violation, and that is compared with the packaged one.
+ *
+ * Only a reported violation counts; no report proves nothing either way.
+ * Chromium reports no violation that an extension's own code causes, the
+ * probe's included, so there the comparison never takes place, and what
+ * keeps a page whose packaged rules were not applied from a positive state
+ * is the background script's check of the extension's access to the site.
+ */
+let otherPolicyFound = false;
+
+function checkPolicyIsPackaged() {
+    if (otherPolicyFound || !expectedPolicy || canaryPolicies.length === 0) return;
+    if (canaryPolicies.some((policy) => V.sameScriptPolicy(policy, expectedPolicy))) return;
+    otherPolicyFound = true;
+    const entry = V.finding('policy-not-in-force',
+        `the browser applied another policy: ${canaryPolicies[0].slice(0, 120)}`);
+    note(entry);
+    stopDocument();
+    applyVerdict({ integrity: V.INTEGRITY.FAILED, reasons: [entry] });
+    scheduleInspection();
 }
 
 function workerControlsDocument() {
@@ -268,14 +320,30 @@ function inspectBaseElement(element) {
         : { path: href.slice(0, 120), error: 'unexpected <base> element', type: 'base-unexpected' };
 }
 
-/** Issues for one element and everything under it. */
+/** A <meta http-equiv="refresh">: a navigation no script policy can stop. */
+function isRefresh(element) {
+    return element.tagName === 'META'
+        && (element.getAttribute('http-equiv') || '').trim().toLowerCase() === 'refresh';
+}
+
+/**
+ * Issues for one element and everything under it. `root` may also be a
+ * shadow root, whose contents no query on the document reaches.
+ */
 function inspectSubtree(root) {
     const issues = [];
     const visit = (element) => {
-        if (element.id === 'pinchat-integrity-warning-host') return;
+        // Only the overlay this script made is skipped: an id can be copied.
+        if (element === overlayElement) return;
         const tag = element.tagName;
         let issue = null;
-        if (tag === 'SCRIPT' || tag === 'LINK') {
+        if (isRefresh(element)) {
+            issue = {
+                path: (element.getAttribute('content') || '').slice(0, 120),
+                error: '<meta http-equiv="refresh">',
+                type: 'meta-refresh',
+            };
+        } else if (tag === 'SCRIPT' || tag === 'LINK') {
             issue = inspectResourceElement(element);
         } else if (tag === 'BASE') {
             issue = inspectBaseElement(element);
@@ -308,17 +376,108 @@ function inspectSubtree(root) {
     };
     if (root.nodeType === Node.ELEMENT_NODE) visit(root);
     if (root.querySelectorAll) {
-        root.querySelectorAll('script, link, base, style, iframe, frame, embed, object, form[action]').forEach(visit);
+        root.querySelectorAll('script, link, base, style, iframe, frame, embed, object, form[action], meta')
+            .forEach(visit);
     }
     return issues;
 }
+
+let refreshStopped = false;
 
 function recordIssues(issues) {
     let changed = false;
     for (const issue of issues) {
         if (note(V.findingForIssue(issue))) changed = true;
+        // Removing the element does not cancel a refresh it scheduled;
+        // stopping the document does. Once is enough.
+        if (issue.type === 'meta-refresh' && !refreshStopped) {
+            refreshStopped = true;
+            stopDocument();
+        }
     }
     return changed;
+}
+
+// =============================================================================
+// Shadow roots
+// =============================================================================
+//
+// What sits in a shadow tree is out of reach of every query on the document,
+// the page's own included, and a closed one cannot even be seen by the page.
+// The parser builds one from served markup (<template shadowrootmode>), with
+// stylesheets, forms and anything else in it, and nothing in this script
+// would otherwise look inside. The extension can: through
+// chrome.dom.openOrClosedShadowRoot in Chromium and
+// element.openOrClosedShadowRoot() in Firefox.
+
+/** Shadow roots seen in this document, kept so that later checks still reach them. */
+const shadowRoots = new Set();
+/** Where each one was found -> whether the parser could have made it. */
+const shadowHosts = new Map();
+/** Set once the document has been parsed and scanned for shadow roots. */
+let parsingScanned = false;
+
+function shadowRootOf(element) {
+    try {
+        const dom = globalThis.chrome && globalThis.chrome.dom;
+        if (dom && typeof dom.openOrClosedShadowRoot === 'function') {
+            return dom.openOrClosedShadowRoot(element) || null;
+        }
+        if (typeof element.openOrClosedShadowRoot === 'function') {
+            return element.openOrClosedShadowRoot() || null;
+        }
+        return element.shadowRoot || null;
+    } catch {
+        return null;
+    }
+}
+
+function describeHost(element) {
+    const id = element.getAttribute('id');
+    return `<${String(element.tagName).toLowerCase()}${id ? ` id="${id.slice(0, 40)}"` : ''}>`;
+}
+
+/**
+ * Take note of the shadow root of one element, if it has one not seen
+ * before: record where it is, inspect what it holds, watch it from now on.
+ * Returns whether it was new.
+ */
+function adoptShadowRoot(element) {
+    if (element === overlayElement) return false;
+    const shadow = shadowRootOf(element);
+    if (!shadow || shadowRoots.has(shadow) || shadowRoots.size >= 200) return false;
+    shadowRoots.add(shadow);
+    const where = describeHost(element);
+    // Until the document has been parsed, a shadow root may be one the
+    // parser built from the served markup. After that only a script can
+    // attach one, and the signed client attaches none.
+    if (!shadowHosts.has(where)) shadowHosts.set(where, !parsingScanned);
+    if (documentObserver) documentObserver.observe(shadow, OBSERVED);
+    recordIssues(inspectSubtree(shadow));
+    scanShadowRoots(shadow);
+    return true;
+}
+
+/** adoptShadowRoot for `root` and everything under it. */
+function scanShadowRoots(root) {
+    let changed = false;
+    if (root.nodeType === Node.ELEMENT_NODE && adoptShadowRoot(root)) changed = true;
+    if (root.querySelectorAll) {
+        for (const element of root.querySelectorAll('*')) {
+            if (adoptShadowRoot(element)) changed = true;
+        }
+    }
+    return changed;
+}
+
+/** Shadow roots as findings: the class depends on what could have made them. */
+function shadowFindings() {
+    return [...shadowHosts].map(([where, duringParsing]) => V.finding(
+        // A document whose bytes were compared with the signed page holds
+        // no shadow root of the server's.
+        duringParsing && !documentAttested ? 'shadow-root' : 'shadow-root-added',
+        `on ${where}`,
+    ));
 }
 
 async function sha256Hex(buffer) {
@@ -368,12 +527,13 @@ function sendMessage(message) {
 }
 
 async function report() {
+    const shadow = shadowFindings();
     const response = await sendMessage({
         type: 'DOCUMENT_REPORT',
         token: DOCUMENT_TOKEN,
         checksDone,
-        findings: [...findings.values()],
-        environment: [...environment.values()],
+        findings: reportedFindings(shadow.filter((entry) => entry.class !== V.CLASS.ENVIRONMENT)),
+        environment: [...environment.values(), ...shadow.filter((entry) => entry.class === V.CLASS.ENVIRONMENT)],
         files: fileCheck ? { checked: fileCheck.checked, failed: fileCheck.failed } : null,
     });
     if (response && response.verdict) applyVerdict(response.verdict);
@@ -382,7 +542,12 @@ async function report() {
 /** Inspect the whole document and report. Debounced by scheduleInspection. */
 async function inspect({ files = false } = {}) {
     if (!manifestData) return;
+    for (const node of unjudged.splice(0)) recordIssues(inspectSubtree(node));
     recordIssues(inspectSubtree(document.documentElement));
+    scanShadowRoots(document.documentElement);
+    // Every shadow root seen, also one that is no longer in the document:
+    // what it loaded while it was there was loaded all the same.
+    for (const shadow of shadowRoots) recordIssues(inspectSubtree(shadow));
     if (files || !fileCheck) {
         fileCheck = fileCheck || { checked: 0, failed: 0, issues: [] };
         fileCheck = await recheckFiles(manifestData);
@@ -400,35 +565,64 @@ function scheduleInspection() {
     }, 300);
 }
 
+// Elements added before the manifest was here, judged once it is: by then
+// the page may have removed them, as the framework does with served markup
+// when it starts.
+const unjudged = [];
+
+let documentObserver = null;
+const OBSERVED = {
+    childList: true,
+    subtree: true,
+    attributes: true,
+    attributeFilter: ['src', 'href', 'integrity', 'type', 'rel', 'action', 'data', 'http-equiv', 'content'],
+};
+
 function watchDocument() {
-    const observer = new MutationObserver((mutations) => {
+    documentObserver = new MutationObserver((mutations) => {
         let changed = false;
         for (const mutation of mutations) {
             if (mutation.type === 'attributes') {
                 if (recordIssues(inspectSubtree(mutation.target))) changed = true;
                 continue;
             }
+            // The parser attaches a declared shadow root to its host after
+            // the host was inserted; what it inserts next has the host as
+            // its parent.
+            if (mutation.target.nodeType === Node.ELEMENT_NODE && adoptShadowRoot(mutation.target)) changed = true;
             for (const node of mutation.addedNodes) {
                 if (node.nodeType !== Node.ELEMENT_NODE) continue;
                 // Recorded when seen: a node that is removed again right
                 // away is still reported, as what it was.
                 if (recordIssues(inspectSubtree(node))) changed = true;
+                if (scanShadowRoots(node)) changed = true;
+                if (!manifestData && unjudged.length < 1000) unjudged.push(node);
             }
         }
         if (changed) scheduleInspection();
         restoreOverlayIfTampered();
     });
-    observer.observe(document.documentElement, {
-        childList: true,
-        subtree: true,
-        attributes: true,
-        attributeFilter: ['src', 'href', 'integrity', 'type', 'rel', 'action', 'data'],
-    });
+    documentObserver.observe(document.documentElement, OBSERVED);
+
+    // At the end of parsing, before any listener of the page: by then every
+    // shadow root the parser could build exists, and the application's
+    // framework has not yet replaced the body that may carry one.
+    const scanParsed = () => {
+        if (scanShadowRoots(document.documentElement)) scheduleInspection();
+        parsingScanned = true;
+    };
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', scanParsed, { once: true });
+    } else {
+        scanParsed();
+    }
 
     document.addEventListener('securitypolicyviolation', (event) => {
-        if (canaryViolationsToSkip > 0 && event.effectiveDirective === 'script-src-attr') {
-            // The probe in policyIsInForce, not the page.
-            canaryViolationsToSkip -= 1;
+        if (V.isProbeViolation(event, PROBE_MARKER)) {
+            // The probe in policyIsInForce, not the page. The policy the
+            // browser names says whether it is the packaged one.
+            if (event.originalPolicy && canaryPolicies.length < 8) canaryPolicies.push(String(event.originalPolicy));
+            checkPolicyIsPackaged();
             return;
         }
         const entry = V.findingForViolation({
@@ -679,7 +873,10 @@ async function start({ restored = false } = {}) {
         manifestData = opened.manifest;
         buildManifestSRIMap(manifestData);
     }
+    documentAttested = !!(opened.verdict && opened.verdict.attested === true);
+    expectedPolicy = typeof opened.expectedPolicy === 'string' ? opened.expectedPolicy : null;
     if (opened.verdict) applyVerdict(opened.verdict);
+    checkPolicyIsPackaged();
 
     const run = () => {
         if (manifestData) {
