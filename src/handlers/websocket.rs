@@ -11,7 +11,7 @@ use std::net::SocketAddr;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use tokio::sync::broadcast::error::RecvError;
-use tokio::time::{Duration, Instant, interval};
+use tokio::time::{Duration, Instant, interval_at};
 use uuid::Uuid;
 
 use crate::config::max_image_payload_size;
@@ -929,6 +929,11 @@ const WS_SEND_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(test)]
 const WS_SEND_TIMEOUT: Duration = Duration::from_secs(1);
 
+/// How often the relay pings an open socket and runs the checks that go with
+/// the ping: the room's expiry, the connection's age and, in a group, the
+/// members that fell behind.
+const HEARTBEAT_PERIOD: Duration = Duration::from_secs(30);
+
 /// How long the relay waits for the next frame of a client before it closes
 /// the connection, and how long one message may take from its first frame to
 /// its last byte.
@@ -1591,7 +1596,11 @@ async fn handle_socket(
     let (stop_sending, mut stopped) = tokio::sync::oneshot::channel::<()>();
     let send_half = &mut sender;
     let send_side = async move {
-        let mut ping_interval = interval(Duration::from_secs(30));
+        // The first ping goes out one period after the upgrade, not at once:
+        // a socket that has just opened needs no sign of life, and a ping
+        // sent now would only fall among its first frames, in an order that
+        // varies from one connection to the next.
+        let mut ping_interval = interval_at(Instant::now() + HEARTBEAT_PERIOD, HEARTBEAT_PERIOD);
 
         loop {
             tokio::select! {
@@ -6272,7 +6281,7 @@ mod tests {
             .await;
 
             let started = Instant::now();
-            let mut ticker = interval(Duration::from_millis(500));
+            let mut ticker = tokio::time::interval(Duration::from_millis(500));
             let mut pongs = 0usize;
             let code = loop {
                 tokio::select! {
