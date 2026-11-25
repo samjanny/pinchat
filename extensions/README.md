@@ -6,8 +6,8 @@ Browser extensions that prevent unapproved scripts from executing on pinchat.im 
 
 The extension uses a defense-in-depth approach combining a packaged CSP, SRI, and signed manifests:
 
-1. **Preventive CSP**: A static Declarative Net Request rule replaces the response CSP before parsing. Each official page gets only its signed script hashes; unknown paths get `script-src 'none'`.
-2. **Manifest Verification**: Extension fetches the signed hash list from GitHub.
+1. **Preventive CSP**: Declarative Net Request rules replace the response CSP before parsing. Each official page gets only the hashes of the scripts the signed manifest lists for it; unknown paths get `script-src 'none'`. The rules are built from the verified manifest (`csp-rules.js`); the copy packaged as `rules.json` applies until the first one is verified.
+2. **Manifest Verification**: Extension fetches the signed hash list from the main branch on GitHub, so a new release of the site needs a new signature, not a new extension.
 3. **Signature Verification**: Verifies its ECDSA P-256 signature using the embedded public key.
 4. **SRI DOM Verification**: Content script checks that the `<script>` and `<link>` tags in the actual page DOM have correct `integrity` attributes matching the signed manifest, including those inside shadow trees, open or closed, which it reaches through APIs only an extension has.
 5. **Browser Enforcement**: CSP + SRI block injected or modified scripts before execution.
@@ -76,23 +76,43 @@ git commit -m "Update SRI attributes and signed hash list"
 git push
 ```
 
-The extensions fetch the manifest from the immutable release tag configured by
-`GITHUB_TAG` in both background scripts. For the current security release this is:
-`https://raw.githubusercontent.com/samjanny/pinchat/v0.9.3/hashes.json.signed`.
+The extensions fetch the manifest from the main branch:
+`https://raw.githubusercontent.com/samjanny/pinchat/main/hashes.json.signed`.
+Besides the hash of every file, the manifest signs the scripts each page
+loads (format 1.3.0), and the extension builds the script policy of every
+page from those lists and puts it in force in place of the packaged one. What
+makes a manifest trustworthy is its signature under the key in the
+extension, made offline; a sequence no lower than the last one seen and than
+`MIN_KNOWN_SEQUENCE` keeps an older release from being replayed.
 
-On every extension release, both background scripts move to the new tag,
-`MIN_KNOWN_SEQUENCE` rises to the signed manifest sequence, both extension
-manifest versions bump, and the release-pin test (`tests/test-security.js`,
-Test 7) follows. `finish-release.sh` does all of that from the freshly signed
-manifest and then runs every CI job, so the only manual step is the signature:
+Up to 1.7.0 the extensions read the manifest of a release tag, and every
+release of the site needed a release of the extensions. Now:
+
+- **A release of the site** needs the signature and nothing in the
+  extensions: `extensions/finish-release.sh <tag>`.
+- **A release that changes the extensions** names their new version:
+  `extensions/finish-release.sh <tag> <extension version>`. Both background
+  scripts take the new manifest's sequence as `MIN_KNOWN_SEQUENCE` (the
+  packaged `rules.json` comes from that manifest), both manifest versions
+  bump, and the release-pin test (`tests/test-security.js`, Test 7) follows.
+
+Either way the script runs every CI job, so the only manual step is the
+signature:
 
 ```bash
 node extensions/generate-hashes.js --private-key private.pem --output hashes.json.signed
-extensions/finish-release.sh v0.8.0 1.3.0   # <tag> <extension version>
+extensions/finish-release.sh v0.9.4          # the site only
+extensions/finish-release.sh v0.9.4 1.8.0    # the site and the extensions
 ```
 
-The release tag must contain the exact signed manifest before the extensions
-are published. addons.mozilla.org also refuses any upload whose Firefox
+Main must not carry a manifest before the site serves it: the pages still
+served would then look like a release nobody signed. Push the tag, build and
+dry-run it on the server, then push main and switch the site right after.
+A page that does not match the manifest makes the extension ask GitHub
+again, past its cache, and a page of a release signed since is loaded again
+under that release's policy, once.
+
+addons.mozilla.org also refuses any upload whose Firefox
 manifest lacks `browser_specific_settings.gecko.data_collection_permissions`
 (mandatory for new submissions since November 2025); ours declares
 `{"required": ["none"]}`, which is the truthful answer and must stay so. `generate-hashes.js` also regenerates `chrome/rules.json` and
@@ -153,18 +173,20 @@ unpacked, and a reserved name in extensions) cannot leak into a release.
 And `manifest.json` lands at the archive root, which is what both stores
 require.
 
-Before building, the script checks that both browsers agree on `GITHUB_TAG`,
-`MIN_KNOWN_SEQUENCE` and the manifest version, that the pinned tag exists, and
-that its signed manifest is at or above the floor. That last check matters:
-store review takes days, and a build whose floor sits above the sequence at
-its own tag rejects every manifest it can fetch.
+Before building, the script checks that both browsers read the manifest from
+main and agree on `MIN_KNOWN_SEQUENCE` and the manifest version, that the
+manifest at the packaged commit lists the scripts of its pages, and that the
+floor is that manifest's sequence, which the packaged rules come from. It
+warns when `origin/main` carries an older manifest than the floor: store
+review takes days, and a build whose floor sits above the manifest on main
+rejects every manifest it can fetch.
 
 ### Release order
 
-Cut and push the release tag first, then submit to the stores. The extension
-fetches its manifest from the pinned tag, so a build that goes live before the
-tag exists leaves every fresh install in an error state, with no cached
-manifest to fall back on.
+Push main before submitting to the stores. The extension fetches its manifest
+from main, so a build that goes live before main carries a manifest at its
+floor leaves every fresh install in an error state, with no cached manifest
+to fall back on.
 
 Auto-update on both stores is driven by one thing only: a higher `version` in
 `manifest.json`. Bump it in both browsers, in the same commit.
@@ -267,10 +289,11 @@ scripts.
    worker never receives the extension's header rules. A policy of the
    server's own, such as `script-src 'self'`, blocks inline handlers too, so
    where the browser reports the probe's violation, the policy it names is
-   also compared with the packaged policy for that address. Chromium
+   also compared with the policy the rules in force give that address (just
+   after a new release, with the one they replaced, too). Chromium
    reports no violation that an extension's own code causes, so there this
    comparison does not take place; what keeps a page from a positive state
-   when the packaged rules did not apply is the check of the extension's
+   when the rules did not apply is the check of the extension's
    access to the site (point 1). If any of this fails, the document is
    stopped and marked failed. Service workers registered for the site are
    removed; the site uses none. The probe's own violation, where a browser
@@ -391,9 +414,9 @@ The public key (`PINCHAT_PUBLIC_KEY`) and domain (`OFFICIAL_DOMAIN`) are **inten
 1. **Server compromise protection**: If an attacker gains access to the pinchat.im server, they CANNOT change the public key used to verify file signatures. The key is baked into the extension code that users have already installed.
 
 2. **Independent trust anchor**: The extension creates a verification path that is completely independent of the server:
-   - Signed manifests are hosted on GitHub (separate from the main server)
+   - Signed manifests are hosted on GitHub (separate from the main server), on the main branch
    - The public key is embedded in extension code (distributed via browser stores)
-   - An attacker would need to compromise BOTH GitHub AND the browser extension stores
+   - An attacker would need BOTH the offline signing key AND write access to GitHub. Up to 1.7.0, which read the manifest of a release tag, new code also had to pass store review in a new extension; since 1.8.0 a release of the site needs no new extension, and the key is the one gate
 
 3. **Verifiable by users**: Anyone can inspect the extension source code to verify:
    - Which public key is being used
@@ -424,7 +447,7 @@ The public key (`PINCHAT_PUBLIC_KEY`) and domain (`OFFICIAL_DOMAIN`) are **inten
 
 The integrity approach provides multiple layers of protection:
 
-1. **Extension-packaged preventive CSP**: Before HTML parsing, permits only the signed script hashes assigned to that page and blocks scripts on unknown paths.
+1. **Preventive CSP from the signed manifest**: Before HTML parsing, permits only the signed script hashes the manifest assigns to that page and blocks scripts on unknown paths. The policy around the hashes is fixed in the extension (`csp-rules.js`): a manifest can only say which of its own signed scripts a page may run.
 2. **Browser SRI enforcement**: For scripts carrying `integrity`, blocks bytes that do not match the declared hash.
 3. **Extension verification**: In Firefox, compares the bytes of every page with the signed hash before the browser parses them. In both browsers, inspects the DOM and re-downloads every file of the manifest; a mismatch there is a failure, a match is not counted as proof (see "What is checked, and how").
 4. **Signed manifest**: Hash list is signed, so attackers cannot forge a valid allowlist with server access alone.
@@ -442,7 +465,7 @@ The integrity approach provides multiple layers of protection:
 | Server adds `<meta http-equiv="refresh">` | Document stopped before the refresh, notice | Page replaced by the block page |
 | Server links an unsigned same-origin stylesheet | Loaded; state "failed" | Page replaced by the block page |
 | Server answers the legal pages' `operator.json` fetch with other values | Not detected, like any other change to those pages' markup | Withheld; state "failed" |
-| Extension allowed on the site only on request | The packaged rules may not apply: "unverifiable" | Same, where the content script runs at all |
+| Extension allowed on the site only on request | The rules may not apply: "unverifiable" | Same, where the content script runs at all |
 | Server sends `Link: rel=stylesheet` | Header removed | Header removed |
 | Server redirects an invite link to another origin | Navigation blocked | Navigation blocked |
 | Server redirects an invite link to the release page or a store, directly or through `/ext/chrome` | Navigation blocked: the address carries a fragment | Same |
@@ -577,7 +600,8 @@ extensions/
 ├── hashes.json.example    # Example hash file format
 ├── chrome/                # Chromium build
 │   ├── manifest.json      # Extension manifest (MV3)
-│   ├── rules.json         # Script policy, header removals, redirect rules
+│   ├── rules.json         # Packaged rules: script policy, header removals, redirect rules
+│   ├── csp-rules.js       # Builds those rules from a signed manifest (here and in generate-csp-rules.js)
 │   ├── verdict.js         # What each state means (pure logic, unit tested)
 │   ├── background.js      # Manifest validation, per-tab state, response check
 │   ├── content.js         # Probes, DOM inspection, overlay
@@ -591,8 +615,8 @@ extensions/
 └── firefox/               # Firefox build: same sources, own manifest and rules
     ├── manifest.json      # Adds the webRequest permissions for the response check
     ├── rules.json         # No redirect rules: enforced in background.js instead
-    └── ...                # verdict.js, background.js, content.js, popup.*,
-                           # blocked.* and warning.css are identical to chrome/
+    └── ...                # verdict.js, csp-rules.js, background.js, content.js,
+                           # popup.*, blocked.* and warning.css are identical to chrome/
 ```
 
 ## Troubleshooting

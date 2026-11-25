@@ -5,21 +5,23 @@
 # The one step that cannot be automated is signing hashes.json.signed with the
 # offline private key. Everything that has to follow it, in lockstep, can be:
 #
-#   1. GITHUB_TAG and MIN_KNOWN_SEQUENCE in both extension background scripts
-#   2. the extension manifest version (what drives store auto-update)
-#   3. the release-pin expectations in tests/test-security.js (Test 7)
-#   4. every CI job, so the commit that carries the manifest is green
+#   1. for a release of the extension too: MIN_KNOWN_SEQUENCE in both
+#      background scripts, the extension manifest version (what drives store
+#      auto-update) and the version pin in tests/test-security.js (Test 7)
+#   2. every CI job, so the commit that carries the manifest is green
 #
-# A pin left behind here ships an extension that rejects every manifest it can
-# fetch, and a manifest that does not match the tree fails verify-sri in CI.
-# Doing all of it from one script, after the signature, removes that class of
-# mistake from the release.
+# The extensions read the manifest from the main branch, so a release of the
+# site alone needs a signature and nothing in the extensions. A release that
+# changes the extensions names their new version as the second argument: the
+# packaged rules.json, written by the signer, then comes from this manifest,
+# and the floor of the build moves to its sequence.
 #
 # Usage:
 #   node extensions/generate-hashes.js --private-key <key> --output hashes.json.signed
-#   extensions/finish-release.sh <tag> <extension-version>
+#   extensions/finish-release.sh <tag> [<extension-version>]
 #
-#   e.g. extensions/finish-release.sh v0.8.0 1.3.0
+#   e.g. extensions/finish-release.sh v0.9.4          # the site only
+#        extensions/finish-release.sh v0.9.4 1.8.0    # the site and the extensions
 #
 # The script does not commit, merge or tag. It stages nothing and prints the
 # exact commands for those steps at the end.
@@ -34,10 +36,11 @@ cd "$ROOT"
 fail() { echo "ERROR: $*" >&2; exit 1; }
 step() { echo; echo "==> $*"; }
 
-[ -n "$TAG" ] && [ -n "$EXT_VERSION" ] \
-    || fail "usage: extensions/finish-release.sh <tag> <extension-version>"
+[ -n "$TAG" ] || fail "usage: extensions/finish-release.sh <tag> [<extension-version>]"
 [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "tag must look like v1.2.3, got $TAG"
-[[ "$EXT_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "extension version must look like 1.2.3, got $EXT_VERSION"
+if [ -n "$EXT_VERSION" ]; then
+    [[ "$EXT_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "extension version must look like 1.2.3, got $EXT_VERSION"
+fi
 command -v jq >/dev/null 2>&1 || fail "jq is required"
 command -v node >/dev/null 2>&1 || fail "node is required"
 command -v cargo >/dev/null 2>&1 || fail "cargo is required"
@@ -57,51 +60,50 @@ HEAD_SEQ="$(git show HEAD:hashes.json.signed 2>/dev/null | jq -r '.data.sequence
 [ "$NEW_SEQ" -gt "$HEAD_SEQ" ] \
     || fail "sequence $NEW_SEQ is not above HEAD's $HEAD_SEQ: run generate-hashes.js with the private key first"
 echo "  sequence $HEAD_SEQ -> $NEW_SEQ"
+[ "$(jq -r '.data.pages | type' hashes.json.signed)" = "array" ] \
+    || fail "hashes.json.signed lists no page scripts: sign it with the current generate-hashes.js"
 
 read_pin() { # <browser> <const-name>
     sed -n "s/^const $2 = '\{0,1\}\([^';]*\)'\{0,1\};/\1/p" "extensions/$1/background.js" | head -1
 }
-OLD_TAG="$(read_pin chrome GITHUB_TAG)"
 OLD_FLOOR="$(read_pin chrome MIN_KNOWN_SEQUENCE)"
 OLD_VERSION="$(jq -r .version extensions/chrome/manifest.json)"
-[ -n "$OLD_TAG" ] && [ -n "$OLD_FLOOR" ] || fail "could not read the current pins from extensions/chrome/background.js"
+[ -n "$OLD_FLOOR" ] || fail "could not read MIN_KNOWN_SEQUENCE from extensions/chrome/background.js"
 
-# Store auto-update keys off the manifest version alone, so it has to move.
-if [ "$OLD_VERSION" = "$EXT_VERSION" ]; then
-    fail "extension version $EXT_VERSION is already the current one; stores only update on a higher version"
+# ---------------------------------------------------------------------------
+# A release of the extensions: same values in both browsers, in the same
+# commit as the manifest their packaged rules come from.
+# ---------------------------------------------------------------------------
+if [ -n "$EXT_VERSION" ]; then
+    # Store auto-update keys off the manifest version alone, so it has to move.
+    if [ "$OLD_VERSION" = "$EXT_VERSION" ]; then
+        fail "extension version $EXT_VERSION is already the current one; stores only update on a higher version"
+    fi
+    step "Extension release: floor $OLD_FLOOR -> $NEW_SEQ, extension $OLD_VERSION -> $EXT_VERSION"
+    for browser in chrome firefox; do
+        bg="extensions/$browser/background.js"
+        sed -i "s/^const MIN_KNOWN_SEQUENCE = [0-9]*;/const MIN_KNOWN_SEQUENCE = $NEW_SEQ;/" "$bg"
+        [ "$(read_pin "$browser" MIN_KNOWN_SEQUENCE)" = "$NEW_SEQ" ] || fail "failed to set MIN_KNOWN_SEQUENCE in $bg"
+
+        manifest="extensions/$browser/manifest.json"
+        # sed rather than jq so key order, indentation and the trailing newline
+        # stay byte-identical apart from the version line.
+        sed -i "s/^\(    \"version\": \"\)[^\"]*\(\",\)$/\1$EXT_VERSION\2/" "$manifest"
+        [ "$(jq -r .version "$manifest")" = "$EXT_VERSION" ] || fail "failed to set version in $manifest"
+    done
+
+    # Test 7 in tests/test-security.js pins the version so CI catches drift.
+    sed -i "s/&& chromeManifest.version === '[^']*'/\&\& chromeManifest.version === '$EXT_VERSION'/" tests/test-security.js
+    grep -q "chromeManifest.version === '$EXT_VERSION'" tests/test-security.js \
+        || fail "failed to update the version pin in tests/test-security.js"
+else
+    step "Release of the site only: the extensions stay at $OLD_VERSION, floor $OLD_FLOOR"
 fi
-
-# ---------------------------------------------------------------------------
-# Pins. Same values in both browsers, in the same commit as the manifest.
-# ---------------------------------------------------------------------------
-step "Setting release pins: tag $OLD_TAG -> $TAG, floor $OLD_FLOOR -> $NEW_SEQ, extension $OLD_VERSION -> $EXT_VERSION"
-for browser in chrome firefox; do
-    bg="extensions/$browser/background.js"
-    sed -i "s/^const GITHUB_TAG = '[^']*';/const GITHUB_TAG = '$TAG';/" "$bg"
-    sed -i "s/^const MIN_KNOWN_SEQUENCE = [0-9]*;/const MIN_KNOWN_SEQUENCE = $NEW_SEQ;/" "$bg"
-    [ "$(read_pin "$browser" GITHUB_TAG)" = "$TAG" ] || fail "failed to set GITHUB_TAG in $bg"
-    [ "$(read_pin "$browser" MIN_KNOWN_SEQUENCE)" = "$NEW_SEQ" ] || fail "failed to set MIN_KNOWN_SEQUENCE in $bg"
-
-    manifest="extensions/$browser/manifest.json"
-    # sed rather than jq so key order, indentation and the trailing newline
-    # stay byte-identical apart from the version line.
-    sed -i "s/^\(    \"version\": \"\)[^\"]*\(\",\)$/\1$EXT_VERSION\2/" "$manifest"
-    [ "$(jq -r .version "$manifest")" = "$EXT_VERSION" ] || fail "failed to set version in $manifest"
-done
-
-# Test 7 in tests/test-security.js pins the same values so CI catches drift.
-sed -i "s/const pinsOk = chromeTag === '[^']*'/const pinsOk = chromeTag === '$TAG'/" tests/test-security.js
-sed -i "s/&& chromeManifest.version === '[^']*'/\&\& chromeManifest.version === '$EXT_VERSION'/" tests/test-security.js
-grep -q "chromeTag === '$TAG'" tests/test-security.js || fail "failed to update the tag pin in tests/test-security.js"
-grep -q "chromeManifest.version === '$EXT_VERSION'" tests/test-security.js || fail "failed to update the version pin in tests/test-security.js"
-
-# The extension README quotes the current release tag.
-sed -i "s#raw.githubusercontent.com/samjanny/pinchat/v[0-9.]*/hashes.json.signed#raw.githubusercontent.com/samjanny/pinchat/$TAG/hashes.json.signed#" extensions/README.md
 
 # ---------------------------------------------------------------------------
 # Every CI job. Order: cheapest and most likely to fail first.
 # ---------------------------------------------------------------------------
-step "verify-sri (signature, SRI, manifest coverage, CSP rule coverage)"
+step "verify-sri (signature, SRI, manifest coverage, page lists, CSP rule coverage)"
 node .github/scripts/verify-sri.js
 
 step "Node test suite"
@@ -131,9 +133,15 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# What is left is a matter of intent, not mechanics: commit, merge, tag.
+# What is left is a matter of intent, not mechanics: commit, merge, tag, and
+# the order in which the site and main change.
 # ---------------------------------------------------------------------------
 BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+if [ -n "$EXT_VERSION" ]; then
+    SUBJECT="chore(release): re-sign at sequence $NEW_SEQ, extension $EXT_VERSION, $TAG"
+else
+    SUBJECT="chore(release): re-sign at sequence $NEW_SEQ, $TAG"
+fi
 cat <<MSG
 
 All checks passed. Changed files:
@@ -144,7 +152,7 @@ cat <<MSG
 Next, in this order:
 
   git add -u    # tracked files only; add any new file by name after reviewing the list above
-  git commit -m "chore(release): re-sign at sequence $NEW_SEQ, pin extension $EXT_VERSION at $TAG"
+  git commit -m "$SUBJECT"
 MSG
 if [ "$BRANCH" != "main" ]; then
     cat <<MSG
@@ -154,10 +162,23 @@ MSG
 fi
 cat <<MSG
   git tag -a $TAG -m "$TAG"
-  git push origin main $TAG
+  git push origin $TAG          # the tag only: main does not move yet
 
-Then deploy the tag (ops/store-release-runbook.md, per-release procedure) and
-only after the tag is live build the store packages:
+The extensions take the manifest from main. Pushed before the site serves
+this release, it would make the pages still served look like a release
+nobody signed. So build the tag on the server and dry-run it first
+(README, "Docker"), then push main and switch the site right after:
+
+  git push origin main          # then, on the server: docker compose up -d
+
+A page loaded in between asks the release host again when it does not match,
+and is loaded again under the new release once main has it.
+MSG
+if [ -n "$EXT_VERSION" ]; then
+    cat <<MSG
+
+Then build the store packages of $EXT_VERSION from the tag:
 
   extensions/package.sh $TAG
 MSG
+fi

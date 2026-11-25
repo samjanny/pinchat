@@ -17,7 +17,7 @@
         "https://raw.githubusercontent.com/samjanny/pinchat/*"
     ],
     "background": {
-        "scripts": ["verdict.js", "background.js"]
+        "scripts": ["verdict.js", "csp-rules.js", "background.js"]
     },
     "declarative_net_request": {
         "rule_resources": [

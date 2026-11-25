@@ -4,9 +4,12 @@
  * The same file runs as the service worker in Chromium and as the event page
  * in Firefox. What it does:
  *
- * 1. Fetches the signed release manifest (hashes.json.signed) from the pinned
- *    release tag, verifies its ECDSA signature against the embedded key and
- *    refuses a sequence lower than the last one seen (anti-rollback).
+ * 1. Fetches the signed release manifest (hashes.json.signed) from the main
+ *    branch of the repository, verifies its ECDSA signature against the
+ *    embedded key and refuses a sequence lower than the last one seen
+ *    (anti-rollback). The script policy of every page is then built from that
+ *    manifest and put in force in place of the packaged one, so a new release
+ *    of the site needs a new signature, not a new extension.
  * 2. Keeps one state per tab and per document. A result obtained for one
  *    document is never shown for another.
  * 3. Where the browser lets an extension hold a response body (Firefox),
@@ -18,8 +21,10 @@
  *    an invite link carries its key in the URL fragment, and browsers carry
  *    the fragment across redirects.
  *
- * The script policy itself (rules.json) is static and applies whether or not
- * this script is running. The meaning of every state is defined in
+ * The script policy is a set of declarativeNetRequest rules, which the browser
+ * applies whether or not this script is running: the packaged ones
+ * (rules.json) until a manifest has been verified, the ones built from it
+ * (csp-rules.js) afterwards. The meaning of every state is defined in
  * verdict.js.
  */
 
@@ -60,42 +65,35 @@ const OFFICIAL_ORIGINS = [`https://${OFFICIAL_DOMAIN}`, `https://www.${OFFICIAL_
 
 // Official GitHub repository for manifest - DO NOT MODIFY for official pinchat.im usage
 const GITHUB_REPO = 'samjanny/pinchat';
-// F-15: pin the manifest URL to a release tag, not a mutable branch.
-// Rationale: an attacker with GitHub-write access (account takeover, malicious
-// PR merge, stolen PAT) could otherwise push a freshly-signed-with-stolen-key
-// manifest to `main` and have every installed extension fetch it on the next
-// refresh. Pinning to a tag moves the trust anchor onto a string that cannot
-// be silently rewritten - a tag rebase shows up in `git log --tags --graph`
-// and the manifest is immutable at the GitHub raw URL once the tag is pushed.
-// Lifecycle: this constant MUST be bumped to the new tag on every extension
-// release. A server-side release that does NOT ship a new extension keeps
-// using the previous pinned manifest - that is the intended behaviour and
-// reinforces the trust anchor.
-const GITHUB_TAG = 'v0.9.3';
+// The manifest is read from the main branch: the latest release is the one
+// the site should be serving, and a release of the site no longer needs a
+// release of the extension.
+//
+// What makes a manifest trustworthy is its signature under the key above,
+// made offline, not where it is read from. Up to 1.7.0 the address named a
+// release tag (F-15), against an attacker who can write to the repository and
+// also holds the signing key. A tag stops nobody who can write to the
+// repository either, so what the tag added was the store: new code reached
+// users only once a new extension had been reviewed. Reading main gives that
+// up, deliberately, and leaves the offline key as the one gate. Against
+// replays, a manifest must also carry a sequence no lower than the last one
+// seen and than MIN_KNOWN_SEQUENCE below.
+const MANIFEST_BRANCH = 'main';
 
 // Minimum acceptable manifest sequence: a hardcoded floor that defeats replay
 // attacks against fresh installs, where lastKnownSequence in storage is 0.
 // A manifest whose sequence is below this constant is rejected even on a
 // first install.
 //
-// COUPLING, read before changing either constant. This floor is checked
-// against the manifest fetched from GITHUB_TAG above, NOT against the
-// working tree. Setting the floor higher than the sequence of the manifest
-// at that tag makes this build reject every manifest it can fetch, which
-// disables verification for everyone running it. The two constants must
-// therefore move together: a build carrying floor N must point at a tag
-// whose hashes.json.signed is at sequence N or higher.
-//
-// tests/test-security.js pins the floor to the sequence in the working-tree
-// manifest, so a server-side re-sign bumps this number. That is safe for
-// already-installed builds (they carry their own baked-in floor and tag) but
-// it means the NEXT extension release must cut a tag containing the current
-// manifest and update GITHUB_TAG in the same commit.
+// It is the sequence of the manifest the packaged rules.json was built from,
+// set by finish-release.sh when the extension itself is released. It must not
+// be higher than the manifest on MANIFEST_BRANCH: a build that rejects every
+// manifest it can fetch verifies nothing for anyone running it.
 const MIN_KNOWN_SEQUENCE = 59;
 
 // Configuration
 const CONFIG = {
-    HASH_LIST_URL: `https://raw.githubusercontent.com/${GITHUB_REPO}/${GITHUB_TAG}/hashes.json.signed`,
+    HASH_LIST_URL: `https://raw.githubusercontent.com/${GITHUB_REPO}/${MANIFEST_BRANCH}/hashes.json.signed`,
     SITE_URL: `https://${OFFICIAL_DOMAIN}`,
     PUBLIC_KEY: PINCHAT_PUBLIC_KEY,
     CHECK_INTERVAL_MINUTES: 5,
@@ -116,10 +114,15 @@ const MIN_LIVE_FETCH_INTERVAL_MS = 60 * 1000;
 // exposes `chrome`; under Manifest V3 both return promises.
 const ext = globalThis.browser || globalThis.chrome;
 
-if (typeof PinChatVerdict === 'undefined' && typeof importScripts === 'function') {
-    importScripts('verdict.js');
+// In Chromium this file is the service worker and loads its two companions
+// itself; Firefox loads them first, from the manifest's background scripts.
+// csp-rules.js needs verdict.js.
+if (typeof importScripts === 'function') {
+    if (typeof PinChatVerdict === 'undefined') importScripts('verdict.js');
+    if (typeof PinChatRules === 'undefined') importScripts('csp-rules.js');
 }
 const V = globalThis.PinChatVerdict;
+const R = globalThis.PinChatRules;
 
 // Whether this browser lets an extension hold the body of a navigation
 // response until it has been checked. Firefox does (filterResponseData);
@@ -145,6 +148,132 @@ const packagedRulesLoaded = fetch(ext.runtime.getURL('rules.json'))
     .then((response) => response.json())
     .then((rules) => { packagedRules = rules; })
     .catch(() => { /* the content script then compares nothing */ });
+
+// =============================================================================
+// The script policy in force
+// =============================================================================
+//
+// One set of rules is in force at a time: the packaged ruleset until a
+// manifest has been verified, then dynamic rules built from that manifest,
+// with the packaged ruleset disabled. Both are declarativeNetRequest rules,
+// which the browser applies to a response before the page is parsed, whether
+// or not this script is running, and both carry the same fixed policy around
+// the script hashes (csp-rules.js). The browser keeps dynamic rules across
+// restarts and updates of the extension, but turns the packaged ruleset back
+// on after an update; reconcileRules puts the two back in step at every start.
+
+const PACKAGED_RULESET = 'pinchat_preventive_csp';
+
+// The two redirect rules match a response header, which only Chromium's
+// declarativeNetRequest supports; the Firefox build enforces the same rule in
+// onDocumentHeaders below. The browser that can hold a response body is
+// Firefox.
+const RULES_BROWSER = CAN_ATTEST ? 'firefox' : 'chrome';
+
+// A document whose response went through the rules just before they were
+// replaced is under the policy of the replaced release. For this long, its
+// content script is told that policy too, so the change does not pass for a
+// policy that is not in force.
+const REPLACED_POLICY_GRACE_MS = 30 * 1000;
+
+const rulesInForce = {
+    rules: null,      // what the browser applies now (null: not established yet)
+    sequence: null,   // the manifest they were built from; null for the packaged ruleset
+    replaced: null,   // the rules in force before the last change
+    replacedAt: 0,
+};
+
+let rulesQueue = Promise.resolve();
+
+/** Changes to the rules run one at a time, in the order they were asked for. */
+function serializeRules(task) {
+    const run = rulesQueue.then(task);
+    rulesQueue = run.catch(() => {});
+    return run;
+}
+
+function recordRulesInForce(rules, sequence) {
+    if (rulesInForce.rules && JSON.stringify(rulesInForce.rules) !== JSON.stringify(rules)) {
+        rulesInForce.replaced = rulesInForce.rules;
+        rulesInForce.replacedAt = Date.now();
+    }
+    rulesInForce.rules = rules;
+    rulesInForce.sequence = sequence;
+}
+
+/** Back to the packaged ruleset alone. */
+async function usePackagedRules() {
+    await packagedRulesLoaded;
+    const dnr = ext.declarativeNetRequest;
+    const installed = await dnr.getDynamicRules();
+    if (installed.length > 0) {
+        await dnr.updateDynamicRules({ removeRuleIds: installed.map((rule) => rule.id) });
+    }
+    await dnr.updateEnabledRulesets({ enableRulesetIds: [PACKAGED_RULESET] });
+    recordRulesInForce(packagedRules, null);
+}
+
+/**
+ * Put the rules of a verified manifest in force, in place of the packaged
+ * ones or of those of an earlier manifest. Never goes back to an older
+ * manifest than the one in force. If the browser refuses the change, the
+ * packaged ruleset is put back: a page is never left with no policy, only
+ * with one that may not run the latest release.
+ */
+function applyManifestRules(data) {
+    return serializeRules(async () => {
+        if (rulesInForce.sequence !== null && data.sequence <= rulesInForce.sequence) return;
+        const dnr = ext.declarativeNetRequest;
+        try {
+            const rules = R.buildRules(data, RULES_BROWSER);
+            const installed = await dnr.getDynamicRules();
+            await dnr.updateDynamicRules({
+                removeRuleIds: installed.map((rule) => rule.id),
+                addRules: rules,
+            });
+            await dnr.updateEnabledRulesets({ disableRulesetIds: [PACKAGED_RULESET] });
+            recordRulesInForce(rules, data.sequence);
+        } catch (error) {
+            console.error('[PinChat Verify] Could not put the rules of the signed manifest in force:', error);
+            try {
+                await usePackagedRules();
+            } catch {
+                /* the browser keeps whatever it has; the packaged ruleset is on by default */
+            }
+        }
+    });
+}
+
+/** At every start: the rules of the stored manifest, or the packaged ones. */
+async function reconcileRules() {
+    await packagedRulesLoaded;
+    const cached = await loadCachedManifest();
+    if (cached) {
+        await applyManifestRules(cached.data);
+        return;
+    }
+    await serializeRules(async () => {
+        // A manifest fetched meanwhile has put its own rules in force.
+        if (rulesInForce.sequence === null) await usePackagedRules();
+    });
+}
+
+/**
+ * The policies a document at this address may be under: the one the rules in
+ * force give it and, just after a change, the one the replaced rules gave it.
+ */
+function expectedPolicies(url) {
+    const policies = [];
+    const add = (rules) => {
+        const policy = V.packagedPolicy(rules, url);
+        if (policy !== null && !policies.includes(policy)) policies.push(policy);
+    };
+    add(rulesInForce.rules || packagedRules);
+    if (rulesInForce.replaced && Date.now() - rulesInForce.replacedAt < REPLACED_POLICY_GRACE_MS) {
+        add(rulesInForce.replaced);
+    }
+    return policies;
+}
 
 /**
  * Whether the extension may act on the site right now. Without it the
@@ -317,6 +446,15 @@ async function validateSignedManifest(signedData) {
         return { ok: false, kind: 'invalid', reason: `DOWNGRADE ATTACK DETECTED - ${detail}` };
     }
 
+    // The script policy of every page is built from the manifest. One that
+    // does not allow it, signed as it is, is a broken release, not an attack,
+    // and nothing is vouched for with it.
+    try {
+        R.pageScriptLists(signedData.data);
+    } catch (error) {
+        return { ok: false, kind: 'error', reason: `Signed manifest is unusable: ${error.message}` };
+    }
+
     return { ok: true, data: signedData.data, sequence: manifestSequence, lastKnownSequence };
 }
 
@@ -331,9 +469,9 @@ async function validateSignedManifest(signedData) {
  * re-validated on every read, so writing to extension storage buys an
  * attacker nothing that forging a signature would not already require.
  *
- * The packaged declarativeNetRequest policy is unaffected either way: it
- * ships inside the extension and keeps blocking unpinned scripts even with
- * no manifest at all.
+ * The script policy is unaffected either way: the rules in force, those of
+ * the last verified manifest or the packaged ones, stay with the browser and
+ * keep blocking unpinned scripts even with no manifest at all.
  */
 async function cacheSignedManifest(signedData) {
     try {
@@ -384,15 +522,20 @@ async function loadCachedManifest() {
  * A manifest that fails its signature or the sequence floor is an attack
  * signal and is never rescued by the stored copy. Only a transport failure
  * falls back to it.
+ *
+ * `bypassCache` asks past the release host's own cache, which keeps a copy of
+ * the main branch for a few minutes: for when a page has just turned out not
+ * to match, and a release signed in those minutes is the likely reason.
  */
-async function verifyIntegrity() {
+async function verifyIntegrity({ bypassCache = false } = {}) {
     verificationState.lastCheck = new Date().toISOString();
     verificationState.errors = [];
 
     let signedData = null;
     let fetchError = null;
     try {
-        const response = await fetchWithTimeout(CONFIG.HASH_LIST_URL, { cache: 'no-store' });
+        const url = bypassCache ? `${CONFIG.HASH_LIST_URL}?t=${Date.now()}` : CONFIG.HASH_LIST_URL;
+        const response = await fetchWithTimeout(url, { cache: 'no-store' });
         if (!response.ok) {
             throw new Error(`Failed to fetch hash list: ${response.status}`);
         }
@@ -429,6 +572,7 @@ async function verifyIntegrity() {
         verificationState.signatureStatus = 'valid';
         verificationState.usingCachedManifest = false;
         verificationState.manifestCachedAt = null;
+        await applyManifestRules(result.data);
     } else {
         const cached = await loadCachedManifest();
         if (!cached) {
@@ -443,10 +587,62 @@ async function verifyIntegrity() {
         verificationState.usingCachedManifest = true;
         verificationState.manifestCachedAt = cached.cachedAt;
         verificationState.errors.push(`Update host unreachable: ${fetchError}`);
+        await applyManifestRules(cached.data);
     }
 
     await reevaluateAllDocuments();
     return verificationState;
+}
+
+// How often a page that does not match may make the extension ask the release
+// host again, past its cache. Bounds what a page that never matches costs.
+const MISMATCH_RECHECK_INTERVAL_MS = 30 * 1000;
+let lastMismatchRecheckAt = 0;
+
+/**
+ * A document did not match the manifest in force. If a newer release was
+ * signed since the extension last asked, that is the likely reason: ask the
+ * release host again before the mismatch stands. True when a newer manifest
+ * is now in force, with its rules.
+ */
+async function newerReleaseSigned() {
+    const now = Date.now();
+    if (now - lastMismatchRecheckAt < MISMATCH_RECHECK_INTERVAL_MS) return false;
+    lastMismatchRecheckAt = now;
+    const before = verificationState.manifest ? verificationState.manifest.sequence : null;
+    await verifyIntegrity({ bypassCache: true });
+    return manifestVerdict() === 'valid'
+        && !verificationState.usingCachedManifest
+        && !!verificationState.manifest
+        && (before === null || verificationState.manifest.sequence > before);
+}
+
+/** tabId -> sequence of the release the tab was last reloaded for. */
+const releaseReloads = new Map();
+
+/**
+ * Load a tab again under the rules of a newer release, once per release: a
+ * page that matches no release must not reload for ever.
+ */
+function reloadForRelease(tabId) {
+    const sequence = verificationState.manifest ? verificationState.manifest.sequence : null;
+    if (sequence === null || releaseReloads.get(tabId) === sequence) return false;
+    releaseReloads.set(tabId, sequence);
+    ext.tabs.reload(tabId).catch(() => {});
+    return true;
+}
+
+// What a page of a release the extension does not know yet looks like from
+// its content script: its scripts are not signed (and the policy blocks
+// them), its files and stylesheets differ.
+const RELEASE_MISMATCH_CODES = new Set([
+    'document-hash-mismatch', 'file-hash-mismatch', 'blocked-script', 'unsigned-stylesheet',
+]);
+
+/** After a content script reported its document: reload it for a newer release, if there is one. */
+async function recheckReleaseFor(record) {
+    if (!record.official || !record.findings.some((entry) => RELEASE_MISMATCH_CODES.has(entry.code))) return;
+    if (await newerReleaseSigned()) reloadForRelease(record.tabId);
 }
 
 /**
@@ -664,6 +860,7 @@ async function reevaluateAllDocuments() {
 function forgetTab(tabId) {
     documents.delete(tabId);
     workerReloads.delete(tabId);
+    releaseReloads.delete(tabId);
     for (const key of [...receipts.keys()]) {
         if (key.startsWith(`${tabId}:`)) receipts.delete(key);
     }
@@ -902,6 +1099,7 @@ async function finishDocument(track) {
     }
     let outcome = { verified: false, code: 'document-not-attested', detail: '' };
     let body = null;
+    let reloadTab = false;
     try {
         await restoreSessionState();
         await ensureManifest();
@@ -919,8 +1117,10 @@ async function finishDocument(track) {
                 body.set(chunk, offset);
                 offset += chunk.byteLength;
             }
-            const expected = V.documentHashes(verificationState.manifest).get(new URL(track.url).pathname);
-            if (expected && toHex(await crypto.subtle.digest('SHA-256', body)) === expected) {
+            const pathname = new URL(track.url).pathname;
+            const actual = toHex(await crypto.subtle.digest('SHA-256', body));
+            const expected = V.documentHashes(verificationState.manifest).get(pathname);
+            if (expected && actual === expected) {
                 outcome = { verified: true, code: null, detail: '' };
             } else if (track.status >= 400) {
                 // The server says itself that this is not the page: a room
@@ -928,10 +1128,23 @@ async function finishDocument(track) {
                 // during a restart. It is withheld like anything else that
                 // is not the signed page, but it is not a mismatch.
                 outcome = { verified: false, code: 'error-response', detail: `HTTP status ${track.status}` };
-            } else if (!expected) {
-                outcome = { verified: false, code: 'unlisted-document', detail: `HTTP status ${track.status}` };
             } else {
-                outcome = { verified: false, code: 'document-hash-mismatch', detail: '' };
+                outcome = expected
+                    ? { verified: false, code: 'document-hash-mismatch', detail: '' }
+                    : { verified: false, code: 'unlisted-document', detail: `HTTP status ${track.status}` };
+                // The page of a release signed after the extension last
+                // asked. Its response already carries the policy of the
+                // release before, which runs none of its scripts: it is
+                // withheld, and loaded again under the policy of its own.
+                if (track.frameId === 0 && await newerReleaseSigned()
+                    && V.documentHashes(verificationState.manifest).get(pathname) === actual) {
+                    outcome = {
+                        verified: false,
+                        code: 'document-not-attested',
+                        detail: 'A newer release has just been signed. The page is being loaded again under its policy.',
+                    };
+                    reloadTab = true;
+                }
             }
         }
     } catch (error) {
@@ -957,6 +1170,7 @@ async function finishDocument(track) {
     }
     try { stream.close(); } catch { /* already closed */ }
     inflight.delete(track.requestId);
+    if (reloadTab) reloadForRelease(track.tabId);
 }
 
 /**
@@ -1125,12 +1339,14 @@ ext.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message.type === 'DOCUMENT_OPENED') {
         if (!isSenderTrusted(sender, 'content')) return false;
         Promise.all([
-            restoreSessionState(), ensureManifest(), hasHostAccess(sender.url), packagedRulesLoaded,
+            restoreSessionState(), ensureManifest(), hasHostAccess(sender.url), packagedRulesLoaded, rulesReady,
         ]).then(([, , hostAccess]) => {
             const record = openDocument(sender, message, hostAccess);
+            const policies = expectedPolicies(record.url);
             sendResponse({
                 ...manifestForContent(),
-                expectedPolicy: V.packagedPolicy(packagedRules, record.url),
+                expectedPolicy: policies.length > 0 ? policies[0] : null,
+                expectedPolicies: policies,
                 verdict: publicView(record),
             });
         });
@@ -1142,6 +1358,7 @@ ext.runtime.onMessage.addListener((message, sender, sendResponse) => {
         restoreSessionState().then(() => {
             const record = updateDocument(sender, message);
             sendResponse(record ? { verdict: publicView(record) } : { verdict: null });
+            if (record) recheckReleaseFor(record).catch(() => {});
         });
         return true;
     }
@@ -1268,4 +1485,7 @@ ext.tabs.onUpdated.addListener((tabId, changeInfo) => {
 });
 
 restoreSessionState();
+const rulesReady = reconcileRules().catch((error) => {
+    console.error('[PinChat Verify] Could not establish the rules in force:', error);
+});
 verifyIfRelevant('background start');

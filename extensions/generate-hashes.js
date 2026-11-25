@@ -20,7 +20,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const readline = require('readline');
-const { writeRulesFromManifest } = require('./generate-csp-rules');
+const { writeRulesFromManifest, pageEntries } = require('./generate-csp-rules');
 
 // Files to hash - order matters: JS/CSS first, then HTML (which depends on JS/CSS hashes)
 const JS_CSS_FILES = [
@@ -571,13 +571,29 @@ async function main() {
         console.log(`  Previous sequence: ${currentSequence}, new sequence: ${sequence}`);
     }
 
+    // Step 6: the scripts each page loads, read from the markup that is being
+    // signed. The extension builds the script policy of every page from this
+    // list and the hashes above, so a page's list is signed with the page.
+    console.log('\nStep 6: Listing the scripts of every page...');
+    const htmlOf = (urlPath) => {
+        const fullPath = path.join(options.staticDir, urlPathToFilePath(urlPath));
+        const update = htmlUpdates.find(u => u.path === fullPath);
+        return update ? String(update.content) : fs.readFileSync(fullPath, 'utf8');
+    };
+    const pages = pageEntries(files, htmlOf);
+    for (const page of pages) {
+        console.log(`  ${page.path}: ${page.scripts.length} scripts`);
+    }
+
     // Create data object
     const data = {
-        version: '1.2.0',  // Bumped version for anti-downgrade support
+        // 1.2.0 added the sequence (anti-downgrade); 1.3.0 the page lists.
+        version: '1.3.0',
         sequence: sequence,  // Anti-downgrade sequence number
         generated: new Date().toISOString(),
         site: 'https://pinchat.im',
-        files
+        files,
+        pages
     };
 
     if (options.noSign) {

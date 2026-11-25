@@ -37,35 +37,48 @@ git rev-parse --verify "$REF" >/dev/null 2>&1 || fail "unknown git ref: $REF"
 # Release-pin consistency.
 #
 # The extension fetches its manifest from
-#   raw.githubusercontent.com/<repo>/<GITHUB_TAG>/hashes.json.signed
-# and refuses anything below MIN_KNOWN_SEQUENCE. Store review takes days, so
-# these have to be right *before* submission: a build whose tag does not exist
-# yet, or whose floor is above the sequence at that tag, rejects every manifest
-# it can fetch and ships a permanently broken verifier.
+#   raw.githubusercontent.com/<repo>/main/hashes.json.signed
+# refuses anything below MIN_KNOWN_SEQUENCE, and until it has verified one
+# applies the rules.json it was packaged with. Store review takes days, so
+# these have to be right *before* submission: a build whose floor is above
+# the manifest on main rejects every manifest it can fetch and ships a
+# broken verifier, and one whose floor is below the manifest its packaged
+# rules come from lets a fresh install accept an older release.
 # ---------------------------------------------------------------------------
 read_pin() { # <browser> <const-name>
     git show "$REF:extensions/$1/background.js" \
         | sed -n "s/^const $2 = '\{0,1\}\([^';]*\)'\{0,1\};/\1/p" | head -1
 }
 
-CHROME_TAG="$(read_pin chrome GITHUB_TAG)"
-FIREFOX_TAG="$(read_pin firefox GITHUB_TAG)"
+CHROME_BRANCH="$(read_pin chrome MANIFEST_BRANCH)"
+FIREFOX_BRANCH="$(read_pin firefox MANIFEST_BRANCH)"
 CHROME_FLOOR="$(read_pin chrome MIN_KNOWN_SEQUENCE)"
 FIREFOX_FLOOR="$(read_pin firefox MIN_KNOWN_SEQUENCE)"
 
-[ -n "$CHROME_TAG" ] || fail "could not read GITHUB_TAG from the chrome background script"
-[ "$CHROME_TAG" = "$FIREFOX_TAG" ] \
-    || fail "GITHUB_TAG differs: chrome=$CHROME_TAG firefox=$FIREFOX_TAG"
+[ "$CHROME_BRANCH" = "main" ] && [ "$FIREFOX_BRANCH" = "main" ] \
+    || fail "both builds must read the manifest from main: chrome=$CHROME_BRANCH firefox=$FIREFOX_BRANCH"
+[ -n "$CHROME_FLOOR" ] || fail "could not read MIN_KNOWN_SEQUENCE from the chrome background script"
 [ "$CHROME_FLOOR" = "$FIREFOX_FLOOR" ] \
     || fail "MIN_KNOWN_SEQUENCE differs: chrome=$CHROME_FLOOR firefox=$FIREFOX_FLOOR"
 
-git rev-parse --verify "$CHROME_TAG^{commit}" >/dev/null 2>&1 \
-    || fail "GITHUB_TAG $CHROME_TAG does not exist locally. Cut and push the release tag first."
+REF_SEQ="$(git show "$REF:hashes.json.signed" | jq -r '.data.sequence')"
+[ "$REF_SEQ" != "null" ] || fail "no signed manifest at $REF"
+[ "$(git show "$REF:hashes.json.signed" | jq -r '.data.pages | type')" = "array" ] \
+    || fail "the manifest at $REF lists no page scripts: this build could verify nothing with it"
+[ "$REF_SEQ" = "$CHROME_FLOOR" ] \
+    || fail "floor $CHROME_FLOOR is not the sequence $REF_SEQ of the manifest at $REF, which the packaged rules come from: release the extension with finish-release.sh <tag> <version>"
 
-TAG_SEQ="$(git show "$CHROME_TAG:hashes.json.signed" | jq -r '.data.sequence')"
-[ "$TAG_SEQ" != "null" ] || fail "no signed manifest at $CHROME_TAG"
-[ "$TAG_SEQ" -ge "$CHROME_FLOOR" ] \
-    || fail "floor $CHROME_FLOOR is above sequence $TAG_SEQ at $CHROME_TAG: this build would reject every manifest it can fetch"
+# The build verifies nothing until main carries its floor. Warn, do not
+# fail: main may simply not have been pushed yet.
+if MAIN_SEQ="$(git show origin/main:hashes.json.signed 2>/dev/null | jq -r '.data.sequence' 2>/dev/null)" \
+    && [[ "$MAIN_SEQ" =~ ^[0-9]+$ ]]; then
+    if [ "$MAIN_SEQ" -lt "$CHROME_FLOOR" ]; then
+        echo "WARNING: origin/main is at sequence $MAIN_SEQ, below the floor $CHROME_FLOOR of this build." >&2
+        echo "         Push main before submitting it, or it verifies nothing." >&2
+    fi
+else
+    echo "WARNING: origin/main not available locally; make sure main carries sequence $CHROME_FLOOR before submitting." >&2
+fi
 
 # Version parity. Both stores key auto-update off this number and nothing else.
 CHROME_VER="$(git show "$REF:extensions/chrome/manifest.json" | jq -r .version)"
@@ -74,7 +87,7 @@ FIREFOX_VER="$(git show "$REF:extensions/firefox/manifest.json" | jq -r .version
     || fail "manifest version differs: chrome=$CHROME_VER firefox=$FIREFOX_VER"
 
 echo "Packaging version $CHROME_VER from $REF"
-echo "  manifest pin: $CHROME_TAG (sequence $TAG_SEQ, floor $CHROME_FLOOR)"
+echo "  manifest from main, floor $CHROME_FLOOR (packaged rules from sequence $REF_SEQ)"
 echo
 
 mkdir -p "$OUT"

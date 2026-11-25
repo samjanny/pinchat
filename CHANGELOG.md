@@ -4,6 +4,50 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Dates are the repository-local commit dates; entries are curated for user-visible impact
 rather than being a 1:1 mirror of `git log`.
 
+## [Unreleased] - extensions 1.8.0
+
+### Changed - the extensions read the latest signed manifest
+
+Up to 1.7.0 each build of the extensions read the manifest of one release
+tag, with the script policy of every page packaged in it, so every release
+of the site needed a release of the extensions and days of store review,
+during which the installed build reported the changed files of the site as
+a mismatch. The extensions now read the manifest from the main branch and
+build the script policy of every page from it.
+
+- The signed manifest (format 1.3.0) lists, for every page, the scripts it
+  loads, read from the page when it is signed. verify-sri.js fails when a
+  signed list and the scripts the page loads differ.
+- The extensions build the policy of each page from that list and the
+  signed hashes (`csp-rules.js`, the same code that writes the packaged
+  `rules.json`), put it in force as dynamic rules and turn the packaged
+  ruleset off. Everything around the hashes stays fixed in the extensions:
+  a manifest can only say which of its own signed scripts a page may run. A
+  manifest whose lists name an unsigned script, an unexpected path or no
+  script at all is not used. The packaged rules apply until a manifest has
+  been verified, and again if the browser refuses the new ones.
+- A page that does not match the manifest makes the extension ask GitHub
+  again, past its cache, at most every 30 seconds. A page of a release
+  signed since is loaded again under that release's policy, once.
+- For 30 seconds after a change of policy, a page that was loaded under the
+  replaced one is told both, so the change does not pass for a policy that
+  is not in force. Checking a page again by hand compares it with the
+  release it was loaded under.
+- `finish-release.sh <tag>` releases the site alone. With an extension
+  version as second argument it releases the extensions too, and their
+  floor (`MIN_KNOWN_SEQUENCE`) moves to the new manifest's sequence.
+  `package.sh` requires the floor to be the sequence of the manifest the
+  packaged rules come from, and warns when main is behind it.
+
+The trust model changes on one point. Up to 1.7.0 new code reached users
+only once a new extension had passed store review; now the offline signing
+key is the one gate, together with write access to the repository (see
+"What This Does NOT Protect Against" in SECURITY.md).
+
+Release order: main must not carry a manifest before the site serves it.
+Push the tag, build and dry-run it on the server, then push main and switch
+the site right after.
+
 ## [2026-11-25] - v0.9.3
 
 Fixes for the findings of an internal audit of v0.9.2 across five areas: the
