@@ -312,6 +312,19 @@ function main() {
       return { bad, pagesChecked };
     }
 
+    // The extension builds the policy of every page from the script list the
+    // manifest signs for it. A list that named a script the page does not
+    // load would allow that script there, and one that missed a script
+    // would block it: the signed lists must be the scripts the pages load.
+    const { pageEntries } = require('../../extensions/generate-csp-rules');
+    const fromPages = pageEntries(signed.data.files);
+    if (JSON.stringify(signed.data.pages) !== JSON.stringify(fromPages)) {
+      console.error('SIGNED MANIFEST: its page lists are not the scripts the pages load (re-sign)');
+      totalBad++;
+    } else {
+      console.log(`Signed manifest: page lists match the scripts of all ${fromPages.length} pages`);
+    }
+
     for (const browser of ['chrome', 'firefox']) {
       const rulesPath = `extensions/${browser}/rules.json`;
       const actualRules = JSON.parse(fs.readFileSync(rulesPath, 'utf8'));

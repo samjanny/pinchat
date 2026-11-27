@@ -335,7 +335,7 @@ async function runTests() {
     console.log('');
 
     // -------------------------------------------------------------------------
-    // Test 7: Extension release pins are compatible with this manifest
+    // Test 7: The extensions read the latest manifest, and accept this one
     // -------------------------------------------------------------------------
     console.log('--- Test 7: Extension release pins are manifest-compatible ---');
     try {
@@ -350,8 +350,8 @@ async function runTests() {
             if (!match) throw new Error(`${name} not found`);
             return match[1] === undefined ? Number(match[2]) : match[1];
         };
-        const chromeTag = readPin(chromeBackground, 'GITHUB_TAG');
-        const firefoxTag = readPin(firefoxBackground, 'GITHUB_TAG');
+        const chromeBranch = readPin(chromeBackground, 'MANIFEST_BRANCH');
+        const firefoxBranch = readPin(firefoxBackground, 'MANIFEST_BRANCH');
         const chromeFloor = readPin(chromeBackground, 'MIN_KNOWN_SEQUENCE');
         const firefoxFloor = readPin(firefoxBackground, 'MIN_KNOWN_SEQUENCE');
         const readPublicKey = (source) => {
@@ -360,23 +360,30 @@ async function runTests() {
             return match[1];
         };
 
-        const pinsOk = chromeTag === 'v0.9.3'
-            && firefoxTag === chromeTag
+        // Both builds read the manifest from main, the release the site
+        // should be serving, and no longer name a release tag: a release of
+        // the site needs a signature, not a release of the extension.
+        const readsMain = [chromeBackground, firefoxBackground].every((source) => !/GITHUB_TAG/.test(source)
+            && /HASH_LIST_URL: `https:\/\/raw\.githubusercontent\.com\/\$\{GITHUB_REPO\}\/\$\{MANIFEST_BRANCH\}\/hashes\.json\.signed`/
+                .test(source));
+        const pinsOk = chromeBranch === 'main'
+            && firefoxBranch === chromeBranch
+            && readsMain
             && Number.isSafeInteger(chromeFloor)
             && chromeFloor > 0
             && chromeFloor <= signed.data.sequence
             && firefoxFloor === chromeFloor
-            && chromeManifest.version === '1.7.0'
+            && chromeManifest.version === '1.8.0'
             && firefoxManifest.version === chromeManifest.version
             && readPublicKey(chromeBackground) === readPublicKey(firefoxBackground);
         if (!pinsOk) {
             throw new Error(
-                `tag chrome/firefox=${chromeTag}/${firefoxTag}, `
+                `branch chrome/firefox=${chromeBranch}/${firefoxBranch}, reads main: ${readsMain}, `
                 + `floor=${chromeFloor}/${firefoxFloor}, signed=${signed.data.sequence}, `
                 + `extension=${chromeManifest.version}/${firefoxManifest.version}`,
             );
         }
-        console.log(`  Release ${chromeTag}, sequence floor ${chromeFloor}, extension ${chromeManifest.version}`);
+        console.log(`  Manifest from ${chromeBranch}, sequence floor ${chromeFloor}, extension ${chromeManifest.version}`);
         console.log('PASSED: Chrome and Firefox release pins are aligned');
         passed++;
     } catch (e) {

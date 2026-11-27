@@ -50,9 +50,10 @@ let checksDone = false;
 // browser reports it, is told from the page's own. See V.isProbeViolation.
 const PROBE_MARKER = Array.from(crypto.getRandomValues(new Uint8Array(V.PROBE_MARKER_LENGTH / 2)))
     .map((byte) => byte.toString(16).padStart(2, '0')).join('');
-// The policy the packaged rules give this address, from the background
-// script, and the policies the browser named for blocking the probe.
-let expectedPolicy = null;
+// The policies the rules in force give this address, from the background
+// script (more than one just after a new release was put in force), and the
+// policies the browser named for blocking the probe.
+let expectedPolicies = [];
 const canaryPolicies = [];
 // Whether the background script compared the bytes of this document with
 // the signed page before the parser saw them (Firefox).
@@ -120,7 +121,8 @@ function policyIsInForce() {
  * script the server cares to serve. That is exactly the situation when the
  * packaged rules were not applied, for instance because the extension may
  * act on the site only on request. The browser names the policy it applied
- * in the violation, and that is compared with the packaged one.
+ * in the violation, and that is compared with the one the rules in force
+ * give this address.
  *
  * Only a reported violation counts; no report proves nothing either way.
  * Chromium reports no violation that an extension's own code causes, the
@@ -131,8 +133,10 @@ function policyIsInForce() {
 let otherPolicyFound = false;
 
 function checkPolicyIsPackaged() {
-    if (otherPolicyFound || !expectedPolicy || canaryPolicies.length === 0) return;
-    if (canaryPolicies.some((policy) => V.sameScriptPolicy(policy, expectedPolicy))) return;
+    if (otherPolicyFound || expectedPolicies.length === 0 || canaryPolicies.length === 0) return;
+    if (canaryPolicies.some((policy) => expectedPolicies.some((expected) => V.sameScriptPolicy(policy, expected)))) {
+        return;
+    }
     otherPolicyFound = true;
     const entry = V.finding('policy-not-in-force',
         `the browser applied another policy: ${canaryPolicies[0].slice(0, 120)}`);
@@ -874,7 +878,8 @@ async function start({ restored = false } = {}) {
         buildManifestSRIMap(manifestData);
     }
     documentAttested = !!(opened.verdict && opened.verdict.attested === true);
-    expectedPolicy = typeof opened.expectedPolicy === 'string' ? opened.expectedPolicy : null;
+    expectedPolicies = (Array.isArray(opened.expectedPolicies) ? opened.expectedPolicies : [opened.expectedPolicy])
+        .filter((policy) => typeof policy === 'string');
     if (opened.verdict) applyVerdict(opened.verdict);
     checkPolicyIsPackaged();
 
@@ -905,12 +910,16 @@ ext.runtime.onMessage.addListener((message, sender, sendResponse) => {
         applyVerdict(message.verdict);
     }
     if (message.type === 'RECHECK') {
+        // The document is checked again against the release it was loaded
+        // under. A newer one may be in force by now, and this document,
+        // loaded before it, is not a copy of it that differs. A manifest is
+        // taken from the background only if the document had none.
         sendMessage({ type: 'GET_STATUS' }).then((status) => {
-            if (status && status.manifest) {
+            if (!manifestData && status && status.manifest) {
                 manifestData = status.manifest;
                 buildManifestSRIMap(manifestData);
-                inspect({ files: true });
             }
+            if (manifestData) inspect({ files: true });
         });
     }
 });

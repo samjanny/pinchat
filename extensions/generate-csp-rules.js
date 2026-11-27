@@ -3,18 +3,24 @@
 /**
  * Generate preventive, hash-only CSP rules for the browser extensions.
  *
- * The rules are derived from the release's signed manifest and packaged in
- * the extension. declarativeNetRequest applies them to response headers before
- * the page is parsed, so a compromised origin cannot execute a newly injected
- * same-origin script. The existing content script remains the detection and
- * warning layer for HTML/SRI tampering.
+ * The rules are derived from the release's signed manifest. The manifest
+ * signs, for every page, the scripts it loads (pageEntries below, read from
+ * the page when the manifest is signed), and the extension builds the same
+ * rules from the manifest it fetches and verifies, with the same code
+ * (chrome/csp-rules.js). The copy packaged here as rules.json is what applies
+ * before the extension has verified any manifest.
+ *
+ * declarativeNetRequest applies the rules to response headers before the
+ * page is parsed, so a compromised origin cannot execute a newly injected
+ * same-origin script. The content script remains the detection and warning
+ * layer for HTML/SRI tampering.
  */
 
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 
-const { EXTERNAL_REDIRECT_TARGETS } = require('./chrome/verdict.js');
+const policy = require('./chrome/csp-rules.js');
 
 // Pages that get a per-page, hash-pinned script-src. The script list for
 // each one is READ FROM THE PAGE ITSELF rather than repeated here.
@@ -27,9 +33,9 @@ const { EXTERNAL_REDIRECT_TARGETS } = require('./chrome/verdict.js');
 // generateNickname() from nicknames.js on every connection.
 //
 // Deriving the list makes that class of drift impossible: adding a <script>
-// to a page automatically adds its hash to that page's policy on the next
-// regeneration, and verify-sri.js fails the build if a page ever loads a
-// script the rules do not cover.
+// to a page automatically adds it to the signed list of that page on the
+// next signature, and verify-sri.js fails the build if the signed list and
+// the page ever disagree.
 const PAGES = [
     '/static/index.html',
     '/static/login.html',
@@ -46,9 +52,10 @@ const SCRIPT_SRC_RE = /<script\b[^>]*\ssrc="([^"]+)"/g;
  * no third-party host, so a cross-origin script tag would be blocked at
  * runtime and silently breaking the page is worse than failing the build.
  */
-function pageScripts(pagePath, hashesByPath) {
-    const filePath = path.join(__dirname, '..', pagePath.replace(/^\//, ''));
-    const html = fs.readFileSync(filePath, 'utf8');
+function pageScripts(pagePath, hashesByPath, html = null) {
+    if (html === null) {
+        html = fs.readFileSync(path.join(__dirname, '..', pagePath.replace(/^\//, '')), 'utf8');
+    }
 
     // Prove this is the signed page before trusting anything in it.
     //
@@ -91,216 +98,24 @@ function pageScripts(pagePath, hashesByPath) {
 }
 
 /**
- * Where each page may submit a form. Only the login page posts one to the
- * server. The forms of the chat and the home page are handled by the
- * application (@submit.prevent) and never submitted, and the legal pages
- * have none. Everywhere else a form, a served one included, whether in the
- * page or in a shadow tree, has nowhere to send what is typed into it.
+ * The `pages` entry of a manifest being signed: every page with the scripts
+ * it loads, read from the page. `htmlOf(pagePath)` may supply the markup
+ * (the signer passes what it is about to write); by default it is read from
+ * the repository.
  */
-const FORM_ACTIONS = {
-    '/static/login.html': "'self'",
-};
-
-function cspBase(pagePath) {
-    return [
-        "default-src 'none'",
-        "style-src 'self'",
-        "img-src 'self' blob:",
-        "font-src 'self'",
-        "connect-src 'self' wss://pinchat.im wss://www.pinchat.im",
-        "object-src 'none'",
-        // The site uses no worker of any kind. Stated explicitly so that it
-        // does not depend on worker-src falling back to script-src.
-        "worker-src 'none'",
-        "base-uri 'none'",
-        `form-action ${FORM_ACTIONS[pagePath] || "'none'"}`,
-        "frame-ancestors 'none'"
-    ];
-}
-
-/**
- * Header changes applied to every document response on the site.
- *
- * Besides setting the policy, two response headers are removed because they
- * act on the document without being part of its body, so no check of the
- * HTML can see them: `Link: <...>; rel=stylesheet` attaches a stylesheet
- * (honoured by Firefox), and `Refresh` navigates away.
- */
-function documentHeaders(csp) {
-    return [
-        { header: 'content-security-policy', operation: 'set', value: csp },
-        { header: 'link', operation: 'remove' },
-        { header: 'refresh', operation: 'remove' },
-    ];
-}
-
-/**
- * Location values a document response on the site may redirect to.
- *
- * An invite link carries its key in the URL fragment. Browsers carry the
- * fragment across an HTTP redirect, to another origin as well, unless the
- * Location header names a fragment of its own. A server that answers an
- * invite link with a redirect to an origin it controls therefore finds the
- * key in that origin's location.hash, without running any code on the site.
- * So a navigation whose address carries a fragment may be redirected to
- * the site and nowhere else (FRAGMENT_REGEX below), and one without a
- * fragment to the site or to one of EXTERNAL_REDIRECT_TARGETS, the few
- * places the site's own links lead to through a redirect.
- *
- * These are header-value patterns: "*" matches any run of characters, "?"
- * matches zero or one character, and a backslash makes the next character
- * literal. A literal question mark therefore has to be escaped: written
- * bare, "/?*" means "a slash, optionally one more character, then
- * anything", which is every value that starts with a slash. They
- * are an allowlist on purpose. "//host/..." and "/\\host/..." are
- * scheme-relative to a browser and start with a slash, so "any value that
- * begins with a slash" would let them through; each relative prefix the
- * site actually uses is listed instead, and none of them can be extended
- * into another authority.
- */
-const ALLOWED_REDIRECT_LOCATIONS = [
-    'https://pinchat.im/*',
-    'https://www.pinchat.im/*',
-    '/',
-    '/\\?*',
-    '/static/*',
-    '/c/*',
-    '/login',
-    '/login\\?*',
-];
-
-// EXTERNAL_REDIRECT_TARGETS is written for both browsers: complete
-// addresses, or a prefix with one final "*". Anything else in an entry
-// would mean something different as a header-value pattern here than it
-// does to the check in verdict.js.
-for (const target of EXTERNAL_REDIRECT_TARGETS) {
-    if (!/^https:\/\/[a-z0-9.-]+\/[A-Za-z0-9._~\/-]*\*?$/.test(target)) {
-        throw new Error(`External redirect target cannot be used as a header-value pattern: ${target}`);
-    }
-}
-
-function hexToSRI(hex) {
-    if (!/^[a-f0-9]{64}$/i.test(hex)) {
-        throw new Error(`Invalid SHA-256 manifest hash: ${hex}`);
-    }
-    return `sha256-${Buffer.from(hex, 'hex').toString('base64')}`;
-}
-
-/**
- * 'report-sample' allows no script. It makes a violation report carry the
- * first 40 characters of what was blocked, which is how the content script
- * tells the violation of its own policy probe, whose handler begins with a
- * marker of its own, from the page's (see isProbeViolation in verdict.js).
- * The catch-all rule keeps a bare 'none', which takes no other keyword.
- */
-function buildCsp(pagePath, scriptPaths, hashesByPath) {
-    const hashSources = scriptPaths.map((scriptPath) => {
-        const hash = hashesByPath.get(scriptPath);
-        if (!hash) throw new Error(`Signed manifest is missing ${scriptPath}`);
-        return `'${hexToSRI(hash)}'`;
-    });
-    return [`script-src 'report-sample' ${hashSources.join(' ')}`, ...cspBase(pagePath)].join('; ') + ';';
-}
-
-// Chrome matches a declarativeNetRequest regexFilter against the full URL,
-// fragment included, even though the fragment never reaches the server. A
-// tail that only allowed an optional query string therefore missed
-// `/static/index.html#features`, the page rule did not apply, and the
-// catch-all `script-src 'none'` rule blocked every script on the page. The
-// chat page never showed it because it always carries `?room=`. The tail
-// now accepts a query, a fragment, or both.
-const CATCH_ALL_REGEX = '^https://(www\\.)?pinchat\\.im\\.?(:[0-9]+)?/';
-
-// The same documents, when the address carries a fragment. The browser
-// matches a rule against the whole address, and the fragment an earlier
-// redirect carried over is part of it.
-const FRAGMENT_REGEX = `${CATCH_ALL_REGEX}[^#]*#`;
-
-function pageRegex(pagePath) {
-    const escapedPath = pagePath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    return `^https://(www\\.)?pinchat\\.im${escapedPath}(?:[?#].*)?$`;
-}
-
-/**
- * Build the ruleset for one browser. The policy rules are the same for
- * both. The redirect rules exist for Chromium only: they rely on matching a
- * response header, which Firefox's declarativeNetRequest does not support.
- * The Firefox build enforces the same rule in its background script.
- */
-function buildRules(manifestDocument, browser = 'chrome') {
-    const data = manifestDocument.data || manifestDocument;
-    if (!data || !Array.isArray(data.files)) {
-        throw new Error('Manifest does not contain a files array');
-    }
-
-    const hashesByPath = new Map(data.files.map((entry) => [entry.path, entry.hash]));
-    const rules = [
-        {
-            id: 1,
-            priority: 1,
-            action: {
-                type: 'modifyHeaders',
-                responseHeaders: documentHeaders(["script-src 'none'", ...cspBase(null)].join('; ') + ';')
-            },
-            condition: {
-                // Every document on the site's host names, on any port and
-                // with or without the trailing root dot. The page rules
-                // below only match the default port, so anything else keeps
-                // this policy and can run no script at all. Anchoring this
-                // rule to the default port left https://pinchat.im:<port>
-                // without any packaged policy, while the content script and
-                // the badge still treated it as the site.
-                regexFilter: CATCH_ALL_REGEX,
-                resourceTypes: ['main_frame', 'sub_frame']
-            }
-        }
-    ];
-
-    let id = 2;
-    for (const pagePath of PAGES) {
-        const scripts = pageScripts(pagePath, hashesByPath);
-        rules.push({
-            id: id++,
-            priority: 2,
-            action: {
-                type: 'modifyHeaders',
-                responseHeaders: documentHeaders(buildCsp(pagePath, scripts, hashesByPath))
-            },
-            condition: {
-                regexFilter: pageRegex(pagePath),
-                resourceTypes: ['main_frame', 'sub_frame']
-            }
-        });
-    }
-    if (browser === 'chrome') {
-        // Two rules, and a redirect has to pass both. The first holds for
-        // every navigation and does not depend on the fragment at all; the
-        // second takes the external targets away again from a navigation
-        // that carries one.
-        const redirectRule = (regexFilter, allowed) => ({
-            id: id++,
-            priority: 3,
-            action: { type: 'block' },
-            condition: {
-                regexFilter,
-                resourceTypes: ['main_frame', 'sub_frame'],
-                responseHeaders: [{
-                    header: 'location',
-                    excludedValues: allowed
-                }]
-            }
-        });
-        rules.push(redirectRule(CATCH_ALL_REGEX, [...ALLOWED_REDIRECT_LOCATIONS, ...EXTERNAL_REDIRECT_TARGETS]));
-        rules.push(redirectRule(FRAGMENT_REGEX, ALLOWED_REDIRECT_LOCATIONS));
-    }
-    return rules;
+function pageEntries(files, htmlOf = () => null) {
+    const hashesByPath = new Map(files.map((entry) => [entry.path, entry.hash]));
+    return PAGES.map((pagePath) => ({
+        path: pagePath,
+        scripts: pageScripts(pagePath, hashesByPath, htmlOf(pagePath)),
+    }));
 }
 
 function writeRulesFromManifest(manifestPath) {
     const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
     const written = {};
     for (const browser of ['chrome', 'firefox']) {
-        written[browser] = buildRules(manifest, browser);
+        written[browser] = policy.buildRules(manifest, browser);
         const outputPath = path.join(__dirname, browser, 'rules.json');
         fs.writeFileSync(outputPath, JSON.stringify(written[browser], null, 2) + '\n');
         console.log(`Preventive CSP rules written: ${outputPath}`);
@@ -317,12 +132,13 @@ if (require.main === module) {
 
 module.exports = {
     PAGES,
-    FORM_ACTIONS,
-    CATCH_ALL_REGEX,
-    FRAGMENT_REGEX,
-    ALLOWED_REDIRECT_LOCATIONS,
-    pageRegex,
+    FORM_ACTIONS: policy.FORM_ACTIONS,
+    CATCH_ALL_REGEX: policy.CATCH_ALL_REGEX,
+    FRAGMENT_REGEX: policy.FRAGMENT_REGEX,
+    ALLOWED_REDIRECT_LOCATIONS: policy.ALLOWED_REDIRECT_LOCATIONS,
+    pageRegex: policy.pageRegex,
     pageScripts,
-    buildRules,
+    pageEntries,
+    buildRules: policy.buildRules,
     writeRulesFromManifest,
 };

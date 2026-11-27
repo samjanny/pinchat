@@ -16,7 +16,24 @@ const path = require('path');
 
 const root = path.join(__dirname, '..');
 const V = require('../extensions/chrome/verdict.js');
+const R = require('../extensions/chrome/csp-rules.js');
+const { pageEntries } = require('../extensions/generate-csp-rules');
 const { INTEGRITY, CLASS } = V;
+
+/**
+ * The signed release manifest, with the script list of every page. A
+ * manifest signed before format 1.3.0 has none: the lists are then read from
+ * the pages, as the signer does, so that what is tested here does not wait
+ * for the next signature. (verify-sri.js and Test 8 of test-security.js
+ * check the signed manifest itself.)
+ */
+function releaseManifest() {
+    const signed = JSON.parse(fs.readFileSync(path.join(root, 'hashes.json.signed'), 'utf8'));
+    if (!Array.isArray(signed.data.pages)) {
+        signed.data = { ...signed.data, pages: pageEntries(signed.data.files) };
+    }
+    return signed;
+}
 
 let passed = 0;
 function test(name, body) {
@@ -40,7 +57,7 @@ const base = (overrides = {}) => ({
 });
 
 test('both browser builds ship the same verdict logic', () => {
-    for (const file of ['verdict.js', 'background.js', 'content.js', 'popup.js', 'popup.html',
+    for (const file of ['verdict.js', 'csp-rules.js', 'background.js', 'content.js', 'popup.js', 'popup.html',
         'warning.css', 'blocked.html', 'blocked.js', 'blocked.css']) {
         assert.strictEqual(
             fs.readFileSync(path.join(root, 'extensions/chrome', file), 'utf8'),
@@ -358,7 +375,7 @@ test('the Chromium redirect rules allow only what the same check allows', () => 
         assert(!allowedByRule(location), `rule must not allow ${JSON.stringify(location)}`);
     }
 
-    const signed = JSON.parse(fs.readFileSync(path.join(root, 'hashes.json.signed'), 'utf8'));
+    const signed = releaseManifest();
     const chrome = buildRules(signed, 'chrome');
     const firefox = buildRules(signed, 'firefox');
     const redirectRules = chrome.filter((rule) => rule.action.type === 'block');
@@ -425,7 +442,7 @@ test('the Chromium redirect rules allow only what the same check allows', () => 
 
 test('only the page that submits a form to the server may do so', () => {
     const { buildRules, PAGES, pageRegex, CATCH_ALL_REGEX, FORM_ACTIONS } = require('../extensions/generate-csp-rules');
-    const signed = JSON.parse(fs.readFileSync(path.join(root, 'hashes.json.signed'), 'utf8'));
+    const signed = releaseManifest();
     const formAction = (rule) => /(?:^|;\s*)form-action ([^;]+)/.exec(rule.action.responseHeaders[0].value)[1];
     for (const rules of [buildRules(signed, 'chrome'), buildRules(signed, 'firefox')]) {
         const catchAll = rules.find((rule) => rule.condition.regexFilter === CATCH_ALL_REGEX);
@@ -595,40 +612,68 @@ const vm = require('vm');
 const nodeCrypto = require('crypto');
 
 /**
- * Runs extensions/chrome/background.js against stand-ins for the extension
- * APIs. `canAttest` gives it a response filter, as in Firefox. With
- * `manifestFiles`, the manifest it fetches is one signed here with a key of
- * the test's own instead of the release manifest.
+ * Signs a manifest with a key of the test's own. The background script under
+ * test is given the public half in place of the release key, so that the
+ * tests can play releases that were never signed for real.
  */
-function loadBackground({ canAttest = false, hostAccess = true, manifestFiles = null } = {}) {
+const testKey = nodeCrypto.generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
+const testPublicPem = testKey.publicKey.export({ type: 'spki', format: 'pem' }).trim();
+function signForTest(data) {
+    return {
+        data,
+        signature: nodeCrypto.sign('sha256', Buffer.from(JSON.stringify(data)), testKey.privateKey).toString('base64'),
+    };
+}
+
+/** The release manifest's data, with `changes` applied: another release. */
+function releaseData(changes = {}) {
+    return { ...releaseManifest().data, ...changes };
+}
+
+/**
+ * What the browser keeps for an extension across restarts of its background
+ * script: extension storage and the declarativeNetRequest rules.
+ */
+function browserState() {
+    return {
+        local: {},
+        dnr: { dynamic: [], packagedEnabled: true, changes: 0 },
+    };
+}
+
+/**
+ * Runs extensions/chrome/background.js against stand-ins for the extension
+ * APIs. `canAttest` gives it a response filter, as in Firefox. The manifest
+ * it fetches is `manifest` (the release's data by default, with
+ * `extraFiles` added to its files), signed here; `serve(data)` signs
+ * and serves another one from then on, and `serve(null)` makes the release
+ * host unreachable, as `offline` does from the start. `state` is what the
+ * browser kept from an earlier run.
+ */
+function loadBackground({
+    canAttest = false, hostAccess = true, extraFiles = [], manifest = null, state = browserState(), offline = false,
+} = {}) {
     let source = fs.readFileSync(path.join(root, 'extensions/chrome/background.js'), 'utf8');
-    let signed = JSON.parse(fs.readFileSync(path.join(root, 'hashes.json.signed'), 'utf8'));
-    if (manifestFiles) {
-        const { privateKey, publicKey } = nodeCrypto.generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
-        const data = { ...signed.data, files: manifestFiles };
-        signed = {
-            data,
-            signature: nodeCrypto.sign('sha256', Buffer.from(JSON.stringify(data)), privateKey).toString('base64'),
-        };
-        const pem = publicKey.export({ type: 'spki', format: 'pem' }).trim();
-        source = source.replace(/const PINCHAT_PUBLIC_KEY = `[\s\S]*?`;/, `const PINCHAT_PUBLIC_KEY = \`${pem}\`;`);
-    }
-    const rules = JSON.parse(fs.readFileSync(path.join(root, 'extensions/chrome/rules.json'), 'utf8'));
+    source = source.replace(/const PINCHAT_PUBLIC_KEY = `[\s\S]*?`;/, () => `const PINCHAT_PUBLIC_KEY = \`${testPublicPem}\`;`);
+    let served = offline ? null
+        : signForTest(manifest || releaseData({ files: [...releaseManifest().data.files, ...extraFiles] }));
+    const manifestFetches = [];
+    const reloads = [];
+    const browserName = canAttest ? 'firefox' : 'chrome';
+    const rules = JSON.parse(fs.readFileSync(path.join(root, `extensions/${browserName}/rules.json`), 'utf8'));
     const listeners = {};
     const event = (name) => ({
         addListener(fn, filter) { (listeners[name] = listeners[name] || []).push({ fn, filter }); },
     });
-    const storage = () => {
-        const data = {};
-        return {
-            async get(keys) {
-                const wanted = keys === undefined ? Object.keys(data) : [].concat(keys);
-                return Object.fromEntries(wanted.filter((key) => key in data).map((key) => [key, data[key]]));
-            },
-            async set(entries) { Object.assign(data, JSON.parse(JSON.stringify(entries))); },
-            async remove(key) { delete data[key]; },
-        };
-    };
+    const storage = (data = {}) => ({
+        async get(keys) {
+            const wanted = keys === undefined ? Object.keys(data) : [].concat(keys);
+            return Object.fromEntries(wanted.filter((key) => key in data).map((key) => [key, data[key]]));
+        },
+        async set(entries) { Object.assign(data, JSON.parse(JSON.stringify(entries))); },
+        async remove(key) { delete data[key]; },
+    });
+    const { dnr } = state;
     const streams = [];
     const browser = {
         runtime: {
@@ -644,11 +689,24 @@ function loadBackground({ canAttest = false, hostAccess = true, manifestFiles = 
             query: async () => [],
             sendMessage: async () => null,
             update: async () => ({}),
+            reload: async (tabId) => { reloads.push(tabId); },
             get: async (id) => ({ id }),
         },
-        storage: { local: storage(), session: storage() },
+        storage: { local: storage(state.local), session: storage() },
         action: { setBadgeText() {}, setBadgeBackgroundColor() {}, setBadgeTextColor() {} },
         permissions: { contains: async () => hostAccess },
+        declarativeNetRequest: {
+            async getDynamicRules() { return JSON.parse(JSON.stringify(dnr.dynamic)); },
+            async updateDynamicRules({ removeRuleIds = [], addRules = [] }) {
+                dnr.dynamic = dnr.dynamic.filter((rule) => !removeRuleIds.includes(rule.id))
+                    .concat(JSON.parse(JSON.stringify(addRules)));
+                dnr.changes += 1;
+            },
+            async updateEnabledRulesets({ enableRulesetIds = [], disableRulesetIds = [] }) {
+                if (enableRulesetIds.includes('pinchat_preventive_csp')) dnr.packagedEnabled = true;
+                if (disableRulesetIds.includes('pinchat_preventive_csp')) dnr.packagedEnabled = false;
+            },
+        },
     };
     if (canAttest) {
         browser.webRequest = {
@@ -666,13 +724,18 @@ function loadBackground({ canAttest = false, hostAccess = true, manifestFiles = 
     }
     const fetchStandIn = async (url) => {
         if (url === browser.runtime.getURL('rules.json')) return { ok: true, json: async () => rules };
-        if (String(url).endsWith('/hashes.json.signed')) return { ok: true, json: async () => signed };
+        if (new URL(url).pathname.endsWith('/hashes.json.signed')) {
+            manifestFetches.push(String(url));
+            if (!served) throw new Error('release host unreachable');
+            const answer = served;
+            return { ok: true, json: async () => JSON.parse(JSON.stringify(answer)) };
+        }
         throw new Error('no network in this test');
     };
     const quiet = { log() {}, warn() {}, error() {} };
     const context = vm.createContext({
-        browser, PinChatVerdict: V, fetch: fetchStandIn, crypto: nodeCrypto.webcrypto, console: quiet,
-        atob, btoa, TextEncoder, TextDecoder, AbortController, URL, setTimeout, clearTimeout,
+        browser, PinChatVerdict: V, PinChatRules: R, fetch: fetchStandIn, crypto: nodeCrypto.webcrypto,
+        console: quiet, atob, btoa, TextEncoder, TextDecoder, AbortController, URL, setTimeout, clearTimeout,
         setInterval, clearInterval,
     });
     vm.runInContext(source, context, { filename: 'background.js' });
@@ -690,7 +753,13 @@ function loadBackground({ canAttest = false, hostAccess = true, manifestFiles = 
     };
     // Results cross from the script's own realm: compared as data.
     const plain = (value) => JSON.parse(JSON.stringify(value));
-    return { send, contentSender, popupSender, listener, streams, settle, plain, rules };
+    const serve = (data) => { served = data ? signForTest(data) : null; };
+    // Lets a test skip the script's wait between two rechecks of the host.
+    const forgetLastRecheck = () => vm.runInContext('lastMismatchRecheckAt = 0;', context);
+    return {
+        send, contentSender, popupSender, listener, streams, settle, plain, rules, serve, state,
+        manifestFetches, reloads, forgetLastRecheck, browserName,
+    };
 }
 
 /**
@@ -698,7 +767,7 @@ function loadBackground({ canAttest = false, hostAccess = true, manifestFiles = 
  * a document and an extension API reduced to what it touches. Returns the
  * means to deliver policy violations to it and to read what it reports.
  */
-function loadContent({ expectedPolicy }) {
+function loadContent({ expectedPolicy = null, expectedPolicies = null }) {
     const url = 'https://pinchat.im/static/chat.html?room=1';
     const listeners = {};
     const element = (tagName) => {
@@ -742,7 +811,11 @@ function loadContent({ expectedPolicy }) {
                 messages.push(JSON.parse(JSON.stringify(message)));
                 const verdict = { integrity: INTEGRITY.PARTIAL, attention: false, reasons: [], attested: false };
                 if (message.type === 'DOCUMENT_OPENED') {
-                    return { manifestStatus: 'valid', manifest: { files: [] }, canAttest: false, expectedPolicy, verdict };
+                    return {
+                        manifestStatus: 'valid', manifest: { files: [] }, canAttest: false,
+                        expectedPolicy: expectedPolicies ? expectedPolicies[0] : expectedPolicy,
+                        expectedPolicies: expectedPolicies || [expectedPolicy], verdict,
+                    };
                 }
                 return { verdict };
             },
@@ -836,13 +909,14 @@ asyncTest('without standing access to the site no positive state is shown', asyn
     }
 });
 
-asyncTest('the content script is told which policy the packaged rules give its document', async () => {
+asyncTest('the content script is told which policy the rules in force give its document', async () => {
     const bg = loadBackground();
+    await bg.settle(() => !bg.state.dnr.packagedEnabled);
     for (const url of ['https://pinchat.im/static/chat.html?room=1', 'https://pinchat.im/c/1']) {
         const opened = bg.plain(await bg.send(
             { type: 'DOCUMENT_OPENED', token: 't2', policyInForce: true, workerControlled: false }, bg.contentSender(url),
         ));
-        assert.strictEqual(opened.expectedPolicy, V.packagedPolicy(bg.rules, url), url);
+        assert.strictEqual(opened.expectedPolicy, V.packagedPolicy(bg.state.dnr.dynamic, url), url);
         assert(opened.expectedPolicy.startsWith('script-src '), url);
     }
 });
@@ -895,7 +969,7 @@ asyncTest('a data file reaches the page only as signed (Firefox)', async () => {
     const stateOf = async (bg) => bg.plain(await bg.send({ type: 'GET_ALL_STATES' }, bg.popupSender))
         .find((entry) => entry.url === terms);
 
-    const bg = loadBackground({ canAttest: true, manifestFiles: [{ path: '/static/operator.json', hash }] });
+    const bg = loadBackground({ canAttest: true, extraFiles: [{ path: '/static/operator.json', hash }] });
     await bg.send({ type: 'DOCUMENT_OPENED', token: 't3', policyInForce: true, workerControlled: false },
         bg.contentSender(terms));
     assert.strictEqual((await fetchOperator(bg, 'd1', signedBytes)).toString(), signedBytes.toString());
@@ -918,6 +992,222 @@ asyncTest('the data files held are the ones the release signs as data', async ()
     const background = fs.readFileSync(path.join(root, 'extensions/chrome/background.js'), 'utf8');
     const list = (text) => JSON.parse(/const DATA_FILES = (\[[^\]]*\])/.exec(text)[1].replace(/'/g, '"'));
     assert.deepStrictEqual(list(background), list(generator));
+});
+
+// ---- The rules in force come from the signed manifest ----------------------
+
+/** The next release: the same pages, with another chat page and another app.js. */
+function nextRelease(before, chatPage) {
+    const chatHash = nodeCrypto.createHash('sha256').update(chatPage).digest('hex');
+    return {
+        ...before,
+        sequence: before.sequence + 1,
+        files: before.files.map((file) => {
+            if (file.path === '/static/chat.html') return { ...file, hash: chatHash };
+            if (file.path === '/static/js/app.js') return { ...file, hash: 'ab'.repeat(32) };
+            return file;
+        }),
+    };
+}
+
+/** Delivers a document response to the Firefox filter and waits for its release. */
+async function deliverDocument(bg, requestId, bytes, tabId = 4) {
+    const documentTypes = ['main_frame', 'sub_frame'];
+    const request = { requestId, url: 'https://pinchat.im/static/chat.html', tabId, frameId: 0 };
+    bg.listener('beforeRequest', documentTypes)(request);
+    bg.listener('headersReceived', documentTypes)({ ...request, statusCode: 200, responseHeaders: [] });
+    const stream = bg.streams[bg.streams.length - 1];
+    stream.ondata({ data: Uint8Array.from(bytes).buffer });
+    stream.onstop();
+    await bg.settle(() => stream.closed);
+    return Buffer.concat(stream.written);
+}
+
+test('a manifest can give a page only scripts that it signs', () => {
+    const data = releaseData();
+    const chatScripts = data.pages.find((page) => page.path === '/static/chat.html').scripts;
+    const chat = (scripts) => ({
+        ...data,
+        pages: data.pages.map((page) => (page.path === '/static/chat.html' ? { ...page, scripts } : page)),
+    });
+    const refused = [
+        [{ ...data, pages: undefined }, /does not list the scripts/],
+        [chat([]), /lists no script/],
+        [chat([...chatScripts, '/static/js/not-signed.js']), /does not sign/],
+        [chat([...chatScripts, 'https://attacker.test/x.js']), /unexpected script path/],
+        [chat([...chatScripts, '//attacker.test/x.js']), /unexpected script path/],
+        [chat([...chatScripts, '/static/js/../x.js']), /unexpected script path/],
+        [chat([...chatScripts, chatScripts[0]]), /twice/],
+        [{ ...data, pages: [...data.pages, data.pages[0]] }, /twice/],
+        [{ ...data, pages: [...data.pages, { path: '/static/other.html', scripts: [chatScripts[0]] }] },
+            /does not sign the page/],
+        [{ ...data, pages: [...data.pages, { path: '/other.html', scripts: [chatScripts[0]] }] }, /unexpected page/],
+    ];
+    for (const [manifest, message] of refused) {
+        assert.throws(() => R.buildRules(manifest), message);
+    }
+    // The lists the signer writes give exactly the packaged rules.
+    for (const browser of ['chrome', 'firefox']) {
+        const packaged = JSON.parse(fs.readFileSync(path.join(root, `extensions/${browser}/rules.json`), 'utf8'));
+        assert.deepStrictEqual(R.buildRules(data, browser), packaged, browser);
+    }
+});
+
+asyncTest('the rules in force are built from the verified manifest, and the packaged ruleset steps aside', async () => {
+    for (const canAttest of [false, true]) {
+        const bg = loadBackground({ canAttest });
+        await bg.settle(() => !bg.state.dnr.packagedEnabled);
+        assert.strictEqual(bg.state.dnr.packagedEnabled, false, bg.browserName);
+        assert.deepStrictEqual(bg.state.dnr.dynamic, R.buildRules(releaseData(), bg.browserName), bg.browserName);
+        const url = 'https://pinchat.im/static/chat.html?room=1';
+        const opened = bg.plain(await bg.send(
+            { type: 'DOCUMENT_OPENED', token: 'r1', policyInForce: true, workerControlled: false }, bg.contentSender(url),
+        ));
+        assert.deepStrictEqual(opened.expectedPolicies, [V.packagedPolicy(bg.state.dnr.dynamic, url)]);
+        assert.strictEqual(opened.expectedPolicy, opened.expectedPolicies[0]);
+    }
+});
+
+asyncTest('a manifest that does not give every page its policy is not used', async () => {
+    const data = releaseData();
+    const broken = {
+        ...data,
+        pages: data.pages.map((page) => (page.path === '/static/chat.html'
+            ? { ...page, scripts: [...page.scripts, '/static/js/not-signed.js'] } : page)),
+    };
+    const bg = loadBackground({ manifest: broken });
+    const status = bg.plain(await bg.send({ type: 'GET_STATUS' }, bg.popupSender));
+    assert.strictEqual(status.manifestStatus, 'unavailable');
+    await bg.settle(() => false);
+    assert.strictEqual(bg.state.dnr.packagedEnabled, true, 'the packaged ruleset stays in force');
+    assert.deepStrictEqual(bg.state.dnr.dynamic, []);
+});
+
+asyncTest('a signed manifest that cannot be used is not reported as one that could not be obtained (Firefox)', async () => {
+    const url = 'https://pinchat.im/static/chat.html';
+    const page = Buffer.from('<!DOCTYPE html><title>a page</title>');
+    const cases = [
+        // Signed and fetched, but without the page lists of format 1.3.0, as
+        // the manifest of an earlier release is.
+        ['unusable', { manifest: { ...releaseData(), pages: undefined } }, 'manifest-unusable'],
+        // Never fetched, and nothing stored.
+        ['unreachable', { offline: true }, 'manifest-unavailable'],
+    ];
+    for (const [name, options, code] of cases) {
+        const bg = loadBackground({ canAttest: true, ...options });
+        const released = (await deliverDocument(bg, `u-${name}`, page)).toString();
+        const opened = bg.plain(await bg.send(
+            { type: 'DOCUMENT_OPENED', token: `u-${name}`, policyInForce: true, workerControlled: false },
+            bg.contentSender(url, 4),
+        ));
+        assert.deepStrictEqual(opened.verdict.reasons.map((entry) => entry.code), [code], name);
+        assert(released.includes(V.FINDINGS[code][1]), `${name}: the block page says why`);
+        assert.strictEqual(opened.verdict.integrity, INTEGRITY.UNVERIFIABLE, name);
+        assert.strictEqual(opened.manifestStatus, 'unavailable', `${name}: the content script is told no manifest`);
+    }
+});
+
+asyncTest('a page of a release signed after the last check is loaded again under its own policy (Firefox)', async () => {
+    const before = releaseData();
+    const bg = loadBackground({ canAttest: true, manifest: before });
+    await bg.settle(() => !bg.state.dnr.packagedEnabled);
+    const page = Buffer.from('<!DOCTYPE html><title>the next release</title>');
+    const next = nextRelease(before, page);
+    bg.serve(next);
+    bg.forgetLastRecheck();
+
+    const first = await deliverDocument(bg, 'n1', page);
+    await bg.settle(() => bg.reloads.length > 0);
+    assert.deepStrictEqual(bg.reloads, [4], 'the tab is loaded again');
+    assert(!first.equals(page), 'nothing of it was released under the policy of the release before');
+    assert(bg.manifestFetches.some((url) => url.includes('?t=')), 'asked past the cache of the release host');
+    assert.deepStrictEqual(bg.state.dnr.dynamic, R.buildRules(next, 'firefox'), 'the new rules are in force');
+    assert.notDeepStrictEqual(R.buildRules(next, 'firefox'), R.buildRules(before, 'firefox'));
+
+    // Loaded again, it is the signed page of the release in force.
+    assert(Buffer.from(await deliverDocument(bg, 'n2', page)).equals(page));
+    assert.deepStrictEqual(bg.reloads, [4], 'and loaded only once');
+
+    // Just after the change, a document still under the replaced policy is
+    // told that one too.
+    const url = 'https://pinchat.im/static/chat.html?room=1';
+    const opened = bg.plain(await bg.send(
+        { type: 'DOCUMENT_OPENED', token: 'n3', policyInForce: true, workerControlled: false }, bg.contentSender(url, 4),
+    ));
+    assert.deepStrictEqual(opened.expectedPolicies, [
+        V.packagedPolicy(R.buildRules(next, 'firefox'), url),
+        V.packagedPolicy(R.buildRules(before, 'firefox'), url),
+    ]);
+});
+
+asyncTest('a page that matches no release is not reloaded, and the host is not asked again for every load', async () => {
+    const bg = loadBackground({ canAttest: true });
+    await bg.settle(() => !bg.state.dnr.packagedEnabled);
+    bg.forgetLastRecheck();
+    const fetchesBefore = bg.manifestFetches.length;
+    const forged = Buffer.from('<!DOCTYPE html><title>not a release</title>');
+    for (const requestId of ['m1', 'm2', 'm3']) {
+        const released = await deliverDocument(bg, requestId, forged);
+        assert(released.toString().includes('Page blocked'), requestId);
+    }
+    await bg.settle(() => false);
+    assert.deepStrictEqual(bg.reloads, []);
+    assert.strictEqual(bg.manifestFetches.length - fetchesBefore, 1, 'asked once, not for every load');
+});
+
+asyncTest('a report of a page of a newer release makes the tab load again, once (Chromium)', async () => {
+    const before = releaseData();
+    const bg = loadBackground({ manifest: before });
+    await bg.settle(() => !bg.state.dnr.packagedEnabled);
+    const sender = bg.contentSender('https://pinchat.im/static/chat.html?room=1', 9);
+    await bg.send({ type: 'DOCUMENT_OPENED', token: 'c1', policyInForce: true, workerControlled: false }, sender);
+    bg.serve(nextRelease(before, Buffer.from('another page')));
+    bg.forgetLastRecheck();
+    const report = {
+        type: 'DOCUMENT_REPORT', token: 'c1', checksDone: true, environment: [],
+        findings: [{ code: 'blocked-script', detail: '/static/js/app.js' }],
+    };
+    await bg.send(report, sender);
+    await bg.settle(() => bg.reloads.length > 0);
+    assert.deepStrictEqual(bg.reloads, [9]);
+
+    // Reported again after the reload, with no newer release: no more reloads.
+    bg.forgetLastRecheck();
+    await bg.send(report, sender);
+    await bg.settle(() => false);
+    assert.deepStrictEqual(bg.reloads, [9]);
+});
+
+asyncTest('a restart puts the stored release back in force, after an update turned the packaged ruleset on', async () => {
+    const next = nextRelease(releaseData(), Buffer.from('a page'));
+    const first = loadBackground({ manifest: next });
+    await first.settle(() => !first.state.dnr.packagedEnabled);
+    // An update of the extension: the browser turns the packaged ruleset
+    // back on and keeps the dynamic rules.
+    first.state.dnr.packagedEnabled = true;
+    const second = loadBackground({ state: first.state, offline: true });
+    await second.settle(() => !second.state.dnr.packagedEnabled);
+    assert.strictEqual(second.state.dnr.packagedEnabled, false);
+    assert.deepStrictEqual(second.state.dnr.dynamic, R.buildRules(next, 'chrome'));
+});
+
+asyncTest('just after a new release, a document under the replaced policy is not taken for one under none', async () => {
+    const rules = JSON.parse(fs.readFileSync(path.join(root, 'extensions/chrome/rules.json'), 'utf8'));
+    const url = 'https://pinchat.im/static/chat.html?room=1';
+    const replacedPolicy = V.packagedPolicy(rules, url);
+    const newPolicy = V.packagedPolicy(R.buildRules(nextRelease(releaseData(), Buffer.from('x')), 'chrome'), url);
+    const codes = (report) => [...report.findings, ...report.environment].map((entry) => entry.code);
+    for (const [policy, expected] of [[replacedPolicy, []], [newPolicy, []], ["script-src 'self'", ['policy-not-in-force']]]) {
+        const content = loadContent({ expectedPolicies: [newPolicy, replacedPolicy] });
+        await new Promise((resolve) => setImmediate(resolve));
+        content.parsed();
+        content.violation({
+            effectiveDirective: 'script-src-attr', violatedDirective: 'script-src-attr', blockedURI: 'inline',
+            sourceFile: '', sample: content.probeSample(), originalPolicy: policy,
+        });
+        await content.settle();
+        assert.deepStrictEqual(codes(content.lastReport()), expected, policy.slice(0, 40));
+    }
 });
 
 (async () => {

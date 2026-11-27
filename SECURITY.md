@@ -925,8 +925,11 @@ describes every state and what each may be based on.
 
 **What This Protects Against, in both browsers**:
 - Server compromise serving malicious JavaScript, including when the server
-  detects the extension and serves it clean files: the packaged CSP makes
-  the browser refuse any script whose hash is not signed
+  detects the extension and serves it clean files: the script policy makes
+  the browser refuse any script whose hash is not signed. The policy of
+  every page is built from the signed manifest, which lists the scripts each
+  page loads; the copy packaged with the extension applies until a manifest
+  has been verified
 - Inline scripts and inline event handlers in altered HTML
 - A redirect of an invite link to another origin, which would hand the key
   in the URL fragment to that origin: a document navigation on the site
@@ -978,7 +981,18 @@ describes every state and what each may be based on.
   link cannot be prevented by the site itself. A page the extension still
   sees without standing access to the site (access on request) is never
   shown as verified or partially verified
-- Compromised signing key (attacker could sign malicious hashes)
+- Compromised signing key. An attacker holding it can sign a manifest for
+  scripts of its own. Since extension 1.8.0 the manifest is read from the
+  main branch, so that a release of the site needs no new extension; with
+  write access to the repository as well, such a manifest reaches users
+  without any extension passing store review. Up to 1.7.0 the manifest of a
+  release tag was read, and new code reached users only with a new
+  extension. The key is kept offline for that reason
+- A server that keeps serving an older signed release to a browser whose
+  extension cannot reach GitHub: with no newer manifest the old one still
+  matches. Once the extension has seen a newer manifest it refuses older
+  ones (sequence), and as long as it can reach GitHub it learns of every
+  new release
 - Malicious browser extension updates, and other extensions: an extension
   with access to the site can read and change everything. Changes to the
   page whose origin cannot be attested are listed, never judged
@@ -989,12 +1003,12 @@ describes every state and what each may be based on.
 
 | Layer | Protection | Bypassed by |
 |-------|------------|-------------|
-| Packaged hash-only CSP | Blocks arbitrary injected scripts before execution | Signed trusted-code gadget/bug; extension not installed |
-| Browser SRI | Blocks modified bytes for allowlisted external scripts | SRI removed without the packaged CSP |
+| Hash-only CSP from the signed manifest | Blocks arbitrary injected scripts before execution | Signed trusted-code gadget/bug; extension not installed |
+| Browser SRI | Blocks modified bytes for allowlisted external scripts | SRI removed without the CSP |
 | Extension SRI check | Detects missing/wrong integrity | User ignoring warnings |
 | Extension hash verification | Detects file tampering (all manifest files) | User ignoring warnings |
 | Manifest signature | Authenticates hash list | Key compromise |
-| Out-of-band manifest | Server can't forge hashes | GitHub compromise |
+| Out-of-band manifest | Server can't forge hashes, nor hide a newer release | Signing key and GitHub write access together |
 | **Anti-downgrade sequence** | Prevents replay of old manifests | Storage cleared + old manifest |
 
 #### Failure Modes
