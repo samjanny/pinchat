@@ -89,7 +89,7 @@ const MANIFEST_BRANCH = 'main';
 // set by finish-release.sh when the extension itself is released. It must not
 // be higher than the manifest on MANIFEST_BRANCH: a build that rejects every
 // manifest it can fetch verifies nothing for anyone running it.
-const MIN_KNOWN_SEQUENCE = 59;
+const MIN_KNOWN_SEQUENCE = 60;
 
 // Configuration
 const CONFIG = {

@@ -4,7 +4,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Dates are the repository-local commit dates; entries are curated for user-visible impact
 rather than being a 1:1 mirror of `git log`.
 
-## [Unreleased] - extensions 1.8.0
+## [2026-11-27] - v0.9.4, extensions 1.8.0
 
 ### Changed - the extensions read the latest signed manifest
 
@@ -47,6 +47,11 @@ key is the one gate, together with write access to the repository (see
 Release order: main must not carry a manifest before the site serves it.
 Push the tag, build and dry-run it on the server, then push main and switch
 the site right after.
+
+The manifest is re-signed at sequence 60 in format 1.3.0. It signs the same
+53 files with the same hashes as v0.9.3 and adds the page lists, so the
+site does not change and needs no new deployment. The extensions move to
+1.8.0 with their floor at 60. Crate 0.9.4.
 
 ### Fixed - a manifest that cannot be used is not one that could not be obtained
 
