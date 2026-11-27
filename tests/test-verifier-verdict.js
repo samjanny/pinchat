@@ -1083,6 +1083,30 @@ asyncTest('a manifest that does not give every page its policy is not used', asy
     assert.deepStrictEqual(bg.state.dnr.dynamic, []);
 });
 
+asyncTest('a signed manifest that cannot be used is not reported as one that could not be obtained (Firefox)', async () => {
+    const url = 'https://pinchat.im/static/chat.html';
+    const page = Buffer.from('<!DOCTYPE html><title>a page</title>');
+    const cases = [
+        // Signed and fetched, but without the page lists of format 1.3.0, as
+        // the manifest of an earlier release is.
+        ['unusable', { manifest: { ...releaseData(), pages: undefined } }, 'manifest-unusable'],
+        // Never fetched, and nothing stored.
+        ['unreachable', { offline: true }, 'manifest-unavailable'],
+    ];
+    for (const [name, options, code] of cases) {
+        const bg = loadBackground({ canAttest: true, ...options });
+        const released = (await deliverDocument(bg, `u-${name}`, page)).toString();
+        const opened = bg.plain(await bg.send(
+            { type: 'DOCUMENT_OPENED', token: `u-${name}`, policyInForce: true, workerControlled: false },
+            bg.contentSender(url, 4),
+        ));
+        assert.deepStrictEqual(opened.verdict.reasons.map((entry) => entry.code), [code], name);
+        assert(released.includes(V.FINDINGS[code][1]), `${name}: the block page says why`);
+        assert.strictEqual(opened.verdict.integrity, INTEGRITY.UNVERIFIABLE, name);
+        assert.strictEqual(opened.manifestStatus, 'unavailable', `${name}: the content script is told no manifest`);
+    }
+});
+
 asyncTest('a page of a release signed after the last check is loaded again under its own policy (Firefox)', async () => {
     const before = releaseData();
     const bg = loadBackground({ canAttest: true, manifest: before });

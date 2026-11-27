@@ -48,6 +48,15 @@ Release order: main must not carry a manifest before the site serves it.
 Push the tag, build and dry-run it on the server, then push main and switch
 the site right after.
 
+### Fixed - a manifest that cannot be used is not one that could not be obtained
+
+A signed manifest that the extensions fetched but could not use (one
+without page lists, for instance, as every manifest signed before format
+1.3.0) was reported as "could not be obtained", which sent the search to
+the network. The popup, and in Firefox the block page and the notice on the
+page, now say that it was obtained and that this version of the extension
+cannot use it.
+
 ## [2026-11-25] - v0.9.3
 
 Fixes for the findings of an internal audit of v0.9.2 across five areas: the

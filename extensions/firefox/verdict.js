@@ -105,6 +105,9 @@
         // ---- limits -------------------------------------------------------
         'manifest-unavailable': [CLASS.LIMIT,
             'The signed release manifest could not be obtained, so nothing could be compared.'],
+        'manifest-unusable': [CLASS.LIMIT,
+            'The signed release manifest was obtained, but this version of the extension cannot use it, '
+            + 'so nothing could be compared.'],
         'no-host-access': [CLASS.LIMIT,
             'The extension is not allowed to act on this site at all times, so its script policy and '
             + 'redirect guard may not apply. Allow it in the extension\'s site access settings.'],

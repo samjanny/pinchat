@@ -292,7 +292,7 @@ async function hasHostAccess(url) {
 // State of the signed manifest. One per extension, not per tab: it says
 // whether the yardstick is available, never whether a page measured up.
 let verificationState = {
-    signatureStatus: 'unknown', // 'valid', 'invalid', 'error', 'checking', 'unknown'
+    signatureStatus: 'unknown', // 'valid', 'invalid', 'unusable', 'error', 'checking', 'unknown'
     lastCheck: null,
     errors: [],
     manifest: null,
@@ -308,6 +308,7 @@ function manifestVerdict() {
     switch (verificationState.signatureStatus) {
     case 'valid': return 'valid';
     case 'invalid': return 'invalid';
+    case 'unusable':
     case 'error': return 'unavailable';
     default: return 'unknown';
     }
@@ -415,7 +416,8 @@ async function verifySignature(data, signatureBase64, publicKey) {
  *
  * Returns { ok: true, data, sequence, lastKnownSequence } or
  * { ok: false, kind, reason }, where `kind` is 'invalid' for a bad signature
- * or a downgrade (both are attack signals) and 'error' for a malformed
+ * or a downgrade (both are attack signals), 'unusable' for a signed manifest
+ * whose page lists this version cannot use, and 'error' for a malformed
  * document.
  */
 async function validateSignedManifest(signedData) {
@@ -452,7 +454,7 @@ async function validateSignedManifest(signedData) {
     try {
         R.pageScriptLists(signedData.data);
     } catch (error) {
-        return { ok: false, kind: 'error', reason: `Signed manifest is unusable: ${error.message}` };
+        return { ok: false, kind: 'unusable', reason: `Signed manifest is unusable: ${error.message}` };
     }
 
     return { ok: true, data: signedData.data, sequence: manifestSequence, lastKnownSequence };
@@ -554,7 +556,7 @@ async function verifyIntegrity({ bypassCache = false } = {}) {
         }
 
         if (!result.ok) {
-            verificationState.signatureStatus = result.kind === 'invalid' ? 'invalid' : 'error';
+            verificationState.signatureStatus = result.kind;
             verificationState.manifest = null;
             verificationState.errors.push(result.reason);
             console.error(`[PinChat Verify] REJECTED: ${result.reason}`);
@@ -1107,7 +1109,10 @@ async function finishDocument(track) {
         if (status === 'invalid') {
             outcome = { verified: false, code: 'manifest-invalid', detail: '' };
         } else if (status !== 'valid') {
-            outcome = { verified: false, code: 'manifest-unavailable', detail: '' };
+            // Obtained and signed, but not usable by this version, is not
+            // the same as never obtained: say which.
+            const code = verificationState.signatureStatus === 'unusable' ? 'manifest-unusable' : 'manifest-unavailable';
+            outcome = { verified: false, code, detail: '' };
         } else if (track.tooLarge) {
             outcome = { verified: false, code: 'document-too-large', detail: '' };
         } else {

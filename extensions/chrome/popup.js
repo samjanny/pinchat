@@ -52,6 +52,7 @@ function manifestCheck(manifest) {
             : [`valid, sequence ${manifest.sequence} (from the release host)`, 'ok'];
     }
     if (manifest.status === 'invalid') return ['REJECTED: bad signature or older than the last one seen', 'failed'];
+    if (manifest.status === 'unusable') return ['signed, but this version of the extension cannot use it', 'missing'];
     if (manifest.status === 'error') return ['not available', 'missing'];
     return ['not loaded yet', 'pending'];
 }
